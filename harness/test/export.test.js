@@ -69,6 +69,7 @@ function setup() {
   write(bench, "results/scores.jsonl", ["pager-js-T01", "pager-js-T03", "rb-js-demo-1"].map(t => JSON.stringify({ track: "A", task: t, tp_weight: 1 })).join("\n") + "\n");
   write(bench, "results/pool.json", JSON.stringify({ set: "final", bugs: [{ id: "P1", task: "pager-js-T01", severity: "major" }, { id: "P2", task: "pager-js-T03", severity: "minor" }, { id: "P3", task: "rb-js-demo-1", severity: "minor" }] }));
   write(bench, "trackc/tasks.txt", "# Track C tasks\npager-js/pager-js-T01\npager-js/pager-js-T03\n");
+  write(bench, "pilot/blind.mjs", "export const b = 1;\n");
   write(bench, "AGENTS.md", "dev notes stay out\n");
   commitAll(bench);
 
@@ -105,7 +106,7 @@ test("the bundle carries public tasks, real bugs, public runs and scores; nothin
     assert.ok(files.includes("runs/final/A/high/codex/pager-js-T01/1/session/output.jsonl"));
     assert.ok(files.includes("runs/final/C/high/claude-codex/pager-js-T01/1/run.json"));
     assert.ok(files.includes("runs/final/A/high/claude/rb-js-demo-1/1/run.json"));
-    for (const f of ["bench/METHODOLOGY.md", "bench/harness/lib/x.js", "bench/analysis/a.py", "bench/report/REPORT.md", "bench/results/leaderboard.json", "bench/trackc/tasks.txt"]) assert.ok(files.includes(f), f);
+    for (const f of ["bench/METHODOLOGY.md", "bench/harness/lib/x.js", "bench/analysis/a.py", "bench/report/REPORT.md", "bench/results/leaderboard.json", "bench/trackc/tasks.txt", "bench/pilot/blind.mjs"]) assert.ok(files.includes(f), f);
 
     // nothing of the private task: no folder, no run, no score row, no answer text anywhere
     assert.ok(!files.some(f => f.includes("pager-js-T03")), files.filter(f => f.includes("pager-js-T03")).join(", "));

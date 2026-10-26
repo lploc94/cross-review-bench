@@ -13,7 +13,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 const BENCH_FILES = new Set(["METHODOLOGY.md", "README.md", "package.json", "package-lock.json", "LICENSE"]);
-const BENCH_DIRS = ["harness/", "analysis/", "report/", "results/", "calibration/", "trackc/"];
+const BENCH_DIRS = ["harness/", "analysis/", "report/", "results/", "calibration/", "trackc/", "pilot/"];
 const CORPUS_FILES = new Set(["README.md", "CORPUS-GUIDE.md", "splits.json"]);
 // files that may name private tasks: the split and the pre-registered Track C task list name ids, nothing more
 const MAY_NAME_PRIVATE = new Set(["corpus/splits.json", "bench/trackc/tasks.txt"]);

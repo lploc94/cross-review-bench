@@ -19,7 +19,7 @@ The corpus is found through `CRB_CORPUS` (default `../cross-review-bench-corpus`
 ## Requirements
 
 - Node.js >= 22
-- The pinned cross-review release: `git -C <cross-review repo> worktree add --detach ~/.crbench/cross-review-v10.5.1 v10.5.1` and `npm ci --prefix ~/.crbench/cross-review-v10.5.1/skill-packs/cross-review`
+- The pinned cross-review release, needed by the tests too: `git clone --depth 1 --branch v10.5.1 https://github.com/lploc94/cross-review ~/.crbench/cross-review-v10.5.1` (or `git -C <cross-review repo> worktree add --detach ~/.crbench/cross-review-v10.5.1 v10.5.1`) and `npm ci --prefix ~/.crbench/cross-review-v10.5.1/skill-packs/cross-review`; `CRB_PINNED` points elsewhere
 
 ## Tasks
 

@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T10",
+  "repo": "booking-java",
+  "kind": "buggy",
+  "title": "Non-refundable rate plans",
+  "description": "Revenue wants to sell a cheaper non-refundable rate next to the flexible one, as most of our channel partners already do. This adds a second rate plan per stay.\n\n- Room types get `nonRefundableDiscountPercent` (0 to 50, default 0 = sold flexible only), set when the room type is created and shown on the room type. Migration V2 adds the column and a `rate_plan` column (default `FLEXIBLE`) to `hold` and `reservation`.\n- Quotes and holds take an optional `ratePlan` (`FLEXIBLE` by default, or `NON_REFUNDABLE`) in the stay. A non-refundable stay gets one new `RATE_PLAN_DISCOUNT` price line, placed last, worth the room type's percentage of everything else in the price. Asking for it on a room type without a discount is a 400. The quote, hold and reservation responses show the rate plan, and the reservation keeps it from the hold.\n- Cancelling a non-refundable reservation still releases its rooms but refunds nothing, whenever it happens; the cancellation quote returns 0 percent and 0.00.\n- `PricingEngine.quote` has an overload with the rate plan; the existing signature means flexible, so availability and the calendar keep showing flexible prices.\n- README: room types, pricing order (\"…extra-guest fee, then the rate plan discount on all of it\"), rate plans, cancellations.\n\nTests: pricing (discount line last, flexible has none, room type without a discount refused) and API (admin discount and its range, non-refundable quote, hold → confirm → cancellation quote and cancel with no refund and rooms released).",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/innkeep/booking/domain/PricingEngine.java",
+      "lines": [
+        80,
+        107
+      ],
+      "category": "spec-deviation",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "The non-refundable discount is accumulated inside the per-night loop from each night's room charge (`planDiscount.plus(nightly.percent(planPercent))`) and only emitted as the last line. The README and description define it as the percentage of the sum of every other line, after the length-of-stay discount and the extra-guest fees. As written, extra-guest fees are never discounted and the length-of-stay discount is ignored (the discount is taken from the undiscounted room nights, and rounded per night), so any stay with extra guests or a length-of-stay discount is priced and charged a different total than documented.",
+      "trigger": "Property with 10 % weekend surcharge and a 5 % length-of-stay discount from 7 nights; room type 100.00, extra guest 15.00, non-refundable 10 %; 7 nights Mon 2027-06-07 to Mon 2027-06-14, 1 room, 3 guests: lines sum to 789.00 so the discount should be −78.90 (total 710.10), the PR gives −72.00 (total 717.00).",
+      "testable": true,
+      "hidden_tests": [
+        "src/test/java/com/innkeep/booking/service/NonRefundableStayPriceTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=NonRefundableStayPriceTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Extra-guest fees are kept out of every discount on purpose: the rule list in PricingEngine's Javadoc keeps the extra-guest fee outside the length-of-stay discount, and the rate plan discount follows the same convention and applies to room nights only. Taking the percentage night by night is the same amount as taking it on the room total, so the line is exactly the documented discount.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

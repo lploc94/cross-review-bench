@@ -1,0 +1,12 @@
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index 2393522..d357dca 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -304,6 +304,7 @@ func (p *Pool) renewLease(queue string, jobID int64, workerID string, tick <-cha
+ 			p.metrics.renewals.Inc(queue, "lost")
+ 			log.Warn("lease lost while the handler was running, cancelling it", "error", err)
+ 			cancel(err)
++			return
+ 		default:
+ 			p.metrics.renewals.Inc(queue, "error")
+ 			log.Error("renew lease", "error", err)

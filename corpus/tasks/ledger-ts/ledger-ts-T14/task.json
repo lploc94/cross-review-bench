@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T14",
+  "repo": "ledger-ts",
+  "kind": "clean",
+  "title": "Currency catalogue endpoints and grouped amount formatting",
+  "description": "Clients currently hard-code the minor-unit exponents of the eight currencies we support. This adds a small read-only catalogue so they can look them up instead:\n\n- `GET /currencies` lists the rows of the `currencies` reference table by code; `GET /currencies/:code` returns one (400 for a code that is not three upper-case letters, 404 for one we do not support). Both need `accounts:read`, which every client that shows balances already has; the data is shared by all tenants.\n- Each currency carries `code`, `name`, `exponent`, `minor_unit` (the smallest amount in major units: \"0.01\", \"1\", \"0.001\") and a `sample` amount formatted with digit grouping, to help clients check their rendering.\n- `formatMinor` gets an options argument with `grouping`, which separates thousands with commas without going through `toLocaleString`, so the output is the same on every host. The default output is unchanged.\n- `show-transfer` now prints amounts with grouping, which is easier to read in support tickets.\n\nNew API tests for both routes (listing, exponents per currency, errors, scopes) and unit tests for grouping across exponents and signs.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["test/hidden/currencyCatalogue.test.ts"],
+  "clean_hidden_test_cmd": "npx vitest run test/hidden/currencyCatalogue.test.ts"
+}

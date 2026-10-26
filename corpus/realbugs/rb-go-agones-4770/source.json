@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/agones-dev/agones",
+  "intro_pr": 4663,
+  "intro_merged_at": "2026-08-29T09:37:06Z",
+  "fix_pr": 4770,
+  "fix_merged_at": "2026-10-12T18:36:18Z",
+  "license": "Apache-2.0",
+  "base_commit": "1cc6f54f080f1178040cdcdd7c857e46c33d2d18",
+  "intro_commit": "c8131ad3542dfcd9af120763a316ace116f62944",
+  "fix_commit": "1c071a107301312af47fdb0fbe61ba8618c0e8df",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

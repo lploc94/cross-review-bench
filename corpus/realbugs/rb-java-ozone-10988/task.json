@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-java-ozone-10988",
+  "repo": "rb-java-ozone-10988",
+  "kind": "realbug",
+  "title": "HDDS-13128. Expose per DN space utilisation as JMX metrics",
+  "description": "## What changes were proposed in this pull request?\r\n\r\nCurrently there are no node-level aggregated DN JMX metrics available to track the space utilised on a Datanode across all its volumes. Having JMX metrics to track the space utilisation per Datanode, allows monitoring and enables the user to take action when the space utilized on a DN is high, by adding nodes or running the Container Balancer.\r\nA new class `DatanodeStorageMetrics` is added to expose 3 metrics related to space utilisation: `Capacity`, `Used` and `UsedPercentage`.\r\n\r\n## What is the link to the Apache JIRA\r\nhttps://issues.apache.org/jira/browse/HDDS-13128\r\n\r\n## How was this patch tested?\r\n1. Resulting JMX Metrics:\r\n```json\r\n{\r\n    \"name\" : \"Hadoop:service=HddsDatanode,name=DatanodeStorageMetrics\",\r\n    \"modelerType\" : \"DatanodeStorageMetrics\",\r\n    \"tag.Context\" : \"ozone\",\r\n    \"tag.Hostname\" : \"7d739934c5d0\",\r\n    \"OzoneCapacity\" : 105076655700,\r\n    \"OzoneUsed\" : 4382720,\r\n    \"OzoneUsedPercentage\" : 0.004170974010167322\r\n}\r\n```\r\n2. Newly added Unit Tests.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/common/volume/DatanodeStorageMetrics.java",
+      "lines": [
+        91,
+        94
+      ],
+      "category": "concurrency",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "DatanodeStorageMetrics.getMetrics() reads the totals through MutableVolumeSet.getStorageReport(), which takes the volume-set read lock. The metrics system calls getMetrics() while holding the DefaultMetricsSystem monitor, and MutableVolumeSet.failVolume() holds the volume-set write lock while HddsVolume.failVolume() unregisters VolumeIOStats, which needs that same monitor. The opposite lock orders deadlock the metrics thread and the volume-failure handler, after which every metrics register, unregister or sample in the process blocks.",
+      "trigger": "A metrics sample (JMX/Prometheus sink timer) of DatanodeStorageMetrics runs while another thread holds the volume-set write lock, e.g. during failVolume() when a data volume fails: the sampler waits for the read lock while holding the metrics-system monitor that failVolume() needs.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "hadoop-hdds/container-service/src/test/java/org/apache/hadoop/ozone/container/common/volume/TestDatanodeStorageMetrics.java"
+      ],
+      "hidden_test_cmd": "MAVEN_BASEDIR=\"$PWD/hadoop-hdds\" mvn -q -pl hadoop-hdds/container-service -am test -Dsurefire.failIfNoSpecifiedTests=false -Dtest=TestDatanodeStorageMetrics"
+    }
+  ]
+}

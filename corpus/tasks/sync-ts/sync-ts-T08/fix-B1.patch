@@ -1,0 +1,13 @@
+diff --git a/packages/server/src/services/pullService.ts b/packages/server/src/services/pullService.ts
+index fdf2649..568772d 100644
+--- a/packages/server/src/services/pullService.ts
++++ b/packages/server/src/services/pullService.ts
+@@ -78,7 +78,7 @@ export class PullService {
+ 
+     const hasMore = matching.length > limit;
+     const events = hasMore ? matching.slice(0, limit) : matching;
+-    const nextAfter = hasMore ? (matching[limit]?.seq ?? examined) : examined;
++    const nextAfter = hasMore ? (matching[limit - 1]?.seq ?? examined) : examined;
+     return { events, nextAfter, hasMore };
+   }
+ 

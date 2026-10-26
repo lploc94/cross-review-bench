@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/livekit/agents",
+  "intro_pr": 6116,
+  "intro_merged_at": "2026-07-07T00:00:13Z",
+  "fix_pr": 7783,
+  "fix_merged_at": "2026-10-19T08:02:09Z",
+  "license": "Apache-2.0",
+  "base_commit": "8e08fa2c851e24097e17595f7f4cedf0fd8533fc",
+  "intro_commit": "ae40effa2e3a7947f1240263e42798476001359d",
+  "fix_commit": "125361bd7220e36950437c7d54bf21bc5ef75716",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

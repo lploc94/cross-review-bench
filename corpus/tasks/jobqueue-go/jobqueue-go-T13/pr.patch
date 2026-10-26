@@ -1,0 +1,758 @@
+diff --git a/README.md b/README.md
+index 7c29825..598519b 100644
+--- a/README.md
++++ b/README.md
+@@ -45,6 +45,11 @@ available ──cancel──▶ cancelled
+ - Handlers run with the timeout of their type (`JOB_TIMEOUT` unless registered with
+   `worker.WithTimeout`). A handler that may outlive its lease calls `worker.ExtendLease(ctx)`;
+   the `sleep` handler shows how.
++- A handler can report how far it has got with `worker.ReportProgress(ctx, percent, message)`
++  (0–100, message up to 200 bytes). The latest report is stored with the job as `progress`, only
++  while the worker still holds the lease, and shown by `GET /v1/jobs/{id}` and `jobctl wait`. It
++  stays after the attempt ends and is cleared when the job is leased again or requeued. The
++  `sleep` handler reports progress each time it extends its lease.
+ - A panicking handler fails its attempt with the panic message; the worker carries on.
+ - `Stop` (on SIGTERM or SIGINT) stops leasing and waits for running handlers to return. It does
+   not cancel them.
+@@ -110,7 +115,7 @@ with status 400 (malformed body), 401, 404, 409 (wrong state), 413, 415 or 422 (
+ | Route | |
+ |---|---|
+ | `POST /v1/queues/{queue}/jobs` | enqueue `{type, payload?, priority?, max_attempts?, run_at?}`; 201 |
+-| `GET /v1/jobs/{id}` | one job |
++| `GET /v1/jobs/{id}` | one job, with `progress` (`{percent, message, updated_at}` or null) |
+ | `GET /v1/jobs?queue=&state=&after=&limit=` | jobs by ascending id; `next_after` is the cursor of the next page |
+ | `POST /v1/jobs/{id}/cancel` | cancel an available job |
+ | `GET /v1/dead?queue=&after=&limit=` | dead jobs |
+diff --git a/cmd/jobctl/commands.go b/cmd/jobctl/commands.go
+index db41117..d397602 100644
+--- a/cmd/jobctl/commands.go
++++ b/cmd/jobctl/commands.go
+@@ -122,7 +122,8 @@ func cancelCmd(ctx context.Context, c *client.Client, args []string, stdout, std
+ var errNotSucceeded = errors.New("job did not succeed")
+ 
+ // waitCmd polls a job until it reaches a terminal state, so that scripts can enqueue a job and
+-// wait for its result. It succeeds only if the job succeeded.
++// wait for its result. It succeeds only if the job succeeded. Progress reports seen while
++// waiting are printed to stderr.
+ func waitCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
+ 	fs := newFlags("wait", stderr)
+ 	timeout := fs.Duration("timeout", 10*time.Minute, "give up after this long")
+@@ -142,11 +143,16 @@ func waitCmd(ctx context.Context, c *client.Client, args []string, stdout, stder
+ 	defer cancel()
+ 	ticker := time.NewTicker(*interval)
+ 	defer ticker.Stop()
++	var lastReport time.Time // updated_at of the last progress report printed
+ 	for {
+ 		job, err := c.GetJob(ctx, ids[0])
+ 		if err != nil {
+ 			return err
+ 		}
++		if p := job.Progress; p != nil && !p.UpdatedAt.Equal(lastReport) {
++			lastReport = p.UpdatedAt
++			fmt.Fprintln(stderr, strings.TrimSpace(fmt.Sprintf("job %d: %d%% %s", job.ID, p.Percent, oneLine(p.Message, 80))))
++		}
+ 		if terminalStates[job.State] {
+ 			if err := printJSON(stdout, job); err != nil {
+ 				return err
+diff --git a/cmd/jobctl/main_test.go b/cmd/jobctl/main_test.go
+index 192d594..9bdcef1 100644
+--- a/cmd/jobctl/main_test.go
++++ b/cmd/jobctl/main_test.go
+@@ -117,6 +117,23 @@ func TestWaitCommand(t *testing.T) {
+ 	}
+ }
+ 
++func TestWaitPrintsProgress(t *testing.T) {
++	running := func(percent int, msg, at string) string {
++		return fmt.Sprintf(`{"id":4,"state":"running","progress":{"percent":%d,"message":"%s","updated_at":"%s"}}`, percent, msg, at)
++	}
++	first := running(40, "copied 4 of 10 files", "2025-03-10T09:01:00Z")
++	api := &fakeAPI{routes: map[string][]response{
++		"GET /v1/jobs/4": {{200, first}, {200, first}, {200, running(90, "", "2025-03-10T09:02:00Z")}, {200, jobJSON(4, "succeeded")}},
++	}}
++	code, _, errOut := runCLI(t, api, "wait", "-interval", "1ms", "4")
++	if code != 0 {
++		t.Fatalf("exit %d: %s", code, errOut)
++	}
++	if errOut != "job 4: 40% copied 4 of 10 files\njob 4: 90%\n" {
++		t.Errorf("stderr = %q, want each new report once", errOut)
++	}
++}
++
+ func TestScheduleCommands(t *testing.T) {
+ 	sc := `{"name":"nightly","spec":"0 3 * * *","queue":"default","type":"noop","enabled":true,"next_run_at":"2025-03-11T03:00:00Z"}`
+ 	api := &fakeAPI{routes: map[string][]response{
+diff --git a/internal/api/jobs.go b/internal/api/jobs.go
+index dc80b65..99ba1bc 100644
+--- a/internal/api/jobs.go
++++ b/internal/api/jobs.go
+@@ -27,9 +27,21 @@ type jobJSON struct {
+ 	CreatedAt   time.Time       `json:"created_at"`
+ 	UpdatedAt   time.Time       `json:"updated_at"`
+ 	FinishedAt  *time.Time      `json:"finished_at"`
++	Progress    *progressJSON   `json:"progress"`
++}
++
++// progressJSON is the last progress report of a job; null until its attempt reports one.
++type progressJSON struct {
++	Percent   int       `json:"percent"`
++	Message   string    `json:"message"`
++	UpdatedAt time.Time `json:"updated_at"`
+ }
+ 
+ func toJobJSON(j domain.Job) jobJSON {
++	var progress *progressJSON
++	if p := j.Progress; p != nil {
++		progress = &progressJSON{Percent: p.Percent, Message: p.Message, UpdatedAt: p.UpdatedAt}
++	}
+ 	return jobJSON{
+ 		ID:          j.ID,
+ 		Queue:       j.Queue,
+@@ -46,6 +58,7 @@ func toJobJSON(j domain.Job) jobJSON {
+ 		CreatedAt:   j.CreatedAt,
+ 		UpdatedAt:   j.UpdatedAt,
+ 		FinishedAt:  j.FinishedAt,
++		Progress:    progress,
+ 	}
+ }
+ 
+diff --git a/internal/api/jobs_test.go b/internal/api/jobs_test.go
+index 516a532..be6f03a 100644
+--- a/internal/api/jobs_test.go
++++ b/internal/api/jobs_test.go
+@@ -24,6 +24,11 @@ type jobBody struct {
+ 	LockedBy    *string        `json:"locked_by"`
+ 	LastError   *string        `json:"last_error"`
+ 	FinishedAt  *time.Time     `json:"finished_at"`
++	Progress    *struct {
++		Percent   int       `json:"percent"`
++		Message   string    `json:"message"`
++		UpdatedAt time.Time `json:"updated_at"`
++	} `json:"progress"`
+ }
+ 
+ type pageBody struct {
+@@ -83,6 +88,28 @@ func TestEnqueueValidation(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetJobShowsProgress(t *testing.T) {
++	e := newEnv(t)
++	ctx := context.Background()
++	job := decode[jobBody](t, call(t, e.handler, http.MethodPost, "/v1/queues/default/jobs", `{"type":"report.build"}`))
++	path := fmt.Sprintf("/v1/jobs/%d", job.ID)
++	if rec := call(t, e.handler, http.MethodGet, path, ""); !strings.Contains(rec.Body.String(), `"progress":null`) {
++		t.Errorf("job without progress: %s", rec.Body)
++	}
++
++	if _, err := e.store.Lease(ctx, "default", "w1", 1, time.Minute); err != nil {
++		t.Fatal(err)
++	}
++	e.clock.Advance(time.Second)
++	if err := e.store.ReportProgress(ctx, job.ID, "w1", 60, "rendered 6 of 10 sections"); err != nil {
++		t.Fatal(err)
++	}
++	got := decode[jobBody](t, call(t, e.handler, http.MethodGet, path, ""))
++	if p := got.Progress; p == nil || p.Percent != 60 || p.Message != "rendered 6 of 10 sections" || !p.UpdatedAt.Equal(t0.Add(time.Second)) {
++		t.Errorf("progress = %+v", p)
++	}
++}
++
+ func TestGetMissingJob(t *testing.T) {
+ 	e := newEnv(t)
+ 	expectError(t, call(t, e.handler, http.MethodGet, "/v1/jobs/4242", ""), http.StatusNotFound, "not_found")
+diff --git a/internal/builtin/builtin.go b/internal/builtin/builtin.go
+index e78e13a..0a329e8 100644
+--- a/internal/builtin/builtin.go
++++ b/internal/builtin/builtin.go
+@@ -62,9 +62,9 @@ type SleepPayload struct {
+ 	Duration string `json:"duration"` // a Go duration such as "90s"
+ }
+ 
+-// Sleep returns a handler that waits for the payload's duration and then succeeds. It extends
+-// its lease every extendEvery, so it may run longer than one lease. A non-positive extendEvery
+-// means the lease is never extended.
++// Sleep returns a handler that waits for the payload's duration and then succeeds. Every
++// extendEvery it extends its lease, so it may run longer than one lease, and reports how much of
++// the duration has passed. A non-positive extendEvery means the lease is never extended.
+ func Sleep(clk clock.Clock, extendEvery time.Duration) worker.HandlerFunc {
+ 	if extendEvery <= 0 {
+ 		extendEvery = MaxSleep
+@@ -78,18 +78,22 @@ func Sleep(clk clock.Clock, extendEvery time.Duration) worker.HandlerFunc {
+ 		if err != nil || d < 0 || d > MaxSleep {
+ 			return domain.Permanent(fmt.Errorf("payload duration must be between 0s and %s, got %q", MaxSleep, p.Duration))
+ 		}
+-		for d > 0 {
+-			step := min(d, extendEvery)
++		for left := d; left > 0; {
++			step := min(left, extendEvery)
+ 			select {
+ 			case <-ctx.Done():
+ 				return ctx.Err()
+ 			case <-clk.After(step):
+ 			}
+-			d -= step
+-			if d > 0 {
++			left -= step
++			if left > 0 {
+ 				if err := worker.ExtendLease(ctx); err != nil {
+ 					return fmt.Errorf("extend lease: %w", err)
+ 				}
++				slept := d - left
++				if err := worker.ReportProgress(ctx, int(slept*100/d), fmt.Sprintf("slept %s of %s", slept, d)); err != nil {
++					return fmt.Errorf("report progress: %w", err)
++				}
+ 			}
+ 		}
+ 		return nil
+diff --git a/internal/client/client.go b/internal/client/client.go
+index bb784a6..22274bd 100644
+--- a/internal/client/client.go
++++ b/internal/client/client.go
+@@ -32,6 +32,14 @@ type Job struct {
+ 	CreatedAt   time.Time       `json:"created_at"`
+ 	UpdatedAt   time.Time       `json:"updated_at"`
+ 	FinishedAt  *time.Time      `json:"finished_at"`
++	Progress    *Progress       `json:"progress"`
++}
++
++// Progress is the last progress report of a job's attempt.
++type Progress struct {
++	Percent   int       `json:"percent"`
++	Message   string    `json:"message"`
++	UpdatedAt time.Time `json:"updated_at"`
+ }
+ 
+ // JobPage is one page of a job listing.
+diff --git a/internal/domain/domain_test.go b/internal/domain/domain_test.go
+index 3fc6ad9..f92002f 100644
+--- a/internal/domain/domain_test.go
++++ b/internal/domain/domain_test.go
+@@ -101,6 +101,27 @@ func TestAttemptsExhausted(t *testing.T) {
+ 	}
+ }
+ 
++func TestValidateProgress(t *testing.T) {
++	cases := []struct {
++		percent int
++		message string
++		fields  []string
++	}{
++		{0, "", nil},
++		{100, strings.Repeat("é", MaxProgressMessageBytes/2), nil},
++		{-1, "", []string{"percent"}},
++		{101, "", []string{"percent"}},
++		{50, strings.Repeat("a", MaxProgressMessageBytes+1), []string{"message"}},
++		{50, "bad \xff byte", []string{"message"}},
++		{50, "nul \x00 char", []string{"message"}},
++	}
++	for _, tc := range cases {
++		if got := fieldsOf(ValidateProgress(tc.percent, tc.message)); !slices.Equal(got, tc.fields) {
++			t.Errorf("ValidateProgress(%d, %q) fields = %v, want %v", tc.percent, tc.message, got, tc.fields)
++		}
++	}
++}
++
+ func TestValidationErrorMessage(t *testing.T) {
+ 	v := &ValidationError{}
+ 	if v.Err() != nil {
+diff --git a/internal/domain/job.go b/internal/domain/job.go
+index 1060b80..c3a595a 100644
+--- a/internal/domain/job.go
++++ b/internal/domain/job.go
+@@ -94,6 +94,9 @@ type Job struct {
+ 	CreatedAt   time.Time
+ 	UpdatedAt   time.Time
+ 	FinishedAt  *time.Time // set when the job reaches a terminal state
++	// Progress is what the latest attempt last reported through worker.ReportProgress, or nil.
++	// It stays after the attempt ends and is cleared when the job is leased again or requeued.
++	Progress *Progress
+ }
+ 
+ // AttemptsExhausted reports whether the job has used all of its attempts. The store applies the
+diff --git a/internal/domain/progress.go b/internal/domain/progress.go
+new file mode 100644
+index 0000000..cb3d177
+--- /dev/null
++++ b/internal/domain/progress.go
+@@ -0,0 +1,32 @@
++package domain
++
++import (
++	"strings"
++	"time"
++	"unicode/utf8"
++)
++
++// MaxProgressMessageBytes bounds the message of a progress report.
++const MaxProgressMessageBytes = 200
++
++// Progress is the last progress report of a job's attempt.
++type Progress struct {
++	Percent   int    // 0 to 100
++	Message   string // optional, for people watching the job
++	UpdatedAt time.Time
++}
++
++// ValidateProgress checks a progress report before it is stored.
++func ValidateProgress(percent int, message string) error {
++	v := &ValidationError{}
++	if percent < 0 || percent > 100 {
++		v.Add("percent", "must be between 0 and 100")
++	}
++	switch {
++	case len(message) > MaxProgressMessageBytes:
++		v.Add("message", "must be at most %d bytes", MaxProgressMessageBytes)
++	case !utf8.ValidString(message) || strings.ContainsRune(message, 0):
++		v.Add("message", "must be valid UTF-8 without NUL characters")
++	}
++	return v.Err()
++}
+diff --git a/internal/store/jobs.go b/internal/store/jobs.go
+index f22a6ca..25c5c12 100644
+--- a/internal/store/jobs.go
++++ b/internal/store/jobs.go
+@@ -134,12 +134,12 @@ func (s *Store) ListDead(ctx context.Context, queue string, after int64, limit i
+ 	return s.List(ctx, ListFilter{Queue: queue, State: domain.StateDead, After: after, Limit: limit})
+ }
+ 
+-// Requeue makes a dead job available again with a fresh set of attempts. The last error is
+-// kept for reference until the job runs again.
++// Requeue makes a dead job available again with a fresh set of attempts and no progress. The
++// last error is kept for reference until the job runs again.
+ func (s *Store) Requeue(ctx context.Context, id int64) (domain.Job, error) {
+ 	now := s.now()
+ 	row := s.pool.QueryRow(ctx, `
+-		UPDATE jobs SET state = 'available', attempts = 0, run_at = $2, finished_at = NULL, updated_at = $2
++		UPDATE jobs SET state = 'available', attempts = 0, run_at = $2, finished_at = NULL, progress = NULL, updated_at = $2
+ 		WHERE id = $1 AND state = 'dead'
+ 		RETURNING `+jobColumns, id, now)
+ 	job, err := scanJob(row)
+diff --git a/internal/store/lease.go b/internal/store/lease.go
+index 192ad4b..cd974ff 100644
+--- a/internal/store/lease.go
++++ b/internal/store/lease.go
+@@ -19,8 +19,8 @@ const ReapBatchSize = 500
+ 
+ // Lease claims up to n available jobs of queue whose run_at has passed, highest priority first,
+ // then oldest run_at, then lowest id. Each claimed job becomes running, owned by workerID until
+-// now+leaseFor, and its attempt counter is incremented. Jobs locked by a concurrent Lease are
+-// skipped rather than waited for.
++// now+leaseFor, its attempt counter is incremented and the previous attempt's progress is
++// cleared. Jobs locked by a concurrent Lease are skipped rather than waited for.
+ func (s *Store) Lease(ctx context.Context, queue, workerID string, n int, leaseFor time.Duration) ([]domain.Job, error) {
+ 	if n < 1 {
+ 		return nil, fmt.Errorf("lease: n must be positive, got %d", n)
+@@ -41,7 +41,7 @@ func (s *Store) Lease(ctx context.Context, queue, workerID string, n int, leaseF
+ 			FOR UPDATE SKIP LOCKED
+ 		)
+ 		UPDATE jobs AS j
+-		SET state = 'running', locked_by = $4, locked_until = $5, attempts = j.attempts + 1, updated_at = $2
++		SET state = 'running', locked_by = $4, locked_until = $5, attempts = j.attempts + 1, progress = NULL, updated_at = $2
+ 		FROM picked
+ 		WHERE j.id = picked.id
+ 		RETURNING `+jobColumnsOf("j"),
+diff --git a/internal/store/progress.go b/internal/store/progress.go
+new file mode 100644
+index 0000000..c3f7e65
+--- /dev/null
++++ b/internal/store/progress.go
+@@ -0,0 +1,50 @@
++package store
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++// progressDoc is the JSON stored in the progress column.
++type progressDoc struct {
++	Percent   int       `json:"percent"`
++	Message   string    `json:"message,omitempty"`
++	UpdatedAt time.Time `json:"updated_at"`
++}
++
++func decodeProgress(raw []byte) (*domain.Progress, error) {
++	var doc progressDoc
++	if err := json.Unmarshal(raw, &doc); err != nil {
++		return nil, fmt.Errorf("decode progress: %w", err)
++	}
++	return &domain.Progress{Percent: doc.Percent, Message: doc.Message, UpdatedAt: doc.UpdatedAt.UTC()}, nil
++}
++
++// ReportProgress replaces the progress of a running job owned by workerID. It returns
++// domain.ErrLeaseLost when workerID no longer holds the lease, so that a worker whose job was
++// reaped cannot overwrite what the new attempt reports.
++func (s *Store) ReportProgress(ctx context.Context, id int64, workerID string, percent int, message string) error {
++	if err := domain.ValidateProgress(percent, message); err != nil {
++		return err
++	}
++	now := s.now()
++	doc, err := json.Marshal(progressDoc{Percent: percent, Message: message, UpdatedAt: now})
++	if err != nil {
++		return fmt.Errorf("encode progress of job %d: %w", id, err)
++	}
++	tag, err := s.pool.Exec(ctx, `
++		UPDATE jobs SET progress = $3, updated_at = $4
++		WHERE id = $1 AND state = 'running' AND locked_by = $2`,
++		id, workerID, doc, now)
++	if err != nil {
++		return fmt.Errorf("report progress of job %d: %w", id, err)
++	}
++	if tag.RowsAffected() == 0 {
++		return fmt.Errorf("report progress of job %d as %s: %w", id, workerID, domain.ErrLeaseLost)
++	}
++	return nil
++}
+diff --git a/internal/store/progress_test.go b/internal/store/progress_test.go
+new file mode 100644
+index 0000000..6e1582c
+--- /dev/null
++++ b/internal/store/progress_test.go
+@@ -0,0 +1,91 @@
++package store_test
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++func TestReportProgress(t *testing.T) {
++	s, clk := newStore(t)
++	ctx := context.Background()
++	job := mustEnqueue(t, s, domain.NewJob{})
++	if got := mustGet(t, s, job.ID); got.Progress != nil {
++		t.Fatalf("new job has progress %+v", got.Progress)
++	}
++	mustLease(t, s, "default", "w1", 1)
++
++	clk.Advance(time.Second)
++	if err := s.ReportProgress(ctx, job.ID, "w1", 25, "fetched 1 of 4 pages"); err != nil {
++		t.Fatal(err)
++	}
++	clk.Advance(time.Second)
++	if err := s.ReportProgress(ctx, job.ID, "w1", 50, ""); err != nil {
++		t.Fatal(err)
++	}
++	got := mustGet(t, s, job.ID)
++	want := domain.Progress{Percent: 50, UpdatedAt: clk.Now()}
++	if got.Progress == nil || *got.Progress != want {
++		t.Fatalf("progress = %+v, want %+v", got.Progress, want)
++	}
++	if !got.UpdatedAt.Equal(clk.Now()) {
++		t.Errorf("updated_at = %s, want %s", got.UpdatedAt, clk.Now())
++	}
++
++	t.Run("other worker", func(t *testing.T) {
++		wantErr(t, s.ReportProgress(ctx, job.ID, "w2", 90, ""), domain.ErrLeaseLost)
++	})
++	t.Run("invalid", func(t *testing.T) {
++		var verr *domain.ValidationError
++		if err := s.ReportProgress(ctx, job.ID, "w1", 101, ""); !errors.As(err, &verr) {
++			t.Errorf("error = %v, want a ValidationError", err)
++		}
++	})
++	if err := s.Complete(ctx, job.ID, "w1"); err != nil {
++		t.Fatal(err)
++	}
++	t.Run("after the attempt", func(t *testing.T) {
++		wantErr(t, s.ReportProgress(ctx, job.ID, "w1", 100, ""), domain.ErrLeaseLost)
++		if got := mustGet(t, s, job.ID); got.Progress == nil || got.Progress.Percent != 50 {
++			t.Errorf("progress after completion = %+v, want the last report kept", got.Progress)
++		}
++	})
++}
++
++func TestProgressIsClearedForTheNextAttempt(t *testing.T) {
++	s, clk := newStore(t)
++	ctx := context.Background()
++	job := mustEnqueue(t, s, domain.NewJob{MaxAttempts: 2})
++
++	mustLease(t, s, "default", "w1", 1)
++	if err := s.ReportProgress(ctx, job.ID, "w1", 70, "almost"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.Fail(ctx, job.ID, "w1", "timeout", clk.Now()); err != nil {
++		t.Fatal(err)
++	}
++	if got := mustGet(t, s, job.ID); got.Progress == nil || got.Progress.Percent != 70 {
++		t.Fatalf("progress of the failed attempt = %+v, want it kept", got.Progress)
++	}
++	leased := mustLease(t, s, "default", "w2", 1)
++	if len(leased) != 1 || leased[0].Progress != nil {
++		t.Fatalf("second attempt leased %+v, want no progress", leased)
++	}
++
++	if err := s.ReportProgress(ctx, job.ID, "w2", 10, ""); err != nil {
++		t.Fatal(err)
++	}
++	if dead, err := s.Fail(ctx, job.ID, "w2", "timeout", clk.Now()); err != nil || dead.State != domain.StateDead {
++		t.Fatalf("Fail = %+v, %v; want dead", dead, err)
++	}
++	requeued, err := s.Requeue(ctx, job.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if requeued.Progress != nil {
++		t.Errorf("requeued job progress = %+v, want none", requeued.Progress)
++	}
++}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 978cdbc..aa2ebd4 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -60,7 +60,7 @@ type querier interface {
+ 
+ // jobColumns is the column list scanJob expects.
+ const jobColumns = "id, queue, type, payload, priority, state, attempts, max_attempts, run_at, " +
+-	"locked_by, locked_until, last_error, created_at, updated_at, finished_at"
++	"locked_by, locked_until, last_error, created_at, updated_at, finished_at, progress"
+ 
+ // jobColumnsOf qualifies the job columns with a table alias.
+ func jobColumnsOf(alias string) string {
+@@ -77,12 +77,18 @@ func scanJob(row pgx.Row) (domain.Job, error) {
+ 		state     string
+ 		lockedBy  *string
+ 		lastError *string
++		progress  []byte
+ 	)
+ 	err := row.Scan(&j.ID, &j.Queue, &j.Type, &j.Payload, &j.Priority, &state, &j.Attempts, &j.MaxAttempts,
+-		&j.RunAt, &lockedBy, &j.LockedUntil, &lastError, &j.CreatedAt, &j.UpdatedAt, &j.FinishedAt)
++		&j.RunAt, &lockedBy, &j.LockedUntil, &lastError, &j.CreatedAt, &j.UpdatedAt, &j.FinishedAt, &progress)
+ 	if err != nil {
+ 		return domain.Job{}, err
+ 	}
++	if progress != nil {
++		if j.Progress, err = decodeProgress(progress); err != nil {
++			return domain.Job{}, fmt.Errorf("job %d: %w", j.ID, err)
++		}
++	}
+ 	j.State = domain.State(state)
+ 	if lockedBy != nil {
+ 		j.LockedBy = *lockedBy
+diff --git a/internal/worker/fake_test.go b/internal/worker/fake_test.go
+index e29d63d..82f1595 100644
+--- a/internal/worker/fake_test.go
++++ b/internal/worker/fake_test.go
+@@ -19,6 +19,7 @@ type fakeStore struct {
+ 	failed    []failCall
+ 	discarded []failCall
+ 	extended  []extendCall
++	progress  []progressCall
+ 
+ 	settleErr error // returned by Complete, Fail and Discard when set
+ 	leaseErrs int   // the next leaseErrs Lease calls fail
+@@ -34,6 +35,13 @@ type failCall struct {
+ 	ctxErr   error // the context's error when the call was made
+ }
+ 
++type progressCall struct {
++	id       int64
++	workerID string
++	percent  int
++	message  string
++}
++
+ type extendCall struct {
+ 	id       int64
+ 	workerID string
+@@ -137,6 +145,13 @@ func (f *fakeStore) ExtendLease(_ context.Context, id int64, workerID string, un
+ 	return nil
+ }
+ 
++func (f *fakeStore) ReportProgress(_ context.Context, id int64, workerID string, percent int, message string) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.progress = append(f.progress, progressCall{id: id, workerID: workerID, percent: percent, message: message})
++	return nil
++}
++
+ // calls is a copy of what a fakeStore recorded.
+ type calls struct {
+ 	leases    int
+@@ -144,6 +159,7 @@ type calls struct {
+ 	failed    []failCall
+ 	discarded []failCall
+ 	extended  []extendCall
++	progress  []progressCall
+ }
+ 
+ func (f *fakeStore) snapshot() calls {
+@@ -155,5 +171,6 @@ func (f *fakeStore) snapshot() calls {
+ 		failed:    append([]failCall(nil), f.failed...),
+ 		discarded: append([]failCall(nil), f.discarded...),
+ 		extended:  append([]extendCall(nil), f.extended...),
++		progress:  append([]progressCall(nil), f.progress...),
+ 	}
+ }
+diff --git a/internal/worker/lease.go b/internal/worker/lease.go
+index f9cb6d3..7a420f5 100644
+--- a/internal/worker/lease.go
++++ b/internal/worker/lease.go
+@@ -6,9 +6,11 @@ import (
+ 	"time"
+ 
+ 	"github.com/relaywork/jobqueue/internal/clock"
++	"github.com/relaywork/jobqueue/internal/domain"
+ )
+ 
+-// ErrNoLease is returned by ExtendLease when the context does not belong to a running job.
++// ErrNoLease is returned by ExtendLease and ReportProgress when the context does not belong to
++// a running job.
+ var ErrNoLease = errors.New("worker: context does not carry a job lease")
+ 
+ type leaseKey struct{}
+@@ -38,6 +40,22 @@ func ExtendLease(ctx context.Context) error {
+ 	return l.store.ExtendLease(ctx, l.jobID, l.workerID, l.clock.Now().Add(l.duration))
+ }
+ 
++// ReportProgress records how far the job running under ctx has got: percent from 0 to 100 and
++// an optional message of at most domain.MaxProgressMessageBytes. The API shows the latest report
++// with the job; each report replaces the previous one. Reporting does not extend the lease. It
++// returns a domain.ValidationError for an invalid report and domain.ErrLeaseLost when the job
++// has been reaped.
++func ReportProgress(ctx context.Context, percent int, message string) error {
++	l, ok := ctx.Value(leaseKey{}).(*lease)
++	if !ok {
++		return ErrNoLease
++	}
++	if err := domain.ValidateProgress(percent, message); err != nil {
++		return err
++	}
++	return l.store.ReportProgress(ctx, l.jobID, l.workerID, percent, message)
++}
++
+ // WorkerID returns the lease owner name of the worker running the job under ctx, or "" when
+ // ctx does not belong to a running job.
+ func WorkerID(ctx context.Context) string {
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index f7ebeed..fad4910 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -27,6 +27,7 @@ type Store interface {
+ 	Fail(ctx context.Context, id int64, workerID, errMsg string, retryAt time.Time) (domain.Job, error)
+ 	Discard(ctx context.Context, id int64, workerID, errMsg string) (domain.Job, error)
+ 	ExtendLease(ctx context.Context, id int64, workerID string, until time.Time) error
++	ReportProgress(ctx context.Context, id int64, workerID string, percent int, message string) error
+ }
+ 
+ // Options configures a Pool.
+diff --git a/internal/worker/pool_test.go b/internal/worker/pool_test.go
+index b001dd8..fb8c8e0 100644
+--- a/internal/worker/pool_test.go
++++ b/internal/worker/pool_test.go
+@@ -3,6 +3,8 @@ package worker_test
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -238,6 +240,37 @@ func TestPoolExtendLeaseFromHandler(t *testing.T) {
+ 	}
+ }
+ 
++func TestPoolReportProgressFromHandler(t *testing.T) {
++	st := newFakeStore(domain.Job{ID: 6, Type: "import"})
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"import": func(ctx context.Context, _ domain.Job) error {
++			if err := worker.ReportProgress(ctx, 30, "read 300 of 1000 rows"); err != nil {
++				return err
++			}
++			var verr *domain.ValidationError
++			if err := worker.ReportProgress(ctx, 130, ""); !errors.As(err, &verr) {
++				return fmt.Errorf("invalid report: %v, want a ValidationError", err)
++			}
++			return nil
++		},
++	}))
++	h.start(t, context.Background())
++
++	if out := h.next(t); out.Err != nil {
++		t.Fatalf("handler failed: %v", out.Err)
++	}
++	want := []progressCall{{id: 6, workerID: "test/default/0", percent: 30, message: "read 300 of 1000 rows"}}
++	if got := st.snapshot().progress; !slices.Equal(got, want) {
++		t.Errorf("ReportProgress calls = %+v, want %+v", got, want)
++	}
++}
++
++func TestReportProgressOutsideAJob(t *testing.T) {
++	if err := worker.ReportProgress(context.Background(), 10, ""); !errors.Is(err, worker.ErrNoLease) {
++		t.Errorf("error = %v, want ErrNoLease", err)
++	}
++}
++
+ func TestExtendLeaseOutsideAJob(t *testing.T) {
+ 	if err := worker.ExtendLease(context.Background()); !errors.Is(err, worker.ErrNoLease) {
+ 		t.Errorf("error = %v, want ErrNoLease", err)
+diff --git a/internal/worker/store_test.go b/internal/worker/store_test.go
+index e3a1348..656f8ea 100644
+--- a/internal/worker/store_test.go
++++ b/internal/worker/store_test.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/jackc/pgx/v5/pgxpool"
+ 
++	"github.com/relaywork/jobqueue/internal/builtin"
+ 	"github.com/relaywork/jobqueue/internal/clock"
+ 	"github.com/relaywork/jobqueue/internal/domain"
+ 	"github.com/relaywork/jobqueue/internal/logging"
+@@ -99,3 +100,38 @@ func TestReaperHandsAbandonedJobToAnotherWorker(t *testing.T) {
+ 		t.Errorf("crashed worker's Complete = %v, want ErrLeaseLost", err)
+ 	}
+ }
++
++func TestSleepJobReportsProgressThroughStore(t *testing.T) {
++	db := testdb.Require(t, testPool)
++	clk := clock.NewManual(t0)
++	st := store.New(db, clk)
++	reg := worker.NewRegistry(time.Minute)
++	reg.Register(builtin.TypeSleep, builtin.Sleep(clk, time.Minute))
++	h := newHarnessWithClock(t, clk, st, reg)
++	ctx := context.Background()
++	job, err := st.Enqueue(ctx, domain.NewJob{Queue: "default", Type: builtin.TypeSleep, Payload: []byte(`{"duration":"150s"}`)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.start(t, ctx)
++
++	for _, want := range []domain.Progress{
++		{Percent: 40, Message: "slept 1m0s of 2m30s", UpdatedAt: t0.Add(time.Minute)},
++		{Percent: 80, Message: "slept 2m0s of 2m30s", UpdatedAt: t0.Add(2 * time.Minute)},
++	} {
++		h.clock.BlockUntil(1) // the handler waits for its next step
++		h.clock.Advance(time.Minute)
++		h.clock.BlockUntil(1) // it has reported and waits again
++		got, err := st.Get(ctx, job.ID)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got.Progress == nil || *got.Progress != want {
++			t.Fatalf("progress = %+v, want %+v", got.Progress, want)
++		}
++	}
++	h.clock.Advance(30 * time.Second)
++	if out := h.next(t); out.State != domain.StateSucceeded {
++		t.Fatalf("outcome = %+v, want succeeded", out)
++	}
++}
+diff --git a/migrations/0003_job_progress.sql b/migrations/0003_job_progress.sql
+new file mode 100644
+index 0000000..cf61e2d
+--- /dev/null
++++ b/migrations/0003_job_progress.sql
+@@ -0,0 +1,3 @@
++-- The last progress report of a running job: {"percent": 0-100, "message": "…", "updated_at": "…"}.
++ALTER TABLE jobs ADD COLUMN progress jsonb;
++ALTER TABLE jobs ADD CONSTRAINT jobs_progress_object_check CHECK (progress IS NULL OR jsonb_typeof(progress) = 'object');

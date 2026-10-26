@@ -1,0 +1,751 @@
+diff --git a/README.md b/README.md
+index 2ae945d..1e83f94 100644
+--- a/README.md
++++ b/README.md
+@@ -94,6 +94,12 @@ summer belongs to the next day in Berlin, and the day of a DST change has 23 or
+ 
+ - `daily-sales`: per day, country and currency, the number of orders and their revenue
+   (cancelled orders are left out; currencies are never added together).
++- `daily-sales --in EUR`: per day and country, the revenue of all currencies in EUR. Each
++  order is converted at the reference rate of its day (the day of the report it falls on),
++  and each cell is rounded half-even to cents once. Rates come from
++  `etl fx load <file>` (CSV `day,currency,rate_to_eur`: EUR per unit of the currency, up to
++  12 decimals; a rate loaded again for the same day replaces the old one) and are kept in
++  `etl.fx_rates`. A missing rate fails the report (`FxRateMissing`, exit 4), naming it.
+ - `customers`: current customers per country, as of now or the end of a given day.
+ 
+ Each report prints a table (or JSON) and writes a CSV file to `REPORT_DIR`.
+@@ -109,8 +115,9 @@ etl rejects list <run-id> [--reason R] [--after LINE] [--limit N] [--json]
+ etl rejects prune --before D [--source S] [--yes]
+ etl checks list [--source S] [--json]        declared checks and their last results
+ etl checks run [--source S] [--json]         evaluate the checks now, record nothing
+-etl report daily-sales [--from D] [--to D] [--json]
++etl report daily-sales [--from D] [--to D] [--in EUR] [--json]
+ etl report customers [--as-of D] [--json]
++etl fx load <file> [--json]                  daily reference rates to EUR
+ etl watermark list [--json]
+ etl watermark show <source> [--json]
+ etl watermark reset <source> [--to INSTANT] [--yes]
+@@ -134,7 +141,7 @@ fails. Exit codes:
+ | 1 | unexpected error |
+ | 2 | invalid request (bad date, bad option value) |
+ | 3 | invalid configuration |
+-| 4 | not found (source, run or file) |
++| 4 | not found (source, run, file, or a reference rate a converted report needs) |
+ | 10 | `SourceFormatError`: unreadable file, or an orders line that cannot be split into its fields or has no readable `order_id` |
+ | 11 | `SchemaMismatch`: required columns missing |
+ | 12 | `TooManyRejects` |
+diff --git a/migrations/versions/0005_fx_rates.py b/migrations/versions/0005_fx_rates.py
+new file mode 100644
+index 0000000..cc76a3d
+--- /dev/null
++++ b/migrations/versions/0005_fx_rates.py
+@@ -0,0 +1,33 @@
++"""fx rates: daily reference rates to EUR for converted reports
++
++Revision ID: 0005
++Revises: 0004
++Create Date: 2026-10-12 11:00:00+00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "0005"
++down_revision: str | None = "0004"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "fx_rates",
++        sa.Column("day", sa.Date(), nullable=False),
++        sa.Column("currency", sa.String(3), nullable=False),
++        sa.Column("rate_to_eur", sa.Numeric(20, 12), nullable=False),
++        sa.Column("loaded_at", sa.DateTime(timezone=True), nullable=False),
++        sa.PrimaryKeyConstraint("day", "currency", name="fx_rates_pkey"),
++        sa.CheckConstraint("rate_to_eur > 0", name="ck_fx_rates_positive"),
++        schema="etl",
++    )
++
++
++def downgrade() -> None:
++    op.drop_table("fx_rates", schema="etl")
+diff --git a/src/etl/api/fx.py b/src/etl/api/fx.py
+new file mode 100644
+index 0000000..8106563
+--- /dev/null
++++ b/src/etl/api/fx.py
+@@ -0,0 +1,93 @@
++"""Reference exchange rates: load a daily rates file into `etl.fx_rates`.
++
++The file is CSV with the header `day,currency,rate_to_eur`: the ISO date, the ISO 4217 code and
++how many EUR one unit of the currency is worth that day, with a decimal point. EUR itself is
++the base and is never listed. A file is loaded whole or not at all; a rate already stored for
++a day and currency is replaced.
++"""
++
++from __future__ import annotations
++
++import csv
++import itertools
++from datetime import date
++from decimal import Context, Decimal
++from pathlib import Path
++
++from etl.api.context import AppContext
++from etl.domain.money import currency, parse_amount
++from etl.errors import SourceFileNotFound, SourceFormatError
++from etl.infra.fs import open_text
++from etl.logging import get_logger
++from etl.schemas.views import FxLoadView
++from etl.sources.base import normalise_header
++from etl.store import fx_rates
++from etl.store.fx_rates import FxRate
++
++BASE_CURRENCY = "EUR"
++# What etl.fx_rates.rate_to_eur holds: NUMERIC(20, 12).
++RATE_DECIMALS = 12
++RATE_QUANTUM = Decimal(1).scaleb(-RATE_DECIMALS)
++MAX_RATE = Decimal(10) ** 8
++RATE_CONTEXT = Context(prec=30)
++HEADER = ["day", "currency", "rate_to_eur"]
++WRITE_BATCH = 1000
++
++log = get_logger(__name__)
++
++
++def load_rates(context: AppContext, path: Path) -> FxLoadView:
++    if not path.is_file():
++        raise SourceFileNotFound(str(path))
++    rates: dict[tuple[date, str], FxRate] = {}
++    with open_text(path, "utf-8-sig") as handle:
++        reader = csv.reader(handle, strict=True)
++        try:
++            header = normalise_header(next(reader, []))
++            if header != HEADER:
++                raise SourceFormatError(f"the header must be {','.join(HEADER)}", line_no=1)
++            for values in reader:
++                if not values:
++                    continue
++                rate = _parse(values, reader.line_num)
++                key = (rate.day, rate.currency)
++                if key in rates:
++                    raise SourceFormatError(
++                        f"{rate.currency} on {rate.day} is listed twice", line_no=reader.line_num
++                    )
++                rates[key] = rate
++        except (csv.Error, UnicodeDecodeError, OSError, EOFError) as error:
++            raise SourceFormatError(f"unreadable rates file: {error}") from None
++    with context.engine.begin() as connection:
++        for batch in itertools.batched(rates.values(), WRITE_BATCH, strict=False):
++            fx_rates.upsert_many(connection, batch, loaded_at=context.clock.now())
++    days = sorted({day for day, _ in rates})
++    log.info("fx.rates_loaded", path=str(path), rates=len(rates))
++    return FxLoadView(
++        rates=len(rates),
++        first_day=days[0] if days else None,
++        last_day=days[-1] if days else None,
++        currencies=sorted({code for _, code in rates}),
++    )
++
++
++def _parse(values: list[str], line_no: int) -> FxRate:
++    if len(values) != len(HEADER):
++        raise SourceFormatError(f"expected {len(HEADER)} fields", line_no=line_no)
++    day_text, code_text, rate_text = (value.strip() for value in values)
++    try:
++        day = date.fromisoformat(day_text)
++        code = currency(code_text).code
++        rate = parse_amount(rate_text, ".")
++    except ValueError as error:
++        raise SourceFormatError(str(error), line_no=line_no) from None
++    if code == BASE_CURRENCY:
++        raise SourceFormatError("EUR is the base currency, not a rate", line_no=line_no)
++    if rate <= 0:
++        raise SourceFormatError("a rate must be positive", line_no=line_no)
++    if rate >= MAX_RATE or rate != rate.quantize(RATE_QUANTUM, context=RATE_CONTEXT):
++        raise SourceFormatError(
++            f"a rate must be below {MAX_RATE} with at most {RATE_DECIMALS} decimals",
++            line_no=line_no,
++        )
++    return FxRate(day, code, rate)
+diff --git a/src/etl/api/reports.py b/src/etl/api/reports.py
+index 52650e4..a169715 100644
+--- a/src/etl/api/reports.py
++++ b/src/etl/api/reports.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ from datetime import date, timedelta
+ 
+ from etl.api.context import AppContext
++from etl.domain.money import currency
+ from etl.domain.timestamps import local_date, start_of_day
+ from etl.errors import InvalidRequest
+ from etl.reports import customers, daily_sales
+@@ -19,10 +20,16 @@ def _yesterday(context: AppContext) -> date:
+ 
+ 
+ def daily_sales_report(
+-    context: AppContext, *, first: date | None = None, last: date | None = None
++    context: AppContext,
++    *,
++    first: date | None = None,
++    last: date | None = None,
++    convert_to: str | None = None,
+ ) -> DailySalesReport:
+     """Daily sales from `first` to `last` (inclusive). `last` defaults to yesterday in the
+-    reporting zone, `first` to `last`."""
++    reporting zone, `first` to `last`. With `convert_to` (EUR, the currency the reference rates
++    are stored against), one row per day and country in that currency."""
++    target = _target_currency(convert_to) if convert_to is not None else None
+     zone = context.settings.reporting_tz
+     last_day = last if last is not None else _yesterday(context)
+     first_day = first if first is not None else last_day
+@@ -31,14 +38,36 @@ def daily_sales_report(
+     if (last_day - first_day).days >= MAX_REPORT_DAYS:
+         raise InvalidRequest(f"a report covers at most {MAX_REPORT_DAYS} days")
+     with context.engine.connect() as connection:
+-        rows = daily_sales.daily_sales(connection, first=first_day, last=last_day, zone=zone)
+-    path = context.settings.report_dir / f"daily_sales_{first_day}_{last_day}.csv"
++        if target is None:
++            rows = daily_sales.daily_sales(connection, first=first_day, last=last_day, zone=zone)
++        else:
++            rows = daily_sales.daily_sales_in(connection, first=first_day, last=last_day, zone=zone)
++    suffix = f"_{target}" if target is not None else ""
++    path = context.settings.report_dir / f"daily_sales_{first_day}_{last_day}{suffix}.csv"
+     write_csv(path, daily_sales.HEADER, daily_sales_cells(rows))
+     return DailySalesReport(
+-        first_day=first_day, last_day=last_day, zone=zone.key, rows=rows, path=path
++        first_day=first_day,
++        last_day=last_day,
++        zone=zone.key,
++        converted_to=target,
++        rows=rows,
++        path=path,
+     )
+ 
+ 
++def _target_currency(code: str) -> str:
++    try:
++        target = currency(code).code
++    except ValueError as error:
++        raise InvalidRequest(str(error)) from None
++    if target != daily_sales.BASE_CURRENCY:
++        raise InvalidRequest(
++            f"reports convert to {daily_sales.BASE_CURRENCY} only: the reference rates are"
++            f" stored against it"
++        )
++    return target
++
++
+ def customer_counts_report(
+     context: AppContext, *, as_of: date | None = None
+ ) -> CustomerCountsReport:
+diff --git a/src/etl/cli/app.py b/src/etl/cli/app.py
+index 0049ec8..b0ebfbe 100644
+--- a/src/etl/cli/app.py
++++ b/src/etl/cli/app.py
+@@ -7,6 +7,7 @@ from etl.cli import db, run, sources
+ from etl.cli.checks import checks_app
+ from etl.cli.common import ContextFactory, LazyContext
+ from etl.cli.db import db_app
++from etl.cli.fx import fx_app
+ from etl.cli.rejects import rejects_app
+ from etl.cli.report import report_app
+ from etl.cli.runs import runs_app
+@@ -41,6 +42,7 @@ def build_app(factory: ContextFactory = build_context) -> typer.Typer:
+     app.add_typer(sources_app, name="sources")
+     app.add_typer(checks_app, name="checks")
+     app.add_typer(report_app, name="report")
++    app.add_typer(fx_app, name="fx")
+     app.add_typer(watermark_app, name="watermark")
+     return app
+ 
+diff --git a/src/etl/cli/fx.py b/src/etl/cli/fx.py
+new file mode 100644
+index 0000000..ec51fb6
+--- /dev/null
++++ b/src/etl/cli/fx.py
+@@ -0,0 +1,33 @@
++"""`etl fx load <file>`: daily reference exchange rates."""
++
++from pathlib import Path
++from typing import Annotated
++
++import typer
++
++from etl.api import fx as fx_api
++from etl.cli.common import app_context, guarded
++from etl.cli.output import echo_json
++
++fx_app = typer.Typer(help="Reference exchange rates.", no_args_is_help=True)
++
++
++@fx_app.command("load")
++@guarded
++def load_command(
++    ctx: typer.Context,
++    path: Annotated[Path, typer.Argument(help="CSV file: day,currency,rate_to_eur.")],
++    as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
++) -> None:
++    """Load daily rates to EUR; a rate already stored for a day and currency is replaced."""
++    view = fx_api.load_rates(app_context(ctx), path)
++    if as_json:
++        echo_json(view)
++        return
++    if view.rates == 0:
++        typer.echo("no rates in the file")
++        return
++    typer.echo(
++        f"loaded {view.rates} rates for {', '.join(view.currencies)},"
++        f" {view.first_day} to {view.last_day}"
++    )
+diff --git a/src/etl/cli/report.py b/src/etl/cli/report.py
+index 788bbd5..1057e10 100644
+--- a/src/etl/cli/report.py
++++ b/src/etl/cli/report.py
+@@ -25,18 +25,28 @@ def daily_sales_command(
+     last: Annotated[
+         str | None, typer.Option("--to", help="Last day, YYYY-MM-DD (default: yesterday).")
+     ] = None,
++    convert_to: Annotated[
++        str | None,
++        typer.Option("--in", help="Convert to EUR at each day's reference rate (etl fx load)."),
++    ] = None,
+     as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
+ ) -> None:
+     """Orders and revenue per day, country and currency (days in the reporting zone)."""
+     report = reports_api.daily_sales_report(
+-        app_context(ctx), first=parse_day(first, "--from"), last=parse_day(last, "--to")
++        app_context(ctx),
++        first=parse_day(first, "--from"),
++        last=parse_day(last, "--to"),
++        convert_to=convert_to,
+     )
+     if as_json:
+         echo_json(report)
+         return
++    converted = (
++        f"in {report.converted_to} at daily reference rates, " if report.converted_to else ""
++    )
+     typer.echo(
+         f"daily sales {report.first_day} to {report.last_day} ({report.zone}), "
+-        f"cancelled orders excluded"
++        f"{converted}cancelled orders excluded"
+     )
+     typer.echo(render_table(daily_sales.HEADER, daily_sales_cells(report.rows), right=(3, 4)))
+     typer.echo(f"written to {report.path}")
+diff --git a/src/etl/errors.py b/src/etl/errors.py
+index e6ef784..a80105c 100644
+--- a/src/etl/errors.py
++++ b/src/etl/errors.py
+@@ -7,6 +7,7 @@ maps them to process exit codes; the CLI looks codes up through `exit_code_for`.
+ from __future__ import annotations
+ 
+ from collections.abc import Sequence
++from datetime import date
+ 
+ from sqlalchemy.exc import DBAPIError
+ 
+@@ -55,6 +56,18 @@ class SourceFileNotFound(NotFound):
+         super().__init__(f"source file {path} does not exist or is not a file")
+ 
+ 
++class FxRateMissing(NotFound):
++    """A converted report needs reference rates that were not loaded."""
++
++    def __init__(self, missing: Sequence[tuple[date, str]]) -> None:
++        self.missing = list(missing)
++        first_day, code = self.missing[0]
++        more = f" (and {len(self.missing) - 1} more)" if len(self.missing) > 1 else ""
++        super().__init__(
++            f"no EUR reference rate for {code} on {first_day}{more}; load it with `etl fx load`"
++        )
++
++
+ class SourceFormatError(EtlError):
+     """A source file cannot be read at all (bad compression, bad encoding, broken CSV quoting),
+     or not safely (an order line that cannot be split into its fields, or whose order_id
+diff --git a/src/etl/infra/tables.py b/src/etl/infra/tables.py
+index efeba2d..3c50e0f 100644
+--- a/src/etl/infra/tables.py
++++ b/src/etl/infra/tables.py
+@@ -11,6 +11,7 @@ from sqlalchemy import (
+     Boolean,
+     CheckConstraint,
+     Column,
++    Date,
+     DateTime,
+     ForeignKey,
+     Identity,
+@@ -34,6 +35,8 @@ metadata = MetaData()
+ TZ = DateTime(timezone=True)
+ # Money columns: up to 15 digits before the point, up to 3 minor units (BHD, KWD, ...).
+ MONEY = Numeric(18, 3)
++# Exchange rates: 12 decimals keep the significant digits of rates of small units (VND, IDR).
++FX_RATE = Numeric(20, 12)
+ 
+ # --- etl: run bookkeeping -------------------------------------------------------------------
+ 
+@@ -113,6 +116,19 @@ check_results = Table(
+     schema=ETL_SCHEMA,
+ )
+ 
++# Daily reference rates: one unit of `currency` is worth `rate_to_eur` EUR on `day`.
++fx_rates = Table(
++    "fx_rates",
++    metadata,
++    Column("day", Date, nullable=False),
++    Column("currency", String(3), nullable=False),
++    Column("rate_to_eur", FX_RATE, nullable=False),
++    Column("loaded_at", TZ, nullable=False),
++    PrimaryKeyConstraint("day", "currency", name="fx_rates_pkey"),
++    CheckConstraint("rate_to_eur > 0", name="ck_fx_rates_positive"),
++    schema=ETL_SCHEMA,
++)
++
+ # --- warehouse: dimensions ------------------------------------------------------------------
+ 
+ products = Table(
+@@ -216,5 +232,5 @@ order_lines = Table(
+     schema=WAREHOUSE_SCHEMA,
+ )
+ 
+-ETL_TABLES = (runs, watermarks, rejects, check_results)
++ETL_TABLES = (runs, watermarks, rejects, check_results, fx_rates)
+ WAREHOUSE_TABLES = (products, customers, orders, order_lines)
+diff --git a/src/etl/reports/daily_sales.py b/src/etl/reports/daily_sales.py
+index 9cc7d28..d7aa87b 100644
+--- a/src/etl/reports/daily_sales.py
++++ b/src/etl/reports/daily_sales.py
+@@ -2,20 +2,28 @@
+ 
+ A day is a calendar day in the reporting zone: an order placed at 23:30 UTC belongs to the next
+ day in Berlin. Revenue sums the order totals in each currency separately; cancelled orders are
+-left out.
++left out. A converted report (`daily_sales_in`) gives one row per day and country instead, in
++EUR at the reference rate of each order's day.
+ """
+ 
+ from __future__ import annotations
+ 
++import math
++from collections import defaultdict
+ from datetime import date
++from decimal import ROUND_HALF_EVEN, Decimal
+ from zoneinfo import ZoneInfo
+ 
+ from sqlalchemy import Connection, Date, cast, func, select
+ 
+ from etl.domain.money import currency
+ from etl.domain.timestamps import day_bounds
++from etl.errors import FxRateMissing
+ from etl.infra.tables import orders
+ from etl.schemas.reports import DailySalesRow
++from etl.store import fx_rates
++
++BASE_CURRENCY = "EUR"
+ 
+ EXCLUDED_STATUSES = ("cancelled",)
+ 
+@@ -57,3 +65,44 @@ def daily_sales(
+         )
+         for row in connection.execute(statement)
+     ]
++
++
++def daily_sales_in(
++    connection: Connection, *, first: date, last: date, zone: ZoneInfo
++) -> list[DailySalesRow]:
++    """Daily sales per day and country in EUR, every order converted at the reference rate of
++    its day (the day in the reporting zone the order belongs to).
++
++    The orders of one day in one currency share a rate, so converting their total is
++    converting each order. Each cell is rounded half-even to cents once, after adding up the
++    currencies of the day and country. Raises FxRateMissing when a rate is not loaded.
++    """
++    groups = daily_sales(connection, first=first, last=last, zone=zone)
++    foreign = {(row.day, row.currency) for row in groups if row.currency != BASE_CURRENCY}
++    rates = fx_rates.between(
++        connection, first=first, last=last, currencies={code for _, code in foreign}
++    )
++    missing = sorted(foreign - rates.keys())
++    if missing:
++        raise FxRateMissing(missing)
++
++    orders_per_cell: dict[tuple[date, str], int] = defaultdict(int)
++    amounts_per_cell: dict[tuple[date, str], list[float]] = defaultdict(list)
++    for row in groups:
++        rate = rates.get((row.day, row.currency), Decimal(1))
++        cell = (row.day, row.country)
++        orders_per_cell[cell] += row.orders
++        amounts_per_cell[cell].append(float(row.revenue) * float(rate))
++    unit = currency(BASE_CURRENCY)
++    return [
++        DailySalesRow(
++            day=day,
++            country=country,
++            currency=unit.code,
++            orders=orders_per_cell[(day, country)],
++            revenue=Decimal(str(math.fsum(amounts))).quantize(
++                unit.quantum, rounding=ROUND_HALF_EVEN
++            ),
++        )
++        for (day, country), amounts in sorted(amounts_per_cell.items())
++    ]
+diff --git a/src/etl/schemas/reports.py b/src/etl/schemas/reports.py
+index 1e8fb1e..b4e94e2 100644
+--- a/src/etl/schemas/reports.py
++++ b/src/etl/schemas/reports.py
+@@ -30,6 +30,8 @@ class DailySalesReport(ReportModel):
+     first_day: date
+     last_day: date
+     zone: str
++    # The currency every row was converted to; None when each currency has its own rows.
++    converted_to: str | None = None
+     rows: list[DailySalesRow]
+     path: Path
+ 
+diff --git a/src/etl/schemas/views.py b/src/etl/schemas/views.py
+index c5592cf..2b3564f 100644
+--- a/src/etl/schemas/views.py
++++ b/src/etl/schemas/views.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime, timedelta
++from datetime import date, datetime, timedelta
+ from decimal import Decimal
+ from typing import Literal
+ 
+@@ -134,6 +134,13 @@ class RejectView(View):
+     reason: str
+ 
+ 
++class FxLoadView(View):
++    rates: int
++    first_day: date | None
++    last_day: date | None
++    currencies: list[str]
++
++
+ class PruneView(View):
+     before: datetime
+     source: str | None
+diff --git a/src/etl/store/fx_rates.py b/src/etl/store/fx_rates.py
+new file mode 100644
+index 0000000..632f220
+--- /dev/null
++++ b/src/etl/store/fx_rates.py
+@@ -0,0 +1,63 @@
++"""Daily reference exchange rates in `etl.fx_rates`, against EUR."""
++
++from __future__ import annotations
++
++from collections.abc import Collection, Sequence
++from dataclasses import dataclass
++from datetime import date, datetime
++from decimal import Decimal
++
++from sqlalchemy import Connection, select
++from sqlalchemy.dialects.postgresql import insert as pg_insert
++
++from etl.infra.tables import fx_rates
++
++
++@dataclass(frozen=True, slots=True)
++class FxRate:
++    day: date
++    currency: str
++    # EUR per unit of `currency`.
++    rate_to_eur: Decimal
++
++
++def upsert_many(connection: Connection, rates: Sequence[FxRate], *, loaded_at: datetime) -> None:
++    """Store `rates`, replacing a stored rate of the same day and currency."""
++    if not rates:
++        return
++    statement = pg_insert(fx_rates).values(
++        [
++            {
++                "day": rate.day,
++                "currency": rate.currency,
++                "rate_to_eur": rate.rate_to_eur,
++                "loaded_at": loaded_at,
++            }
++            for rate in rates
++        ]
++    )
++    connection.execute(
++        statement.on_conflict_do_update(
++            index_elements=["day", "currency"],
++            set_={
++                "rate_to_eur": statement.excluded.rate_to_eur,
++                "loaded_at": statement.excluded.loaded_at,
++            },
++        )
++    )
++
++
++def between(
++    connection: Connection, *, first: date, last: date, currencies: Collection[str]
++) -> dict[tuple[date, str], Decimal]:
++    """The rates of `currencies` from `first` to `last` (inclusive), by day and currency."""
++    if not currencies:
++        return {}
++    rows = connection.execute(
++        select(fx_rates.c.day, fx_rates.c.currency, fx_rates.c.rate_to_eur).where(
++            fx_rates.c.day >= first,
++            fx_rates.c.day <= last,
++            fx_rates.c.currency.in_(sorted(currencies)),
++        )
++    )
++    return {(row.day, row.currency): row.rate_to_eur for row in rows}
+diff --git a/tests/reports/test_fx_conversion.py b/tests/reports/test_fx_conversion.py
+new file mode 100644
+index 0000000..e682da0
+--- /dev/null
++++ b/tests/reports/test_fx_conversion.py
+@@ -0,0 +1,138 @@
++"""Reference rates and daily sales converted to EUR."""
++
++from __future__ import annotations
++
++import json
++from datetime import date
++from decimal import Decimal
++
++import pytest
++
++from etl.api.fx import load_rates
++from etl.api.reports import daily_sales_report
++from etl.errors import FxRateMissing, InvalidRequest, SourceFormatError
++from etl.infra.tables import fx_rates
++from tests.helpers.db import rows
++from tests.helpers.factories import customer_obj, order_row, write_customers, write_orders
++from tests.helpers.files import write_text
++
++
++def write_rates(tmp_path, lines, name="rates.csv"):
++    return write_text(
++        tmp_path / name, "day,currency,rate_to_eur\n" + "".join(f"{line}\n" for line in lines)
++    )
++
++
++def load_orders(pipeline, tmp_path, lines):
++    pipeline.run("customers", write_customers(tmp_path, [customer_obj()]))
++    pipeline.run("orders", write_orders(tmp_path, lines))
++
++
++def test_rates_are_loaded_and_replaced(context, db, tmp_path):
++    load_rates(context, write_rates(tmp_path, ["2026-03-02,USD,0.92", "2026-03-02,sek,0.0875"]))
++    view = load_rates(context, write_rates(tmp_path, ["2026-03-02,USD,0.9175"], name="fix.csv"))
++
++    assert (view.rates, view.currencies, view.first_day) == (1, ["USD"], date(2026, 3, 2))
++    stored = {(row["currency"], row["rate_to_eur"]) for row in rows(db, fx_rates)}
++    assert stored == {("USD", Decimal("0.917500000000")), ("SEK", Decimal("0.087500000000"))}
++
++
++@pytest.mark.parametrize(
++    ("line", "reason"),
++    [
++        ("2026-03-02,EUR,1", "base currency"),
++        ("2026-03-02,USD,-0.9", "positive"),
++        ("2026-03-02,USD,9e-1", "not an amount"),
++        ("2026-03-02,USD,0", "positive"),
++        ("2026-03-02,USD,0.1234567890123", "at most 12 decimals"),
++        ("2026-02-30,USD,0.9", "day is out of range"),
++        ("2026-03-02,ABC,0.9", "unknown currency"),
++    ],
++)
++def test_a_bad_rate_refuses_the_whole_file(context, db, tmp_path, line, reason):
++    path = write_rates(tmp_path, ["2026-03-01,USD,0.91", line])
++
++    with pytest.raises(SourceFormatError, match=reason):
++        load_rates(context, path)
++
++    assert rows(db, fx_rates) == []
++
++
++def test_daily_sales_in_eur_add_up_the_currencies_of_a_day(pipeline, context, tmp_path):
++    load_orders(
++        pipeline,
++        tmp_path,
++        [
++            order_row(
++                order_id="A", ordered_at="02.03.2026 10:00:00", updated_at="02.03.2026 10:00:00"
++            ),
++            order_row(
++                order_id="B",
++                currency="USD",
++                ordered_at="02.03.2026 11:00:00",
++                updated_at="02.03.2026 11:00:00",
++            ),
++            # 00:30 in Berlin on 3 March: converted at the rate of 3 March
++            order_row(
++                order_id="C",
++                currency="USD",
++                ordered_at="03.03.2026 00:30:00",
++                updated_at="03.03.2026 00:30:00",
++            ),
++            order_row(
++                order_id="D",
++                currency="USD",
++                status="cancelled",
++                ordered_at="03.03.2026 09:00:00",
++                updated_at="03.03.2026 09:00:00",
++            ),
++        ],
++    )
++    load_rates(context, write_rates(tmp_path, ["2026-03-02,USD,0.92", "2026-03-03,USD,0.9"]))
++
++    report = daily_sales_report(
++        context, first=date(2026, 3, 2), last=date(2026, 3, 3), convert_to="eur"
++    )
++
++    assert report.converted_to == "EUR"
++    assert [
++        (r.day.isoformat(), r.country, r.currency, r.orders, r.revenue) for r in report.rows
++    ] == [
++        ("2026-03-02", "DE", "EUR", 2, Decimal("48.00")),
++        ("2026-03-03", "DE", "EUR", 1, Decimal("22.50")),
++    ]
++    assert report.path.name == "daily_sales_2026-03-02_2026-03-03_EUR.csv"
++
++
++def test_a_missing_rate_fails_the_report(pipeline, context, tmp_path):
++    load_orders(pipeline, tmp_path, [order_row(currency="USD")])
++
++    with pytest.raises(FxRateMissing, match="no EUR reference rate for USD on 2026-03-02"):
++        daily_sales_report(context, first=date(2026, 3, 2), last=date(2026, 3, 2), convert_to="EUR")
++    with pytest.raises(InvalidRequest, match="EUR only"):
++        daily_sales_report(context, first=date(2026, 3, 2), last=date(2026, 3, 2), convert_to="USD")
++
++
++def test_the_fx_and_report_commands(cli, pipeline, tmp_path):
++    load_orders(pipeline, tmp_path, [order_row(currency="USD")])
++    missing = cli(
++        "report", "daily-sales", "--from", "2026-03-02", "--to", "2026-03-02", "--in", "EUR"
++    )
++    loaded = cli("fx", "load", write_rates(tmp_path, ["2026-03-02,USD,0.92"]))
++    report = cli(
++        "report",
++        "daily-sales",
++        "--from",
++        "2026-03-02",
++        "--to",
++        "2026-03-02",
++        "--in",
++        "EUR",
++        "--json",
++    )
++
++    assert missing.exit_code == 4
++    assert "etl fx load" in missing.stderr
++    assert loaded.exit_code == 0, loaded.output
++    assert "loaded 1 rates for USD, 2026-03-02 to 2026-03-02" in loaded.stdout
++    assert json.loads(report.stdout)["rows"][0]["revenue"] == "23.00"

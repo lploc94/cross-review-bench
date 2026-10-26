@@ -1,0 +1,14 @@
+diff --git a/internal/core/canary.go b/internal/core/canary.go
+index 932490e..f1ac7ca 100644
+--- a/internal/core/canary.go
++++ b/internal/core/canary.go
+@@ -31,6 +31,9 @@ func (c *Canary) takes(r *http.Request, key string) bool {
+ 	case canaryNever:
+ 		return false
+ 	}
++	if c.Percent == 0 {
++		return false
++	}
+ 	h := fnv.New32a()
+ 	_, _ = h.Write([]byte(key))
+ 	return h.Sum32()%100 <= c.Percent

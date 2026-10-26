@@ -1,0 +1,2332 @@
+diff --git a/backend/internal/app/application.go b/backend/internal/app/application.go
+index 169a11a..a447b0e 100644
+--- a/backend/internal/app/application.go
++++ b/backend/internal/app/application.go
+@@ -592,6 +592,17 @@ func (a *Application) Run(ctx context.Context) error {
+ 		})
+ 		return nil
+ 	})
++	startBackground("audit_retention_cleanup", func(taskCtx context.Context) error {
++		a.runPeriodicTask(taskCtx, time.Hour, "audit_retention_cleanup", func(runCtx context.Context) error {
++			retentionDays := a.settings.Get().Config.Audit.RetentionDays
++			if retentionDays == 0 {
++				return nil
++			}
++			_, err := a.audits.PurgeOutdated(runCtx, retentionDays)
++			return err
++		})
++		return nil
++	})
+ 	startBackground("quota_recovery", func(taskCtx context.Context) error {
+ 		a.quotaRecovery.Run(taskCtx)
+ 		return nil
+diff --git a/backend/internal/application/audit/service.go b/backend/internal/application/audit/service.go
+index 4051fc1..242fbc7 100644
+--- a/backend/internal/application/audit/service.go
++++ b/backend/internal/application/audit/service.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -67,13 +68,20 @@ const (
+ )
+ 
+ const (
+-	auditEnqueueWait        = 25 * time.Millisecond
+-	auditWriteTimeout       = 2 * time.Second
+-	auditWriteAttempts      = 3
+-	auditWriteRetryBase     = 250 * time.Millisecond
+-	auditWriteRetryMax      = 5 * time.Second
+-	auditDefaultCommitDelay = 5 * time.Millisecond
+-	auditSummaryTTL         = 10 * time.Second
++	auditEnqueueWait         = 25 * time.Millisecond
++	auditWriteTimeout        = 2 * time.Second
++	auditWriteAttempts       = 3
++	auditWriteRetryBase      = 250 * time.Millisecond
++	auditWriteRetryMax       = 5 * time.Second
++	auditDefaultCommitDelay  = 5 * time.Millisecond
++	auditSummaryTTL          = 10 * time.Second
++	requestMethodLimit       = 16
++	requestPathLimit         = 2048
++	requestHeaderNameLimit   = 256
++	requestHeaderValueLimit  = 2048
++	requestHeaderValuesLimit = 32
++	requestHeaderCountLimit  = 128
++	requestHeadersLimit      = 32 << 10
+ )
+ 
+ type auditWriteRequest struct {
+@@ -244,7 +252,7 @@ func (s *Service) Start() {
+ 
+ // Record 将审计写入有界队列；突发满载时短暂等待，持续拥塞才降级丢弃审计。
+ func (s *Service) Record(value auditdomain.Record) bool {
+-	return s.enqueueBestEffort(context.Background(), auditWriteRequest{record: value}) == nil
++	return s.enqueueBestEffort(context.Background(), auditWriteRequest{record: sanitizeRequestMetadata(value)}) == nil
+ }
+ 
+ // Create returns success only after the audit and billing transaction commits.
+@@ -265,6 +273,7 @@ func (s *Service) createAcknowledged(ctx context.Context, value auditdomain.Reco
+ 	if value.ClientIP == "" {
+ 		value.ClientIP = requestmeta.ClientIP(ctx)
+ 	}
++	value = sanitizeRequestMetadata(value)
+ 	if !s.started.Load() || s.stopped.Load() {
+ 		return ErrWriterUnavailable
+ 	}
+@@ -290,6 +299,70 @@ func (s *Service) createAcknowledged(ctx context.Context, value auditdomain.Reco
+ 	}
+ }
+ 
++func sanitizeRequestMetadata(value auditdomain.Record) auditdomain.Record {
++	// Query strings can contain credentials or signed resource URLs. Endpoint
++	// identity only needs the path.
++	value.RequestMethod = truncateRequestMetadata(strings.ToUpper(strings.TrimSpace(value.RequestMethod)), requestMethodLimit)
++	value.RequestPath = truncateRequestMetadata(strings.SplitN(value.RequestPath, "?", 2)[0], requestPathLimit)
++	if len(value.RequestHeaders) == 0 {
++		value.RequestHeaders = nil
++		return value
++	}
++	names := make([]string, 0, len(value.RequestHeaders))
++	for name := range value.RequestHeaders {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	result := make(map[string][]string, len(value.RequestHeaders))
++	for _, originalName := range names {
++		if len(result) >= requestHeaderCountLimit {
++			break
++		}
++		name := truncateRequestMetadata(strings.TrimSpace(originalName), requestHeaderNameLimit)
++		if name == "" {
++			continue
++		}
++		values := value.RequestHeaders[originalName]
++		cloned := make([]string, 0, len(values))
++		if isSensitiveRequestHeader(name) {
++			cloned = []string{"[REDACTED]"}
++		} else {
++			for _, item := range values[:min(len(values), requestHeaderValuesLimit)] {
++				cloned = append(cloned, truncateRequestMetadata(item, requestHeaderValueLimit))
++			}
++		}
++		result[name] = cloned
++		encoded, err := json.Marshal(result)
++		if err != nil || len(encoded) > requestHeadersLimit {
++			delete(result, name)
++			break
++		}
++	}
++	value.RequestHeaders = result
++	return value
++}
++
++func truncateRequestMetadata(value string, limit int) string {
++	value = strings.ToValidUTF8(value, "�")
++	runes := []rune(value)
++	if len(runes) <= limit {
++		return value
++	}
++	return string(runes[:limit])
++}
++
++func isSensitiveRequestHeader(name string) bool {
++	name = strings.ToLower(strings.TrimSpace(name))
++	for _, marker := range []string{
++		"auth", "cookie", "credential", "dpop", "jwt", "key", "password", "secret", "session", "signature", "token",
++	} {
++		if strings.Contains(name, marker) {
++			return true
++		}
++	}
++	return false
++}
++
+ func (s *Service) tryEnqueue(request auditWriteRequest) error {
+ 	s.lifecycleMu.RLock()
+ 	defer s.lifecycleMu.RUnlock()
+@@ -405,6 +478,15 @@ func (s *Service) Get(ctx context.Context, id uint64) (auditdomain.Record, error
+ 	return s.audits.Get(ctx, id)
+ }
+ 
++// PurgeOutdated 清理超过指定保留天数的历史审计记录。
++func (s *Service) PurgeOutdated(ctx context.Context, retentionDays int) (int64, error) {
++	if retentionDays <= 0 {
++		return 0, nil
++	}
++	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
++	return s.audits.PurgeOlderThan(ctx, cutoff)
++}
++
+ // CursorResult 表示按递减 ID 游标读取的一页审计记录。
+ type CursorResult struct {
+ 	Items      []auditdomain.Record
+diff --git a/backend/internal/application/audit/service_test.go b/backend/internal/application/audit/service_test.go
+index 6cce705..646c4b1 100644
+--- a/backend/internal/application/audit/service_test.go
++++ b/backend/internal/application/audit/service_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -70,6 +71,40 @@ func TestCreateCapturesClientIPFromRequestContext(t *testing.T) {
+ 	}
+ }
+ 
++func TestCreateKeepsOnlySanitizedRequestMetadata(t *testing.T) {
++	repo := newGatedAuditRepository()
++	close(repo.release)
++	service := NewService(repo, slog.Default(), 8, 1, time.Hour)
++	service.Start()
++	t.Cleanup(func() { closeAuditService(t, service) })
++
++	record := auditdomain.Record{
++		EventID: "evt_payload_policy_0001", RequestID: "payload-policy", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200,
++		RequestMethod: "POST", RequestPath: "/v1/responses?api_key=query-secret",
++		RequestHeaders: map[string][]string{
++			"Authorization":  {"Bearer client-secret"},
++			"X-Api-Key":      {"client-key"},
++			"X-Goog-Api-Key": {"google-key"},
++			"X-Session-ID":   {"session-secret"},
++			"User-Agent":     {"audit-test"},
++			"X-Oversized":    {strings.Repeat("x", requestHeaderValueLimit+100)},
++		},
++	}
++	if err := service.Create(context.Background(), record); err != nil {
++		t.Fatal(err)
++	}
++	stored := <-repo.started
++	if len(stored) != 1 || stored[0].RequestMethod != "POST" || stored[0].RequestPath != "/v1/responses" {
++		t.Fatalf("request metadata = %#v", stored)
++	}
++	if stored[0].RequestHeaders["Authorization"][0] != "[REDACTED]" || stored[0].RequestHeaders["X-Api-Key"][0] != "[REDACTED]" || stored[0].RequestHeaders["X-Goog-Api-Key"][0] != "[REDACTED]" || stored[0].RequestHeaders["X-Session-ID"][0] != "[REDACTED]" || stored[0].RequestHeaders["User-Agent"][0] != "audit-test" {
++		t.Fatalf("sanitized request headers = %#v", stored[0].RequestHeaders)
++	}
++	if len([]rune(stored[0].RequestHeaders["X-Oversized"][0])) != requestHeaderValueLimit {
++		t.Fatalf("oversized header was not bounded: %d", len([]rune(stored[0].RequestHeaders["X-Oversized"][0])))
++	}
++}
++
+ func TestAuditBatchRetriesTransientDatabaseFailure(t *testing.T) {
+ 	repo := &flakyAuditRepository{failures: 5}
+ 	service := NewService(repo, slog.Default(), 8, 4, time.Hour)
+diff --git a/backend/internal/application/gateway/image.go b/backend/internal/application/gateway/image.go
+index 4988bec..258a05d 100644
+--- a/backend/internal/application/gateway/image.go
++++ b/backend/internal/application/gateway/image.go
+@@ -31,6 +31,9 @@ type ImageGenerationInput struct {
+ 	ResponseFormat string
+ 	Streaming      bool
+ 	PartialImages  int
++	Method         string
++	Path           string
++	Headers        map[string][]string
+ }
+ 
+ // ImageEditInput 表示图片编辑用例已经完成协议校验后的输入。
+@@ -48,6 +51,9 @@ type ImageEditInput struct {
+ 	ResponseFormat string
+ 	Streaming      bool
+ 	PartialImages  int
++	Method         string
++	Path           string
++	Headers        map[string][]string
+ }
+ 
+ type imageProviderSupport func(accountdomain.Provider) bool
+@@ -69,7 +75,7 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
+ 			Size: input.Size, AspectRatio: input.AspectRatio, Resolution: input.Resolution, Quality: input.Quality,
+ 			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming, PartialImages: input.PartialImages,
+ 		})
+-	}, input.Streaming, input.Resolution, input.Quality, input.Count, 0)
++	}, input.Streaming, input.Resolution, input.Quality, input.Count, 0, input.Method, input.Path, input.Headers)
+ }
+ 
+ // EditImage 选择支持图片编辑的路由和账号，并返回可统一审计的上游响应。
+@@ -88,7 +94,7 @@ func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result,
+ 			Resolution: input.Resolution, Quality: input.Quality, ResponseFormat: input.ResponseFormat,
+ 			Streaming: input.Streaming, PartialImages: input.PartialImages,
+ 		})
+-	}, input.Streaming, input.Resolution, input.Quality, input.Count, len(input.ImageURLs))
++	}, input.Streaming, input.Resolution, input.Quality, input.Count, len(input.ImageURLs), input.Method, input.Path, input.Headers)
+ }
+ 
+ func (s *Service) executeImage(
+@@ -105,6 +111,9 @@ func (s *Service) executeImage(
+ 	quality string,
+ 	requestedCount int,
+ 	inputImageCount int,
++	method string,
++	path string,
++	headers map[string][]string,
+ ) (*Result, error) {
+ 	ctx, egressTrace := infraegress.WithTrace(ctx)
+ 	startedAt := time.Now()
+@@ -130,6 +139,7 @@ func (s *Service) executeImage(
+ 		ClientIP:     requestmeta.ClientIP(ctx),
+ 		ModelRouteID: route.ID, ModelPublicID: externalModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
+ 		Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone, Streaming: streaming,
++		RequestMethod: method, RequestPath: path, RequestHeaders: headers,
+ 	}
+ 	if operation == audit.OperationImageEdit {
+ 		auditBase.MediaInputImages = int64(max(0, inputImageCount))
+diff --git a/backend/internal/application/gateway/service.go b/backend/internal/application/gateway/service.go
+index 403b52d..3fae961 100644
+--- a/backend/internal/application/gateway/service.go
++++ b/backend/internal/application/gateway/service.go
+@@ -115,6 +115,9 @@ type Input struct {
+ 	// GrokTurnIndex forwards only the turn supplied by a real Grok Shell client; the server never infers or increments it.
+ 	GrokTurnIndex string
+ 	Operation     audit.Operation
++	Method        string
++	Path          string
++	Headers       map[string][]string
+ 	// auditOperation may classify a normal protocol request differently for
+ 	// operator visibility without changing routing or Provider semantics.
+ 	auditOperation audit.Operation
+@@ -953,6 +956,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
+ 		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
+ 		Provider: string(route.Provider), Operation: auditOperation, UsageSource: audit.UsageSourceNone, Streaming: input.Streaming,
+ 		MediaInputImages: mediaSummary.InputImages,
++		RequestMethod:    input.Method, RequestPath: input.Path, RequestHeaders: input.Headers,
+ 	}
+ 	if errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
+ 		record := auditBase
+@@ -1115,6 +1119,25 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
+ 				record.DurationMS = time.Since(startedAt).Milliseconds()
+ 				record.ErrorCode = errorCode
+ 				attempts := failureAttempts.snapshot()
++				if !successful && len(attempts) == 0 {
++					statusCode := response.StatusCode
++					failureAttempts.append(audit.Attempt{
++						Source:             audit.AttemptSourceUpstreamHTTP,
++						Stage:              "response_stream",
++						AccountID:          auditAccountID(credential.ID),
++						AccountName:        credential.Name,
++						Method:             http.MethodPost,
++						RequestPath:        sanitizeRequestPath(path),
++						UpstreamURL:        sanitizeUpstreamURL(response.UpstreamURL),
++						StartedAt:          upstreamStartedAt.UTC(),
++						DurationMS:         time.Since(upstreamStartedAt).Milliseconds(),
++						UpstreamStatusCode: &statusCode,
++						UpstreamStatus:     response.Status,
++						ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
++						TransportError:     errorCode,
++					})
++					attempts = failureAttempts.snapshot()
++				}
+ 				if !successful || len(attempts) > 0 {
+ 					record.Attempts = attempts
+ 				}
+diff --git a/backend/internal/application/gateway/service_test.go b/backend/internal/application/gateway/service_test.go
+index 4f89382..9e749ef 100644
+--- a/backend/internal/application/gateway/service_test.go
++++ b/backend/internal/application/gateway/service_test.go
+@@ -1234,7 +1234,7 @@ func TestUnpricedVoiceRemainsAvailableToFiniteClientKey(t *testing.T) {
+ 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+ 	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, nil, 1)
+ 	executed := false
+-	result, err := service.executeVoice(ctx, "req-voice-billing", clientkey.Key{ID: 1, BillingLimitUSDTicks: 1}, voiceModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, audit.PricingResult{}, func(account.Provider) bool {
++	result, err := service.executeVoice(ctx, "req-voice-billing", clientkey.Key{ID: 1, BillingLimitUSDTicks: 1}, voiceModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, audit.PricingResult{}, "", "", nil, func(account.Provider) bool {
+ 		return true
+ 	}, func(context.Context, account.Provider, account.Credential, string) (voiceExecutionResult, error) {
+ 		executed = true
+@@ -1305,7 +1305,7 @@ func TestVoicePricingSettlesTTSAndRESTSTTUsage(t *testing.T) {
+ 	if !ok {
+ 		t.Fatal("TTS pricing unavailable")
+ 	}
+-	ttsResult, err := service.executeVoice(ctx, "req-priced-tts", limitedKey, ttsModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, ttsPricing, func(account.Provider) bool {
++	ttsResult, err := service.executeVoice(ctx, "req-priced-tts", limitedKey, ttsModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, ttsPricing, "", "", nil, func(account.Provider) bool {
+ 		return true
+ 	}, func(context.Context, account.Provider, account.Credential, string) (voiceExecutionResult, error) {
+ 		return voiceExecutionResult{response: jsonVoiceResponse(http.StatusOK, map[string]any{"ok": true}), pricing: ttsPricing}, nil
+@@ -1328,7 +1328,7 @@ func TestVoicePricingSettlesTTSAndRESTSTTUsage(t *testing.T) {
+ 	if !ok {
+ 		t.Fatal("STT pricing unavailable")
+ 	}
+-	sttResult, err := service.executeVoice(ctx, "req-priced-stt", limitedKey, sttModel, audit.OperationSTT, modeldomain.CapabilitySTT, true, audit.PricingResult{}, func(account.Provider) bool {
++	sttResult, err := service.executeVoice(ctx, "req-priced-stt", limitedKey, sttModel, audit.OperationSTT, modeldomain.CapabilitySTT, true, audit.PricingResult{}, "", "", nil, func(account.Provider) bool {
+ 		return true
+ 	}, func(context.Context, account.Provider, account.Credential, string) (voiceExecutionResult, error) {
+ 		return voiceExecutionResult{response: jsonVoiceResponse(http.StatusOK, map[string]any{"text": "hello"}), pricing: sttPricing}, nil
+@@ -1369,7 +1369,7 @@ func TestVoicePricingSettlesTTSAndRESTSTTUsage(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	executed := false
+-	_, err = service.executeVoice(ctx, "req-capped-tts", cappedKey, ttsModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, ttsPricing, func(account.Provider) bool {
++	_, err = service.executeVoice(ctx, "req-capped-tts", cappedKey, ttsModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, ttsPricing, "", "", nil, func(account.Provider) bool {
+ 		return true
+ 	}, func(context.Context, account.Provider, account.Credential, string) (voiceExecutionResult, error) {
+ 		executed = true
+diff --git a/backend/internal/application/gateway/video.go b/backend/internal/application/gateway/video.go
+index 9791c79..aff4917 100644
+--- a/backend/internal/application/gateway/video.go
++++ b/backend/internal/application/gateway/video.go
+@@ -994,6 +994,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
+ 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
+ 		MediaInputImages: int64(job.InputImageCount),
+ 		DurationMS:       durationMS, AttemptCount: len(attempts), Attempts: append([]audit.Attempt(nil), attempts...), CreatedAt: createdAt,
++		RequestMethod: http.MethodPost, RequestPath: "/v1/videos/generations",
+ 	}
+ 	if job.Status == media.StatusCompleted && job.Seconds > 0 {
+ 		record.MediaOutputSeconds = int64(max(0, job.Seconds))
+diff --git a/backend/internal/application/gateway/voice.go b/backend/internal/application/gateway/voice.go
+index 2cde532..dd714e4 100644
+--- a/backend/internal/application/gateway/voice.go
++++ b/backend/internal/application/gateway/voice.go
+@@ -35,6 +35,9 @@ type TTSInput struct {
+ 	OptimizeStreamingLatency int
+ 	TextNormalization        bool
+ 	WithTimestamps           bool
++	Method                   string
++	Path                     string
++	Headers                  map[string][]string
+ }
+ 
+ type STTInput struct {
+@@ -58,6 +61,9 @@ type STTInput struct {
+ 	// ResponseFormat is empty for the native Console-compatible response, or an
+ 	// OpenAI-compatible format normalized by the HTTP transport.
+ 	ResponseFormat string
++	Method         string
++	Path           string
++	Headers        map[string][]string
+ }
+ 
+ type VoiceListInput struct {
+@@ -82,7 +88,7 @@ type voiceExecutionResult struct {
+ 
+ func (s *Service) SynthesizeSpeech(ctx context.Context, input TTSInput) (*Result, error) {
+ 	reservation, _ := audit.EstimateOfficialTTSCost(input.Text)
+-	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, reservation, func(providerValue accountdomain.Provider) bool {
++	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationTTS, modeldomain.CapabilityTTS, true, reservation, input.Method, input.Path, input.Headers, func(providerValue accountdomain.Provider) bool {
+ 		_, ok := s.providers.TTS(providerValue)
+ 		return ok
+ 	}, func(executionCtx context.Context, providerValue accountdomain.Provider, credential accountdomain.Credential, upstream string) (voiceExecutionResult, error) {
+@@ -127,7 +133,7 @@ func (s *Service) SynthesizeSpeech(ctx context.Context, input TTSInput) (*Result
+ }
+ 
+ func (s *Service) ListTTSVoices(ctx context.Context, input VoiceListInput) (*Result, error) {
+-	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationTTS, modeldomain.CapabilityTTS, false, audit.PricingResult{}, func(providerValue accountdomain.Provider) bool {
++	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationTTS, modeldomain.CapabilityTTS, false, audit.PricingResult{}, "", "", nil, func(providerValue accountdomain.Provider) bool {
+ 		_, ok := s.providers.TTS(providerValue)
+ 		return ok
+ 	}, func(executionCtx context.Context, providerValue accountdomain.Provider, credential accountdomain.Credential, _ string) (voiceExecutionResult, error) {
+@@ -156,7 +162,7 @@ func (s *Service) ListTTSVoices(ctx context.Context, input VoiceListInput) (*Res
+ }
+ 
+ func (s *Service) GetTTSVoice(ctx context.Context, input VoiceIDInput) (*Result, error) {
+-	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationTTS, modeldomain.CapabilityTTS, false, audit.PricingResult{}, func(providerValue accountdomain.Provider) bool {
++	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationTTS, modeldomain.CapabilityTTS, false, audit.PricingResult{}, "", "", nil, func(providerValue accountdomain.Provider) bool {
+ 		_, ok := s.providers.TTS(providerValue)
+ 		return ok
+ 	}, func(executionCtx context.Context, providerValue accountdomain.Provider, credential accountdomain.Credential, _ string) (voiceExecutionResult, error) {
+@@ -181,7 +187,7 @@ func (s *Service) GetTTSVoice(ctx context.Context, input VoiceIDInput) (*Result,
+ }
+ 
+ func (s *Service) TranscribeSpeech(ctx context.Context, input STTInput) (*Result, error) {
+-	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationSTT, modeldomain.CapabilitySTT, true, audit.PricingResult{}, func(providerValue accountdomain.Provider) bool {
++	return s.executeVoice(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationSTT, modeldomain.CapabilitySTT, true, audit.PricingResult{}, input.Method, input.Path, input.Headers, func(providerValue accountdomain.Provider) bool {
+ 		_, ok := s.providers.STT(providerValue)
+ 		return ok
+ 	}, func(executionCtx context.Context, providerValue accountdomain.Provider, credential accountdomain.Credential, upstream string) (voiceExecutionResult, error) {
+@@ -277,6 +283,9 @@ func (s *Service) executeVoice(
+ 	capability modeldomain.Capability,
+ 	consumesQuota bool,
+ 	reservation audit.PricingResult,
++	method string,
++	path string,
++	headers map[string][]string,
+ 	supports voiceProviderSupport,
+ 	execute func(context.Context, accountdomain.Provider, accountdomain.Credential, string) (voiceExecutionResult, error),
+ ) (*Result, error) {
+@@ -303,6 +312,7 @@ func (s *Service) executeVoice(
+ 		ClientIP:     requestmeta.ClientIP(ctx),
+ 		ModelRouteID: route.ID, ModelPublicID: externalModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
+ 		Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone,
++		RequestMethod: method, RequestPath: path, RequestHeaders: headers,
+ 	}
+ 	if err := s.checkLedgerReady(); err != nil {
+ 		return nil, err
+diff --git a/backend/internal/application/settings/service.go b/backend/internal/application/settings/service.go
+index 79249c6..bafcdc9 100644
+--- a/backend/internal/application/settings/service.go
++++ b/backend/internal/application/settings/service.go
+@@ -119,10 +119,12 @@ type SegmentedSelectorConfig struct {
+ 
+ // AuditConfig 是管理接口使用的审计可编辑输入。
+ type AuditConfig struct {
+-	BufferSize    int
+-	BatchSize     int
+-	FlushInterval string
+-	CommitDelayMS int
++	BufferSize            int
++	BatchSize             int
++	FlushInterval         string
++	CommitDelayMS         int
++	RetentionDays         int
++	RetentionDaysProvided bool
+ }
+ 
+ // ClientKeyDefaultsConfig 是管理接口使用的密钥默认限制输入。
+@@ -403,10 +405,14 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
+ 	if value.Audit.CommitDelay > 0 {
+ 		commitDelay = value.Audit.CommitDelay
+ 	}
++	retentionDays := base.Audit.RetentionDays
++	if value.Audit.RetentionDays != nil {
++		retentionDays = *value.Audit.RetentionDays
++	}
+ 	base.Audit = config.AuditConfig{
+ 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),
+-		CommitDelay: config.Duration(commitDelay),
+-		LedgerMode:  base.Audit.LedgerMode, LedgerFailureThreshold: base.Audit.LedgerFailureThreshold,
++		CommitDelay: config.Duration(commitDelay), RetentionDays: retentionDays,
++		LedgerMode: base.Audit.LedgerMode, LedgerFailureThreshold: base.Audit.LedgerFailureThreshold,
+ 		LedgerUnhealthyGrace: base.Audit.LedgerUnhealthyGrace, LedgerQueueHighWatermarkPct: base.Audit.LedgerQueueHighWatermarkPct,
+ 	}
+ 	base.ClientKeyDefaults = config.ClientKeyDefaultsConfig{
+@@ -482,6 +488,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
+ 		},
+ 		Audit: settingsdomain.AuditConfig{
+ 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(), CommitDelay: value.Audit.CommitDelay.Value(),
++			RetentionDays: intPointer(value.Audit.RetentionDays),
+ 		},
+ 		ClientKeyDefaults: settingsdomain.ClientKeyDefaultsConfig{
+ 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
+@@ -498,6 +505,8 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
+ 	}
+ }
+ 
++func intPointer(value int) *int { return &value }
++
+ func (s *Service) snapshotLocked() Snapshot {
+ 	restartRequired := []string{}
+ 	if s.cfg.Audit.BufferSize != s.activeBufferSize {
+@@ -574,6 +583,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config,
+ 	if input.Audit.CommitDelayMS > 0 {
+ 		next.Audit.CommitDelay = config.Duration(time.Duration(input.Audit.CommitDelayMS) * time.Millisecond)
+ 	}
++	if input.Audit.RetentionDaysProvided {
++		next.Audit.RetentionDays = input.Audit.RetentionDays
++	}
+ 	next.ClientKeyDefaults.RPMLimit = input.ClientKeyDefaults.RPMLimit
+ 	next.ClientKeyDefaults.MaxConcurrent = input.ClientKeyDefaults.MaxConcurrent
+ 	if input.AccountsProvided {
+@@ -711,6 +723,7 @@ func toEditable(cfg config.Config) EditableConfig {
+ 		},
+ 		Audit: AuditConfig{
+ 			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(), CommitDelayMS: int(cfg.Audit.CommitDelay.Value() / time.Millisecond),
++			RetentionDays: cfg.Audit.RetentionDays, RetentionDaysProvided: true,
+ 		},
+ 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: cfg.ClientKeyDefaults.RPMLimit, MaxConcurrent: cfg.ClientKeyDefaults.MaxConcurrent},
+ 		Accounts: AccountsConfig{
+diff --git a/backend/internal/application/settings/service_test.go b/backend/internal/application/settings/service_test.go
+index cf71117..9e068f8 100644
+--- a/backend/internal/application/settings/service_test.go
++++ b/backend/internal/application/settings/service_test.go
+@@ -706,6 +706,50 @@ func TestUpdateAuditCommitDelayRoundTrip(t *testing.T) {
+ 	}
+ }
+ 
++func TestUpdateAuditRetentionPreservesExplicitZero(t *testing.T) {
++	cfg := testConfig(t)
++	cfg.Audit.RetentionDays = 7
++	repo := &runtimeSettingsRepositoryStub{}
++	var applied config.Config
++	service := NewService(cfg, time.Time{}, 0, repo, nil, func(next config.Config) { applied = next })
++	input := service.Get().Config
++	input.Audit.RetentionDays = 0
++	input.Audit.RetentionDaysProvided = true
++
++	if _, err := service.Update(context.Background(), service.Get().Revision, input); err != nil {
++		t.Fatal(err)
++	}
++	if applied.Audit.RetentionDays != 0 {
++		t.Fatalf("applied audit policy = %#v", applied.Audit)
++	}
++	if repo.value.Audit.RetentionDays == nil || *repo.value.Audit.RetentionDays != 0 {
++		t.Fatalf("persisted audit policy = %#v", repo.value.Audit)
++	}
++	reloaded, _, _, err := LoadPersisted(context.Background(), cfg, repo)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if reloaded.Audit.RetentionDays != 0 {
++		t.Fatalf("reloaded audit policy = %#v", reloaded.Audit)
++	}
++}
++
++func TestLoadPersistedKeepsAuditDefaultsForOlderPayload(t *testing.T) {
++	cfg := testConfig(t)
++	cfg.Audit.RetentionDays = 30
++	value := toDomainConfig(cfg)
++	value.Audit.RetentionDays = nil
++	repo := &runtimeSettingsRepositoryStub{value: value, found: true}
++
++	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repo)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if loaded.Audit.RetentionDays != 30 {
++		t.Fatalf("legacy audit defaults = %#v", loaded.Audit)
++	}
++}
++
+ func TestUpdateRejectsNegativeAuditCommitDelay(t *testing.T) {
+ 	cfg := testConfig(t)
+ 	service := NewService(cfg, time.Time{}, 0, &runtimeSettingsRepositoryStub{}, nil, nil)
+diff --git a/backend/internal/domain/audit/audit.go b/backend/internal/domain/audit/audit.go
+index 6a8ea6c..13fe4e0 100644
+--- a/backend/internal/domain/audit/audit.go
++++ b/backend/internal/domain/audit/audit.go
+@@ -111,6 +111,9 @@ type Record struct {
+ 	FirstTokenMS            *int64
+ 	DurationMS              int64
+ 	ErrorCode               string
++	RequestMethod           string
++	RequestPath             string
++	RequestHeaders          map[string][]string
+ 	AttemptCount            int
+ 	Attempts                []Attempt
+ 	CreatedAt               time.Time
+diff --git a/backend/internal/domain/settings/settings.go b/backend/internal/domain/settings/settings.go
+index 2a00bef..7acfaf8 100644
+--- a/backend/internal/domain/settings/settings.go
++++ b/backend/internal/domain/settings/settings.go
+@@ -98,10 +98,10 @@ type ProviderBuildConfig struct {
+ 
+ // RoutingConfig 定义会话粘性、冷却和故障切换边界。
+ type RoutingConfig struct {
+-	StickyTTL       time.Duration
+-	CooldownBase    time.Duration
+-	CooldownMax     time.Duration
+-	CapacityWait    time.Duration
++	StickyTTL        time.Duration
++	CooldownBase     time.Duration
++	CooldownMax      time.Duration
++	CapacityWait     time.Duration
+ 	MaxAttempts      int
+ 	VideoMaxAttempts int
+ 	PreferFreeBuild  bool
+@@ -124,6 +124,7 @@ type AuditConfig struct {
+ 	BatchSize     int
+ 	FlushInterval time.Duration
+ 	CommitDelay   time.Duration
++	RetentionDays *int
+ }
+ 
+ // ClientKeyDefaultsConfig 定义新建客户端密钥的默认限制。
+diff --git a/backend/internal/infra/config/config.go b/backend/internal/infra/config/config.go
+index fbd49c7..3cfa79d 100644
+--- a/backend/internal/infra/config/config.go
++++ b/backend/internal/infra/config/config.go
+@@ -248,6 +248,7 @@ type AuditConfig struct {
+ 	BatchSize                   int      `yaml:"batchSize"`
+ 	FlushInterval               Duration `yaml:"flushInterval"`
+ 	CommitDelay                 Duration `yaml:"commitDelay"`
++	RetentionDays               int      `yaml:"retentionDays"`
+ 	LedgerMode                  string   `yaml:"ledgerMode"`
+ 	LedgerFailureThreshold      int      `yaml:"ledgerFailureThreshold"`
+ 	LedgerUnhealthyGrace        Duration `yaml:"ledgerUnhealthyGrace"`
+@@ -688,6 +689,9 @@ func (c Config) Validate() error {
+ 	if c.Audit.CommitDelay.Value() < minAuditCommitDelay || c.Audit.CommitDelay.Value() > maxAuditCommitDelay {
+ 		return errors.New("audit.commitDelay 必须在 1ms 到 50ms 之间")
+ 	}
++	if c.Audit.RetentionDays < 0 || c.Audit.RetentionDays > 365 {
++		return errors.New("audit.retentionDays 必须在 0 到 365 之间")
++	}
+ 	if c.Audit.LedgerMode != "observe" && c.Audit.LedgerMode != "enforce" {
+ 		return errors.New("audit.ledgerMode 必须是 observe 或 enforce")
+ 	}
+@@ -926,7 +930,8 @@ func defaultConfig() Config {
+ 		},
+ 		Audit: AuditConfig{
+ 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
+-			LedgerMode: "enforce", LedgerFailureThreshold: 1,
++			RetentionDays: 7,
++			LedgerMode:    "enforce", LedgerFailureThreshold: 1,
+ 			LedgerUnhealthyGrace: Duration(10 * time.Second), LedgerQueueHighWatermarkPct: 90,
+ 		},
+ 		QualityGuard: QualityGuardConfig{
+diff --git a/backend/internal/infra/config/config_test.go b/backend/internal/infra/config/config_test.go
+index 6244a68..c131d21 100644
+--- a/backend/internal/infra/config/config_test.go
++++ b/backend/internal/infra/config/config_test.go
+@@ -415,6 +415,27 @@ func TestRoutingMaxAttemptsSupportsLargeCredentialPools(t *testing.T) {
+ 	}
+ }
+ 
++func TestValidateAuditRetentionDaysRange(t *testing.T) {
++	for _, days := range []int{-1, 366} {
++		cfg := defaultConfig()
++		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
++		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
++		cfg.Audit.RetentionDays = days
++		if err := cfg.Validate(); err == nil {
++			t.Fatalf("audit retentionDays %d should be rejected", days)
++		}
++	}
++	for _, days := range []int{0, 7, 365} {
++		cfg := defaultConfig()
++		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
++		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
++		cfg.Audit.RetentionDays = days
++		if err := cfg.Validate(); err != nil {
++			t.Fatalf("audit retentionDays %d should be valid: %v", days, err)
++		}
++	}
++}
++
+ func TestValidateRejectsInvalidAutoAssignShareConfig(t *testing.T) {
+ 	cfg := defaultConfig()
+ 	cfg.Routing.AutoAssignMaxNodeShare = 0.03
+diff --git a/backend/internal/infra/persistence/relational/audit_repository.go b/backend/internal/infra/persistence/relational/audit_repository.go
+index 80536ee..1c41490 100644
+--- a/backend/internal/infra/persistence/relational/audit_repository.go
++++ b/backend/internal/infra/persistence/relational/audit_repository.go
+@@ -28,6 +28,7 @@ const (
+ 	auditInsertBatchSize   = 20
+ 	auditLookupBatchSize   = 500
+ 	attemptInsertBatchSize = 40
++	auditPurgeBatchSize    = 1000
+ 	auditSuccessPredicate  = "status_code >= 200 AND status_code < 300 AND (error_code IS NULL OR error_code = '')"
+ 	auditSuccessAggregate  = "COALESCE(SUM(CASE WHEN " + auditSuccessPredicate + " THEN 1 ELSE 0 END), 0)"
+ )
+@@ -127,6 +128,15 @@ func validatePreparedAudit(value preparedAudit) error {
+ 	if row.StatusCode < 100 || row.StatusCode > 599 {
+ 		return errors.New("status_code must be between 100 and 599")
+ 	}
++	if utf8.RuneCountInString(row.RequestMethod) > 16 {
++		return errors.New("request method exceeds the storage limit")
++	}
++	if utf8.RuneCountInString(row.RequestPath) > 2048 {
++		return errors.New("request path exceeds the storage limit")
++	}
++	if utf8.RuneCountInString(row.RequestHeadersJSON) > 65536 {
++		return errors.New("request headers exceed the storage limit")
++	}
+ 	attemptNumbers := make(map[int]struct{}, len(value.attempts))
+ 	for index, attempt := range value.attempts {
+ 		if err := validatePreparedAuditAttempt(attempt); err != nil {
+@@ -351,6 +361,12 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
+ 		digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d", value.RequestID, value.ClientKeyID, value.ModelRouteID, value.CreatedAt.UnixNano())))
+ 		eventID = fmt.Sprintf("evt_%x", digest[:18])
+ 	}
++	requestHeadersJSON := "{}"
++	if len(value.RequestHeaders) > 0 {
++		if raw, err := json.Marshal(value.RequestHeaders); err == nil {
++			requestHeadersJSON = string(raw)
++		}
++	}
+ 	row := requestAuditModel{
+ 		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160), ClientIP: strings.TrimSpace(value.ClientIP),
+ 		ModelRouteID: value.ModelRouteID, ModelPublicID: truncate(value.ModelPublicID, 255), ModelUpstreamModel: truncate(value.ModelUpstreamModel, 255),
+@@ -365,7 +381,11 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
+ 		EstimatedCostInUSDTicks: nonNegative(value.EstimatedCostInUSDTicks), PricingModel: truncate(value.PricingModel, 100), PricingVersion: truncate(value.PricingVersion, 20),
+ 		NumSourcesUsed: nonNegative(value.NumSourcesUsed), NumServerSideToolsUsed: nonNegative(value.NumServerSideToolsUsed),
+ 		ContextInputTokens: nonNegative(value.ContextInputTokens), ContextOutputTokens: nonNegative(value.ContextOutputTokens), FirstTokenMS: normalizedFirstToken(value), DurationMS: nonNegative(value.DurationMS),
+-		ErrorCode: truncate(value.ErrorCode, 100), AttemptCount: len(value.Attempts), CreatedAt: value.CreatedAt,
++		ErrorCode:          truncate(value.ErrorCode, 100),
++		RequestMethod:      truncate(value.RequestMethod, 16),
++		RequestPath:        truncate(value.RequestPath, 2048),
++		RequestHeadersJSON: truncate(requestHeadersJSON, 65536),
++		AttemptCount:       len(value.Attempts), CreatedAt: value.CreatedAt,
+ 	}
+ 	attempts := make([]requestAuditAttemptModel, 0, len(value.Attempts))
+ 	for _, attempt := range value.Attempts {
+@@ -576,7 +596,7 @@ func (r *AuditRepository) List(ctx context.Context, offset, limit int) ([]audit.
+ 		return nil, 0, err
+ 	}
+ 	var rows []requestAuditModel
+-	if err := query.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
++	if err := query.Omit("request_headers_json").Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+ 		return nil, 0, err
+ 	}
+ 	out := make([]audit.Record, 0, len(rows))
+@@ -632,7 +652,7 @@ func (r *AuditRepository) ListCursor(ctx context.Context, input repository.Audit
+ 	}
+ 	var rows []requestAuditModel
+ 	query = applyStableSort(query, input.Sort, fields, fallback, "request_audits.id")
+-	if err := query.Limit(input.Limit + 1).Find(&rows).Error; err != nil {
++	if err := query.Omit("request_headers_json").Limit(input.Limit + 1).Find(&rows).Error; err != nil {
+ 		return nil, false, err
+ 	}
+ 	hasMore := len(rows) > input.Limit
+@@ -1047,3 +1067,48 @@ func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter
+ 	}
+ 	return query
+ }
++
++func (r *AuditRepository) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
++	var totalDeleted int64
++	for {
++		var batchDeleted int64
++		var batchSelected int
++		err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++			var ids []uint64
++			if err := tx.Model(&requestAuditModel{}).
++				Select("id").
++				Where("created_at < ?", cutoff).
++				Order("id ASC").
++				Limit(auditPurgeBatchSize).
++				Pluck("id", &ids).Error; err != nil {
++				return err
++			}
++			if len(ids) == 0 {
++				return nil
++			}
++			batchSelected = len(ids)
++			if err := tx.Where("audit_id IN ?", ids).Delete(&requestAuditAttemptModel{}).Error; err != nil {
++				return err
++			}
++			res := tx.Where("id IN ? AND created_at < ?", ids, cutoff).Delete(&requestAuditModel{})
++			if res.Error != nil {
++				return res.Error
++			}
++			batchDeleted = res.RowsAffected
++			return nil
++		})
++		if err != nil {
++			return totalDeleted, err
++		}
++		totalDeleted += batchDeleted
++		// Use the number selected rather than RowsAffected to decide whether
++		// another batch may exist. In a multi-instance deployment another
++		// cleaner can delete part of this batch between selection and deletion.
++		if batchSelected < auditPurgeBatchSize {
++			return totalDeleted, nil
++		}
++		if err := ctx.Err(); err != nil {
++			return totalDeleted, err
++		}
++	}
++}
+diff --git a/backend/internal/infra/persistence/relational/audit_repository_test.go b/backend/internal/infra/persistence/relational/audit_repository_test.go
+index 916b06e..ea8ef4a 100644
+--- a/backend/internal/infra/persistence/relational/audit_repository_test.go
++++ b/backend/internal/infra/persistence/relational/audit_repository_test.go
+@@ -556,4 +556,104 @@ func TestDegradeTimestampScansPostgresTimeValue(t *testing.T) {
+ 	}
+ }
+ 
++func TestAuditRepositoryRequestMetadata(t *testing.T) {
++	ctx := context.Background()
++	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-request-body.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer database.Close()
++	if err := database.InitializeSchema(ctx); err != nil {
++		t.Fatal(err)
++	}
++	repository := NewAuditRepository(database)
++	now := time.Now().UTC()
++	reqHeaders := map[string][]string{
++		"User-Agent":   {"curl/8.4.0"},
++		"Content-Type": {"application/json"},
++	}
++	record := audit.Record{
++		RequestID:      "req-with-body",
++		ClientKeyID:    1,
++		ModelRouteID:   1,
++		StatusCode:     200,
++		RequestMethod:  "POST",
++		RequestPath:    "/v1/chat/completions",
++		RequestHeaders: reqHeaders,
++		CreatedAt:      now,
++	}
++	if err := repository.Create(ctx, record); err != nil {
++		t.Fatal(err)
++	}
++	items, _, err := repository.List(ctx, 0, 10)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(items) != 1 {
++		t.Fatalf("items len = %d, want 1", len(items))
++	}
++	if len(items[0].RequestHeaders) != 0 {
++		t.Fatalf("list unexpectedly loaded audit payloads: %#v", items[0])
++	}
++	detail, err := repository.Get(ctx, items[0].ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if detail.RequestMethod != "POST" || detail.RequestPath != "/v1/chat/completions" || detail.RequestHeaders["User-Agent"][0] != "curl/8.4.0" {
++		t.Fatalf("Detail HTTP fields mismatch: %#v", detail)
++	}
++}
++
++func TestAuditRepositoryPurgeOlderThanBatchesAuditsAndAttempts(t *testing.T) {
++	ctx := context.Background()
++	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-purge.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer database.Close()
++	if err := database.InitializeSchema(ctx); err != nil {
++		t.Fatal(err)
++	}
++	repository := NewAuditRepository(database)
++	cutoff := time.Now().UTC().Add(-24 * time.Hour)
++	values := make([]audit.Record, auditPurgeBatchSize+1)
++	for index := range values {
++		values[index] = audit.Record{
++			EventID:      fmt.Sprintf("evt_audit_purge_%04d", index),
++			RequestID:    fmt.Sprintf("purge-%04d", index),
++			ClientKeyID:  1,
++			ModelRouteID: 1,
++			StatusCode:   200,
++			CreatedAt:    cutoff.Add(-time.Hour),
++			Attempts: []audit.Attempt{{
++				Number: 1, Source: audit.AttemptSourceCredential, Stage: "response_stream", StartedAt: cutoff.Add(-time.Hour),
++			}},
++		}
++	}
++	if err := repository.CreateBatch(ctx, values); err != nil {
++		t.Fatal(err)
++	}
++	if err := repository.Create(ctx, audit.Record{
++		EventID: "evt_audit_purge_new", RequestID: "purge-new", ClientKeyID: 1, ModelRouteID: 1,
++		StatusCode: 200, CreatedAt: cutoff.Add(time.Hour),
++		Attempts: []audit.Attempt{{Number: 1, Source: audit.AttemptSourceCredential, Stage: "response", StartedAt: cutoff.Add(time.Hour)}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++
++	deleted, err := repository.PurgeOlderThan(ctx, cutoff)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if deleted != int64(len(values)) {
++		t.Fatalf("deleted = %d, want %d", deleted, len(values))
++	}
++	if count := tableRowCount(t, database, "request_audits"); count != 1 {
++		t.Fatalf("remaining audits = %d", count)
++	}
++	if count := tableRowCount(t, database, "request_audit_attempts"); count != 1 {
++		t.Fatalf("remaining attempts = %d", count)
++	}
++}
++
+ func uint64Pointer(value uint64) *uint64 { return &value }
+diff --git a/backend/internal/infra/persistence/relational/mapping.go b/backend/internal/infra/persistence/relational/mapping.go
+index c6ce6e6..6f0deef 100644
+--- a/backend/internal/infra/persistence/relational/mapping.go
++++ b/backend/internal/infra/persistence/relational/mapping.go
+@@ -252,6 +252,10 @@ func toClientKeyDomain(value clientKeyModel, allowedModels []uint64) clientkey.K
+ }
+ 
+ func toAuditDomain(value requestAuditModel) audit.Record {
++	var requestHeaders map[string][]string
++	if strings.TrimSpace(value.RequestHeadersJSON) != "" && value.RequestHeadersJSON != "{}" {
++		_ = json.Unmarshal([]byte(value.RequestHeadersJSON), &requestHeaders)
++	}
+ 	return audit.Record{
+ 		ID: value.ID, EventID: value.EventID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName, ClientIP: value.ClientIP,
+ 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
+@@ -266,7 +270,7 @@ func toAuditDomain(value requestAuditModel) audit.Record {
+ 		EstimatedCostInUSDTicks: value.EstimatedCostInUSDTicks, PricingModel: value.PricingModel, PricingVersion: value.PricingVersion,
+ 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
+ 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens, FirstTokenMS: value.FirstTokenMS, DurationMS: value.DurationMS,
+-		ErrorCode: value.ErrorCode, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
++		ErrorCode: value.ErrorCode, RequestMethod: value.RequestMethod, RequestPath: value.RequestPath, RequestHeaders: requestHeaders, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
+ 	}
+ }
+ 
+diff --git a/backend/internal/infra/persistence/relational/models.go b/backend/internal/infra/persistence/relational/models.go
+index 48b3fec..4b8bc3f 100644
+--- a/backend/internal/infra/persistence/relational/models.go
++++ b/backend/internal/infra/persistence/relational/models.go
+@@ -342,6 +342,9 @@ type requestAuditModel struct {
+ 	FirstTokenMS            *int64    `gorm:"column:first_token_ms"`
+ 	DurationMS              int64     `gorm:"not null;default:0"`
+ 	ErrorCode               string    `gorm:"size:100;check:chk_request_audits_error_code,length(error_code) <= 100"`
++	RequestMethod           string    `gorm:"size:16;not null;default:'';check:chk_request_audits_request_method,length(request_method) <= 16"`
++	RequestPath             string    `gorm:"type:text;not null;default:'';check:chk_request_audits_request_path,length(request_path) <= 2048"`
++	RequestHeadersJSON      string    `gorm:"type:text;not null;default:'{}';check:chk_request_audits_request_headers,length(request_headers_json) <= 65536"`
+ 	AttemptCount            int       `gorm:"not null;default:0;check:chk_request_audits_attempt_count,attempt_count >= 0"`
+ 	CreatedAt               time.Time `gorm:"not null"`
+ }
+diff --git a/backend/internal/repository/audit.go b/backend/internal/repository/audit.go
+index d8e7bce..65e406a 100644
+--- a/backend/internal/repository/audit.go
++++ b/backend/internal/repository/audit.go
+@@ -17,6 +17,7 @@ type AuditRepository interface {
+ 	Summarize(ctx context.Context, query AuditSummaryQuery) (audit.Summary, error)
+ 	SumTokensByAccountsSince(ctx context.Context, accountIDs []uint64, since time.Time) (map[uint64]int64, error)
+ 	SummarizeDegrade(ctx context.Context, query DegradeSummaryQuery) (DegradeSummaryResult, error)
++	PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+ }
+ 
+ type DegradeSummaryQuery struct {
+diff --git a/backend/internal/transport/http/audit/handler.go b/backend/internal/transport/http/audit/handler.go
+index 4cb5d4b..01e33bb 100644
+--- a/backend/internal/transport/http/audit/handler.go
++++ b/backend/internal/transport/http/audit/handler.go
+@@ -126,6 +126,9 @@ type auditResponse struct {
+ 	OutputTokensPerSecond   *float64                  `json:"outputTokensPerSecond,omitempty"`
+ 	DurationMS              int64                     `json:"durationMs"`
+ 	ErrorCode               string                    `json:"errorCode,omitempty"`
++	RequestMethod           string                    `json:"requestMethod,omitempty"`
++	RequestPath             string                    `json:"requestPath,omitempty"`
++	RequestHeaders          map[string][]string       `json:"requestHeaders,omitempty"`
+ 	AttemptCount            int                       `json:"attemptCount"`
+ 	CreatedAt               time.Time                 `json:"createdAt"`
+ }
+@@ -474,7 +477,7 @@ func newListFilter(c *gin.Context) auditapp.ListFilter {
+ }
+ 
+ func newAuditResponse(value auditdomain.Record) auditResponse {
+-	return auditResponse{
++	result := auditResponse{
+ 		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName, ClientIP: value.ClientIP,
+ 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
+ 		Provider: value.Provider, Operation: string(value.Operation), UsageSource: string(value.UsageSource),
+@@ -490,8 +493,11 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
+ 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
+ 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens,
+ 		FirstTokenMS: value.FirstTokenMS, OutputTokensPerSecond: auditOutputTokensPerSecond(value), DurationMS: value.DurationMS,
+-		ErrorCode: value.ErrorCode, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
++		ErrorCode: value.ErrorCode, RequestMethod: value.RequestMethod, RequestPath: value.RequestPath, RequestHeaders: value.RequestHeaders,
++		AttemptCount: value.AttemptCount,
++		CreatedAt:    value.CreatedAt,
+ 	}
++	return result
+ }
+ 
+ func newBillingBreakdown(value auditdomain.Record) *billingBreakdownResponse {
+diff --git a/backend/internal/transport/http/inference/handler.go b/backend/internal/transport/http/inference/handler.go
+index b7986ae..dbc4423 100644
+--- a/backend/internal/transport/http/inference/handler.go
++++ b/backend/internal/transport/http/inference/handler.go
+@@ -325,6 +325,9 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
+ 		PromptCacheSeed:           extractPromptCacheSeed(c.Request.Header, body),
+ 		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
+ 		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
++		Method:                    c.Request.Method,
++		Path:                      c.Request.URL.Path,
++		Headers:                   c.Request.Header.Clone(),
+ 	})
+ 	if err != nil {
+ 		writeGatewayError(c, err)
+@@ -367,6 +370,9 @@ func (h *Handler) createMessage(c *gin.Context) {
+ 		PromptCacheSeed:           extractPromptCacheSeed(c.Request.Header, body),
+ 		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
+ 		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
++		Method:                    c.Request.Method,
++		Path:                      c.Request.URL.Path,
++		Headers:                   c.Request.Header.Clone(),
+ 	})
+ 	if err != nil {
+ 		writeGatewayAnthropicError(c, err)
+@@ -381,8 +387,13 @@ func (h *Handler) generateImage(c *gin.Context) {
+ 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片生成仅支持 application/json")
+ 		return
+ 	}
++	body, err := io.ReadAll(c.Request.Body)
++	if err != nil {
++		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
++		return
++	}
+ 	var request imageGenerationRequest
+-	if decodeSingleJSON(c.Request.Body, &request, false) != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
++	if decodeSingleJSON(bytes.NewReader(body), &request, false) != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
+ 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片请求缺少有效 model 或 prompt")
+ 		return
+ 	}
+@@ -428,6 +439,7 @@ func (h *Handler) generateImage(c *gin.Context) {
+ 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
+ 		Resolution: request.Resolution, Quality: quality, ResponseFormat: request.ResponseFormat,
+ 		Streaming: request.Stream, PartialImages: partialImages,
++		Method: c.Request.Method, Path: c.Request.URL.Path, Headers: c.Request.Header.Clone(),
+ 	})
+ 	if err != nil {
+ 		writeGatewayError(c, err)
+@@ -572,8 +584,13 @@ func (h *Handler) editImage(c *gin.Context) {
+ 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json")
+ 		return
+ 	}
++	body, err := io.ReadAll(c.Request.Body)
++	if err != nil {
++		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
++		return
++	}
+ 	var request imageEditJSONRequest
+-	if err := decodeSingleJSON(c.Request.Body, &request, false); err != nil {
++	if err := decodeSingleJSON(bytes.NewReader(body), &request, false); err != nil {
+ 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 JSON 请求无效")
+ 		return
+ 	}
+@@ -661,6 +678,7 @@ func (h *Handler) editImage(c *gin.Context) {
+ 		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio,
+ 		Resolution: resolution, Quality: quality, ResponseFormat: request.ResponseFormat,
+ 		Streaming: request.Stream, PartialImages: partialImages,
++		Method: c.Request.Method, Path: c.Request.URL.Path, Headers: c.Request.Header.Clone(),
+ 	})
+ 	if err != nil {
+ 		writeGatewayError(c, err)
+@@ -1140,6 +1158,9 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
+ 		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body), PreviousResponseID: request.PreviousResponseID,
+ 		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
+ 		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
++		Method:                    c.Request.Method,
++		Path:                      c.Request.URL.Path,
++		Headers:                   c.Request.Header.Clone(),
+ 	}
+ 	var result *gateway.Result
+ 	if compact {
+@@ -1643,6 +1664,10 @@ func (i *responseInspector) Inspect(chunk []byte) {
+ 	}
+ }
+ 
++func (i *responseInspector) Metadata() responseMetadata {
++	return normalizeMetadataUsage(i.metadata, i.protocol)
++}
++
+ func (i *responseInspector) observeReasoningStart() {
+ 	if i.firstTokenSeen || i.firstTokenReady || i.onFirstToken == nil {
+ 		return
+@@ -1759,10 +1784,6 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
+ 	return false
+ }
+ 
+-func (i *responseInspector) Metadata() responseMetadata {
+-	return normalizeMetadataUsage(i.metadata, i.protocol)
+-}
+-
+ func normalizeMetadataUsage(metadata responseMetadata, protocol streamProtocol) responseMetadata {
+ 	if protocol != streamProtocolAnthropic {
+ 		return metadata
+diff --git a/backend/internal/transport/http/inference/openai_audio_handler.go b/backend/internal/transport/http/inference/openai_audio_handler.go
+index ba964d3..a9df1df 100644
+--- a/backend/internal/transport/http/inference/openai_audio_handler.go
++++ b/backend/internal/transport/http/inference/openai_audio_handler.go
+@@ -1,7 +1,9 @@
+ package inference
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
++	"io"
+ 	"net/http"
+ 	"strings"
+ 
+@@ -43,8 +45,13 @@ func (h *Handler) handleOpenAISpeech(c *gin.Context) {
+ 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "audio speech 仅支持 application/json")
+ 		return
+ 	}
++	body, err := io.ReadAll(c.Request.Body)
++	if err != nil {
++		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
++		return
++	}
+ 	var request openAISpeechRequest
+-	if err := decodeSingleJSON(c.Request.Body, &request, false); err != nil {
++	if err := decodeSingleJSON(bytes.NewReader(body), &request, false); err != nil {
+ 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "audio speech 请求无效")
+ 		return
+ 	}
+@@ -109,6 +116,9 @@ func (h *Handler) handleOpenAISpeech(c *gin.Context) {
+ 		OutputFormat:             format,
+ 		Speed:                    speed,
+ 		OptimizeStreamingLatency: optimize,
++		Method:                   c.Request.Method,
++		Path:                     c.Request.URL.Path,
++		Headers:                  c.Request.Header.Clone(),
+ 	}
+ 	if request.TextNormalization != nil {
+ 		input.TextNormalization = *request.TextNormalization
+diff --git a/backend/internal/transport/http/inference/voice_handler.go b/backend/internal/transport/http/inference/voice_handler.go
+index b727ccd..6190cde 100644
+--- a/backend/internal/transport/http/inference/voice_handler.go
++++ b/backend/internal/transport/http/inference/voice_handler.go
+@@ -1,6 +1,7 @@
+ package inference
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"errors"
+ 	"io"
+@@ -33,8 +34,13 @@ func (h *Handler) synthesizeSpeech(c *gin.Context) {
+ 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "TTS 仅支持 application/json")
+ 		return
+ 	}
++	body, err := io.ReadAll(c.Request.Body)
++	if err != nil {
++		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
++		return
++	}
+ 	var request ttsRequest
+-	if err := decodeSingleJSON(c.Request.Body, &request, false); err != nil {
++	if err := decodeSingleJSON(bytes.NewReader(body), &request, false); err != nil {
+ 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "TTS 请求无效")
+ 		return
+ 	}
+@@ -70,6 +76,7 @@ func (h *Handler) synthesizeSpeech(c *gin.Context) {
+ 	input := gateway.TTSInput{
+ 		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Text: text, VoiceID: strings.TrimSpace(request.VoiceID),
+ 		Language: language, OutputFormat: format, Speed: speed, OptimizeStreamingLatency: optimize,
++		Method: c.Request.Method, Path: c.Request.URL.Path, Headers: c.Request.Header.Clone(),
+ 	}
+ 	if request.TextNormalization != nil {
+ 		input.TextNormalization = *request.TextNormalization
+@@ -128,7 +135,9 @@ func (h *Handler) transcribeSpeech(c *gin.Context) {
+ func (h *Handler) transcribeSpeechRequest(c *gin.Context, openAICompatible bool) {
+ 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
+ 	contentType := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
+-	input := gateway.STTInput{PublicModel: "grok-stt"}
++	input := gateway.STTInput{
++		PublicModel: "grok-stt", Method: c.Request.Method, Path: c.Request.URL.Path, Headers: c.Request.Header.Clone(),
++	}
+ 	unsupportedOpenAIParameter := ""
+ 	if strings.HasPrefix(contentType, "multipart/form-data") {
+ 		if err := c.Request.ParseMultipartForm(h.maxBodyBytes); err != nil {
+@@ -283,6 +292,9 @@ func (h *Handler) transcribeSpeechRequest(c *gin.Context, openAICompatible bool)
+ 	}
+ 	input.ClientKey = clientKey
+ 	input.RequestID = requestID
++	input.Method = c.Request.Method
++	input.Path = c.Request.URL.Path
++	input.Headers = c.Request.Header.Clone()
+ 	result, err := h.gateway.TranscribeSpeech(c.Request.Context(), input)
+ 	if err != nil {
+ 		writeGatewayError(c, err)
+diff --git a/backend/internal/transport/http/settings/handler.go b/backend/internal/transport/http/settings/handler.go
+index 0684910..de23db4 100644
+--- a/backend/internal/transport/http/settings/handler.go
++++ b/backend/internal/transport/http/settings/handler.go
+@@ -120,6 +120,7 @@ type auditConfigDTO struct {
+ 	BatchSize     int    `json:"batchSize"`
+ 	FlushInterval string `json:"flushInterval"`
+ 	CommitDelayMS int    `json:"commitDelayMS"`
++	RetentionDays *int   `json:"retentionDays,omitempty"`
+ }
+ 
+ type clientKeyDefaultsConfigDTO struct {
+@@ -233,6 +234,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
+ 		},
+ 		Audit: settingsapp.AuditConfig{
+ 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval, CommitDelayMS: value.Audit.CommitDelayMS,
++			RetentionDays: intValue(value.Audit.RetentionDays), RetentionDaysProvided: value.Audit.RetentionDays != nil,
+ 		},
+ 		ClientKeyDefaults: settingsapp.ClientKeyDefaultsConfig{
+ 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
+@@ -317,6 +319,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
+ 			},
+ 			Audit: auditConfigDTO{
+ 				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval, CommitDelayMS: config.Audit.CommitDelayMS,
++				RetentionDays: intPointer(config.Audit.RetentionDays),
+ 			},
+ 			ClientKeyDefaults: clientKeyDefaultsConfigDTO{
+ 				RPMLimit: config.ClientKeyDefaults.RPMLimit, MaxConcurrent: config.ClientKeyDefaults.MaxConcurrent,
+@@ -357,6 +360,15 @@ func boolValue(value *bool) bool {
+ 	return *value
+ }
+ 
++func intPointer(value int) *int { return &value }
++
++func intValue(value *int) int {
++	if value == nil {
++		return 0
++	}
++	return *value
++}
++
+ func stringSliceValue(value *[]string) []string {
+ 	if value == nil {
+ 		return nil
+diff --git a/config.example.yaml b/config.example.yaml
+index 52cc176..37db00d 100644
+--- a/config.example.yaml
++++ b/config.example.yaml
+@@ -115,6 +115,8 @@ audit:
+   flushInterval: 250ms
+   # [通常不要修改] 需要调用方确认提交的审计最多聚合等待该时长；建议保持 1ms–50ms。
+   commitDelay: 5ms
++  # [按需修改] 自动清理超过该天数的请求审计与尝试诊断；0 表示永久保留。
++  retentionDays: 7
+   # [通常不要修改] enforce 会在异常持续超过宽限期后暂停新的推理请求；确认发生数据丢失时会立即暂停。
+   ledgerMode: enforce # observe | enforce
+   ledgerFailureThreshold: 1
+diff --git a/frontend/src/features/audits/request-audit-detail-dialog.tsx b/frontend/src/features/audits/request-audit-detail-dialog.tsx
+index ef946bf..3d99c32 100644
+--- a/frontend/src/features/audits/request-audit-detail-dialog.tsx
++++ b/frontend/src/features/audits/request-audit-detail-dialog.tsx
+@@ -1,5 +1,14 @@
+ import { useQuery } from "@tanstack/react-query";
+-import { Braces, FileText, Globe2, KeyRound, Network, Server, TriangleAlert } from "lucide-react";
++import {
++  CheckCircle2,
++  FileText,
++  Globe2,
++  KeyRound,
++  ListTree,
++  Network,
++  Server,
++  TriangleAlert,
++} from "lucide-react";
+ import { useMemo, useState, type ReactNode } from "react";
+ import { useTranslation } from "react-i18next";
+ 
+@@ -23,9 +32,16 @@ const PRE_UPSTREAM_ERROR_CODES = new Set([
+   "upstream_unavailable",
+ ]);
+ 
+-export function RequestAuditDetailDialog({ audit, open, onOpenChange }: { audit: AuditDTO | null; open: boolean; onOpenChange: (open: boolean) => void }) {
++export function RequestAuditDetailDialog({
++  audit,
++  open,
++  onOpenChange,
++}: {
++  audit: AuditDTO | null;
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}) {
+   const { t, i18n } = useTranslation();
+-  const [selectedNumber, setSelectedNumber] = useState<number | null>(null);
+   const detailQuery = useQuery({
+     queryKey: ["request-audits", "detail", audit?.id],
+     queryFn: ({ signal }) => getRequestAudit(audit?.id ?? "", signal),
+@@ -33,101 +49,350 @@ export function RequestAuditDetailDialog({ audit, open, onOpenChange }: { audit:
+     gcTime: AUDIT_DETAIL_CACHE_TIME_MS,
+   });
+ 
++  const activeAudit = detailQuery.data?.audit ?? audit;
+   const attempts = detailQuery.data?.attempts ?? [];
+-  const selectedAttempt = attempts.find((attempt) => attempt.number === selectedNumber) ?? attempts[0];
+ 
+   return (
+     <Dialog open={open} onOpenChange={onOpenChange}>
+-      <DialogContent className="flex h-[min(620px,calc(100svh-2rem))] max-h-[calc(100svh-2rem)] min-h-0 flex-col gap-0 overflow-hidden p-0 text-xs sm:max-w-4xl">
+-        <DialogHeader className="shrink-0 px-5 py-4 pr-12">
+-          <DialogTitle>{t("audits.detailTitle")}</DialogTitle>
+-          <DialogDescription className="flex min-w-0 flex-wrap gap-x-4 gap-y-0.5">
+-            <span className="truncate" title={audit?.requestId}>{audit?.requestId}</span>
+-            {audit?.clientIp ? <Badge variant="outline"><Globe2 className="mr-1 size-3" />{t("audits.clientIp")}: {audit.clientIp}</Badge> : null}
+-            {audit?.reasoningEffort ? <Badge variant="secondary">{t("audits.reasoningEffort")}: {audit.reasoningEffort}</Badge> : null}
+-            {audit ? <span>{formatDateTime(audit.createdAt, i18n.language)}</span> : null}
++      <DialogContent className="flex h-[min(700px,calc(100svh-2rem))] max-h-[calc(100svh-2rem)] min-h-0 flex-col gap-0 overflow-hidden p-0 text-xs sm:max-w-[900px]">
++        <DialogHeader className="shrink-0 px-5 pb-3 pt-4 pr-12">
++          <div className="flex items-center gap-2">
++            <DialogTitle>{t("audits.detailTitle")}</DialogTitle>
++            {activeAudit ? (
++              <StatusBadge
++                statusCode={activeAudit.statusCode}
++                failed={Boolean(activeAudit.errorCode) || activeAudit.statusCode >= 400}
++              />
++            ) : null}
++          </div>
++          <DialogDescription asChild>
++            <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-normal text-muted-foreground">
++              {activeAudit?.requestId ? (
++                <span className="max-w-[280px] truncate" title={activeAudit.requestId}>
++                  {activeAudit.requestId}
++                </span>
++              ) : null}
++              {activeAudit?.clientIp ? (
++                <>
++                  {activeAudit.requestId ? <span aria-hidden="true">·</span> : null}
++                  <span className="inline-flex items-center gap-1">
++                    <Globe2 className="size-3" />
++                    {activeAudit.clientIp}
++                  </span>
++                </>
++              ) : null}
++              {activeAudit?.operation ? (
++                <>
++                  {activeAudit.requestId || activeAudit.clientIp ? <span aria-hidden="true">·</span> : null}
++                  <span>{activeAudit.operation}</span>
++                </>
++              ) : null}
++              {activeAudit ? (
++                <>
++                  {activeAudit.requestId || activeAudit.clientIp || activeAudit.operation ? <span aria-hidden="true">·</span> : null}
++                  <span>{formatDateTime(activeAudit.createdAt, i18n.language)}</span>
++                </>
++              ) : null}
++            </div>
+           </DialogDescription>
+         </DialogHeader>
+ 
+-        {detailQuery.isPending ? <LoadingState className="min-h-0 flex-1" /> : null}
+-        {detailQuery.isError ? <ErrorState message={detailQuery.error.message} onRetry={() => void detailQuery.refetch()} /> : null}
+-        {detailQuery.data ? (
+-          attempts.length > 0 && selectedAttempt ? (
+-            <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[190px_minmax(0,1fr)] lg:grid-rows-1">
+-              <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-muted/25 p-2.5">
+-                <p className="mb-1 shrink-0 px-2 text-muted-foreground">{t("audits.attemptTimeline")}</p>
+-                <div className="flex max-h-28 gap-1 overflow-auto lg:min-h-0 lg:max-h-none lg:flex-1 lg:flex-col">
+-                  {attempts.map((attempt) => (
+-                    <AttemptButton
+-                      key={attempt.id}
+-                      attempt={attempt}
+-                      selected={attempt.number === selectedAttempt.number}
+-                      onClick={() => setSelectedNumber(attempt.number)}
+-                    />
+-                  ))}
+-                </div>
+-              </aside>
+-              <AttemptDetail key={selectedAttempt.id} attempt={selectedAttempt} />
+-            </div>
+-          ) : (
+-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+-              <TriangleAlert className="size-7 stroke-1" />
+-              <p>{t(detailQuery.data.audit.errorCode && PRE_UPSTREAM_ERROR_CODES.has(detailQuery.data.audit.errorCode) ? "audits.noUpstreamAttempt" : "audits.noFailureAttempts")}</p>
+-              {detailQuery.data.audit.errorCode ? <span className="max-w-full break-words">{detailQuery.data.audit.errorCode}</span> : null}
++        {detailQuery.isPending && !activeAudit ? <LoadingState className="min-h-0 flex-1" /> : null}
++        {detailQuery.isError ? (
++          <ErrorState message={detailQuery.error.message} onRetry={() => void detailQuery.refetch()} />
++        ) : null}
++
++        {activeAudit ? (
++          <Tabs defaultValue="overview" className="flex min-h-0 flex-1 flex-col overflow-hidden">
++            <div className="shrink-0 overflow-x-auto bg-muted/15 px-4 py-2 sm:px-5">
++              <TabsList className="h-8 w-max">
++                <TabsTrigger value="overview" className="gap-1.5 px-3 text-xs">
++                  <FileText className="size-3.5" />
++                  {t("audits.requestOverview")}
++                </TabsTrigger>
++                <TabsTrigger value="requestMetadata" className="gap-1.5 px-3 text-xs">
++                  <ListTree className="size-3.5" />
++                  {t("audits.requestMetadata")}
++                </TabsTrigger>
++                <TabsTrigger value="attempts" className="gap-1.5 px-3 text-xs">
++                  <Server className="size-3.5" />
++                  {t("audits.upstreamDiagnostics")}
++                  {attempts.length > 0 ? (
++                    <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px] font-mono">
++                      {attempts.length}
++                    </Badge>
++                  ) : null}
++                </TabsTrigger>
++              </TabsList>
+             </div>
+-          )
++
++            <TabsContent value="overview" className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 focus-visible:outline-none sm:p-5">
++              <RequestOverviewPanel audit={activeAudit} />
++            </TabsContent>
++
++            <TabsContent value="requestMetadata" className="min-h-0 flex-1 overflow-hidden px-4 pb-4 pt-3 focus-visible:outline-none sm:px-5 sm:pb-5">
++              <RequestMetadataPanel audit={activeAudit} />
++            </TabsContent>
++
++            <TabsContent value="attempts" className="min-h-0 flex-1 overflow-hidden focus-visible:outline-none">
++              <UpstreamAttemptsPanel audit={activeAudit} attempts={attempts} />
++            </TabsContent>
++          </Tabs>
+         ) : null}
+       </DialogContent>
+     </Dialog>
+   );
+ }
+ 
+-function AttemptButton({ attempt, selected, onClick }: { attempt: AuditAttemptDTO; selected: boolean; onClick: () => void }) {
++function RequestOverviewPanel({ audit }: { audit: AuditDTO }) {
++  const { t, i18n } = useTranslation();
++
++  const tokenSummary = useMemo(() => {
++    if (!audit.totalTokens && !audit.inputTokens && !audit.outputTokens) return null;
++    const parts = [
++      `${t("audits.input")} ${formatNumber(audit.inputTokens, i18n.language)}`,
++    ];
++    if (audit.cachedInputTokens > 0) {
++      parts.push(`(${t("audits.cached")} ${formatNumber(audit.cachedInputTokens, i18n.language)})`);
++    }
++    parts.push(`· ${t("audits.output")} ${formatNumber(audit.outputTokens, i18n.language)}`);
++    if (audit.reasoningTokens > 0) {
++      parts.push(`(${t("audits.reasoning")} ${formatNumber(audit.reasoningTokens, i18n.language)})`);
++    }
++    parts.push(`· ${t("audits.total")} ${formatNumber(audit.totalTokens, i18n.language)}`);
++    return parts.join(" ");
++  }, [audit, t, i18n.language]);
++
++  const costDisplay = useMemo(() => {
++    const costTicks = audit.costInUsdTicks > 0 ? audit.costInUsdTicks : audit.estimatedCostInUsdTicks;
++    if (!costTicks) return "$0";
++    const usd = (costTicks / 100_000_000).toFixed(6);
++    return `$${usd}${audit.costInUsdTicks <= 0 && audit.estimatedCostInUsdTicks > 0 ? ` (${t("audits.estimated")})` : ""}`;
++  }, [audit, t]);
++
++  const durationDisplay = useMemo(() => {
++    let text = `${formatNumber(audit.durationMs, i18n.language)} ms`;
++    if (audit.firstTokenMs) {
++      text += ` (${t("audits.firstTokenMs")}: ${formatNumber(audit.firstTokenMs, i18n.language)} ms)`;
++    }
++    return text;
++  }, [audit, t, i18n.language]);
++
++  return (
++    <div className="grid gap-2.5 sm:grid-cols-2">
++      <OverviewField
++        label={t("audits.targetAccount")}
++        value={audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-")}
++      />
++      <OverviewField
++        label={t("audits.requestModel")}
++        value={audit.modelPublicId || "-"}
++        copy={Boolean(audit.modelPublicId)}
++      />
++      <OverviewField
++        label={t("audits.upstreamModel")}
++        value={audit.modelUpstreamModel || "-"}
++      />
++      <OverviewField
++        label={t("audits.clientApiKey")}
++        value={audit.clientKeyName || (audit.clientKeyId ? `#${audit.clientKeyId}` : "-")}
++      />
++      <OverviewField
++        label={t("audits.clientIp")}
++        value={audit.clientIp || "-"}
++      />
++      <OverviewField
++        label={t("audits.egressNode")}
++        value={audit.egressNodeName || (audit.egressNodeId ? `#${audit.egressNodeId}` : "-")}
++      />
++      <OverviewField
++        label={t("audits.duration")}
++        value={durationDisplay}
++      />
++      <OverviewField
++        label={t("audits.cost")}
++        value={costDisplay}
++      />
++      {audit.errorCode ? (
++        <OverviewField
++          className="sm:col-span-2"
++          label={t("audits.errorLabel")}
++          value={audit.errorCode}
++          copy
++        />
++      ) : null}
++      {tokenSummary ? (
++        <OverviewField
++          className="sm:col-span-2"
++          label={t("audits.tokenUsage")}
++          value={tokenSummary}
++        />
++      ) : null}
++      {audit.mediaInputImages > 0 || audit.mediaOutputImages > 0 || audit.mediaOutputSeconds > 0 ? (
++        <OverviewField
++          className="sm:col-span-2"
++          label={t("audits.mediaInput")}
++          value={[
++            audit.mediaInputImages > 0 ? `${t("audits.mediaInput")}: ${t("audits.imageCount", { count: audit.mediaInputImages })}` : "",
++            audit.mediaOutputImages > 0 ? `${t("audits.mediaOutput")}: ${t("audits.imageCount", { count: audit.mediaOutputImages })}` : "",
++            audit.mediaOutputSeconds > 0 ? t("audits.secondsCount", { count: audit.mediaOutputSeconds }) : "",
++          ].filter(Boolean).join(" · ")}
++        />
++      ) : null}
++    </div>
++  );
++}
++
++function RequestMetadataPanel({ audit }: { audit: AuditDTO }) {
++  const { t } = useTranslation();
++  const headers = useMemo(() => audit.requestHeaders ?? {}, [audit.requestHeaders]);
++
++  if (!audit.requestMethod && !audit.requestPath && Object.keys(headers).length === 0) {
++    return <EmptyPanel icon={<FileText />} message={t("audits.noRequestMetadata")} />;
++  }
++
++  return (
++    <div className="flex h-full min-h-0 flex-col gap-4">
++      <section className="shrink-0">
++        <p className="mb-2 px-1 text-[11px] font-medium text-muted-foreground">{t("audits.requestPath")}</p>
++        <div className="flex h-10 min-w-0 items-center gap-3 rounded-lg bg-muted/15 px-3">
++          <span className="shrink-0 text-xs text-muted-foreground">
++            {audit.requestMethod || "-"}
++          </span>
++          <span className="min-w-0 flex-1 truncate text-xs" title={audit.requestPath}>
++            {audit.requestPath || "-"}
++          </span>
++          {audit.requestPath ? <CopyButton value={audit.requestPath} /> : null}
++        </div>
++      </section>
++      <section className="min-h-0 flex-1">
++        <HeadersPanel title={t("audits.requestHeaders")} headers={headers} emptyMessage={t("audits.noRequestHeaders")} />
++      </section>
++    </div>
++  );
++}
++
++function UpstreamAttemptsPanel({
++  audit,
++  attempts,
++}: {
++  audit: AuditDTO;
++  attempts: AuditAttemptDTO[];
++}) {
++  const { t } = useTranslation();
++  const [selectedNumber, setSelectedNumber] = useState<number | null>(null);
++
++  const selectedAttempt = attempts.find((attempt) => attempt.number === selectedNumber) ?? attempts[0];
++
++  if (attempts.length === 0) {
++    const isSuccess = audit.statusCode >= 200 && audit.statusCode < 300 && !audit.errorCode;
++    if (isSuccess) {
++      return (
++        <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2 p-6 text-center text-muted-foreground">
++          <CheckCircle2 className="size-8 stroke-1 text-emerald-500" />
++          <p className="text-xs">{t("audits.successNoAttempts")}</p>
++        </div>
++      );
++    }
++    return (
++      <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2 p-6 text-center text-muted-foreground">
++        <TriangleAlert className="size-8 stroke-1 text-amber-500" />
++        <p className="max-w-md text-xs">
++          {t(
++            audit.errorCode && PRE_UPSTREAM_ERROR_CODES.has(audit.errorCode)
++              ? "audits.noUpstreamAttempt"
++              : "audits.noFailureAttempts"
++          )}
++        </p>
++        {audit.errorCode ? (
++          <Badge variant="outline" className="font-mono text-xs">
++            {audit.errorCode}
++          </Badge>
++        ) : null}
++      </div>
++    );
++  }
++
++  const terminalAttemptNumber = Math.max(...attempts.map((attempt) => attempt.number));
++
++  return (
++    <div className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[190px_minmax(0,1fr)] lg:grid-rows-1">
++      <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-b border-border/40 bg-muted/25 px-4 py-2 sm:px-5 lg:border-r lg:border-b-0 lg:pr-2.5">
++        <p className="mb-0.5 shrink-0 text-xs text-muted-foreground">{t("audits.attemptTimeline")}</p>
++        <div className="flex max-h-28 gap-1 overflow-auto lg:min-h-0 lg:max-h-none lg:flex-1 lg:flex-col">
++          {attempts.map((attempt) => (
++            <AttemptButton
++              key={attempt.id}
++              attempt={attempt}
++              statusCode={attempt.upstreamStatusCode || (attempt.number === terminalAttemptNumber ? audit.statusCode : 0)}
++              selected={attempt.number === selectedAttempt.number}
++              onClick={() => setSelectedNumber(attempt.number)}
++            />
++          ))}
++        </div>
++      </aside>
++      <AttemptDetail key={selectedAttempt.id} attempt={selectedAttempt} />
++    </div>
++  );
++}
++
++function AttemptButton({ attempt, statusCode, selected, onClick }: { attempt: AuditAttemptDTO; statusCode: number; selected: boolean; onClick: () => void }) {
+   const { t } = useTranslation();
+   const Icon = attempt.source === "upstream_http" ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
+   return (
+     <button
+       type="button"
+-      className={cn("w-48 shrink-0 rounded-md px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 lg:w-full", selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/60")}
++      className={cn(
++        "flex h-8 w-36 shrink-0 items-center justify-between gap-2 rounded-lg px-2.5 text-left text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 lg:w-full",
++        selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/60"
++      )}
+       aria-pressed={selected}
+       onClick={onClick}
+     >
+-      <span className="flex items-center justify-between gap-2">
+-        <span className="flex min-w-0 items-center gap-2"><Icon className="size-3.5 shrink-0" />{t("audits.attemptNumber", { number: attempt.number })}</span>
+-        {attempt.upstreamStatusCode ? <StatusBadge statusCode={attempt.upstreamStatusCode} failed={attempt.stage === "response_stream"} /> : null}
++      <span className="flex min-w-0 items-center gap-2 truncate">
++        <Icon className="size-3.5 shrink-0" />
++        {t("audits.attemptNumber", { number: attempt.number })}
+       </span>
++      {statusCode ? (
++        <StatusBadge statusCode={statusCode} failed={attempt.stage === "response_stream"} />
++      ) : (
++        <span className="shrink-0 text-xs text-muted-foreground">—</span>
++      )}
+     </button>
+   );
+ }
+ 
+ function AttemptDetail({ attempt }: { attempt: AuditAttemptDTO }) {
+   const { t } = useTranslation();
++  const hasBody = Boolean(attempt.responseBody);
++  const hasHeaders = Object.keys(attempt.responseHeaders).length > 0;
++  const hasErrors = attempt.errorChain.length > 0;
+   return (
+     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+-      <Tabs defaultValue="overview" className="min-h-0 flex-1 overflow-hidden px-4 pb-4 sm:px-5">
+-        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 py-2">
++      <Tabs defaultValue="overview" className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-4 sm:px-5">
++        <div className="flex shrink-0 flex-wrap items-center gap-2.5 py-3">
+           <AttemptSummary attempt={attempt} />
+-          <div className="ml-auto max-w-full overflow-x-auto">
+-            <TabsList>
+-              <TabsTrigger value="overview">{t("audits.overview")}</TabsTrigger>
+-              <TabsTrigger value="body">{t("audits.responseBody")}</TabsTrigger>
+-              <TabsTrigger value="headers">{t("audits.responseHeaders")}</TabsTrigger>
+-              <TabsTrigger value="errors">{t("audits.errorChain")}</TabsTrigger>
++          <div className="ml-auto max-w-full shrink-0 overflow-x-auto pb-0.5">
++            <TabsList className="h-7 w-max">
++              <TabsTrigger value="overview" className="h-6 px-2.5 text-xs">{t("audits.overview")}</TabsTrigger>
++              {hasBody ? <TabsTrigger value="body" className="h-6 px-2.5 text-xs">{t("audits.responseBody")}</TabsTrigger> : null}
++              {hasHeaders ? <TabsTrigger value="headers" className="h-6 px-2.5 text-xs">{t("audits.responseHeaders")}</TabsTrigger> : null}
++              {hasErrors ? <TabsTrigger value="errors" className="h-6 px-2.5 text-xs">{t("audits.errorChain")}</TabsTrigger> : null}
+             </TabsList>
+           </div>
+         </div>
+         <TabsContent value="overview" className="min-h-0 flex-1 overflow-y-auto">
+           <AttemptOverview attempt={attempt} />
+         </TabsContent>
+-        <TabsContent value="body" className="min-h-0 flex-1 overflow-hidden pt-3">
++        {hasBody ? <TabsContent value="body" className="min-h-0 flex-1 overflow-hidden pt-2">
+           <AttemptResponseBody attempt={attempt} />
+-        </TabsContent>
+-        <TabsContent value="headers" className="min-h-0 flex-1 overflow-hidden pt-3">
+-          <HeadersPanel headers={attempt.responseHeaders} />
+-        </TabsContent>
+-        <TabsContent value="errors" className="min-h-0 flex-1 overflow-hidden pt-3">
++        </TabsContent> : null}
++        {hasHeaders ? <TabsContent value="headers" className="min-h-0 flex-1 overflow-hidden pt-2">
++          <HeadersPanel title={t("audits.responseHeaders")} headers={attempt.responseHeaders} />
++        </TabsContent> : null}
++        {hasErrors ? <TabsContent value="errors" className="min-h-0 flex-1 overflow-hidden pt-2">
+           <ErrorChainPanel attempt={attempt} />
+-        </TabsContent>
++        </TabsContent> : null}
+       </Tabs>
+     </main>
+   );
+@@ -136,7 +401,15 @@ function AttemptDetail({ attempt }: { attempt: AuditAttemptDTO }) {
+ function AttemptResponseBody({ attempt }: { attempt: AuditAttemptDTO }) {
+   const { t } = useTranslation();
+   const displayValue = useMemo(() => formattedResponseBody(attempt), [attempt]);
+-  return <CodePanel value={attempt.responseBody} displayValue={displayValue} emptyMessage={t("audits.emptyResponseBody")} encoding={attempt.responseBodyEncoding} truncated={attempt.responseBodyTruncated} />;
++  return (
++    <CodePanel
++      value={attempt.responseBody}
++      displayValue={displayValue}
++      emptyMessage={t("audits.emptyResponseBody")}
++      encoding={attempt.responseBodyEncoding}
++      truncated={attempt.responseBodyTruncated}
++    />
++  );
+ }
+ 
+ function AttemptSummary({ attempt }: { attempt: AuditAttemptDTO }) {
+@@ -148,11 +421,13 @@ function AttemptSummary({ attempt }: { attempt: AuditAttemptDTO }) {
+     ? t("audits.upstreamStreamFailure", { status: attempt.upstreamStatusCode ?? "-" })
+     : isHTTP
+     ? t("audits.upstreamHttpFailure", { status: attempt.upstreamStatusCode ?? "-" })
+-    : attempt.source === "gateway_transport" ? t("audits.gatewayTransportFailure") : t("audits.credentialFailure");
++    : attempt.source === "gateway_transport"
++    ? t("audits.gatewayTransportFailure")
++    : t("audits.credentialFailure");
+   return (
+     <div className="flex min-w-0 items-center gap-2">
+       <Icon className="size-4 shrink-0 text-destructive" />
+-      <p className="min-w-0 truncate">{title}</p>
++      <p className="min-w-0 truncate font-medium">{title}</p>
+     </div>
+   );
+ }
+@@ -160,28 +435,37 @@ function AttemptSummary({ attempt }: { attempt: AuditAttemptDTO }) {
+ function AttemptOverview({ attempt }: { attempt: AuditAttemptDTO }) {
+   const { t, i18n } = useTranslation();
+   return (
+-    <div className="grid gap-x-10 gap-y-6 px-1 py-4 sm:grid-cols-2">
++    <div className="grid gap-x-10 gap-y-4 px-1 py-3 sm:grid-cols-2">
+       <OverviewField label={t("audits.attemptStartedAt")} value={formatDateTime(attempt.startedAt, i18n.language)} />
+       <OverviewField label={t("audits.duration")} value={`${formatNumber(attempt.durationMs, i18n.language)} ms`} />
+-      <OverviewField label={t("audits.account")} value={attempt.accountName || (attempt.accountId ? `#${attempt.accountId}` : "-")} />
++      <OverviewField label={t("audits.targetAccount")} value={attempt.accountName || (attempt.accountId ? `#${attempt.accountId}` : "-")} />
+       <OverviewField label={t("audits.requestMethod")} value={attempt.method || "-"} />
+       <OverviewField label={t("audits.requestPath")} value={attempt.requestPath || "-"} />
+       <OverviewField label={t("audits.upstreamStatus")} value={attempt.upstreamStatus || (attempt.upstreamStatusCode ? String(attempt.upstreamStatusCode) : "-")} />
+       <OverviewField className="sm:col-span-2" label={t("audits.upstreamUrl")} value={attempt.upstreamUrl || t("audits.upstreamUrlUnavailable")} copy={Boolean(attempt.upstreamUrl)} />
+-      {attempt.transportError ? <OverviewField className="sm:col-span-2" label={attempt.source === "gateway_transport" ? t("audits.transportError") : t("audits.attemptError")} value={attempt.transportError} copy /> : null}
++      {attempt.transportError ? (
++        <OverviewField
++          className="sm:col-span-2"
++          label={attempt.source === "gateway_transport" ? t("audits.transportError") : t("audits.attemptError")}
++          value={attempt.transportError}
++          copy
++        />
++      ) : null}
+     </div>
+   );
+ }
+ 
+ function OverviewField({ className, label, value, copy }: { className?: string; label: string; value: string; copy?: boolean }) {
+   return (
+-    <div className={cn("flex min-w-0 items-start gap-4", className)}>
++    <div className={cn("flex min-w-0 items-start gap-3 rounded-lg bg-muted/25 p-3", className)}>
+       <div className="min-w-0 flex-1">
+-        <p className="text-muted-foreground">{label}</p>
+-        <p className="mt-1 break-all" title={value}>{value}</p>
++        <p className="text-[11px] text-muted-foreground">{label}</p>
++        <p className="mt-0.5 break-all text-xs font-medium" title={value}>
++          {value}
++        </p>
+       </div>
+       {copy ? (
+-        <div className="shrink-0 pt-4">
++        <div className="shrink-0 pt-0.5">
+           <CopyButton value={value} />
+         </div>
+       ) : null}
+@@ -189,39 +473,62 @@ function OverviewField({ className, label, value, copy }: { className?: string;
+   );
+ }
+ 
+-function CodePanel({ value, displayValue, emptyMessage, encoding, truncated }: { value: string; displayValue: string; emptyMessage: string; encoding: string; truncated: boolean }) {
++function CodePanel({
++  value,
++  displayValue,
++  emptyMessage,
++  encoding,
++  truncated,
++}: {
++  value: string;
++  displayValue: string;
++  emptyMessage: string;
++  encoding: string;
++  truncated: boolean;
++}) {
+   const { t } = useTranslation();
+   if (!value) return <EmptyPanel icon={<FileText />} message={emptyMessage} />;
+   return (
+-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-md bg-muted/25">
++    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg bg-muted/20">
+       <div className="flex h-10 shrink-0 items-center justify-between px-3">
+-        <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
++        <span className="flex min-w-0 items-center gap-2 text-muted-foreground text-[11px]">
+           <span>{t("audits.bodyEncoding", { encoding })}</span>
+-          {truncated ? <Badge variant="outline">{t("audits.bodyTruncated")}</Badge> : null}
++          {truncated ? <Badge variant="outline" className="text-[10px]">{t("audits.bodyTruncated")}</Badge> : null}
+         </span>
+         <CopyButton value={value} />
+       </div>
+-      <div className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3">{displayValue}</div>
++      <div className="min-h-0 flex-1 overflow-auto p-3">
++        <pre className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all select-text">
++          {displayValue}
++        </pre>
++      </div>
+     </div>
+   );
+ }
+ 
+-function HeadersPanel({ headers }: { headers: Record<string, string[]> }) {
++function HeadersPanel({ title, headers, emptyMessage }: { title?: string; headers: Record<string, string[]>; emptyMessage?: string }) {
+   const { t } = useTranslation();
+-  const entries = useMemo(() => Object.entries(headers), [headers]);
++  const entries = useMemo(() => Object.entries(headers).sort(([left], [right]) => left.localeCompare(right)), [headers]);
+   const copyValue = useMemo(() => JSON.stringify(headers, null, 2), [headers]);
+-  if (entries.length === 0) return <EmptyPanel icon={<Braces />} message={t("audits.emptyResponseHeaders")} />;
++  if (entries.length === 0) return <EmptyPanel icon={<FileText />} message={emptyMessage ?? t("audits.emptyResponseHeaders")} />;
+   return (
+-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-md bg-muted/15">
++    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg bg-muted/15">
+       <div className="flex h-10 shrink-0 items-center justify-between px-3">
+-        <span className="text-muted-foreground">{t("audits.headerCount", { count: entries.length })}</span>
++        <span className="flex min-w-0 items-center gap-2 text-[11px]">
++          {title ? <span className="truncate font-medium text-foreground">{title}</span> : null}
++          <span className="text-muted-foreground">{t("audits.headerItemCount", { count: entries.length })}</span>
++        </span>
+         <CopyButton value={copyValue} />
+       </div>
+-      <div className="min-h-0 flex-1 space-y-1 overflow-auto px-2 pb-2">
+-        {entries.map(([name, values]) => (
+-          <div key={name} className="grid gap-1 rounded-md px-2 py-2 hover:bg-background/60 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-4">
+-            <span className="break-all text-muted-foreground">{name}</span>
+-            <div className="min-w-0 space-y-1">{values.map((value, index) => <span key={`${name}-${index}`} className="block break-all">{value}</span>)}</div>
++      <div className="min-h-0 flex-1 space-y-0.5 overflow-auto px-2 pb-2">
++        {entries.map(([name, values], entryIndex) => (
++          <div key={name} className={cn("grid gap-1 rounded-md px-2.5 py-2 transition-colors hover:bg-background/70 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-4", entryIndex % 2 === 0 && "bg-background/35")}>
++            <span className="break-all font-mono text-[11px] text-muted-foreground">{name}</span>
++            <div className="min-w-0 space-y-1">
++              {values.map((value, index) => (
++                <span key={`${name}-${index}`} className={cn("block break-all font-mono text-[11px]", value === "[REDACTED]" && "font-semibold text-amber-700 dark:text-amber-300")}>{value}</span>
++              ))}
++            </div>
+           </div>
+         ))}
+       </div>
+@@ -234,16 +541,19 @@ function ErrorChainPanel({ attempt }: { attempt: AuditAttemptDTO }) {
+   const copyValue = useMemo(() => JSON.stringify(attempt.errorChain, null, 2), [attempt.errorChain]);
+   if (attempt.errorChain.length === 0) return <EmptyPanel icon={<Network />} message={t("audits.emptyErrorChain")} />;
+   return (
+-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-md bg-muted/15">
++    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg bg-muted/15">
+       <div className="flex h-10 shrink-0 items-center justify-between px-3">
+-        <span className="text-muted-foreground">{t("audits.errorFrameCount", { count: attempt.errorChain.length })}</span>
++        <span className="text-muted-foreground text-[11px]">{t("audits.errorFrameCount", { count: attempt.errorChain.length })}</span>
+         <CopyButton value={copyValue} />
+       </div>
+-      <ol className="min-h-0 flex-1 space-y-4 overflow-auto px-3 pb-3">
++      <ol className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+         {attempt.errorChain.map((frame, index) => (
+-          <li key={`${frame.type}-${index}`}>
+-            <div className="flex items-center gap-2 text-muted-foreground"><span>#{index + 1}</span><span className="break-all">{frame.type}</span></div>
+-            <p className="mt-2 whitespace-pre-wrap break-words">{frame.message}</p>
++          <li key={`${frame.type}-${index}`} className="rounded-md bg-background/50 p-2.5">
++            <div className="flex items-center gap-2 text-muted-foreground text-[11px]">
++              <span>#{index + 1}</span>
++              <span className="break-all font-medium text-foreground">{frame.type}</span>
++            </div>
++            <p className="mt-1.5 font-mono text-[11px] whitespace-pre-wrap break-words">{frame.message}</p>
+           </li>
+         ))}
+       </ol>
+@@ -252,26 +562,42 @@ function ErrorChainPanel({ attempt }: { attempt: AuditAttemptDTO }) {
+ }
+ 
+ function EmptyPanel({ icon, message }: { icon: ReactNode; message: string }) {
+-  return <div className="flex h-full min-h-40 flex-col items-center justify-center gap-2 rounded-md bg-muted/15 text-muted-foreground [&_svg]:size-6 [&_svg]:stroke-1"><span>{icon}</span><p>{message}</p></div>;
++  return (
++    <div className="flex h-full min-h-40 flex-col items-center justify-center gap-2 rounded-lg bg-muted/15 px-6 text-center text-muted-foreground [&_svg]:size-6 [&_svg]:stroke-1">
++      <span>{icon}</span>
++      <p className="text-xs">{message}</p>
++    </div>
++  );
+ }
+ 
+ function formattedResponseBody(attempt: AuditAttemptDTO): string {
+   if (attempt.responseBodyEncoding !== "utf8") return attempt.responseBody;
+   const contentType = Object.entries(attempt.responseHeaders).find(([name]) => name.toLowerCase() === "content-type")?.[1].join(";") ?? "";
+   if (attempt.stage !== "response_stream" && !contentType.toLowerCase().includes("json")) return attempt.responseBody;
++  return formatJSONBody(attempt.responseBody);
++}
++
++function formatJSONBody(value: string): string {
+   try {
+-    return JSON.stringify(JSON.parse(attempt.responseBody), null, 2);
++    return JSON.stringify(JSON.parse(value), null, 2);
+   } catch {
+-    return attempt.responseBody;
++    return value;
+   }
+ }
+ 
+ function StatusBadge({ statusCode, failed = false }: { statusCode: number; failed?: boolean }) {
+-  const className = failed
+-    ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
+-    : statusCode >= 500
+-    ? "bg-red-500/10 text-red-700 dark:text-red-300"
+-    : statusCode >= 400 ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
+-      : statusCode >= 200 && statusCode < 300 ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "bg-muted text-muted-foreground";
+-  return <Badge variant="secondary" className={cn("min-w-9 justify-center px-1.5", className)}>{statusCode}</Badge>;
++  const className = statusCode >= 500
++    ? "bg-red-500/10 text-red-700 dark:text-red-300 border-red-500/30"
++    : statusCode >= 400
++    ? "bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/30"
++    : failed
++    ? "bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/30"
++    : statusCode >= 200 && statusCode < 300
++    ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30"
++    : "bg-muted text-muted-foreground";
++  return (
++    <Badge variant="outline" className={cn("h-5 min-w-8 justify-center px-1.5 text-xs font-normal", className)}>
++      {statusCode}
++    </Badge>
++  );
+ }
+diff --git a/frontend/src/features/audits/request-audits-api.ts b/frontend/src/features/audits/request-audits-api.ts
+index 4d510bf..d3c1da9 100644
+--- a/frontend/src/features/audits/request-audits-api.ts
++++ b/frontend/src/features/audits/request-audits-api.ts
+@@ -66,6 +66,9 @@ export type AuditDTO = {
+   outputTokensPerSecond?: number;
+   durationMs: number;
+   errorCode?: string;
++  requestMethod?: string;
++  requestPath?: string;
++  requestHeaders?: Record<string, string[]>;
+   attemptCount: number;
+   createdAt: string;
+ };
+@@ -154,7 +157,8 @@ const auditValidator = hasShape({
+   costInUsdTicks: isNumber, estimatedCostInUsdTicks: isNumber, pricingModel: isOptional(isString), pricingVersion: isOptional(isString), billing: isOptional(auditBillingValidator),
+   numSourcesUsed: isNumber, numServerSideToolsUsed: isNumber, contextInputTokens: isNumber, contextOutputTokens: isNumber,
+   firstTokenMs: isOptional(isNumber), outputTokensPerSecond: isOptional(isNumber),
+-  durationMs: isNumber, errorCode: isOptional(isString), attemptCount: isNumber, createdAt: isString,
++  durationMs: isNumber, errorCode: isOptional(isString), requestMethod: isOptional(isString), requestPath: isOptional(isString),
++  requestHeaders: isOptional(isRecordOf(isArrayOf(isString))), attemptCount: isNumber, createdAt: isString,
+ });
+ const auditAttemptValidator = hasShape({
+   id: isString, number: isNumber, source: isOneOf("upstream_http", "gateway_transport", "credential"), stage: isString,
+diff --git a/frontend/src/features/audits/request-audits-page.tsx b/frontend/src/features/audits/request-audits-page.tsx
+index 7988ebf..b7ae6e8 100644
+--- a/frontend/src/features/audits/request-audits-page.tsx
++++ b/frontend/src/features/audits/request-audits-page.tsx
+@@ -705,14 +705,20 @@ function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void })
+       <span className="block whitespace-nowrap text-[10px] text-muted-foreground">{mode}</span>
+     </>
+   );
+-  if (!audit.errorCode && audit.attemptCount === 0) return <div className="space-y-0.5 text-center">{content}</div>;
+   return (
+     <Tooltip>
+       <TooltipTrigger asChild>
+-        <button type="button" className="group space-y-0.5 rounded-md text-center outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&>span:last-child]:underline-offset-2 hover:[&>span:last-child]:text-foreground hover:[&>span:last-child]:underline" aria-label={t("audits.openDiagnostics")} onClick={onOpen}>{content}</button>
++        <button
++          type="button"
++          className="group inline-flex flex-col items-center justify-center space-y-0.5 rounded-md px-2 py-1 text-center outline-none transition-colors hover:bg-muted/80 focus-visible:ring-2 focus-visible:ring-ring/50 [&>span:last-child]:underline-offset-2 hover:[&>span:last-child]:text-foreground hover:[&>span:last-child]:underline cursor-pointer"
++          aria-label={t("audits.viewDetails")}
++          onClick={onOpen}
++        >
++          {content}
++        </button>
+       </TooltipTrigger>
+       <TooltipContent className="max-w-80 whitespace-normal break-words text-left leading-5" side="top">
+-        {audit.errorCode || t("audits.openDiagnostics")}
++        {audit.errorCode || t("audits.viewDetails")}
+       </TooltipContent>
+     </Tooltip>
+   );
+diff --git a/frontend/src/features/settings/settings-api.ts b/frontend/src/features/settings/settings-api.ts
+index a36847f..ac735fb 100644
+--- a/frontend/src/features/settings/settings-api.ts
++++ b/frontend/src/features/settings/settings-api.ts
+@@ -24,7 +24,7 @@ export type SettingsConfigDTO = {
+     accountIsolatedConnections: boolean;
+     segmentedSelector: { enabled: boolean; minCandidates: number; windowSize: number };
+   };
+-  audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number };
++  audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number; retentionDays?: number };
+   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
+   accounts: {
+     markBuildForbiddenReauth: boolean;
+@@ -132,7 +132,10 @@ const settingsConfigValidator = hasShape({
+     accountIsolatedConnections: isOptional(isBoolean),
+     segmentedSelector: isOptional(hasShape({ enabled: isBoolean, minCandidates: isNumber, windowSize: isNumber })),
+   }),
+-  audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber) }),
++  audit: hasShape({
++    bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber),
++    retentionDays: isOptional(isNumber),
++  }),
+   clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
+   // Older backends may omit accounts; withSettingsDefaults supplies a safe local default.
+   accounts: isOptional(hasShape({
+@@ -172,6 +175,7 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
+       audit: {
+         ...snapshot.config.audit,
+         commitDelayMS: snapshot.config.audit.commitDelayMS ?? 5,
++        retentionDays: snapshot.config.audit.retentionDays ?? 7,
+       },
+       routing: {
+         ...snapshot.config.routing,
+diff --git a/frontend/src/features/settings/settings-model.ts b/frontend/src/features/settings/settings-model.ts
+index 96c03fd..1c900a0 100644
+--- a/frontend/src/features/settings/settings-model.ts
++++ b/frontend/src/features/settings/settings-model.ts
+@@ -152,7 +152,13 @@ export const settingsSchema = z.object({
+     }),
+   }).refine((value) => durationSeconds(value.cooldownMax) >= durationSeconds(value.cooldownBase), { path: ["cooldownMax"] })
+     .refine((value) => value.segmentedSelector.windowSize <= value.segmentedSelector.minCandidates, { path: ["segmentedSelector", "windowSize"] }),
+-  audit: z.object({ bufferSize: positiveInteger.max(262_144), batchSize: positiveInteger.max(4_096), flushInterval: auditFlushDuration, commitDelayMS: positiveInteger.max(50) })
++  audit: z.object({
++    bufferSize: positiveInteger.max(262_144),
++    batchSize: positiveInteger.max(4_096),
++    flushInterval: auditFlushDuration,
++    commitDelayMS: positiveInteger.max(50),
++    retentionDays: z.number().int().min(0).max(365),
++  })
+     .refine((value) => value.batchSize <= value.bufferSize, { path: ["batchSize"] }),
+   clientKeyDefaults: z.object({ rpmLimit: positiveInteger.max(100_000), maxConcurrent: positiveInteger.max(1_024) }),
+   accounts: z.object({
+@@ -209,7 +215,13 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
+       accountIsolatedConnections: config.routing.accountIsolatedConnections,
+       segmentedSelector: config.routing.segmentedSelector,
+     },
+-    audit: { bufferSize: config.audit.bufferSize, batchSize: config.audit.batchSize, flushInterval: parseDuration(config.audit.flushInterval), commitDelayMS: config.audit.commitDelayMS },
++    audit: {
++      bufferSize: config.audit.bufferSize,
++      batchSize: config.audit.batchSize,
++      flushInterval: parseDuration(config.audit.flushInterval),
++      commitDelayMS: config.audit.commitDelayMS,
++      retentionDays: config.audit.retentionDays ?? 7,
++    },
+     clientKeyDefaults: config.clientKeyDefaults,
+     accounts: {
+       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
+@@ -252,7 +264,13 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
+       accountIsolatedConnections: config.routing.accountIsolatedConnections,
+       segmentedSelector: config.routing.segmentedSelector,
+     },
+-    audit: { bufferSize: config.audit.bufferSize, batchSize: config.audit.batchSize, flushInterval: formatDuration(config.audit.flushInterval), commitDelayMS: config.audit.commitDelayMS },
++    audit: {
++      bufferSize: config.audit.bufferSize,
++      batchSize: config.audit.batchSize,
++      flushInterval: formatDuration(config.audit.flushInterval),
++      commitDelayMS: config.audit.commitDelayMS,
++      retentionDays: config.audit.retentionDays,
++    },
+     clientKeyDefaults: config.clientKeyDefaults,
+     accounts: {
+       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
+diff --git a/frontend/src/features/settings/settings-page.tsx b/frontend/src/features/settings/settings-page.tsx
+index c88919d..7823e82 100644
+--- a/frontend/src/features/settings/settings-page.tsx
++++ b/frontend/src/features/settings/settings-page.tsx
+@@ -85,6 +85,7 @@ export function SettingsPage() {
+             <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="console">{t("console.name")}</TabsTrigger>
+             <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="delivery">{t("settings.groups.delivery")}</TabsTrigger>
+             <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="policies">{t("settings.groups.policies")}</TabsTrigger>
++            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="audit">{t("settings.audit.tabTitle")}</TabsTrigger>
+             <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="accounts">{t("settings.accounts.title")}</TabsTrigger>
+             <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="about">{t("updates.title")}</TabsTrigger>
+           </TabsList>
+@@ -341,15 +342,6 @@ export function SettingsPage() {
+             </AlertDialog>
+           </SettingsSection>
+ 
+-          <SettingsSection title={t("settings.audit.title")}>
+-            <div className="space-y-0">
+-              <SettingsField controlId="audit-buffer-size" label={t("settings.audit.bufferSize")} description={t("settings.audit.bufferSizeHelp")} badge={t("settings.restartRequired")} error={form.formState.errors.audit?.bufferSize?.message}><Input id="audit-buffer-size" type="number" min={1} max={262_144} {...form.register("audit.bufferSize", { valueAsNumber: true })} /></SettingsField>
+-              <SettingsField controlId="audit-batch-size" label={t("settings.audit.batchSize")} description={t("settings.audit.batchSizeHelp")} error={form.formState.errors.audit?.batchSize?.message}><Input id="audit-batch-size" type="number" min={1} max={4_096} {...form.register("audit.batchSize", { valueAsNumber: true })} /></SettingsField>
+-              <SettingsField controlId="audit-flush-interval" label={t("settings.audit.flushInterval")} description={t("settings.audit.flushIntervalHelp")} error={form.formState.errors.audit?.flushInterval?.message}><Controller control={form.control} name="audit.flushInterval" render={({ field }) => <DurationInput id="audit-flush-interval" value={field.value} onChange={field.onChange} />} /></SettingsField>
+-              <SettingsField controlId="audit-commit-delay" label={t("settings.audit.commitDelay")} description={t("settings.audit.commitDelayHelp")} error={form.formState.errors.audit?.commitDelayMS?.message}><Input id="audit-commit-delay" type="number" min={1} max={50} {...form.register("audit.commitDelayMS", { valueAsNumber: true })} /></SettingsField>
+-            </div>
+-          </SettingsSection>
+-
+           <SettingsSection title={t("settings.clientKeys.title")}>
+             <div className="space-y-0">
+               <SettingsField controlId="client-key-default-rpm" label={t("settings.clientKeys.rpmLimit")} description={t("settings.clientKeys.rpmLimitHelp")} error={form.formState.errors.clientKeyDefaults?.rpmLimit?.message}><Input id="client-key-default-rpm" type="number" min={1} max={100_000} {...form.register("clientKeyDefaults.rpmLimit", { valueAsNumber: true })} /></SettingsField>
+@@ -358,6 +350,90 @@ export function SettingsPage() {
+           </SettingsSection>
+           </SettingsPane>
+ 
++          <SettingsPane value="audit">
++            <SettingsSection title={t("settings.audit.retentionTitle")}>
++              <div className="space-y-0">
++                <SettingsField
++                  controlId="audit-retention-days"
++                  label={t("settings.audit.retentionDays")}
++                  description={t("settings.audit.retentionDaysHelp")}
++                  error={form.formState.errors.audit?.retentionDays?.message}
++                >
++                  <Input
++                    id="audit-retention-days"
++                    type="number"
++                    min={0}
++                    max={365}
++                    {...form.register("audit.retentionDays", { valueAsNumber: true })}
++                  />
++                </SettingsField>
++
++              </div>
++            </SettingsSection>
++
++            <SettingsSection title={t("settings.audit.performanceTitle")}>
++              <div className="space-y-0">
++                <SettingsField
++                  controlId="audit-buffer-size"
++                  label={t("settings.audit.bufferSize")}
++                  description={t("settings.audit.bufferSizeHelp")}
++                  badge={t("settings.restartRequired")}
++                  error={form.formState.errors.audit?.bufferSize?.message}
++                >
++                  <Input
++                    id="audit-buffer-size"
++                    type="number"
++                    min={1}
++                    max={262_144}
++                    {...form.register("audit.bufferSize", { valueAsNumber: true })}
++                  />
++                </SettingsField>
++                <SettingsField
++                  controlId="audit-batch-size"
++                  label={t("settings.audit.batchSize")}
++                  description={t("settings.audit.batchSizeHelp")}
++                  error={form.formState.errors.audit?.batchSize?.message}
++                >
++                  <Input
++                    id="audit-batch-size"
++                    type="number"
++                    min={1}
++                    max={4_096}
++                    {...form.register("audit.batchSize", { valueAsNumber: true })}
++                  />
++                </SettingsField>
++                <SettingsField
++                  controlId="audit-flush-interval"
++                  label={t("settings.audit.flushInterval")}
++                  description={t("settings.audit.flushIntervalHelp")}
++                  error={form.formState.errors.audit?.flushInterval?.message}
++                >
++                  <Controller
++                    control={form.control}
++                    name="audit.flushInterval"
++                    render={({ field }) => (
++                      <DurationInput id="audit-flush-interval" value={field.value} onChange={field.onChange} />
++                    )}
++                  />
++                </SettingsField>
++                <SettingsField
++                  controlId="audit-commit-delay"
++                  label={t("settings.audit.commitDelay")}
++                  description={t("settings.audit.commitDelayHelp")}
++                  error={form.formState.errors.audit?.commitDelayMS?.message}
++                >
++                  <Input
++                    id="audit-commit-delay"
++                    type="number"
++                    min={1}
++                    max={50}
++                    {...form.register("audit.commitDelayMS", { valueAsNumber: true })}
++                  />
++                </SettingsField>
++              </div>
++            </SettingsSection>
++          </SettingsPane>
++
+           <SettingsPane value="accounts">
+             <SettingsSection title={t("settings.accounts.invalidationTitle")}>
+               <div className="space-y-0">
+diff --git a/frontend/src/shared/i18n/index.ts b/frontend/src/shared/i18n/index.ts
+index b2b2d73..ccf909a 100644
+--- a/frontend/src/shared/i18n/index.ts
++++ b/frontend/src/shared/i18n/index.ts
+@@ -925,6 +925,8 @@ const resources = {
+         successRate: "成功率",
+         averageDuration: "平均耗时 {{duration}}",
+         estimatedCost: "估算费用",
++        cost: "费用",
++        estimated: "估算",
+         unbilled: "未计费",
+         exactBilling: "完整数值",
+         billingSource: "计费来源",
+@@ -958,6 +960,20 @@ const resources = {
+         sourcesLabel: "检索来源",
+         serverTools: "工具调用 {{count}} 次",
+         detailTitle: "请求诊断详情",
++        requestOverview: "请求概览",
++        requestMetadata: "请求信息",
++        requestHeaders: "请求 Headers",
++        upstreamDiagnostics: "上游诊断",
++        noRequestMetadata: "未记录到请求信息。",
++        noRequestHeaders: "未记录到 HTTP 请求头。",
++        successNoAttempts: "该请求已成功完成，无上游失败诊断记录。",
++        requestModel: "请求模型",
++        upstreamModel: "上游模型",
++        targetAccount: "目标账号",
++        clientApiKey: "客户端 Key",
++        egressNode: "出口节点",
++        tokenUsage: "Token 消耗",
++        firstTokenMs: "首字耗时",
+         failedAttemptCount: "{{count}} 次失败",
+         attemptTimeline: "失败尝试",
+         noFailureAttempts: "该请求没有可用的失败尝试诊断。",
+@@ -966,7 +982,7 @@ const resources = {
+         openDiagnostics: "查看安全诊断",
+         viewDetails: "查看详情",
+         overview: "概览",
+-        responseBody: "响应 Body",
++        responseBody: "错误响应",
+         responseHeaders: "响应 Headers",
+         errorChain: "Error Chain",
+         upstreamHttpFailure: "上游 HTTP {{status}}",
+@@ -989,6 +1005,7 @@ const resources = {
+         bodyEncoding: "内容编码：{{encoding}}",
+         bodyTruncated: "内容已裁剪至安全上限",
+         headerCount: "{{count}} 个 Header",
++        headerItemCount: "{{count}} 项",
+         errorFrameCount: "{{count}} 层错误",
+       },
+       settings: {
+@@ -998,7 +1015,7 @@ const resources = {
+         restartRequired: "重启生效",
+         invalidValue: "请输入有效值",
+         durationUnit: "时长单位",
+-        groups: { providers: "Provider 配置", delivery: "媒体与网络", policies: "运行策略", about: "关于" },
++        groups: { providers: "Provider 配置", delivery: "媒体与网络", policies: "运行策略", audit: "日志设置", accounts: "账号维护", about: "关于" },
+         server: { title: "服务容量", maxConcurrentRequests: "API 请求并发上限", maxConcurrentRequestsHelp: "单实例同时处理的 /v1 请求数；调低不会中断进行中的请求。" },
+         provider: { title: "Grok Build", baseURL: "上游地址", baseURLHelp: "Grok Build 请求使用的主要上游端点。", fallbackBaseURL: "XAI 备用地址", fallbackBaseURLHelp: "自动路由至 XAI 或 Build 请求回退时使用的端点。", clientVersion: "客户端版本", clientVersionHelp: "随 Build 请求发送的版本；建议使用已完成兼容验证的版本。", clientIdentifier: "客户端标识", clientIdentifierHelp: "随请求发送的客户端身份标识，需与上游协议保持一致。", tokenAuth: "Token Auth", tokenAuthHelp: "随 Grok Build 请求发送的客户端协议标识，通常保持为 xai-grok-cli。", userAgent: "User-Agent", userAgentHelp: "用于 Grok Build 推理请求及其出口节点；直连 XAI 媒体请求按客户端版本使用官方 xai-grok-build User-Agent。", recommendedVersion: "推荐 {{version}}", syncRecommendedVersion: "同步最新版本", recommendedVersionApplied: "已是推荐版本", syncRecommendedVersionDescription: "使用已完成兼容验证的版本和 User-Agent 填充当前表单，保存后生效。" },
+         web: { title: "Grok Web", baseURL: "上游地址", baseURLHelp: "Grok Web API 与账号操作使用的基础端点。", statsigMode: "x-statsig 获取方式", statsigModeHelp: "选择固定配置或通过签名服务动态获取请求标识。", statsigManual: "手动填写", statsigURL: "URL 获取", statsigValue: "x-statsig-id", statsigValueHelp: "直接配置 Grok Web 请求使用的 x-statsig-id。", statsigConfigured: "已配置", statsigKeepConfigured: "留空保持当前配置", statsigValuePlaceholder: "粘贴 x-statsig-id", statsigSignerURL: "签名服务 URL", statsigSignerURLHelp: "按请求获取 x-statsig-id 的内部签名服务地址。", quotaTimeout: "额度请求超时", quotaTimeoutHelp: "查询账号额度与状态时允许等待上游响应的最长时间。", chatTimeout: "聊天超时", chatTimeoutHelp: "Grok Web 聊天请求完成前允许等待的最长时间。", streamIdleTimeout: "流式空闲超时", streamIdleTimeoutHelp: "上游文本聊天流连续无数据时允许等待的最长时间；不影响图片、视频和其他媒体请求。", imageTimeout: "图片超时", imageTimeoutHelp: "图片生成与编辑任务完成前允许等待的最长时间。", videoTimeout: "视频超时", videoTimeoutHelp: "视频生成任务完成前允许等待的最长时间。", mediaConcurrency: "媒体任务并发", mediaConcurrencyHelp: "单实例可同时执行的图片与视频任务数；修改后需重启。", recoveryBackoffBase: "额度恢复退避", recoveryBackoffBaseHelp: "额度恢复检查连续失败后的初始重试间隔。", recoveryBackoffMax: "额度恢复最大退避", recoveryBackoffMaxHelp: "额度恢复检查采用指数退避时允许达到的最大间隔。", allowNSFW: "允许 NSFW 图片", allowNSFWHelp: "允许 Grok Web 图片请求启用成人内容偏好。", clearanceMode: "Clearance 管理", clearanceModeHelp: "选择手动维护 Cloudflare 凭据，或由 FlareSolverr 按实际出口自动获取并定期刷新。", clearanceManual: "手动维护", clearanceFlareSolverr: "FlareSolverr", flareSolverrURL: "FlareSolverr 地址", flareSolverrURLHelp: "用于求解 Cloudflare Clearance 的内部 FlareSolverr 服务地址。", clearanceTimeout: "求解超时", clearanceTimeoutHelp: "等待单次 FlareSolverr 求解完成的最长时间。", clearanceRefresh: "刷新周期", clearanceRefreshHelp: "固定出口 Clearance 的定期刷新间隔；账号粘性代理会在实际请求中按账号独立维护。" },
+@@ -1007,7 +1024,22 @@ const resources = {
+         media: { title: "媒体存储", maxImageSize: "单张图片上限", maxImageSizeHelp: "单个图片文件允许写入本地媒体存储的最大大小。", maxTotalSize: "媒体存储上限", maxTotalSizeHelp: "本地图片与视频文件允许占用的总存储空间。", cleanupThresholdPercent: "自动清理阈值", cleanupThresholdPercentHelp: "存储使用率达到该比例后，系统按时间清理较早的媒体文件。", cleanupInterval: "容量检查间隔", cleanupIntervalHelp: "后台检查媒体存储使用量并触发清理的时间间隔。", sizeUnit: "存储单位", publicApiBaseURL: "公共 API 地址", publicApiBaseURLHelp: "用于生成图片公开 URL 与文档示例地址。留空时回退到服务启动值，默认为 http://127.0.0.1:8000。" },
+         egress: { title: "出口代理", description: "节点按 Grok Build、Grok Web、Grok Console 或 Web 资源独立管理代理和健康状态。Build 沿用 Provider 的 User-Agent；Web 与 Console 节点单独管理浏览器 User-Agent 和 Cookie。代理地址和 Cloudflare Cookie 仅写入。", add: "添加节点", saved: "代理节点已保存", deleted: "代理节点已删除", name: "名称", scope: "作用域", proxy: "代理", clearance: "Clearance", health: "健康度", directFallback: "未配置节点时使用直连", scopeBuild: "Grok Build", scopeWeb: "Grok Web", scopeWebAsset: "Grok Web（仅资源）", configured: "已配置", direct: "直连", none: "无", editTitle: "编辑代理节点", addTitle: "添加代理节点", dialogDescription: "Build 节点只配置代理并沿用 Provider 的 User-Agent；Web 与 Console 节点使用各自的浏览器 User-Agent 和 Cloudflare Cookie。", enabled: "启用", proxyURL: "代理地址", proxyProtocols: "支持 HTTP、HTTPS、SOCKS4/4A、SOCKS5/5H、Trojan、VLESS、Shadowsocks 和 VMess。\n隧道协议支持 TCP、WebSocket 与 TLS；Resin 可在用户名中使用 {account}。", proxyPool: "代理池模式", proxyPoolHelp: "共享代理池的单次连接失败不会使整个出口节点进入冷却；包含 {account} 的代理会自动启用此策略。", userAgent: "User-Agent", cloudflareCookie: "Cloudflare Cookie", keepConfigured: "已配置，留空保持不变", operationFailed: "操作失败", refreshClearance: "刷新 Clearance", clearanceRefreshed: "Clearance 已刷新", clearanceManaged: "Cloudflare Cookie 与 User-Agent 由 FlareSolverr 自动维护；Resin 等账号粘性代理会按账号隔离。", accounts: "已绑定", probe: "探测", healthy: "可用", unhealthy: "不可用", notTested: "未测试", test: "测试代理", testedOne: "代理测试完成", operations: "代理运营", automation: "自动任务", subscriptions: "代理订阅", testAll: "测试全部", rebalance: "立即调配", importText: "导入文本", addSource: "添加订阅", source: "订阅源", sync: "同步", capacity: "账号容量", noSources: "暂无订阅源", never: "从未", unlimited: "无限制", sourceSaved: "订阅源已保存", sourceDeleted: "订阅源已删除", sourceSynced: "订阅同步完成：导入 {{imported}}，跳过 {{skipped}}", imported: "代理导入完成：导入 {{imported}}，跳过 {{skipped}}", tested: "代理测试完成：可用 {{healthy}}，不可用 {{unhealthy}}", rebalanced: "账号调配完成：新增 {{assigned}}，均衡 {{rebalanced}}，未分配 {{unplaced}}", automationSaved: "自动任务已保存", editSource: "编辑订阅", subscriptionURL: "订阅地址", sourceDialogDescription: "配置订阅来源、作用域、刷新周期和单节点账号容量。", importDialogDescription: "支持明文或 Base64 代理列表，每行一个 HTTP、SOCKS、Trojan、VLESS、SS 或 VMess 地址。", probeInterval: "探测间隔（秒）", probeIntervalHelp: "后台重新测试已启用代理节点的间隔。", assignmentInterval: "调配间隔（秒）", assignmentIntervalHelp: "后台检查自动分配与节点容量的间隔。", autoAssign: "自动分配未绑定账号", autoAssignHelp: "将可调度且未绑定的账号分配到近期探测可用的节点。", autoBalance: "自动均衡自动绑定账号", autoBalanceHelp: "在健康节点之间调整自动绑定；手工绑定始终保持不变。", refreshInterval: "订阅刷新间隔（秒）", proxyList: "代理列表" },
+         routing: { title: "路由策略", stickyTTL: "会话粘性时长", stickyTTLHelp: "同一会话优先复用已选账号的有效时长；到期后重新参与调度。", cooldownBase: "基础冷却时间", cooldownBaseHelp: "账号发生可恢复故障后首次进入冷却的时长。", cooldownMax: "最大冷却时间", cooldownMaxHelp: "连续故障触发指数退避时允许达到的最长冷却时间。", capacityWait: "账号满载等待", capacityWaitHelp: "全部候选账号并发已满时，切换或失败前等待容量释放的时间。", maxAttempts: "最大尝试次数", maxAttemptsHelp: "单次请求在可用账号之间切换并重试的最大次数，范围为 1–200。", videoMaxAttempts: "视频最大尝试次数", videoMaxAttemptsHelp: "仅作用于视频任务创建阶段的切号重试，可单独设置数值，或开启无限制。创建成功后的轮询不会换号。", preferFreeBuild: "Grok Build Free 账号优先", preferFreeBuildHelp: "启用后优先选择已确认可用的 Free 账号，其他路由条件保持不变。", accountIsolatedConnections: "按账号隔离上游连接", accountIsolatedConnectionsHelp: "开启后，不同账号使用各自的上游 TCP/HTTP 连接池，便于外部 L4 或按连接哈希的负载均衡器分散流量；同一账号仍可复用连接。适用于 Build / Web / Console 出站及 Web 转 Build。会增加连接数、TLS 握手、内存和文件描述符占用，建议仅在确有外部连接级负载均衡需求时开启。" },
+-        audit: { title: "请求审计", bufferSize: "队列容量", bufferSizeHelp: "审计记录进入持久化前可在内存队列中等待的最大数量。", batchSize: "批量写入数", batchSizeHelp: "每次数据库事务最多写入的审计记录数量。", flushInterval: "刷新间隔", flushIntervalHelp: "队列未达到批量写入数时，强制提交待处理审计记录的间隔。", commitDelay: "提交聚合等待（毫秒）", commitDelayHelp: "需要确认提交的请求进入原子批次前允许等待的最长时间。" },
++        audit: {
++          title: "请求审计与日志设置",
++          tabTitle: "日志设置",
++          retentionTitle: "日志保留策略",
++          retentionDays: "日志保留天数",
++          retentionDaysHelp: "自动清理超过指定天数的请求审计与上游失败诊断记录。设置为 0 表示永久保留，默认为 7 天。",
++          performanceTitle: "写入缓冲与性能",
++          bufferSize: "队列容量",
++          bufferSizeHelp: "审计记录进入持久化前可在内存队列中等待的最大数量。",
++          batchSize: "批量写入数",
++          batchSizeHelp: "每次数据库事务最多写入的审计记录数量。",
++          flushInterval: "刷新间隔",
++          flushIntervalHelp: "队列未达到批量写入数时，强制提交待处理审计记录的间隔。",
++          commitDelay: "提交聚合等待（毫秒）",
++          commitDelayHelp: "需要确认提交的请求进入原子批次前允许等待的最长时间。",
++        },
+         clientKeys: { title: "密钥默认限制", rpmLimit: "默认 RPM", rpmLimitHelp: "新建客户端密钥默认允许的每分钟请求数。", maxConcurrent: "默认并发数", maxConcurrentHelp: "新建客户端密钥默认允许同时执行的请求数。" },
+         accounts: {
+           title: "账号维护",
+@@ -1694,6 +1726,8 @@ const resources = {
+         successRate: "Success rate",
+         averageDuration: "Average duration {{duration}}",
+         estimatedCost: "Estimated cost",
++        cost: "Cost",
++        estimated: "estimated",
+         unbilled: "Unbilled",
+         exactBilling: "Full value",
+         billingSource: "Billing source",
+@@ -1726,7 +1760,21 @@ const resources = {
+         sources: "Sources {{count}}",
+         sourcesLabel: "Search sources",
+         serverTools: "Tool calls {{count}} times",
+-        detailTitle: "Request diagnostics",
++        detailTitle: "Request Diagnostics",
++        requestOverview: "Overview",
++        requestMetadata: "Request Metadata",
++        requestHeaders: "Request headers",
++        upstreamDiagnostics: "Upstream Diagnostics",
++        noRequestMetadata: "No request metadata was recorded.",
++        noRequestHeaders: "No HTTP request headers captured.",
++        successNoAttempts: "This request completed successfully with no failed upstream attempts.",
++        requestModel: "Model",
++        upstreamModel: "Upstream Model",
++        targetAccount: "Account",
++        clientApiKey: "Client Key",
++        egressNode: "Egress Node",
++        tokenUsage: "Token Usage",
++        firstTokenMs: "First Token",
+         failedAttemptCount: "{{count}} failed",
+         failedAttemptCount_one: "{{count}} failed attempt",
+         failedAttemptCount_other: "{{count}} failed attempts",
+@@ -1737,7 +1785,7 @@ const resources = {
+         openDiagnostics: "View safe diagnostics",
+         viewDetails: "View details",
+         overview: "Overview",
+-        responseBody: "Response body",
++        responseBody: "Error response",
+         responseHeaders: "Response headers",
+         errorChain: "Error chain",
+         upstreamHttpFailure: "Upstream HTTP {{status}}",
+@@ -1762,11 +1810,12 @@ const resources = {
+         headerCount: "{{count}} headers",
+         headerCount_one: "{{count}} header",
+         headerCount_other: "{{count}} headers",
++        headerItemCount: "{{count}} items",
+         errorFrameCount: "{{count}} error frames",
+         errorFrameCount_one: "{{count}} error frame",
+         errorFrameCount_other: "{{count}} error frames",
+       },
+-        settings: { title: "Runtime settings", description: "Manage hot-reloadable gateway runtime parameters.", saved: "Settings saved and applied", restartRequired: "Restart required", invalidValue: "Enter a valid value", durationUnit: "Duration unit", groups: { providers: "Providers", delivery: "Media & network", policies: "Runtime policies", about: "About" }, server: { title: "Service capacity", maxConcurrentRequests: "API request concurrency limit", maxConcurrentRequestsHelp: "Maximum simultaneous /v1 requests per instance. Lowering the limit does not interrupt active requests." }, provider: { title: "Grok Build provider", baseURL: "Upstream URL", baseURLHelp: "Primary upstream endpoint used for Grok Build requests.", fallbackBaseURL: "XAI fallback URL", fallbackBaseURLHelp: "Endpoint used when routing to XAI or falling back from Grok Build.", clientVersion: "Client version", clientVersionHelp: "Version sent with Build requests. Use a version that has passed compatibility validation.", clientIdentifier: "Client identifier", clientIdentifierHelp: "Client identity sent with requests; keep it aligned with the upstream protocol.", tokenAuth: "Token auth", tokenAuthHelp: "Client protocol identifier sent with Grok Build requests; normally keep xai-grok-cli.", userAgent: "User-Agent", userAgentHelp: "Used by Grok Build inference requests and their egress nodes. Direct XAI media requests derive the official xai-grok-build User-Agent from the client version.", recommendedVersion: "Recommended {{version}}", syncRecommendedVersion: "Sync latest version", recommendedVersionApplied: "Recommended version active", syncRecommendedVersionDescription: "Fill the form with the validated version and User-Agent; save to apply." }, web: { title: "Grok Web", baseURL: "Upstream URL", baseURLHelp: "Base endpoint used for Grok Web API calls and account operations.", statsigMode: "x-statsig source", statsigModeHelp: "Use a fixed value or retrieve request identity dynamically from a signer service.", statsigManual: "Manual", statsigURL: "Fetch from URL", statsigValue: "x-statsig-id", statsigValueHelp: "Fixed x-statsig-id attached to Grok Web requests.", statsigConfigured: "Configured", statsigKeepConfigured: "Leave blank to keep the current value", statsigValuePlaceholder: "Paste x-statsig-id", statsigSignerURL: "Signer URL", statsigSignerURLHelp: "Internal signer endpoint used to retrieve x-statsig-id per request.", quotaTimeout: "Quota timeout", quotaTimeoutHelp: "Maximum time to wait for upstream quota and account-status queries.", chatTimeout: "Chat timeout", chatTimeoutHelp: "Maximum time to wait for a Grok Web chat request to complete.", streamIdleTimeout: "Stream idle timeout", streamIdleTimeoutHelp: "Maximum period without upstream data for raw text-chat streams; image, video, and other media requests are unaffected.", imageTimeout: "Image timeout", imageTimeoutHelp: "Maximum time to wait for image generation or editing to complete.", videoTimeout: "Video timeout", videoTimeoutHelp: "Maximum time to wait for a Grok Web video generation request to complete.", mediaConcurrency: "Media job concurrency", mediaConcurrencyHelp: "Image and video jobs one instance may run concurrently. Changes require a restart.", recoveryBackoffBase: "Quota recovery backoff", recoveryBackoffBaseHelp: "Initial retry interval after consecutive quota-recovery check failures.", recoveryBackoffMax: "Maximum recovery backoff", recoveryBackoffMaxHelp: "Maximum interval reached by exponential backoff for quota-recovery checks.", allowNSFW: "Allow NSFW images", allowNSFWHelp: "Allow Grok Web image requests to enable the adult-content preference.", clearanceMode: "Clearance management", clearanceModeHelp: "Maintain Cloudflare credentials manually or let FlareSolverr acquire and refresh them on the actual egress.", clearanceManual: "Manual", clearanceFlareSolverr: "FlareSolverr", flareSolverrURL: "FlareSolverr URL", flareSolverrURLHelp: "Internal FlareSolverr endpoint used to solve Cloudflare Clearance.", clearanceTimeout: "Solve timeout", clearanceTimeoutHelp: "Maximum time allowed for one FlareSolverr solve.", clearanceRefresh: "Refresh interval", clearanceRefreshHelp: "Periodic refresh interval for fixed egress; account-bound proxies are maintained independently during requests." }, console: { baseURLHelp: "Base endpoint used for Grok Console requests and account operations.", chatTimeoutHelp: "Maximum time to wait for a Grok Console chat request to complete.", streamIdleTimeout: "Stream idle timeout", streamIdleTimeoutHelp: "Maximum period without upstream data for text SSE only; media and non-streaming requests are unaffected." }, batch: { title: "Batch tasks", importConcurrency: "Import sync concurrency", importConcurrencyHelp: "Accounts initialized and synchronized concurrently after a batch import.", conversionConcurrency: "Account conversion concurrency", conversionConcurrencyHelp: "Cross-provider account conversions that may run concurrently.", syncConcurrency: "Data sync concurrency", syncConcurrencyHelp: "Quota, status, and capability synchronizations that may run concurrently.", refreshConcurrency: "Credential refresh concurrency", refreshConcurrencyHelp: "Account credential refreshes that may run concurrently.", randomDelay: "Maximum random delay (ms)", randomDelayHelp: "Maximum randomized delay before batch work starts to smooth upstream request bursts." }, media: { title: "Media storage", maxImageSize: "Maximum image size", maxImageSizeHelp: "Largest individual image that may be written to local media storage.", maxTotalSize: "Media storage limit", maxTotalSizeHelp: "Total local storage available to image and video files.", cleanupThresholdPercent: "Automatic cleanup threshold", cleanupThresholdPercentHelp: "Storage utilization that triggers removal of older media files.", cleanupInterval: "Capacity check interval", cleanupIntervalHelp: "Interval between background storage checks and cleanup evaluation.", sizeUnit: "Storage unit", publicApiBaseURL: "Public API base URL", publicApiBaseURLHelp: "Used for public image URLs and docs examples. Leave empty to use the service startup value, which defaults to http://127.0.0.1:8000." }, egress: { title: "Egress proxies", description: "Nodes manage proxy and health independently for Grok Build, Grok Web, Grok Console, or Web assets. Build inherits the Provider User-Agent; Web and Console nodes manage their own browser User-Agent and cookies. Proxy URLs and Cloudflare cookies are write-only.", add: "Add node", saved: "Proxy node saved", deleted: "Proxy node deleted", name: "Name", scope: "Scope", proxy: "Proxy", clearance: "Clearance", health: "Health", directFallback: "Direct connection is used when no node is configured", scopeBuild: "Grok Build", scopeWeb: "Grok Web", scopeWebAsset: "Grok Web (assets only)", configured: "Configured", direct: "Direct", none: "None", editTitle: "Edit proxy node", addTitle: "Add proxy node", dialogDescription: "Build nodes only configure the proxy and inherit the Provider User-Agent; Web and Console nodes use their own browser User-Agent and Cloudflare cookies.", enabled: "Enabled", proxyURL: "Proxy URL", proxyProtocols: "Supports HTTP, HTTPS, SOCKS4, SOCKS4A, SOCKS5, and SOCKS5H.\nResin users can put {account} in the username to bind one lease per account.", proxyPool: "Proxy pool mode", proxyPoolHelp: "A request-level connection failure does not cool the entire shared node. Proxies containing {account} use this policy automatically.", userAgent: "User-Agent", cloudflareCookie: "Cloudflare Cookie", keepConfigured: "Configured; leave blank to keep unchanged", operationFailed: "Operation failed", refreshClearance: "Refresh Clearance", clearanceRefreshed: "Clearance refreshed", clearanceManaged: "Cloudflare cookies and User-Agent are managed by FlareSolverr; account-bound proxies are isolated per account." }, routing: { title: "Routing policy", stickyTTL: "Sticky session TTL", stickyTTLHelp: "How long a session prefers its selected account before returning to normal scheduling.", cooldownBase: "Base cooldown", cooldownBaseHelp: "Initial cooldown applied after a recoverable account failure.", cooldownMax: "Maximum cooldown", cooldownMaxHelp: "Longest cooldown allowed when repeated failures trigger exponential backoff.", capacityWait: "Saturated account wait", capacityWaitHelp: "How long to wait for capacity before switching accounts or failing when all candidates are saturated.", maxAttempts: "Maximum attempts", maxAttemptsHelp: "Maximum account switches and retries allowed for one request, from 1 to 200.", videoMaxAttempts: "Video maximum attempts", videoMaxAttemptsHelp: "Create-phase account failover for video jobs only. Set a number or enable unlimited. Polling after create stays on the same account.", preferFreeBuild: "Prefer Grok Build Free accounts", preferFreeBuildHelp: "Prefer confirmed usable Free accounts without changing other routing eligibility rules.", accountIsolatedConnections: "Isolate upstream connections by account", accountIsolatedConnectionsHelp: "When enabled, each account uses its own upstream TCP/HTTP connection pool so external L4 or connection-hash load balancers can spread traffic; the same account still reuses connections. Applies to Build, Web, Console, and Web-to-Build traffic. This increases connections, TLS handshakes, memory, and file-descriptor usage, so enable it only when connection-level balancing is required." }, audit: { title: "Request audit", bufferSize: "Queue capacity", bufferSizeHelp: "Maximum audit records held in memory before persistence.", batchSize: "Batch size", batchSizeHelp: "Maximum audit records written in one database transaction.", flushInterval: "Flush interval", flushIntervalHelp: "Maximum time pending audit records wait before they are committed.", commitDelay: "Commit aggregation delay (ms)", commitDelayHelp: "Maximum time acknowledged writes wait to join an atomic batch before commit." }, clientKeys: { title: "Client key defaults", rpmLimit: "Default RPM", rpmLimitHelp: "Requests per minute assigned to newly created client keys.", maxConcurrent: "Default concurrency", maxConcurrentHelp: "Concurrent requests assigned to newly created client keys." }, accounts: { title: "Account maintenance", invalidationTitle: "Automatic interception", botRiskSchedulingTitle: "Bot-risk scheduling", excludeBuildBotFlaggedFromScheduling: "Exclude bot-risk Build accounts from scheduling", excludeBuildBotFlaggedFromSchedulingHelp: "When enabled, Grok Build accounts whose JWT bot_flag_source/bfs is 1 or 2 are removed from Build scheduling only. Linked Web/Console accounts keep their normal scheduling. Accounts remain in the pool for viewing and manual actions.", cleanupTitle: "Account cleanup", autoCleanReauthEnabled: "Automatic invalid-account cleanup", autoCleanReauthEnabledHelp: "Permanently deletes invalid accounts after the configured retention period. Accounts with active requests or video jobs are skipped.", autoCleanReauthInterval: "Cleanup interval", autoCleanReauthIntervalHelp: "How often to check for eligible accounts, from 1 minute to 1 hour.", autoCleanReauthMinAge: "Minimum retention", autoCleanReauthMinAgeHelp: "How long to retain an account after it is marked for reauthorization.", autoCleanIncludeDisabled: "Include disabled accounts", autoCleanIncludeDisabledHelp: "Includes disabled accounts that require reauthorization in automatic cleanup.", autoCleanEnableTitle: "Enable automatic cleanup?", autoCleanEnableDescription: "Eligible accounts will be permanently deleted and cannot be recovered. The first run starts after one full cleanup interval.", autoCleanIncludeDisabledTitle: "Include disabled accounts?", autoCleanIncludeDisabledDescription: "Disabled accounts that require reauthorization will also be permanently deleted. This action cannot be undone.", autoCleanConfirm: "Enable" }, units: { seconds: "Seconds", minutes: "Minutes", hours: "Hours", days: "Days" } },
++        settings: { title: "Runtime settings", description: "Manage hot-reloadable gateway runtime parameters.", saved: "Settings saved and applied", restartRequired: "Restart required", invalidValue: "Enter a valid value", durationUnit: "Duration unit", groups: { providers: "Providers", delivery: "Media & network", policies: "Runtime policies", audit: "Audit & Logs", accounts: "Account maintenance", about: "About" }, server: { title: "Service capacity", maxConcurrentRequests: "API request concurrency limit", maxConcurrentRequestsHelp: "Maximum simultaneous /v1 requests per instance. Lowering the limit does not interrupt active requests." }, provider: { title: "Grok Build provider", baseURL: "Upstream URL", baseURLHelp: "Primary upstream endpoint used for Grok Build requests.", fallbackBaseURL: "XAI fallback URL", fallbackBaseURLHelp: "Endpoint used when routing to XAI or falling back from Grok Build.", clientVersion: "Client version", clientVersionHelp: "Version sent with Build requests. Use a version that has passed compatibility validation.", clientIdentifier: "Client identifier", clientIdentifierHelp: "Client identity sent with requests; keep it aligned with the upstream protocol.", tokenAuth: "Token auth", tokenAuthHelp: "Client protocol identifier sent with Grok Build requests; normally keep xai-grok-cli.", userAgent: "User-Agent", userAgentHelp: "Used by Grok Build inference requests and their egress nodes. Direct XAI media requests derive the official xai-grok-build User-Agent from the client version.", recommendedVersion: "Recommended {{version}}", syncRecommendedVersion: "Sync latest version", recommendedVersionApplied: "Recommended version active", syncRecommendedVersionDescription: "Fill the form with the validated version and User-Agent; save to apply." }, web: { title: "Grok Web", baseURL: "Upstream URL", baseURLHelp: "Base endpoint used for Grok Web API calls and account operations.", statsigMode: "x-statsig source", statsigModeHelp: "Use a fixed value or retrieve request identity dynamically from a signer service.", statsigManual: "Manual", statsigURL: "Fetch from URL", statsigValue: "x-statsig-id", statsigValueHelp: "Fixed x-statsig-id attached to Grok Web requests.", statsigConfigured: "Configured", statsigKeepConfigured: "Leave blank to keep the current value", statsigValuePlaceholder: "Paste x-statsig-id", statsigSignerURL: "Signer URL", statsigSignerURLHelp: "Internal signer endpoint used to retrieve x-statsig-id per request.", quotaTimeout: "Quota timeout", quotaTimeoutHelp: "Maximum time to wait for upstream quota and account-status queries.", chatTimeout: "Chat timeout", chatTimeoutHelp: "Maximum time to wait for a Grok Web chat request to complete.", streamIdleTimeout: "Stream idle timeout", streamIdleTimeoutHelp: "Maximum period without upstream data for raw text-chat streams; image, video, and other media requests are unaffected.", imageTimeout: "Image timeout", imageTimeoutHelp: "Maximum time to wait for image generation or editing to complete.", videoTimeout: "Video timeout", videoTimeoutHelp: "Maximum time to wait for a Grok Web video generation request to complete.", mediaConcurrency: "Media job concurrency", mediaConcurrencyHelp: "Image and video jobs one instance may run concurrently. Changes require a restart.", recoveryBackoffBase: "Quota recovery backoff", recoveryBackoffBaseHelp: "Initial retry interval after consecutive quota-recovery check failures.", recoveryBackoffMax: "Maximum recovery backoff", recoveryBackoffMaxHelp: "Maximum interval reached by exponential backoff for quota-recovery checks.", allowNSFW: "Allow NSFW images", allowNSFWHelp: "Allow Grok Web image requests to enable the adult-content preference.", clearanceMode: "Clearance management", clearanceModeHelp: "Maintain Cloudflare credentials manually or let FlareSolverr acquire and refresh them on the actual egress.", clearanceManual: "Manual", clearanceFlareSolverr: "FlareSolverr", flareSolverrURL: "FlareSolverr URL", flareSolverrURLHelp: "Internal FlareSolverr endpoint used to solve Cloudflare Clearance.", clearanceTimeout: "Solve timeout", clearanceTimeoutHelp: "Maximum time allowed for one FlareSolverr solve.", clearanceRefresh: "Refresh interval", clearanceRefreshHelp: "Periodic refresh interval for fixed egress; account-bound proxies are maintained independently during requests." }, console: { baseURLHelp: "Base endpoint used for Grok Console requests and account operations.", chatTimeoutHelp: "Maximum time to wait for a Grok Console chat request to complete.", streamIdleTimeout: "Stream idle timeout", streamIdleTimeoutHelp: "Maximum period without upstream data for text SSE only; media and non-streaming requests are unaffected." }, batch: { title: "Batch tasks", importConcurrency: "Import sync concurrency", importConcurrencyHelp: "Accounts initialized and synchronized concurrently after a batch import.", conversionConcurrency: "Account conversion concurrency", conversionConcurrencyHelp: "Cross-provider account conversions that may run concurrently.", syncConcurrency: "Data sync concurrency", syncConcurrencyHelp: "Quota, status, and capability synchronizations that may run concurrently.", refreshConcurrency: "Credential refresh concurrency", refreshConcurrencyHelp: "Account credential refreshes that may run concurrently.", randomDelay: "Maximum random delay (ms)", randomDelayHelp: "Maximum randomized delay before batch work starts to smooth upstream request bursts." }, media: { title: "Media storage", maxImageSize: "Maximum image size", maxImageSizeHelp: "Largest individual image that may be written to local media storage.", maxTotalSize: "Media storage limit", maxTotalSizeHelp: "Total local storage available to image and video files.", cleanupThresholdPercent: "Automatic cleanup threshold", cleanupThresholdPercentHelp: "Storage utilization that triggers removal of older media files.", cleanupInterval: "Capacity check interval", cleanupIntervalHelp: "Interval between background storage checks and cleanup evaluation.", sizeUnit: "Storage unit", publicApiBaseURL: "Public API base URL", publicApiBaseURLHelp: "Used for public image URLs and docs examples. Leave empty to use the service startup value, which defaults to http://127.0.0.1:8000." }, egress: { title: "Egress proxies", description: "Nodes manage proxy and health independently for Grok Build, Grok Web, Grok Console, or Web assets. Build inherits the Provider User-Agent; Web and Console nodes manage their own browser User-Agent and cookies. Proxy URLs and Cloudflare cookies are write-only.", add: "Add node", saved: "Proxy node saved", deleted: "Proxy node deleted", name: "Name", scope: "Scope", proxy: "Proxy", clearance: "Clearance", health: "Health", directFallback: "Direct connection is used when no node is configured", scopeBuild: "Grok Build", scopeWeb: "Grok Web", scopeWebAsset: "Grok Web (assets only)", configured: "Configured", direct: "Direct", none: "None", editTitle: "Edit proxy node", addTitle: "Add proxy node", dialogDescription: "Build nodes only configure the proxy and inherit the Provider User-Agent; Web and Console nodes use their own browser User-Agent and Cloudflare cookies.", enabled: "Enabled", proxyURL: "Proxy URL", proxyProtocols: "Supports HTTP, HTTPS, SOCKS4, SOCKS4A, SOCKS5, and SOCKS5H.\nResin users can put {account} in the username to bind one lease per account.", proxyPool: "Proxy pool mode", proxyPoolHelp: "A request-level connection failure does not cool the entire shared node. Proxies containing {account} use this policy automatically.", userAgent: "User-Agent", cloudflareCookie: "Cloudflare Cookie", keepConfigured: "Configured; leave blank to keep unchanged", operationFailed: "Operation failed", refreshClearance: "Refresh Clearance", clearanceRefreshed: "Clearance refreshed", clearanceManaged: "Cloudflare cookies and User-Agent are managed by FlareSolverr; account-bound proxies are isolated per account." }, routing: { title: "Routing policy", stickyTTL: "Sticky session TTL", stickyTTLHelp: "How long a session prefers its selected account before returning to normal scheduling.", cooldownBase: "Base cooldown", cooldownBaseHelp: "Initial cooldown applied after a recoverable account failure.", cooldownMax: "Maximum cooldown", cooldownMaxHelp: "Longest cooldown allowed when repeated failures trigger exponential backoff.", capacityWait: "Saturated account wait", capacityWaitHelp: "How long to wait for capacity before switching accounts or failing when all candidates are saturated.", maxAttempts: "Maximum attempts", maxAttemptsHelp: "Maximum account switches and retries allowed for one request, from 1 to 200.", videoMaxAttempts: "Video maximum attempts", videoMaxAttemptsHelp: "Create-phase account failover for video jobs only. Set a number or enable unlimited. Polling after create stays on the same account.", preferFreeBuild: "Prefer Grok Build Free accounts", preferFreeBuildHelp: "Prefer confirmed usable Free accounts without changing other routing eligibility rules.", accountIsolatedConnections: "Isolate upstream connections by account", accountIsolatedConnectionsHelp: "When enabled, each account uses its own upstream TCP/HTTP connection pool so external L4 or connection-hash load balancers can spread traffic; the same account still reuses connections. Applies to Build, Web, Console, and Web-to-Build traffic. This increases connections, TLS handshakes, memory, and file-descriptor usage, so enable it only when connection-level balancing is required." }, audit: { title: "Request Audit & Logs", tabTitle: "Audit & Logs", retentionTitle: "Log Retention Policy", retentionDays: "Log retention days", retentionDaysHelp: "Automatically purges request audits and failure attempts older than the specified days. Set to 0 for indefinite retention, default is 7 days.", performanceTitle: "Buffer & Performance", bufferSize: "Queue capacity", bufferSizeHelp: "Maximum audit records held in memory before persistence.", batchSize: "Batch size", batchSizeHelp: "Maximum audit records written in one database transaction.", flushInterval: "Flush interval", flushIntervalHelp: "Maximum time pending audit records wait before they are committed.", commitDelay: "Commit aggregation delay (ms)", commitDelayHelp: "Maximum time acknowledged writes wait to join an atomic batch before commit." }, clientKeys: { title: "Client key defaults", rpmLimit: "Default RPM", rpmLimitHelp: "Requests per minute assigned to newly created client keys.", maxConcurrent: "Default concurrency", maxConcurrentHelp: "Concurrent requests assigned to newly created client keys." }, accounts: { title: "Account maintenance", invalidationTitle: "Automatic interception", botRiskSchedulingTitle: "Bot-risk scheduling", excludeBuildBotFlaggedFromScheduling: "Exclude bot-risk Build accounts from scheduling", excludeBuildBotFlaggedFromSchedulingHelp: "When enabled, Grok Build accounts whose JWT bot_flag_source/bfs is 1 or 2 are removed from Build scheduling only. Linked Web/Console accounts keep their normal scheduling. Accounts remain in the pool for viewing and manual actions.", cleanupTitle: "Account cleanup", autoCleanReauthEnabled: "Automatic invalid-account cleanup", autoCleanReauthEnabledHelp: "Permanently deletes invalid accounts after the configured retention period. Accounts with active requests or video jobs are skipped.", autoCleanReauthInterval: "Cleanup interval", autoCleanReauthIntervalHelp: "How often to check for eligible accounts, from 1 minute to 1 hour.", autoCleanReauthMinAge: "Minimum retention", autoCleanReauthMinAgeHelp: "How long to retain an account after it is marked for reauthorization.", autoCleanIncludeDisabled: "Include disabled accounts", autoCleanIncludeDisabledHelp: "Includes disabled accounts that require reauthorization in automatic cleanup.", autoCleanEnableTitle: "Enable automatic cleanup?", autoCleanEnableDescription: "Eligible accounts will be permanently deleted and cannot be recovered. The first run starts after one full cleanup interval.", autoCleanIncludeDisabledTitle: "Include disabled accounts?", autoCleanIncludeDisabledDescription: "Disabled accounts that require reauthorization will also be permanently deleted. This action cannot be undone.", autoCleanConfirm: "Enable" }, units: { seconds: "Seconds", minutes: "Minutes", hours: "Hours", days: "Days" } },
+ 
+       egressProxyProfiles: { title: "Proxy address library", libraryTitle: "Proxy address library", libraryDescription: "Manage reusable proxy addresses in one place. Changes sync to every node using the address.", description: "Save proxy addresses that need to be reused across nodes.", add: "Add proxy address", addTitle: "Add proxy address", editTitle: "Edit proxy address", dialogDescription: "Changing the proxy address updates every bound node. Capacity and operational state remain isolated per node.", name: "Address name", endpoint: "Proxy address", nodes: "Used by", search: "Search address names", empty: "No proxy addresses", emptyLibrary: "The library is empty. Add an address to reuse it across nodes.", noMatches: "No matching proxy addresses", loadingSelection: "Loading selected address…", selectionUnavailable: "Proxy address #{{id}} is unavailable", saved: "Proxy address saved", deleted: "Proxy address deleted", deleteTitle: "Delete proxy address?", deleteDescription: "This deletes {{name}}. Addresses currently used by nodes cannot be deleted.", deleteBlocked: "Used by {{count}} nodes", assignment: "Proxy address source", assignmentHelp: "Select an address from the library to reuse it across Provider nodes. Health, capacity, User-Agent, and Clearance remain isolated per node.", independent: "Configure this node separately", managedByProfile: "Managed by the proxy address library", nodeCount: "{{count}} nodes", backToLibrary: "Back to address library", createFromPicker: "Add and use a proxy address", refreshNodes: "Refresh proxy nodes", reveal: "Reveal full proxy URL", hide: "Hide full proxy URL", revealUnavailable: "Only a saved proxy address can reveal its URL" },
+       settingsBuildTransport: { responseHeaderTimeout: "Response header timeout", responseHeaderTimeoutHelp: "Maximum time to wait for the first Grok Build response headers after the request body is sent.", streamIdleTimeout: "Stream idle timeout", streamIdleTimeoutHelp: "Maximum wait for useful generated content or tool progress. Keepalives and private control events do not extend the deadline." },

@@ -1,0 +1,52 @@
+diff --git a/internal/common/environments.go b/internal/common/environments.go
+index 11f87739d..4f17013ed 100644
+--- a/internal/common/environments.go
++++ b/internal/common/environments.go
+@@ -255,6 +255,10 @@ const (
+ 	EnvGoogleDriveWebOAuthRedirectURI    = "GOOGLE_DRIVE_WEB_OAUTH_REDIRECT_URI"
+ 	EnvSpacyModelDir                     = "SPACY_MODEL_DIR"
+ 
++	// EnvExtractorChatTimeout sets the Extractor LLM call timeout in seconds,
++	// including retries and backoff. It does not apply to tag extraction.
++	EnvExtractorChatTimeout = "EXTRACTOR_CHAT_TIMEOUT"
++
+ 	// EnvDeepDocModelDir points the in-process (Go) DeepDoc backend at the
+ 	// model snapshot (see common.DeepDocModelFiles); mirrors
+ 	// the RAGFlow default model dir (internal/rag/res/deepdoc).
+diff --git a/internal/ingestion/component/extractor.go b/internal/ingestion/component/extractor.go
+index 296c7e323..39614bc60 100644
+--- a/internal/ingestion/component/extractor.go
++++ b/internal/ingestion/component/extractor.go
+@@ -39,6 +39,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"math"
+ 	"os"
+ 	"regexp"
+ 	"sort"
+@@ -66,20 +67,16 @@ import (
+ 
+ const componentNameExtractor = "Extractor"
+ 
+-// defaultExtractorChatTimeout bounds one LLM chat call. It is a hung-call
+-// ceiling, not a pacing target: a fast model answers in seconds and never
+-// approaches it, so per-model speed variance needs no tuning — only a hung
+-// provider burns the full budget. Larger than the tag path's 60s because a
+-// thinking model legitimately needs longer on open-ended prompts, and the
+-// driver-level 20m stays as the absolute backstop.
++// defaultExtractorChatTimeout bounds one Extractor LLM call, including
++// retries and backoff. Tag extraction has its own timeout.
+ const defaultExtractorChatTimeout = 180 * time.Second
+ 
+ // extractorChatTimeout resolves the per-call LLM budget from
+ // EXTRACTOR_CHAT_TIMEOUT (seconds), falling back to
+ // defaultExtractorChatTimeout on unset/invalid values.
+ func extractorChatTimeout() time.Duration {
+-	if v := os.Getenv("EXTRACTOR_CHAT_TIMEOUT"); v != "" {
+-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
++	if v := os.Getenv(common.EnvExtractorChatTimeout); v != "" {
++		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 && n <= math.MaxInt64/int64(time.Second) {
+ 			return time.Duration(n) * time.Second
+ 		}
+ 	}

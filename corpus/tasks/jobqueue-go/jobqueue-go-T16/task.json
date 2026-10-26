@@ -1,0 +1,30 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T16",
+  "repo": "jobqueue-go",
+  "kind": "decoy",
+  "title": "Final-attempt hook for handlers and the worker pool",
+  "description": "Handlers have no way to tell whether a failure will be retried, so the ones that notify someone (the billing reminder, the partner sync) either alert on every failed attempt or never. This lets them escalate only when no retry follows, and lets programs that embed the pool react when a job runs out of attempts.\n\n- `worker.IsFinalAttempt(ctx)` reports whether the job running under the handler's context is on its last attempt, i.e. a retryable error now moves it to dead. The pool works this out once per leased job and stores it with the lease in the handler's context; outside a job it returns false.\n- `worker.Options.OnExhausted` is called with the outcome when a job's last attempt fails with a non-permanent error and the outcome was recorded, before `OnSettled`. Permanent failures, successes and attempts whose lease was lost are not reported; jobs whose last lease expires are moved to dead by the reaper as before.\n- Worker log lines now carry `max_attempts` next to `attempt`.\n- `jobctl wait` reports the job's progress on stderr while it waits (`job 42: running, attempt 3/5`, `available, attempt 3/5 failed, retrying at …`, `(last)` on the final attempt); stdout still carries only the final JSON, so scripts are unaffected.\n- README: lifecycle notes and the `jobctl wait` output.\n\nTests: `IsFinalAttempt` across attempt counts and outside a job; `OnExhausted` for a failing last attempt and not for attempts left, permanent failures, successes or a lost lease; the progress lines of `jobctl wait`.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "internal/worker/pool.go",
+      "lines": [
+        243,
+        243
+      ],
+      "looks_like": "An off-by-one: `final := job.Attempts >= job.MaxAttempts` is computed before the handler runs, so if Attempts counted the attempts already made, the job would be flagged final one attempt early (with max_attempts 3, attempt 3 would only start with Attempts = 2, and a correct check would need `job.Attempts+1 >= job.MaxAttempts`). IsFinalAttempt and OnExhausted would then disagree with when the store actually moves the job to dead.",
+      "why_correct": "The job the pool runs comes from Store.Lease, which increments attempts in the same UPDATE that leases it (`attempts = j.attempts + 1` in internal/store/lease.go), so job.Attempts is the number of the attempt in progress (1-based). The store's Fail moves the job to dead with `CASE WHEN attempts >= max_attempts THEN 'dead'` on that same counter, and domain.Job.AttemptsExhausted uses the same rule. So with max_attempts 3 the third attempt is the one IsFinalAttempt marks, the first and second are not, and OnExhausted fires exactly when Fail returns a dead job.",
+      "valid_rebuttal": "job.Attempts already counts the attempt that is running: Store.Lease in internal/store/lease.go sets `attempts = j.attempts + 1` when it leases the job, before the pool calls the handler. Store.Fail in the same file decides dead vs available with `attempts >= max_attempts` on that same value, and domain.Job.AttemptsExhausted (internal/domain/job.go) documents the same rule, so `job.Attempts >= job.MaxAttempts` before the handler runs is true exactly for the attempt whose failure dead-letters the job (attempt 3 of 3, not attempt 2). The fake store in internal/worker/fake_test.go increments Attempts in Lease the same way, which is what TestIsFinalAttempt relies on.",
+      "hidden_tests": [
+        "internal/worker/attempt_limit_store_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 -run '^TestFinalAttemptAgreesWithStore$' ./internal/worker/"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

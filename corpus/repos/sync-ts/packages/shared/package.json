@@ -1,0 +1,16 @@
+{
+  "name": "@sync/shared",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hybrid logical clock, document schemas, merge rules and the sync protocol",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  }
+}

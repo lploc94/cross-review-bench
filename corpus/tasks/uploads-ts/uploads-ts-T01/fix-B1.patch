@@ -1,0 +1,13 @@
+diff --git a/src/api/routes/sendFile.ts b/src/api/routes/sendFile.ts
+index aab8553..3fd7ec2 100644
+--- a/src/api/routes/sendFile.ts
++++ b/src/api/routes/sendFile.ts
+@@ -47,7 +47,7 @@ export async function sendFile(
+     return reply
+       .code(206)
+       .header("content-range", `bytes ${start}-${end}/${file.size}`)
+-      .header("content-length", String(end - start))
++      .header("content-length", String(end - start + 1))
+       .send(stream);
+   }
+   const stream = await files.openContent(file);

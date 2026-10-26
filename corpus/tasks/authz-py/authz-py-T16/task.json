@@ -1,0 +1,25 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T16",
+  "repo": "authz-py",
+  "kind": "decoy",
+  "title": "Sign out all other sessions",
+  "description": "Someone who notices a session they do not recognise, or who lost a phone, currently has to list their sessions and call `DELETE /v1/sessions/{id}` once per session. This adds a \"sign out everywhere else\" call.\n\n- `POST /v1/sessions/revoke-others` (access token) revokes every other open session of the caller (not revoked, not expired) and answers `{\"revoked\": [<session ids>]}`; the session of the access token used for the call stays signed in. Revoked sessions get `revoked_reason` `revoked_others`, and their refresh tokens stop working with them.\n- `SessionRepository.revoke_all_except` does it with one `UPDATE … WHERE user_id = :user AND id <> :current AND revoked_at IS NULL AND expires_at > :now RETURNING id`, so the sessions are revoked together in one statement, without loading them first. `SessionService.revoke_others` logs `session.revoked_others` with the number of sessions (like `session.revoked` for a single one; sessions are not part of an organisation's audit log).\n\nTests in `tests/api/test_sessions.py`: the current session kept and the others' access and refresh tokens refused, other users untouched, revoked and expired sessions left as they were, a token required. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "src/authz/repositories/sessions.py",
+      "lines": [82, 98],
+      "looks_like": "A bulk UPDATE with no row locks (no SELECT … FOR UPDATE of the sessions, no lock on the user) racing a concurrent POST /v1/auth/refresh of one of those sessions: the refresh seems able to rotate its token after the sessions were revoked, or to have read the session as active just before, so the device the user wanted to sign out keeps a fresh access token and a fresh refresh token and stays signed in.",
+      "why_correct": "AuthService.refresh (src/authz/services/auth.py) takes the session row with `sessions.get(current.session_id, for_update=True)` and checks `login.is_active(now)` under that lock, then issues the new pair and commits. The UPDATE takes the same row lock on every row it changes. If the refresh locks first, the UPDATE waits for its commit and then, under READ COMMITTED, re-checks its WHERE on the committed row (still `revoked_at IS NULL`) and revokes it; the access token the refresh issued is refused on its next use because AuthService.authenticate checks on every request that the token's session is active, and the new refresh token is refused because refresh checks the session again. If the UPDATE locks first, the refresh's SELECT … FOR UPDATE waits for its commit and then reads the revoked row, so it raises InvalidToken. Either way nothing of the revoked session survives, and a single UPDATE statement is atomic, so loading and locking the rows first would add nothing.",
+      "valid_rebuttal": "The refresh side already serialises on the session row: AuthService.refresh in src/authz/services/auth.py locks it with `SessionRepository.get(..., for_update=True)` and checks `is_active` under the lock before issuing a pair. The UPDATE in revoke_all_except locks each row it revokes, so it either waits for an in-flight refresh to commit and then revokes the session anyway (READ COMMITTED re-evaluates `revoked_at IS NULL` on the new row version), or holds the lock first so the refresh then reads the revoked row and answers 401. Tokens a refresh issued just before are refused afterwards: AuthService.authenticate checks the session on every request (`row.is_active(now)`), and refresh checks it again for the new refresh token. The README states both (\"Each request also checks that the session is still open\"; a refresh token \"whose session was revoked … answers 401\").",
+      "hidden_tests": ["tests/hidden/test_revoke_others_during_refresh.py"],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_revoke_others_during_refresh.py"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

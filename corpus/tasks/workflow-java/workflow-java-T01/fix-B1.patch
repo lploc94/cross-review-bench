@@ -1,0 +1,15 @@
+diff --git a/src/main/java/com/papertrail/workflow/service/DelegationService.java b/src/main/java/com/papertrail/workflow/service/DelegationService.java
+index 4035723..80fd5ee 100644
+--- a/src/main/java/com/papertrail/workflow/service/DelegationService.java
++++ b/src/main/java/com/papertrail/workflow/service/DelegationService.java
+@@ -52,8 +52,8 @@ public class DelegationService {
+         users
+             .lockById(delegatorId == null ? actor.userId() : delegatorId)
+             .orElseThrow(() -> new NotFoundException("delegator not found"));
+-    if (delegator.isAdmin() && !actor.admin()) {
+-      throw new ForbiddenException("only an admin may set up a delegation for an admin");
++    if (!actor.admin() && delegator.getId() != actor.userId()) {
++      throw new ForbiddenException("only an admin may set up a delegation for someone else");
+     }
+     AppUser delegate =
+         users

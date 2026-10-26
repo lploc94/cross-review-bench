@@ -1,0 +1,562 @@
+diff --git a/README.md b/README.md
+index c9415f9..419000a 100644
+--- a/README.md
++++ b/README.md
+@@ -55,6 +55,21 @@ internal/testredis/ per-test Redis key spaces for tests
+    `non_idempotent` is set, and only when the body was buffered: bodies up to `BODY_BUFFER_LIMIT`
+    are held in memory, longer ones are streamed and sent once. Each retry waits an exponential
+    backoff with jitter and prefers an upstream not tried yet.
++   A route's `max_request_bytes` caps its bodies: a body whose declared length is larger is refused
++   with `413 body_too_large` before authentication and before the upstream is contacted; a body of
++   unknown length is cut off once it passes the cap, and the client gets `413` without a retry and
++   without the upstream's breaker counting the attempt. Buffered bodies use the smaller of the cap
++   and `BODY_BUFFER_LIMIT`; the `413` message names the limit that applied. When the upstream's
++   response comes back before a body of unknown length has ended (an upstream that answers
++   without reading the whole body), the body gets 50 ms, or the route's `timeout` when that is
++   shorter, to end: an oversize body gets `413` in place of the response; otherwise the rest of
++   the body is not forwarded, which ends the connection to the upstream, and the response is
++   relayed, also to a client that has stopped sending, as far as the gateway had received it by
++   then. An early answer is in practice a short error response; a longer one that is cut off ends
++   with an aborted connection rather than looking complete. The client's connection is closed
++   after the response. The limit decision is made on the bytes seen in that window, so a body
++   still being sent then is judged by how much of it has arrived. An upstream that does not
++   answer gets `504` at the route's `timeout`, as before.
+ 7. The response streams back with its trailers, which follow the same rules as its header
+    (hop-by-hop fields and the route's response transform); event streams and bodies of unknown
+    length are flushed after every write. No response headers within the route's `timeout` is
+@@ -103,7 +118,8 @@ Every response the gateway produces itself is JSON:
+ 
+ Only `id`, one of `path` or `path_prefix`, and `upstreams` are required; the values above for
+ `retry`, `circuit_breaker` and `health_check` are the defaults filled in when the object is present.
+-`auth` defaults to `none` and `timeout` to `30s`. Transforms run rename, then remove, then add; they
++`auth` defaults to `none` and `timeout` to `30s`. `max_request_bytes` (optional, a non-negative
++number of bytes; `0` or absent means no route limit) caps the request body, see the request path. Transforms run rename, then remove, then add; they
+ may not touch hop-by-hop fields, `Host`, `Content-Length`, `Trailer` or the headers the gateway
+ owns (`X-Request-Id`, `X-Forwarded-For`, `-Proto` and `-Host`, `X-Consumer-Id`).
+ 
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..57a7fe7 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -70,6 +70,9 @@ type Route struct {
+ 	StripPrefix bool       `json:"strip_prefix,omitempty"`
+ 	Timeout     Duration   `json:"timeout,omitempty"` // per attempt, until the response headers arrive
+ 	Auth        string     `json:"auth,omitempty"`
++	// MaxRequestBytes caps the request body the route accepts; 0 means only BODY_BUFFER_LIMIT
++	// applies to buffered bodies, and no cap applies to streamed ones.
++	MaxRequestBytes int64 `json:"max_request_bytes,omitempty"`
+ 
+ 	RateLimit      *RateLimit      `json:"rate_limit,omitempty"`
+ 	Retry          *Retry          `json:"retry,omitempty"`
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..37c7eac 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -112,6 +112,9 @@ func (r *Route) validate(p routeProblems) {
+ 	if r.Timeout.D() < 0 || r.Timeout.D() > MaxTimeout {
+ 		p.add("timeout", "must be positive and at most %s", MaxTimeout)
+ 	}
++	if r.MaxRequestBytes < 0 {
++		p.add("max_request_bytes", "must not be negative, got %d", r.MaxRequestBytes)
++	}
+ 	switch r.Auth {
+ 	case AuthNone, AuthAPIKey, AuthHMAC:
+ 	default:
+diff --git a/internal/core/route.go b/internal/core/route.go
+index 9872989..6a16d6f 100644
+--- a/internal/core/route.go
++++ b/internal/core/route.go
+@@ -22,12 +22,14 @@ type Route struct {
+ 	Methods     []string // nil means every method
+ 	StripPrefix bool
+ 	Timeout     time.Duration // per attempt, until the response headers arrive
+-	Auth        string        // config.AuthNone, config.AuthAPIKey or config.AuthHMAC
+-	RateLimit   *RateLimitPolicy
+-	Retry       RetryPolicy
+-	Request     HeaderTransform // applied to forwarded requests
+-	Response    HeaderTransform // applied to responses returned to the client
+-	Upstreams   []*Upstream
++	// MaxRequestBytes caps the request body; 0 means no route limit.
++	MaxRequestBytes int64
++	Auth            string // config.AuthNone, config.AuthAPIKey or config.AuthHMAC
++	RateLimit       *RateLimitPolicy
++	Retry           RetryPolicy
++	Request         HeaderTransform // applied to forwarded requests
++	Response        HeaderTransform // applied to responses returned to the client
++	Upstreams       []*Upstream
+ 
+ 	balancer *Balancer
+ 	spec     config.Route
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..165bd52 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -194,8 +194,10 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		StripPrefix: spec.StripPrefix,
+ 		Timeout:     spec.Timeout.D(),
+ 		Auth:        spec.Auth,
+-		Retry:       retryPolicy(spec.Retry),
+-		spec:        spec,
++
++		MaxRequestBytes: spec.MaxRequestBytes,
++		Retry:           retryPolicy(spec.Retry),
++		spec:            spec,
+ 	}
+ 	if len(r.Methods) == 0 {
+ 		r.Methods = nil
+diff --git a/internal/proxy/body.go b/internal/proxy/body.go
+index a697127..ec76995 100644
+--- a/internal/proxy/body.go
++++ b/internal/proxy/body.go
+@@ -5,23 +5,68 @@ import (
+ 	"errors"
+ 	"io"
+ 	"net/http"
++	"sync"
++	"sync/atomic"
+ )
+ 
+-// errBodyTooLarge reports a body that had to be held in memory but exceeds the buffer limit.
+-var errBodyTooLarge = errors.New("request body exceeds the buffer limit")
++// errBodyTooLarge reports a body that had to be held in memory but exceeds the buffer limit, or
++// a body of unknown length that exceeds the route's request limit while it is sent.
++var errBodyTooLarge = errors.New("request body exceeds the limit")
++
++// errBodyCut reports a body of unknown length that stopped being sent because the upstream had
++// already answered; the request is not counted against the route's limit for it.
++var errBodyCut = errors.New("request body no longer sent: the upstream answered")
+ 
+ // requestBody is the body of a request as the forwarding loop sees it: either held in memory,
+ // so that every attempt can send it again, or a stream that only one attempt can send.
+ type requestBody struct {
+-	buf        []byte    // the complete body, when replayable
+-	replayable bool      // whether buf holds the complete body
+-	stream     io.Reader // the body to send once, when not replayable
+-	length     int64     // the stream's length, -1 when unknown
++	buf        []byte         // the complete body, when replayable
++	replayable bool           // whether buf holds the complete body
++	stream     io.Reader      // the body to send once, when not replayable
++	length     int64          // the stream's length, -1 when unknown
++	capped     *limitedReader // counts the stream against the route's limit, when it is of unknown length
+ }
+ 
+ // noBody is a request without a body. It is trivially replayable.
+ var noBody = &requestBody{replayable: true}
+ 
++// limitedReader passes a body through and fails the read that would take it past limit. Its
++// exceeded flag tells the forwarding loop that the body was cut short on purpose.
++type limitedReader struct {
++	r        io.Reader
++	limit    int64
++	read     int64         // touched by the goroutine that sends the body only
++	exceeded atomic.Bool   // read by the forwarding loop, which may run concurrently
++	stopped  atomic.Bool   // set by the forwarding loop once the upstream answered before the body ended
++	finished chan struct{} // closed once the body is over: ended, failed or cut short
++	once     sync.Once
++}
++
++func (l *limitedReader) Read(p []byte) (int, error) {
++	if l.exceeded.Load() {
++		return 0, errBodyTooLarge
++	}
++	if l.stopped.Load() {
++		return 0, errBodyCut
++	}
++	n, err := l.r.Read(p)
++	l.read += int64(n)
++	if l.read > l.limit {
++		l.exceeded.Store(true)
++		l.finish()
++		return n - int(l.read-l.limit), errBodyTooLarge
++	}
++	if err != nil {
++		l.finish()
++	}
++	return n, err
++}
++
++func (l *limitedReader) finish() { l.once.Do(func() { close(l.finished) }) }
++
++// cut stops the body from being sent any further.
++func (l *limitedReader) cut() { l.stopped.Store(true) }
++
+ // hasBody reports whether the request carries a body.
+ func hasBody(r *http.Request) bool {
+ 	return r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0
+@@ -49,13 +94,14 @@ func bufferBody(r *http.Request, limit int64) (*requestBody, error) {
+ // retryableBody reads the body into memory when it fits within limit, so that a failed attempt
+ // can be retried. A longer body is streamed instead, and the request is sent once: a body whose
+ // declared length exceeds the limit is not read at all, and one of unknown length that turns out
+-// too long is sent as the part already read followed by the rest.
+-func retryableBody(r *http.Request, limit int64) (*requestBody, error) {
++// too long is sent as the part already read followed by the rest. maxBytes is the route's own
++// limit (0 for none), which a stream of unknown length is counted against.
++func retryableBody(r *http.Request, limit, maxBytes int64) (*requestBody, error) {
+ 	if !hasBody(r) {
+ 		return noBody, nil
+ 	}
+ 	if r.ContentLength > limit {
+-		return &requestBody{stream: r.Body, length: r.ContentLength}, nil
++		return streamOf(r.Body, r.ContentLength, maxBytes), nil
+ 	}
+ 	buf, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+ 	if err != nil {
+@@ -64,15 +110,32 @@ func retryableBody(r *http.Request, limit int64) (*requestBody, error) {
+ 	if int64(len(buf)) <= limit {
+ 		return &requestBody{buf: buf, replayable: true}, nil
+ 	}
+-	return &requestBody{stream: io.MultiReader(bytes.NewReader(buf), r.Body), length: r.ContentLength}, nil
++	return streamOf(io.MultiReader(bytes.NewReader(buf), r.Body), r.ContentLength, maxBytes), nil
+ }
+ 
+-// streamBody passes the body through without reading it.
+-func streamBody(r *http.Request) *requestBody {
++// streamBody passes the body through without reading it. maxBytes is the route's limit (0 for
++// none).
++func streamBody(r *http.Request, maxBytes int64) *requestBody {
+ 	if !hasBody(r) {
+ 		return noBody
+ 	}
+-	return &requestBody{stream: r.Body, length: r.ContentLength}
++	return streamOf(r.Body, r.ContentLength, maxBytes)
++}
++
++// streamOf returns a stream of rd sent once. A stream of unknown length is counted against
++// maxBytes when that is set, so that a body longer than the route allows is cut off mid-send.
++func streamOf(rd io.Reader, length, maxBytes int64) *requestBody {
++	b := &requestBody{stream: rd, length: length}
++	if length < 0 && maxBytes > 0 {
++		b.capped = &limitedReader{r: rd, limit: maxBytes, finished: make(chan struct{})}
++		b.stream = b.capped
++	}
++	return b
++}
++
++// tooLarge reports whether a stream was cut short for exceeding the route's limit.
++func (b *requestBody) tooLarge() bool {
++	return b.capped != nil && b.capped.exceeded.Load()
+ }
+ 
+ // forAttempt returns the body and content length for one attempt. A stream can be handed out
+diff --git a/internal/proxy/forward.go b/internal/proxy/forward.go
+index 9a51c3f..d2552f9 100644
+--- a/internal/proxy/forward.go
++++ b/internal/proxy/forward.go
+@@ -7,6 +7,7 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
+ 	"strings"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -33,12 +34,13 @@ type attemptResult struct {
+ 	err      error
+ 	class    core.ErrorClass // why err happened
+ 	canceled bool            // the client went away; says nothing about the upstream
++	tooLarge bool            // the request body outgrew the route's limit; says nothing about the upstream
+ }
+ 
+ // outcome is what the attempt tells the upstream's circuit breaker.
+ func (a *attemptResult) outcome() core.Outcome {
+ 	switch {
+-	case a.canceled:
++	case a.canceled, a.tooLarge:
+ 		return core.Ignored
+ 	case a.err != nil, a.resp.StatusCode >= 500:
+ 		return core.Failure
+@@ -49,7 +51,7 @@ func (a *attemptResult) outcome() core.Outcome {
+ // retryable reports whether the policy retries this outcome.
+ func (a *attemptResult) retryable(p core.RetryPolicy) bool {
+ 	switch {
+-	case a.canceled:
++	case a.canceled, a.tooLarge:
+ 		return false
+ 	case a.err != nil:
+ 		return p.RetryError(a.class)
+@@ -103,6 +105,11 @@ func (h *Handler) forward(w *statusRecorder, ex *exchange, body *requestBody) {
+ 		ex.upstream, ex.attempts = u, n
+ 		last = h.attempt(ex, u, body)
+ 		ticket.Done(last.outcome())
++		if last.tooLarge {
++			h.fail(w, ex, newError(http.StatusRequestEntityTooLarge, codeBodyTooLarge,
++				"the request body exceeds "+strconv.FormatInt(route.MaxRequestBytes, 10)+" bytes"))
++			return
++		}
+ 		if !last.retryable(route.Retry) {
+ 			break
+ 		}
+@@ -229,11 +236,24 @@ func (h *Handler) attempt(ex *exchange, u *core.Upstream, body *requestBody) *at
+ 	start := h.clock.Now()
+ 	resp, err := h.transport.RoundTrip(out)
+ 	timer.Stop()
++	if resp != nil && body.capped != nil {
++		// The upstream answered before taking the rest of a body of unknown length. A body
++		// already sent in full is counted first, so that its outcome decides the answer.
++		h.settleBody(body.capped, stream, ex.route.Timeout)
++	}
+ 	if stream != nil && stream.interrupted.Load() {
+ 		// What is left of the body is still on the client's connection, which cannot carry
+ 		// another request.
+ 		ex.headers.Set("Connection", "close")
+ 	}
++	if body.tooLarge() {
++		// The body was cut short on purpose: whatever the upstream made of it is dropped.
++		if resp != nil {
++			resp.Body.Close()
++		}
++		cancel(nil)
++		return &attemptResult{err: errBodyTooLarge, tooLarge: true}
++	}
+ 	if !deadline.CompareAndSwap(deadlinePending, deadlineMet) {
+ 		// The timeout fired while the headers were arriving: treat the attempt as timed out
+ 		// rather than relay a response whose context is cancelled.
+@@ -252,6 +272,29 @@ func (h *Handler) attempt(ex *exchange, u *core.Upstream, body *requestBody) *at
+ 	return &attemptResult{resp: resp, release: cancel}
+ }
+ 
++// bodySettle is how long an upstream answer that arrives before a body of unknown length has
++// ended waits for that body: long enough for a body that is already sent to be read and counted,
++// short enough that a client which stalls does not hold up the answer.
++const bodySettle = 50 * time.Millisecond
++
++// settleBody gives a body of unknown length up to bodySettle, and at most d, to end. A body that
++// is still going then stops being sent, and the upstream's answer is relayed. s is the stream
++// the transport reads l through: a client that has stopped sending leaves that read waiting,
++// and the server cannot write the answer while it waits, so it is interrupted.
++func (h *Handler) settleBody(l *limitedReader, s *clientStream, d time.Duration) {
++	select {
++	case <-l.finished:
++		return
++	default:
++	}
++	select {
++	case <-l.finished:
++	case <-h.clock.After(min(d, bodySettle)):
++		l.cut()
++		s.interrupt()
++	}
++}
++
+ // classify sorts a failed attempt: a timeout of the route's own deadline, the client going
+ // away, a failure to connect, or a connection that broke before the response.
+ func classify(attemptCtx, clientCtx context.Context, err error) (class core.ErrorClass, canceled bool) {
+diff --git a/internal/proxy/handler.go b/internal/proxy/handler.go
+index 5767e69..aafa978 100644
+--- a/internal/proxy/handler.go
++++ b/internal/proxy/handler.go
+@@ -145,6 +145,11 @@ func (h *Handler) serve(w *statusRecorder, ex *exchange) {
+ 		return
+ 	}
+ 	ex.route = route
++	if max := route.MaxRequestBytes; max > 0 && r.ContentLength > max {
++		h.fail(w, ex, newError(http.StatusRequestEntityTooLarge, codeBodyTooLarge,
++			"the request body exceeds "+strconv.FormatInt(max, 10)+" bytes"))
++		return
++	}
+ 
+ 	body, ok := h.authenticate(w, ex)
+ 	if !ok {
+@@ -156,9 +161,9 @@ func (h *Handler) serve(w *statusRecorder, ex *exchange) {
+ 	if body == nil {
+ 		var err error
+ 		if route.Retry.Retries(r.Method) {
+-			body, err = retryableBody(r, h.bodyLimit)
++			body, err = retryableBody(r, h.bodyBudget(route), route.MaxRequestBytes)
+ 		} else {
+-			body = streamBody(r)
++			body = streamBody(r, route.MaxRequestBytes)
+ 		}
+ 		if err != nil {
+ 			h.fail(w, ex, newError(http.StatusBadRequest, codeBadRequest, "the request body could not be read"))
+@@ -186,11 +191,11 @@ func (h *Handler) authenticate(w *statusRecorder, ex *exchange) (*requestBody, b
+ 	var body *requestBody
+ 	if authn.NeedsBody() {
+ 		var err error
+-		body, err = bufferBody(ex.req, h.bodyLimit)
++		budget := h.bodyBudget(route)
++		body, err = bufferBody(ex.req, budget)
+ 		switch {
+ 		case errors.Is(err, errBodyTooLarge):
+-			h.fail(w, ex, newError(http.StatusRequestEntityTooLarge, codeBodyTooLarge,
+-				"the request body exceeds "+strconv.FormatInt(h.bodyLimit, 10)+" bytes"))
++			h.fail(w, ex, newError(http.StatusRequestEntityTooLarge, codeBodyTooLarge, h.bufferLimitMessage(route)))
+ 			return nil, false
+ 		case err != nil:
+ 			h.fail(w, ex, newError(http.StatusBadRequest, codeBadRequest, "the request body could not be read"))
+@@ -235,6 +240,31 @@ func (h *Handler) authFailed(w *statusRecorder, ex *exchange, err error) {
+ 	h.fail(w, ex, ge)
+ }
+ 
++// bodyBudget is how many bytes of a request body the gateway holds in memory for the route: the
++// smaller of BODY_BUFFER_LIMIT and the route's max_request_bytes.
++func (h *Handler) bodyBudget(route *core.Route) int64 {
++	if max := route.MaxRequestBytes; max > 0 && max < h.bodyLimit {
++		return max
++	}
++	return h.bodyLimit
++}
++
++// bufferLimitMessage names the limit that stopped a body the gateway had to hold in memory for
++// the route: the route's max_request_bytes when that is the smaller one, else BODY_BUFFER_LIMIT,
++// which then names the route's limit too if there is one.
++func (h *Handler) bufferLimitMessage(route *core.Route) string {
++	max := route.MaxRequestBytes
++	if max > 0 && max <= h.bodyLimit {
++		return "the request body exceeds the route's max_request_bytes of " + strconv.FormatInt(max, 10) + " bytes"
++	}
++	msg := "the request body exceeds " + strconv.FormatInt(h.bodyLimit, 10) +
++		" bytes, the most the gateway holds in memory for this route (BODY_BUFFER_LIMIT)"
++	if max > 0 {
++		msg += "; the route's max_request_bytes is " + strconv.FormatInt(max, 10) + " bytes"
++	}
++	return msg
++}
++
+ // rateLimit applies the route's rate limit, if any, to the consumer, or to the client address
+ // on routes without authentication. It returns false when it has answered the request.
+ func (h *Handler) rateLimit(w *statusRecorder, ex *exchange) bool {
+diff --git a/internal/proxy/request_limit_test.go b/internal/proxy/request_limit_test.go
+new file mode 100644
+index 0000000..5613cc3
+--- /dev/null
++++ b/internal/proxy/request_limit_test.go
+@@ -0,0 +1,138 @@
++package proxy
++
++import (
++	"bufio"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/relaywork/gateway/internal/auth"
++	"github.com/relaywork/gateway/internal/model"
++)
++
++// limitRoute accepts uploads of at most 16 bytes; retries are off unless a test turns them on.
++const limitRoute = `{"routes":[{"id":"upload","path_prefix":"/upload",
++  "upstreams":[{"url":"http://up.test"}],"max_request_bytes":16%s}]}`
++
++// chunkedRequest is a request whose length is not declared, as a chunked body arrives.
++func chunkedRequest(method, target, body string) *http.Request {
++	r := httptest.NewRequest(method, target, strings.NewReader(body))
++	r.ContentLength = -1
++	return r
++}
++
++func TestDeclaredOversizeIsRefusedBeforeTheUpstream(t *testing.T) {
++	f := newFixture(t, strings.Replace(limitRoute, "%s", "", 1), fixtureOptions{})
++	w := f.do(httptest.NewRequest(http.MethodPost, "/upload/a", strings.NewReader(strings.Repeat("x", 17))))
++	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), `"body_too_large"`) {
++		t.Fatalf("status %d, body %s; want 413 body_too_large", w.Code, w.Body.String())
++	}
++}
++
++func TestStreamedOversizeIsCutOffWithoutRetry(t *testing.T) {
++	tr := statusTransport(200)
++	routes := strings.Replace(limitRoute, "%s", `,"retry":{"attempts":3,"non_idempotent":true}`, 1)
++	f := newFixture(t, routes, fixtureOptions{transport: tr})
++	w := f.do(chunkedRequest(http.MethodPost, "/upload/a", strings.Repeat("x", 17)))
++	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), `"body_too_large"`) {
++		t.Fatalf("status %d, body %s; want 413 body_too_large", w.Code, w.Body.String())
++	}
++	if n := len(tr.sent()); n != 1 {
++		t.Fatalf("the upstream saw %d attempts; a cut-off body is not retried", n)
++	}
++}
++
++func TestChunkedBodyAtTheLimitPasses(t *testing.T) {
++	tr := statusTransport(200)
++	f := newFixture(t, strings.Replace(limitRoute, "%s", "", 1), fixtureOptions{transport: tr})
++	w := f.do(chunkedRequest(http.MethodPost, "/upload/a", strings.Repeat("y", 16)))
++	if w.Code != http.StatusOK {
++		t.Fatalf("status %d; want 200", w.Code)
++	}
++	if got := tr.sent(); len(got) != 1 || got[0].body != strings.Repeat("y", 16) {
++		t.Fatalf("upstream got %+v; want the 16-byte body once", got)
++	}
++}
++
++func TestRouteLimitMustNotBeNegative(t *testing.T) {
++	_, err := tryFixture(t, `{"routes":[{"id":"u","path_prefix":"/u",
++	  "upstreams":[{"url":"http://up.test"}],"max_request_bytes":-1}]}`, fixtureOptions{})
++	if err == nil || !strings.Contains(err.Error(), "max_request_bytes") {
++		t.Fatalf("error %v; want one naming max_request_bytes", err)
++	}
++}
++
++// TestBufferLimitMessageNamesTheLimit: an authenticated route buffers the body in memory, so a body
++// over BODY_BUFFER_LIMIT is refused with the limit that applied named, even when the route's own
++// max_request_bytes is larger.
++func TestBufferLimitMessageNamesTheLimit(t *testing.T) {
++	routes := `{"routes":[{"id":"s","path_prefix":"/s","upstreams":[{"url":"http://up.test"}],
++	  "auth":"hmac","max_request_bytes":1000}]}`
++	signer := &fakeAuth{needsBody: true, consumer: model.Consumer{ID: "c_0123456789abcdef"}}
++	f := newFixture(t, routes, fixtureOptions{auth: auth.Modes{"hmac": signer}, bodyLimit: 100})
++	w := f.do(chunkedRequest(http.MethodPost, "/s/x", strings.Repeat("b", 500)))
++	body := w.Body.String()
++	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(body, "BODY_BUFFER_LIMIT") ||
++		!strings.Contains(body, "max_request_bytes is 1000") {
++		t.Fatalf("status %d, body %s; want 413 naming BODY_BUFFER_LIMIT and the route's max_request_bytes", w.Code, body)
++	}
++}
++
++// TestEarlyAnswerCannotHideAnOversizeBody: an upstream that answers at once, without reading a
++// chunked body that is sent in full, must not get its 200 relayed when that body exceeds the
++// route's limit; the body is counted while it is sent, so the answer is 413 every time.
++func TestEarlyAnswerCannotHideAnOversizeBody(t *testing.T) {
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	t.Cleanup(up.Close)
++	f := newFixture(t, `{"routes":[{"id":"u","path_prefix":"/u","upstreams":[{"url":"`+up.URL+`"}],"max_request_bytes":16}]}`,
++		fixtureOptions{transport: &http.Transport{}})
++	for i := range 20 {
++		w := f.do(chunkedRequest(http.MethodPost, "/u/x", strings.Repeat("e", 500)))
++		if w.Code != http.StatusRequestEntityTooLarge {
++			t.Fatalf("attempt %d: status %d; want 413", i, w.Code)
++		}
++	}
++}
++
++// TestStalledClientGetsTheEarlyAnswer: an upstream that answers 200 and closes the connection
++// without reading a chunked body is relayed while the client has sent only part of it and
++// stalls; the gateway runs as a real server, which cannot write the answer while a read of the
++// body waits on the client.
++func TestStalledClientGetsTheEarlyAnswer(t *testing.T) {
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Connection", "close")
++		_, _ = io.WriteString(w, "bye")
++	}))
++	t.Cleanup(up.Close)
++	f := newFixture(t, `{"routes":[{"id":"u","path_prefix":"/u","upstreams":[{"url":"`+up.URL+`"}],"max_request_bytes":16,"timeout":"10s"}]}`,
++		fixtureOptions{transport: &http.Transport{}})
++	gw := httptest.NewServer(f.h)
++	t.Cleanup(gw.Close)
++	conn, err := net.Dial("tcp", gw.Listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { conn.Close() })
++	// Three bytes of a chunked body, and then nothing more.
++	if _, err := io.WriteString(conn, "POST /u/x HTTP/1.1\r\nHost: gw\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n"); err != nil {
++		t.Fatal(err)
++	}
++	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
++	if err != nil {
++		t.Fatalf("no answer while the client stalls: %v", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil || resp.StatusCode != http.StatusOK || string(body) != "bye" {
++		t.Fatalf("status %d, body %q, error %v; want the upstream's 200 \"bye\"", resp.StatusCode, body, err)
++	}
++}

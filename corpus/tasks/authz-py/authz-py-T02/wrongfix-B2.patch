@@ -1,0 +1,53 @@
+diff --git a/src/authz/services/api_keys.py b/src/authz/services/api_keys.py
+index c0499c5..e547c0c 100644
+--- a/src/authz/services/api_keys.py
++++ b/src/authz/services/api_keys.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ import uuid
+-from datetime import timedelta
++from datetime import datetime, timedelta
+ 
+ from authz.domain.permissions import API_KEY_PERMISSIONS
+ from authz.domain.policy import effective_permissions
+@@ -12,7 +12,7 @@ from authz.errors import AuthenticationFailed, InvalidInputError, InvalidToken,
+ from authz.infra.clock import Clock
+ from authz.infra.db import Database
+ from authz.infra.hashing import PasswordHasher
+-from authz.infra.randomness import RandomSource
++from authz.infra.randomness import RandomSource, hash_token
+ from authz.models import ApiKey
+ from authz.repositories.api_keys import ApiKeyRepository
+ from authz.repositories.roles import RoleRepository
+@@ -25,6 +25,7 @@ KEY_MARKER = "azk_"
+ PREFIX_LENGTH = 12
+ MAX_KEY_LENGTH = 200
+ LAST_USED_PRECISION = timedelta(minutes=1)
++VERIFIED_FOR = timedelta(seconds=60)
+ 
+ 
+ def is_api_key(token: str) -> bool:
+@@ -56,6 +57,7 @@ class ApiKeyService:
+         self._hasher = hasher
+         self._authz = authz
+         self._audit = audit
++        self._verified: dict[tuple[uuid.UUID, str], datetime] = {}
+ 
+     async def create(
+         self, principal: Principal, org_id: uuid.UUID, *, name: str, role_id: uuid.UUID
+@@ -125,8 +127,14 @@ class ApiKeyService:
+         async with self._db.read() as session:
+             candidates = await ApiKeyRepository(session).active_with_prefix(prefix)
+         key = None
++        seen = hash_token(token)
+         for candidate in candidates:
++            verified_at = self._verified.get((candidate.id, seen))
++            if verified_at is not None and self._clock.now() - verified_at < VERIFIED_FOR:
++                key = candidate
++                break
+             if await self._hasher.verify(candidate.secret_hash, secret):
++                self._verified[(candidate.id, seen)] = self._clock.now()
+                 key = candidate
+                 break
+         if key is None:

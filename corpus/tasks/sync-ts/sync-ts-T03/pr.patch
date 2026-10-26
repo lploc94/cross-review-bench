@@ -1,0 +1,763 @@
+diff --git a/README.md b/README.md
+index 603ec06..8dd3862 100644
+--- a/README.md
++++ b/README.md
+@@ -43,12 +43,15 @@ timestamp is greater. The server applies the same rule, so the order in which mu
+ does not change the result.
+ 
+ **Push.** `POST /v1/sync/push` takes up to `PUSH_MAX_MUTATIONS` mutations and applies them in one
+-transaction. Mutation ids already recorded for the user are acknowledged without being applied
+-again, so a client that lost an answer can simply send the batch again. Every field write that
+-wins becomes an event in the user's change feed and updates the stored document. One invalid
+-mutation rejects the whole request (422 with its `index`), as does a timestamp too far ahead
+-(422 `clock_drift`). The answer lists every mutation id of the request and the server's clock,
+-which the client merges into its own. Pushes of one user are serialized, so events get their
++transaction. Mutation ids already recorded for the user are acknowledged without being checked
++or applied again, so a client that lost an answer can simply send the batch again. Every field
++write that wins becomes an event in the user's change feed and updates the stored document. An
++invalid mutation (unknown collection or field, a value of the wrong type, an id repeated in the
++request) is not recorded and is listed in the answer's `rejected` as `{ index, code, message,
++issues }`, `index` being its position in the request; the rest of the request is applied. A
++timestamp too far ahead still rejects the whole request (422 `clock_drift`). The answer lists
++every recorded mutation id of the request in `acked` and the server's clock, which the client
++merges into its own. Pushes of one user are serialized, so events get their
+ sequence numbers in commit order.
+ 
+ **Pull.** `GET /v1/sync/pull?after=<seq>&limit=<n>` returns the user's events with `seq > after`
+@@ -60,7 +63,9 @@ change nothing, because their timestamps are not newer than what the replica hol
+ latest seq.
+ 
+ **Client sync.** `SyncClient.sync()` pushes the outbox in batches, oldest first, removing what
+-the server acknowledged; then it pulls pages until `hasMore` is false, applying each page
++the server acknowledged and marking what it rejected: a rejected mutation stays applied to the
++replica and in the outbox (`rejectedMutations()` lists it), but is never sent again and no
++longer counts as pending. Then it pulls pages until `hasMore` is false, applying each page
+ together with the new cursor and clock in one SQLite transaction. A failure leaves everything
+ applied before it in place, and the next `sync()` continues from there: the outbox still holds
+ every unacknowledged mutation and the cursor points after the last applied page. The error is a
+@@ -82,7 +87,7 @@ version is answered 426 `protocol_mismatch` with the server's version. Every ans
+ | Method | Path | |
+ |---|---|---|
+ | GET | `/health` | 200 when the database answers, 503 otherwise; no token |
+-| POST | `/v1/sync/push` | `{ "mutations": [...] }` → `{ "acked": [...], "serverHlc" }` |
++| POST | `/v1/sync/push` | `{ "mutations": [...] }` → `{ "acked": [...], "rejected": [...], "serverHlc" }` |
+ | GET | `/v1/sync/pull?after=&limit=` | `{ "events": [...], "nextAfter", "hasMore" }` |
+ | GET | `/v1/sync/status` | `{ "latestSeq", "cursor" }` |
+ | GET | `/v1/documents/:collection/:id` | the server's state of a document, with its field timestamps |
+@@ -101,7 +106,7 @@ Every route except `/health` needs a device token. Errors always have the shape
+ | 409 | `device_limit` |
+ | 413 | `payload_too_large` |
+ | 415 | `unsupported_media_type` |
+-| 422 | `invalid_mutation`, `clock_drift` |
++| 422 | `clock_drift` |
+ | 426 | `protocol_mismatch` |
+ | 500 | `internal_error` |
+ | 503 | `unavailable` |
+diff --git a/packages/client/src/cli/commands.ts b/packages/client/src/cli/commands.ts
+index c188a96..72c5e6c 100644
+--- a/packages/client/src/cli/commands.ts
++++ b/packages/client/src/cli/commands.ts
+@@ -108,6 +108,8 @@ export async function runCommand(args: ParsedArgs, ctx: CommandContext): Promise
+       const cursor = client.pullCursor();
+       out(`node ${client.nodeId}`);
+       out(`pending ${client.pendingCount()}`);
++      const rejected = client.rejectedMutations().length;
++      if (rejected > 0) out(`rejected by the server ${rejected}`);
+       out(`pulled up to ${cursor}`);
+       if (ctx.server) {
+         const remote = await ctx.server.status();
+diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
+index c10ba7b..2d7ba30 100644
+--- a/packages/client/src/index.ts
++++ b/packages/client/src/index.ts
+@@ -6,6 +6,7 @@ export { checkPage } from "./sync/pullPhase.js";
+ export { IN_MEMORY, openDatabase, type SqliteDatabase } from "./store/database.js";
+ export { CorruptStoreError, SchemaVersionError } from "./store/errors.js";
+ export { META_KEYS } from "./store/metaStore.js";
++export type { RejectedEntry } from "./store/outboxStore.js";
+ export { migrate, schemaVersion, type MigrationOutcome } from "./store/migrator.js";
+ export { CLIENT_MIGRATIONS, CLIENT_SCHEMA_VERSION, type SchemaMigration } from "./store/schema.js";
+ export { HttpError, InvalidResponseError, NetworkError, ProtocolMismatchError, isRetryableStatus } from "./transport/errors.js";
+diff --git a/packages/client/src/store/outboxStore.ts b/packages/client/src/store/outboxStore.ts
+index 2b0089c..5812310 100644
+--- a/packages/client/src/store/outboxStore.ts
++++ b/packages/client/src/store/outboxStore.ts
+@@ -24,6 +24,14 @@ interface OutboxRow {
+   last_error: string | null;
+ }
+ 
++/** An outbox entry the server rejected: kept for inspection, never pushed again. */
++export interface RejectedEntry {
++  readonly seq: number;
++  readonly mutation: Mutation;
++  readonly code: string;
++  readonly message: string;
++}
++
+ function toEntry(row: OutboxRow): OutboxEntry {
+   return {
+     seq: row.seq,
+@@ -44,13 +52,23 @@ const COLUMNS = "seq, mutation_id, collection, doc_id, fields, hlc, attempts, la
+ /** Longest error message kept in `last_error`. */
+ const MAX_ERROR_LENGTH = 500;
+ 
+-/** The `outbox` table: mutations in the order they were made, until the server acknowledges them. */
++function truncate(message: string): string {
++  return message.length > MAX_ERROR_LENGTH ? `${message.slice(0, MAX_ERROR_LENGTH - 1)}…` : message;
++}
++
++/**
++ * The `outbox` table: mutations in the order they were made, until the server acknowledges them.
++ * Entries the server rejected stay, marked with `rejected_code`, and are skipped by batches and
++ * counts.
++ */
+ export class OutboxStore {
+   private readonly db: SqliteDatabase;
+   private readonly insert: Statement<[string, string, string, string, string]>;
+   private readonly selectAfter: Statement<[number, number], OutboxRow>;
+   private readonly deleteByMutationId: Statement<[string]>;
+   private readonly markFailed: Statement<[string, number]>;
++  private readonly markRejected: Statement<[string, string, number]>;
++  private readonly selectRejected: Statement<[], OutboxRow & { rejected_code: string }>;
+   private readonly countAll: Statement<[], { count: number }>;
+ 
+   constructor(db: SqliteDatabase) {
+@@ -58,12 +76,18 @@ export class OutboxStore {
+     this.insert = db.prepare(
+       "INSERT INTO outbox (mutation_id, collection, doc_id, fields, hlc) VALUES (?, ?, ?, ?, ?)",
+     );
+-    this.selectAfter = db.prepare(`SELECT ${COLUMNS} FROM outbox WHERE seq > ? ORDER BY seq LIMIT ?`);
++    this.selectAfter = db.prepare(
++      `SELECT ${COLUMNS} FROM outbox WHERE seq > ? AND rejected_code IS NULL ORDER BY seq LIMIT ?`,
++    );
+     this.deleteByMutationId = db.prepare("DELETE FROM outbox WHERE mutation_id = ?");
+     this.markFailed = db.prepare(
+       "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE seq = ?",
+     );
+-    this.countAll = db.prepare("SELECT count(*) AS count FROM outbox");
++    this.markRejected = db.prepare("UPDATE outbox SET rejected_code = ?, last_error = ? WHERE seq = ?");
++    this.selectRejected = db.prepare(
++      `SELECT ${COLUMNS}, rejected_code FROM outbox WHERE rejected_code IS NOT NULL ORDER BY seq`,
++    );
++    this.countAll = db.prepare("SELECT count(*) AS count FROM outbox WHERE rejected_code IS NULL");
+   }
+ 
+   /** Queue a mutation; returns its seq. */
+@@ -94,12 +118,28 @@ export class OutboxStore {
+ 
+   /** Count a failed push against each entry and keep the error for inspection. */
+   recordFailure(seqs: readonly number[], message: string): void {
+-    const kept = message.length > MAX_ERROR_LENGTH ? `${message.slice(0, MAX_ERROR_LENGTH - 1)}…` : message;
++    const kept = truncate(message);
+     this.db.transaction(() => {
+       for (const seq of seqs) this.markFailed.run(kept, seq);
+     })();
+   }
+ 
++  /** Mark entries the server rejected, with its error code and message. */
++  reject(rejections: readonly { seq: number; code: string; message: string }[]): void {
++    this.db.transaction(() => {
++      for (const r of rejections) this.markRejected.run(r.code, truncate(r.message), r.seq);
++    })();
++  }
++
++  /** Entries the server rejected, oldest first. */
++  rejected(): RejectedEntry[] {
++    return this.selectRejected.all().map((row) => {
++      const entry = toEntry(row);
++      return { seq: entry.seq, mutation: entry.mutation, code: row.rejected_code, message: row.last_error ?? "" };
++    });
++  }
++
++  /** Entries waiting to be pushed. */
+   count(): number {
+     return this.countAll.get()?.count ?? 0;
+   }
+diff --git a/packages/client/src/store/schema.ts b/packages/client/src/store/schema.ts
+index 7ffd9ff..1d49905 100644
+--- a/packages/client/src/store/schema.ts
++++ b/packages/client/src/store/schema.ts
+@@ -45,6 +45,12 @@ export const CLIENT_MIGRATIONS: readonly SchemaMigration[] = [
+     description: "docs, outbox and meta",
+     up: (db) => db.exec(V1),
+   },
++  {
++    version: 2,
++    description: "outbox entries the server rejected",
++    // The server's error code for a rejected mutation; such entries are no longer pushed.
++    up: (db) => db.exec("ALTER TABLE outbox ADD COLUMN rejected_code TEXT"),
++  },
+ ];
+ 
+ export const CLIENT_SCHEMA_VERSION = CLIENT_MIGRATIONS.length;
+diff --git a/packages/client/src/sync/pushPhase.ts b/packages/client/src/sync/pushPhase.ts
+index 6ddfb35..02cfb65 100644
+--- a/packages/client/src/sync/pushPhase.ts
++++ b/packages/client/src/sync/pushPhase.ts
+@@ -1,7 +1,8 @@
+-import { parseHlc, type Hlc, type MutationPayload } from "@sync/shared";
++import { parseHlc, type Hlc, type MutationPayload, type PushRejection } from "@sync/shared";
+ import type { SqliteDatabase } from "../store/database.js";
+ import type { MetaStore } from "../store/metaStore.js";
+ import type { OutboxEntry, OutboxStore } from "../store/outboxStore.js";
++import { InvalidResponseError } from "../transport/errors.js";
+ import type { SyncTransport } from "../transport/transport.js";
+ 
+ export interface PushContext {
+@@ -16,6 +17,8 @@ export interface PushContext {
+ export interface PushOutcome {
+   /** Mutations the server acknowledged and that left the outbox. */
+   readonly pushed: number;
++  /** Mutations the server rejected; they stay in the outbox, marked, and are not sent again. */
++  readonly rejected: number;
+   readonly batches: number;
+ }
+ 
+@@ -24,15 +27,38 @@ function toPayload(entry: OutboxEntry): MutationPayload {
+ }
+ 
+ /**
+- * Push the outbox in batches, oldest first. Acknowledged mutations leave the outbox; the others
+- * stay for the next sync. Each batch is sent at most once per call, so a mutation the server
+- * keeps not acknowledging cannot make this loop forever. A failed batch is counted against its
++ * The entries of a batch that the server rejected. A rejection names a mutation by its position
++ * in the request; one outside the batch, or one the same answer also acknowledges, breaks the
++ * protocol.
++ */
++function rejectedEntries(
++  batch: readonly OutboxEntry[],
++  rejections: readonly PushRejection[],
++  acked: ReadonlySet<string>,
++): { seq: number; code: string; message: string }[] {
++  return rejections.map((rejection) => {
++    const entry = batch[rejection.index];
++    if (!entry || acked.has(entry.mutation.mutationId)) {
++      throw new InvalidResponseError(
++        `the push answer rejects mutation ${rejection.index} of ${batch.length}, which it ${entry ? "also acknowledges" : "was not sent"}`,
++      );
++    }
++    return { seq: entry.seq, code: rejection.code, message: rejection.message };
++  });
++}
++
++/**
++ * Push the outbox in batches, oldest first. Acknowledged mutations leave the outbox, rejected
++ * ones are marked and stay out of later batches; the others stay for the next sync. Each batch
++ * is sent at most once per call, so a mutation the server keeps not acknowledging cannot make
++ * this loop forever. A failed batch is counted against its
+  * entries and the error is thrown: the outbox keeps every unacknowledged mutation, and sending
+  * them again is safe because the server recognises mutation ids it has already recorded.
+  */
+ export async function pushOutbox(ctx: PushContext): Promise<PushOutcome> {
+   let afterSeq = 0;
+   let pushed = 0;
++  let rejected = 0;
+   let batches = 0;
+   for (;;) {
+     const batch = ctx.outbox.batchAfter(afterSeq, ctx.batchSize);
+@@ -54,11 +80,15 @@ export async function pushOutbox(ctx: PushContext): Promise<PushOutcome> {
+ 
+     const sent = new Set(batch.map((entry) => entry.mutation.mutationId));
+     const acked = response.acked.filter((id) => sent.has(id));
++    // Checked before anything changes: an answer that breaks the protocol leaves the outbox as is.
++    const refused = rejectedEntries(batch, response.rejected, new Set(acked));
+     pushed += ctx.outbox.remove(acked);
++    ctx.outbox.reject(refused);
++    rejected += refused.length;
+     // After the acknowledged mutations are gone: a server clock too far ahead must not keep
+     // them in the outbox.
+     ctx.hlc.receive(parseHlc(response.serverHlc));
+     ctx.meta.setLastHlc(ctx.hlc.last);
+   }
+-  return { pushed, batches };
++  return { pushed, rejected, batches };
+ }
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 694c08a..d92d4f2 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -24,7 +24,7 @@ import { openDatabase, type SqliteDatabase } from "../store/database.js";
+ import { DocsStore, type StoredDoc } from "../store/docsStore.js";
+ import { MetaStore } from "../store/metaStore.js";
+ import { migrate } from "../store/migrator.js";
+-import { OutboxStore } from "../store/outboxStore.js";
++import { OutboxStore, type RejectedEntry } from "../store/outboxStore.js";
+ import type { SyncTransport } from "../transport/transport.js";
+ import { ChangeEmitter, rethrowLater, type ChangeListener, type DocumentChange } from "./changes.js";
+ import { pullChanges } from "./pullPhase.js";
+@@ -264,12 +264,22 @@ export class SyncClient {
+     return docs.map((doc) => toTyped(collection, doc));
+   }
+ 
+-  /** Local mutations not yet acknowledged by the server. */
++  /** Local mutations waiting to be pushed: neither acknowledged nor rejected by the server yet. */
+   pendingCount(): number {
+     this.assertOpen();
+     return this.parts.outbox.count();
+   }
+ 
++  /**
++   * Local mutations the server rejected (for instance a field this server version does not
++   * know), oldest first, with its error code and message. They stay applied to the replica and
++   * are never pushed again; `pendingCount` leaves them out.
++   */
++  rejectedMutations(): RejectedEntry[] {
++    this.assertOpen();
++    return this.parts.outbox.rejected();
++  }
++
+   /** The pull cursor: the last server sequence number applied locally. */
+   pullCursor(): number {
+     this.assertOpen();
+diff --git a/packages/client/test/e2e/rejections.test.ts b/packages/client/test/e2e/rejections.test.ts
+new file mode 100644
+index 0000000..f59b99a
+--- /dev/null
++++ b/packages/client/test/e2e/rejections.test.ts
+@@ -0,0 +1,67 @@
++import { IN_MEMORY, InvalidResponseError, PUSH_PATH, SyncClient, openDatabase } from "@sync/client";
++import { ManualClock, formatHlc, seededRandom } from "@sync/shared";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { ScriptedTransport, openClient, type TestClient } from "../helpers/clients.js";
++import { tempDbPath } from "../helpers/tempFiles.js";
++import { startTestServer, type TestAccount, type TestServer } from "../helpers/testServer.js";
++
++let server: TestServer;
++let laptop: TestAccount;
++const opened: TestClient[] = [];
++
++beforeEach(async () => {
++  server = await startTestServer();
++  laptop = await server.createUser("Ada");
++});
++
++afterEach(async () => {
++  for (const c of opened.splice(0)) await c.client.close();
++  await server.close();
++});
++
++/** Replace the fields of a queued mutation, as a newer app version could have written them. */
++function rewriteQueued(dbPath: string, docId: string, fields: unknown): void {
++  const db = openDatabase(dbPath);
++  db.prepare("UPDATE outbox SET fields = ? WHERE doc_id = ?").run(JSON.stringify(fields), docId);
++  db.close();
++}
++
++describe("rejected mutations", () => {
++  it("are marked and kept out of later pushes while the rest of the batch syncs", async () => {
++    const dbPath = tempDbPath();
++    const writer = openClient(server, laptop, { dbPath });
++    writer.client.setMany(["n1", "n2", "n3"].map((id) => ({ collection: "notes" as const, id, fields: { title: id } })));
++    await writer.client.close();
++    rewriteQueued(dbPath, "n2", { title: "n2", archived: true });
++
++    const a = openClient(server, laptop, { dbPath });
++    opened.push(a);
++    expect(await a.client.sync()).toMatchObject({ pushed: 2 });
++    expect(a.client.pendingCount()).toBe(0);
++    expect(a.client.rejectedMutations()).toMatchObject([
++      { mutation: { docId: "n2", fields: { archived: true } }, code: "invalid_mutation" },
++    ]);
++    expect(a.client.rejectedMutations()[0]?.message).toMatch(/^mutation 1 /);
++    expect(await server.countEvents(laptop.userId)).toBe(2);
++
++    await a.client.sync();
++    expect(a.transport.count(PUSH_PATH)).toBe(1);
++  });
++
++  it("must name a mutation of the batch that was not acknowledged", async () => {
++    const serverHlc = formatHlc({ wallMs: new ManualClock().now(), counter: 0, node: "server" });
++    const rejection = { code: "invalid_mutation", message: "no", issues: [] };
++    for (const index of [0, 2]) {
++      const transport = new ScriptedTransport();
++      const client = SyncClient.open({ dbPath: IN_MEMORY, transport, clock: new ManualClock(), random: seededRandom(3) });
++      const [first] = client.setMany(
++        ["n1", "n2"].map((id) => ({ collection: "notes" as const, id, fields: { title: id } })),
++      );
++      transport.answerPush({ acked: [first?.mutationId ?? ""], rejected: [{ index, ...rejection }], serverHlc });
++      await expect(client.sync()).rejects.toBeInstanceOf(InvalidResponseError);
++      expect(client.pendingCount()).toBe(2);
++      expect(client.rejectedMutations()).toEqual([]);
++      await client.close();
++    }
++  });
++});
+diff --git a/packages/client/test/store/migrator.test.ts b/packages/client/test/store/migrator.test.ts
+index ac02670..e105718 100644
+--- a/packages/client/test/store/migrator.test.ts
++++ b/packages/client/test/store/migrator.test.ts
+@@ -1,4 +1,5 @@
+ import {
++  CLIENT_MIGRATIONS,
+   CLIENT_SCHEMA_VERSION,
+   IN_MEMORY,
+   SchemaVersionError,
+@@ -22,7 +23,16 @@ describe("client schema migrator", () => {
+     const db = openDatabase(IN_MEMORY);
+     expect(migrate(db)).toEqual({ from: 0, to: CLIENT_SCHEMA_VERSION });
+     expect(tables(db)).toEqual(["docs", "meta", "outbox"]);
+-    expect(schemaVersion(db)).toBe(1);
++    expect(schemaVersion(db)).toBe(CLIENT_SCHEMA_VERSION);
++    db.close();
++  });
++
++  it("keeps queued mutations when it adds the outbox's rejected_code", () => {
++    const db = openDatabase(IN_MEMORY);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
++    db.exec("INSERT INTO outbox (mutation_id, collection, doc_id, fields, hlc) VALUES ('m1', 'notes', 'n1', '{}', 'h')");
++    expect(migrate(db)).toEqual({ from: 1, to: 2 });
++    expect(db.prepare("SELECT mutation_id, rejected_code FROM outbox").all()).toEqual([{ mutation_id: "m1", rejected_code: null }]);
+     db.close();
+   });
+ 
+@@ -32,13 +42,13 @@ describe("client schema migrator", () => {
+     migrate(first);
+     first.close();
+     const again = openDatabase(path);
+-    expect(migrate(again)).toEqual({ from: 1, to: 1 });
++    expect(migrate(again)).toEqual({ from: CLIENT_SCHEMA_VERSION, to: CLIENT_SCHEMA_VERSION });
+     again.close();
+   });
+ 
+   it("applies later migrations in order", () => {
+     const db = openDatabase(IN_MEMORY);
+-    migrate(db);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
+     const steps: SchemaMigration[] = [
+       { version: 1, description: "base", up: () => expect.unreachable() },
+       { version: 2, description: "add a table", up: (d) => d.exec("CREATE TABLE extra (id TEXT)") },
+@@ -51,7 +61,7 @@ describe("client schema migrator", () => {
+ 
+   it("leaves the previous version intact when a migration fails", () => {
+     const db = openDatabase(IN_MEMORY);
+-    migrate(db);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
+     const steps: SchemaMigration[] = [
+       { version: 1, description: "base", up: () => undefined },
+       {
+diff --git a/packages/client/test/sync/pullPages.test.ts b/packages/client/test/sync/pullPages.test.ts
+index 1fc5833..bad5b6b 100644
+--- a/packages/client/test/sync/pullPages.test.ts
++++ b/packages/client/test/sync/pullPages.test.ts
+@@ -103,7 +103,7 @@ describe("pulling pages", () => {
+   });
+ 
+   it("keeps a newer local value over an older remote write", async () => {
+-    const transport = new ScriptedTransport().answerPush({ acked: [], serverHlc: formatHlc({ wallMs: clock.now(), counter: 0, node: "server" }) });
++    const transport = new ScriptedTransport().answerPush({ acked: [], rejected: [], serverHlc: formatHlc({ wallMs: clock.now(), counter: 0, node: "server" }) });
+     const client = open(transport);
+     client.set("notes", "n1", { title: "local" });
+     transport.answerPull(page([event(1, "title", "older"), event(2, "color", "red")], 2));
+diff --git a/packages/server/src/api/routes/sync.ts b/packages/server/src/api/routes/sync.ts
+index e897528..12fc2b2 100644
+--- a/packages/server/src/api/routes/sync.ts
++++ b/packages/server/src/api/routes/sync.ts
+@@ -19,7 +19,7 @@ export async function syncRoutes(app: FastifyInstance, options: RouteOptions): P
+     const auth = authOf(request);
+     const body = parse(pushBody, request.body, "body");
+     const result = await push.push(auth, body.mutations);
+-    return { acked: result.acked, serverHlc: result.serverHlc };
++    return { acked: result.acked, rejected: result.rejected, serverHlc: result.serverHlc };
+   });
+ 
+   app.get("/pull", async (request): Promise<PullResponse> => {
+diff --git a/packages/server/src/domain/errors.ts b/packages/server/src/domain/errors.ts
+index 7230603..957f5dc 100644
+--- a/packages/server/src/domain/errors.ts
++++ b/packages/server/src/domain/errors.ts
+@@ -53,8 +53,8 @@ export class EmailTakenError extends ConflictError {
+ 
+ /**
+  * One mutation of a push cannot be applied: unknown collection, unknown field, a value of the
+- * wrong type, a duplicate id within the request. The whole push is rejected; `index` is the
+- * mutation's position in the request.
++ * wrong type, a duplicate id within the request. Push reports it in the answer's `rejected`
++ * list and applies the rest of the request.
+  */
+ export class InvalidMutationError extends DomainError {
+   readonly code = "invalid_mutation";
+diff --git a/packages/server/src/repositories/mutations.ts b/packages/server/src/repositories/mutations.ts
+index 8037f38..77db506 100644
+--- a/packages/server/src/repositories/mutations.ts
++++ b/packages/server/src/repositories/mutations.ts
+@@ -7,6 +7,20 @@ export interface MutationRecord {
+   readonly hlc: string;
+ }
+ 
++/** The ids among `mutationIds` that the user's earlier pushes recorded. */
++export async function findRecordedMutations(
++  db: Queryable,
++  userId: string,
++  mutationIds: readonly string[],
++): Promise<Set<string>> {
++  if (mutationIds.length === 0) return new Set();
++  const result = await db.query<{ mutation_id: string }>(
++    "SELECT mutation_id FROM mutations WHERE user_id = $1 AND mutation_id = ANY($2::uuid[])",
++    [userId, mutationIds],
++  );
++  return new Set(result.rows.map((row) => row.mutation_id));
++}
++
+ /**
+  * Record mutations as received from the device and return the ids that were not recorded
+  * before. A mutation already recorded (a retried push) is left alone. A concurrent transaction
+diff --git a/packages/server/src/services/pushService.ts b/packages/server/src/services/pushService.ts
+index 82c0be0..6884b6a 100644
+--- a/packages/server/src/services/pushService.ts
++++ b/packages/server/src/services/pushService.ts
+@@ -9,10 +9,12 @@ import {
+   mergeWrites,
+   parseHlc,
+   type DocState,
++  type FieldIssue,
+   type Hlc,
+   type HlcTimestamp,
+   type MutationPayload,
+   type PhysicalClock,
++  type PushRejection,
+ } from "@sync/shared";
+ import type { Pool } from "../db/pool.js";
+ import { withTransaction } from "../db/tx.js";
+@@ -26,12 +28,14 @@ import {
+ import type { Logger } from "../infra/logger.js";
+ import { saveDocuments, loadDocuments, type DocRef, type DocumentWrite } from "../repositories/documents.js";
+ import { insertEvents, type NewEvent } from "../repositories/events.js";
+-import { claimMutations } from "../repositories/mutations.js";
++import { claimMutations, findRecordedMutations } from "../repositories/mutations.js";
+ import { lockUser } from "../repositories/users.js";
+ 
+ export interface PushResult {
+-  /** Every mutation id of the request, in request order. */
++  /** Every mutation id of the request that is now recorded, in request order. */
+   readonly acked: string[];
++  /** The mutations that were refused, in request order. */
++  readonly rejected: PushRejection[];
+   /** The server clock after receiving the mutations, as a canonical HLC string. */
+   readonly serverHlc: string;
+   /** Mutations seen for the first time (the others were acknowledged before). */
+@@ -47,9 +51,10 @@ interface CheckedMutation extends Omit<MutationPayload, "fields"> {
+ 
+ /**
+  * Applies pushed mutations. One request is one transaction: mutations already recorded are
+- * acknowledged without being applied again; the others are recorded, merged field by field into
+- * the stored documents (last writer wins by HLC), and every field write that wins becomes an
+- * event. A request with an invalid mutation changes nothing.
++ * acknowledged without being checked or applied again; the others are validated, and the valid
++ * ones are recorded, merged field by field into the stored documents (last writer wins by HLC),
++ * and every field write that wins becomes an event. An invalid mutation is rejected on its own
++ * and is not recorded, so the rest of the request still goes through.
+  */
+ export class PushService {
+   private readonly pool: Pool;
+@@ -65,20 +70,21 @@ export class PushService {
+   }
+ 
+   async push(auth: AuthContext, mutations: readonly MutationPayload[]): Promise<PushResult> {
+-    const checked = this.check(mutations);
+-    this.receiveTimestamps(checked);
++    this.receiveTimestamps(mutations);
+     // Taken before the transaction, so nothing can fail between the commit and the answer.
+     const serverHlc = formatHlc(this.tick(() => this.hlc.now()));
+     const receivedAt = new Date(this.clock.now());
+ 
+-    const { fresh, events } = await withTransaction(this.pool, async (client) => {
++    const { fresh, events, refused } = await withTransaction(this.pool, async (client) => {
+       // Pushes of one user run one at a time: their events get sequence numbers in commit
+       // order, so a pull that has seen seq N can never later miss an event below N.
+       if (!(await lockUser(client, auth.userId))) {
+         throw new UnauthorizedError("the device's user no longer exists");
+       }
+-      const claimed = await claimMutations(client, auth.userId, auth.deviceId, checked, receivedAt);
+-      const freshMutations = checked.filter((m) => claimed.has(m.mutationId));
++      const recorded = await findRecordedMutations(client, auth.userId, mutations.map((m) => m.mutationId));
++      const { accepted, refused } = this.check(mutations, recorded);
++      const claimed = await claimMutations(client, auth.userId, auth.deviceId, accepted, receivedAt);
++      const freshMutations = accepted.filter((m) => claimed.has(m.mutationId));
+       const refs = uniqueDocs(freshMutations);
+       const stored = await loadDocuments(client, auth.userId, refs);
+       const states = new Map<string, DocState>(
+@@ -118,37 +124,65 @@ export class PushService {
+         writes.push({ ...ref, ...state, updatedSeq: seq });
+       }
+       await saveDocuments(client, auth.userId, writes, receivedAt);
+-      return { fresh: freshMutations.length, events: inserted.length };
++      return { fresh: freshMutations.length, events: inserted.length, refused };
+     });
+ 
++    if (refused.size > 0) {
++      this.logger.info(
++        { userId: auth.userId, deviceId: auth.deviceId, rejected: refused.size },
++        "push rejected mutations",
++      );
++    }
+     this.logger.debug(
+-      { userId: auth.userId, deviceId: auth.deviceId, mutations: checked.length, fresh, events },
++      { userId: auth.userId, deviceId: auth.deviceId, mutations: mutations.length, fresh, events },
+       "push applied",
+     );
+-    return { acked: checked.map((m) => m.mutationId), serverHlc, fresh, applied: events };
++    return {
++      acked: mutations.filter((m) => !refused.has(m)).map((m) => m.mutationId),
++      rejected: [...refused.values()],
++      serverHlc,
++      fresh,
++      applied: events,
++    };
+   }
+ 
+-  /** Validate every mutation against its collection; the first invalid one rejects the request. */
+-  private check(mutations: readonly MutationPayload[]): CheckedMutation[] {
++  /**
++   * Validate the mutations not `recorded` yet against their collections. Returns the valid ones,
++   * and a rejection for each invalid one (an unknown collection or field, a value of the wrong
++   * type, an id that appears earlier in the request), keyed by the mutation. A mutation recorded
++   * by an earlier push is not checked again: it stays acknowledged even if the rules for its
++   * fields have changed since.
++   */
++  private check(
++    mutations: readonly MutationPayload[],
++    recorded: ReadonlySet<string>,
++  ): { accepted: CheckedMutation[]; refused: Map<MutationPayload, PushRejection> } {
+     const seen = new Set<string>();
+-    return mutations.map((mutation, index) => {
++    const accepted: CheckedMutation[] = [];
++    const refused = new Map<MutationPayload, PushRejection>();
++    const unseen = mutations.filter((m) => !recorded.has(m.mutationId));
++    unseen.forEach((mutation, index) => {
++      const reject = (issues: readonly FieldIssue[], summary?: string) => {
++        const err = new InvalidMutationError(index, mutation.mutationId, issues, summary);
++        refused.set(mutation, { index, code: err.code, message: err.message, issues: [...issues] });
++      };
+       if (seen.has(mutation.mutationId)) {
+-        throw new InvalidMutationError(
+-          index,
+-          mutation.mutationId,
++        reject(
+           [{ field: "", message: "the mutation id appears twice in this request" }],
+           `mutation ${index} (${mutation.mutationId}) repeats an earlier mutation id of the request`,
+         );
++        return;
+       }
+       seen.add(mutation.mutationId);
+       const result = checkFieldWrites(mutation.collection, mutation.fields);
+-      if (!result.ok) throw new InvalidMutationError(index, mutation.mutationId, result.issues);
+-      return { ...mutation, fields: result.fields };
++      if (result.ok) accepted.push({ ...mutation, fields: result.fields });
++      else reject(result.issues);
+     });
++    return { accepted, refused };
+   }
+ 
+   /** Merge every mutation's timestamp into the server clock; one too far ahead rejects the request. */
+-  private receiveTimestamps(mutations: readonly CheckedMutation[]): void {
++  private receiveTimestamps(mutations: readonly MutationPayload[]): void {
+     mutations.forEach((mutation, index) => {
+       try {
+         this.tick(() => this.hlc.receive(parseHlc(mutation.hlc)));
+diff --git a/packages/server/test/api/push.test.ts b/packages/server/test/api/push.test.ts
+index f80cae4..9c68608 100644
+--- a/packages/server/test/api/push.test.ts
++++ b/packages/server/test/api/push.test.ts
+@@ -141,29 +141,27 @@ describe("POST /v1/sync/push", () => {
+     expect(runs).toHaveLength(4);
+   });
+ 
+-  it("rejects the whole request when one mutation has an unknown collection", async () => {
+-    const res = await push(t, ada, [
+-      mutation({ hlc: hlc(now - 10) }),
+-      mutation({ hlc: hlc(now - 5), collection: "contacts" }),
+-    ]);
+-    expect(res.statusCode).toBe(422);
+-    expect(res.json()).toMatchObject({ error: { code: "invalid_mutation", details: { index: 1 } } });
+-    expect(await events()).toHaveLength(0);
+-    expect(await document()).toBeUndefined();
++  it("applies the valid mutations and rejects one with an unknown collection", async () => {
++    const valid = mutation({ hlc: hlc(now - 10) });
++    const res = await push(t, ada, [valid, mutation({ hlc: hlc(now - 5), collection: "contacts" })]);
++    expect(res.statusCode).toBe(200);
++    expect(res.json()).toMatchObject({ acked: [valid.mutationId], rejected: [{ index: 1, code: "invalid_mutation" }] });
++    expect(await events()).toHaveLength(1);
++    expect((await document())?.fields).toEqual({ title: "Groceries" });
+   });
+ 
+   it("names the mutation and field of a value of the wrong type", async () => {
+-    const bad = mutation({ hlc: hlc(now), fields: { title: "ok", pinned: "yes" } });
++    const bad = mutation({ docId: "note-2", hlc: hlc(now), fields: { title: "ok", pinned: "yes" } });
+     const res = await push(t, ada, [mutation({ hlc: hlc(now - 1) }), mutation({ hlc: hlc(now - 2) }), bad]);
+-    expect(res.statusCode).toBe(422);
+-    const body = res.json<{ error: { details: { index: number; mutationId: string; issues: { field: string }[] } } }>();
+-    expect(body.error.details.index).toBe(2);
+-    expect(body.error.details.mutationId).toBe(bad.mutationId);
+-    expect(body.error.details.issues.map((i) => i.field)).toEqual(["pinned"]);
+-    expect(await events()).toHaveLength(0);
++    const body = res.json<PushResponse>();
++    expect(body.acked).toHaveLength(2);
++    expect(body.rejected).toHaveLength(1);
++    expect(body.rejected[0]).toMatchObject({ index: 2, message: `mutation 2 (${bad.mutationId}) is invalid` });
++    expect(body.rejected[0]?.issues.map((i) => i.field)).toEqual(["pinned"]);
++    expect(await document("note-2")).toBeUndefined();
+   });
+ 
+-  it("rejects unknown fields, empty writes and impossible dates", async () => {
++  it("rejects unknown fields, empty writes and impossible dates, and does not record them", async () => {
+     const cases = [
+       mutation({ hlc: hlc(now), fields: { colour: "red" } }),
+       mutation({ hlc: hlc(now), fields: {} }),
+@@ -171,15 +169,17 @@ describe("POST /v1/sync/push", () => {
+       mutation({ hlc: hlc(now), fields: { title: "nul \u0000 inside" } }),
+     ];
+     for (const m of cases) {
+-      expect((await push(t, ada, [m])).statusCode).toBe(422);
++      for (let attempt = 0; attempt < 2; attempt++) {
++        expect((await push(t, ada, [m])).json()).toMatchObject({ acked: [], rejected: [{ index: 0 }] });
++      }
+     }
++    expect(await events()).toHaveLength(0);
+   });
+ 
+-  it("rejects a request that repeats a mutation id", async () => {
++  it("applies the first of two mutations with the same id and rejects the second", async () => {
+     const m = mutation({ hlc: hlc(now) });
+     const res = await push(t, ada, [m, { ...m, hlc: hlc(now + 1) }]);
+-    expect(res.statusCode).toBe(422);
+-    expect(res.json()).toMatchObject({ error: { details: { index: 1 } } });
++    expect(res.json()).toMatchObject({ acked: [m.mutationId], rejected: [{ index: 1 }] });
+   });
+ 
+   it("rejects malformed envelopes with 400", async () => {
+diff --git a/packages/shared/src/core/protocol.ts b/packages/shared/src/core/protocol.ts
+index a07635c..b5f3188 100644
+--- a/packages/shared/src/core/protocol.ts
++++ b/packages/shared/src/core/protocol.ts
+@@ -37,9 +37,23 @@ export const pushRequestSchema = z.strictObject({
+   mutations: z.array(mutationSchema).min(1),
+ });
+ 
++/**
++ * A mutation the server refused (an unknown collection or field, a value of the wrong type, an
++ * id repeated within the request). It is not recorded; the rest of the request is applied.
++ */
++export const pushRejectionSchema = z.object({
++  /** The mutation's position in the request's `mutations`, from 0. */
++  index: z.int().min(0),
++  code: z.string(),
++  message: z.string(),
++  issues: z.array(z.object({ field: z.string(), message: z.string() })),
++});
++
+ export const pushResponseSchema = z.object({
+   /** Every mutation of the request that the server has now recorded, applied or not. */
+   acked: z.array(uuidSchema),
++  /** The mutations of the request that the server refused, in request order. */
++  rejected: z.array(pushRejectionSchema).default([]),
+   /** The server's clock after receiving the mutations. */
+   serverHlc: hlcSchema,
+ });
+@@ -114,6 +128,7 @@ export const errorBodySchema = z.object({
+ export type MutationPayload = z.output<typeof mutationSchema>;
+ export type PushRequest = z.output<typeof pushRequestSchema>;
+ export type PushResponse = z.output<typeof pushResponseSchema>;
++export type PushRejection = z.output<typeof pushRejectionSchema>;
+ export type PullRequest = z.output<typeof pullRequestSchema>;
+ export type SyncEvent = z.output<typeof syncEventSchema>;
+ export type PullResponse = z.output<typeof pullResponseSchema>;

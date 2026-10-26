@@ -1,0 +1,58 @@
+diff --git a/src/repositories/fileRepo.ts b/src/repositories/fileRepo.ts
+index bc3aaeb..958e625 100644
+--- a/src/repositories/fileRepo.ts
++++ b/src/repositories/fileRepo.ts
+@@ -224,6 +224,15 @@ export async function markObjectsDeleted(db: Queryable, ids: string[], now: Date
+   );
+ }
+ 
++/** Whether a file that is not deleted still uses this storage key (deduplicated files share keys). */
++export async function isStorageKeyInUse(db: Queryable, storageKey: string): Promise<boolean> {
++  const result = await db.query(
++    "SELECT 1 FROM files WHERE storage_key = $1 AND status <> 'deleted' LIMIT 1",
++    [storageKey],
++  );
++  return result.rows.length > 0;
++}
++
+ /**
+  * Deleted files whose storage object may still exist and whose grace period is over, locked for
+  * the caller's transaction. Rows another cleanup run holds are skipped.
+diff --git a/src/services/cleanup.ts b/src/services/cleanup.ts
+index b2048bf..663c659 100644
+--- a/src/services/cleanup.ts
++++ b/src/services/cleanup.ts
+@@ -106,7 +106,10 @@ export class CleanupService {
+         const gone: string[] = [];
+         for (const file of due) {
+           try {
+-            await storage.delete(file.storageKey);
++            // A deduplicated object stays while another live file uses it.
++            if (!(await files.isStorageKeyInUse(client, file.storageKey))) {
++              await storage.delete(file.storageKey);
++            }
+             gone.push(file.id);
+           } catch (err) {
+             logger.warn({ err, fileId: file.id }, "could not remove a deleted file's object");
+diff --git a/src/services/fileCatalog.ts b/src/services/fileCatalog.ts
+index 7e95679..74a5323 100644
+--- a/src/services/fileCatalog.ts
++++ b/src/services/fileCatalog.ts
+@@ -140,12 +140,15 @@ export class FileCatalog {
+ 
+   /**
+    * Remove the storage object of a file whose row is already soft-deleted and committed, and
+-   * record that it is gone. A failure is logged and left for the cleanup job, never thrown: the
++   * record that it is gone. An object another live file still shares is kept; the deleted row
++   * no longer owns it. A failure is logged and left for the cleanup job, never thrown: the
+    * request that deleted the file has succeeded.
+    */
+   async removeObjectOf(file: FileRecord): Promise<void> {
+     try {
+-      await this.deps.storage.delete(file.storageKey);
++      if (!(await files.isStorageKeyInUse(this.deps.pool, file.storageKey))) {
++        await this.deps.storage.delete(file.storageKey);
++      }
+       await files.markObjectsDeleted(this.deps.pool, [file.id], this.deps.clock.now());
+     } catch (err) {
+       this.deps.logger.warn(

@@ -1,0 +1,15 @@
+diff --git a/packages/server/src/services/pushService.ts b/packages/server/src/services/pushService.ts
+index 6884b6a..074c75c 100644
+--- a/packages/server/src/services/pushService.ts
++++ b/packages/server/src/services/pushService.ts
+@@ -160,8 +160,8 @@ export class PushService {
+     const seen = new Set<string>();
+     const accepted: CheckedMutation[] = [];
+     const refused = new Map<MutationPayload, PushRejection>();
+-    const unseen = mutations.filter((m) => !recorded.has(m.mutationId));
+-    unseen.forEach((mutation, index) => {
++    mutations.forEach((mutation, index) => {
++      if (recorded.has(mutation.mutationId)) return;
+       const reject = (issues: readonly FieldIssue[], summary?: string) => {
+         const err = new InvalidMutationError(index, mutation.mutationId, issues, summary);
+         refused.set(mutation, { index, code: err.code, message: err.message, issues: [...issues] });

@@ -1,0 +1,407 @@
+diff --git a/README.md b/README.md
+index 2ae945d..43a88d6 100644
+--- a/README.md
++++ b/README.md
+@@ -13,13 +13,13 @@ pydantic-settings and structlog; managed with uv.
+ 
+ **Sources.** Declared in code in `src/etl/sources/registry.py`. Each names its file format, the
+ columns its exports must have, the IANA zone of its naive timestamps, how ambiguous local times
+-are read, and the lookback of its incremental window:
++are read, the lookback of its incremental window, and its max age (freshness, see Runs):
+ 
+-| Source | Format | Timestamps | Lookback |
+-|---|---|---|---|
+-| `orders` | CSV, `;` delimiter, decimal comma; one row per order line | `DD.MM.YYYY HH:MM[:SS]`, Europe/Berlin, ambiguous times read as the earlier one | 6 h |
+-| `customers` | JSON Lines, UTF-8 | ISO 8601, UTC when no offset is given | 1 h |
+-| `products` | CSV, `,` delimiter, `.` decimals, UTF-8 with or without a BOM | ISO 8601, UTC when no offset is given | 1 h |
++| Source | Format | Timestamps | Lookback | Max age |
++|---|---|---|---|---|
++| `orders` | CSV, `;` delimiter, decimal comma; one row per order line | `DD.MM.YYYY HH:MM[:SS]`, Europe/Berlin, ambiguous times read as the earlier one | 6 h | 2 h |
++| `customers` | JSON Lines, UTF-8 | ISO 8601, UTC when no offset is given | 1 h | 26 h |
++| `products` | CSV, `,` delimiter, `.` decimals, UTF-8 with or without a BOM | ISO 8601, UTC when no offset is given | 1 h | 7 days |
+ 
+ Any file may be gzip-compressed (recognised by its content, not its name). Readers stream the
+ file and number its lines. A header that lacks a required column or names one twice fails the
+@@ -82,6 +82,9 @@ newer data.
+ A PostgreSQL advisory lock per source stops two runs of one source at once (`RunLocked`); a
+ run left `running` by a process that died is marked failed by the next run. Everything a run
+ writes to the warehouse, the watermark and its check results commit together or not at all.
++A source is stale when its last succeeded run finished more than its max age ago, or when it
++has never had one; `etl sources stale` lists every source's freshness and exits 17 when any
++is stale, so a scheduler or a monitoring check can alert on it.
+ 
+ **Quality checks.** Declared per table in `src/etl/quality/registry.py`: not-null, unique,
+ accepted values, referential (every order's customer exists) and row-count delta against the
+@@ -116,6 +119,7 @@ etl watermark show <source> [--json]
+ etl watermark reset <source> [--to INSTANT] [--yes]
+ etl sources list [--json]
+ etl sources show <source> [--json]           how the source's files are read
++etl sources stale [--json]                   freshness per source; exits 17 when one is stale
+ etl db check [--config alembic.ini] [--json] reachable, schema revision against the code
+ etl db upgrade [--config alembic.ini]        apply missing migrations
+ etl settings [--json]                        effective configuration, password masked
+@@ -142,6 +146,7 @@ fails. Exit codes:
+ | 14 | `WatermarkConflict`: the watermark changed during the run |
+ | 15 | `RunLocked`: another run of the source is in progress |
+ | 16 | `SchemaNotCurrent`: the database schema is behind the code (`db check`) |
++| 17 | `SourcesStale`: a source has had no successful run within its max age (`sources stale`) |
+ | 20 | other `EtlError` |
+ 
+ The mapping lives in `src/etl/errors.py` (`EXIT_CODES`).
+diff --git a/src/etl/api/sources.py b/src/etl/api/sources.py
+index e54a328..d595eee 100644
+--- a/src/etl/api/sources.py
++++ b/src/etl/api/sources.py
+@@ -2,9 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++from datetime import timedelta
++
+ from etl.api.context import AppContext
+ from etl.infra.locks import is_locked
+-from etl.schemas.views import SourceStatusView, SourceView
++from etl.schemas.views import FreshnessView, SourceStatusView, SourceView
+ from etl.sources.registry import CsvFormat, SourceSpec, get_source
+ from etl.store import runs, watermarks
+ 
+@@ -23,6 +25,7 @@ def _view(spec: SourceSpec) -> SourceView:
+         ambiguous_times=str(spec.ambiguous_times),
+         timestamp_formats=list(spec.timestamp_formats),
+         lookback=spec.lookback,
++        max_age=spec.max_age,
+         required_columns=list(spec.required_columns),
+         optional_columns=list(spec.optional_columns),
+         description=spec.description,
+@@ -63,3 +66,28 @@ def source_status(context: AppContext, source: str | None = None) -> list[Source
+                 )
+             )
+     return views
++
++
++def source_freshness(context: AppContext) -> list[FreshnessView]:
++    """Per source: when its last successful run finished, and whether that was more than the
++    source's max age ago (stale). A source without any successful run is stale."""
++    now = context.clock.now()
++    views = []
++    with context.engine.connect() as connection:
++        for name in sorted(context.sources):
++            spec = context.sources[name]
++            succeeded = runs.last_succeeded(connection, name)
++            finished = succeeded.finished_at if succeeded is not None else None
++            # A finish time ahead of this clock (another host's clock) counts as just now.
++            age = max(now - finished, timedelta(0)) if finished is not None else None
++            views.append(
++                FreshnessView(
++                    source=name,
++                    max_age=spec.max_age,
++                    last_succeeded_run_id=succeeded.id if succeeded is not None else None,
++                    last_succeeded_at=finished,
++                    age=age,
++                    stale=age is None or age > spec.max_age,
++                )
++            )
++    return views
+diff --git a/src/etl/cli/sources.py b/src/etl/cli/sources.py
+index 452cb0a..daa9bde 100644
+--- a/src/etl/cli/sources.py
++++ b/src/etl/cli/sources.py
+@@ -1,5 +1,6 @@
+-"""`etl sources list|show` and `etl status`."""
++"""`etl sources list|show|stale` and `etl status`."""
+ 
++from datetime import timedelta
+ from typing import Annotated
+ 
+ import typer
+@@ -7,6 +8,7 @@ import typer
+ from etl.api import sources as sources_api
+ from etl.cli.common import app_context, guarded
+ from etl.cli.output import echo_json, format_time, render_table
++from etl.errors import SourcesStale
+ from etl.schemas.views import SourceView
+ 
+ sources_app = typer.Typer(help="Declared sources.", no_args_is_help=True)
+@@ -28,6 +30,7 @@ def describe_source(view: SourceView) -> str:
+         f"  timestamps       {formats}; naive ones in {view.zone}",
+         f"  ambiguous times  {view.ambiguous_times}",
+         f"  lookback         {view.lookback}",
++        f"  max age          {view.max_age}",
+         f"  required         {', '.join(view.required_columns)}",
+         f"  optional         {', '.join(view.optional_columns) or '-'}",
+     ]
+@@ -66,6 +69,45 @@ def show_command(
+         typer.echo(describe_source(view))
+ 
+ 
++def _format_age(age: timedelta | None) -> str:
++    if age is None:
++        return "never"
++    return str(timedelta(seconds=int(age.total_seconds())))
++
++
++@sources_app.command("stale")
++@guarded
++def stale_command(
++    ctx: typer.Context,
++    as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
++) -> None:
++    """Show how long ago each source last loaded successfully.
++
++    Exits with the stale-sources code when a source has had no successful run within its max
++    age.
++    """
++    views = sources_api.source_freshness(app_context(ctx))
++    if as_json:
++        echo_json(views)
++    else:
++        rows = [
++            [
++                view.source,
++                "STALE" if view.stale else "fresh",
++                str(view.max_age),
++                str(view.last_succeeded_run_id) if view.last_succeeded_run_id is not None else "-",
++                format_time(view.last_succeeded_at),
++                _format_age(view.age),
++            ]
++            for view in views
++        ]
++        header = ["source", "state", "max age", "last good", "succeeded at", "age"]
++        typer.echo(render_table(header, rows))
++    stale = [view.source for view in views if view.stale]
++    if stale:
++        raise SourcesStale(stale)
++
++
+ def register(app: typer.Typer) -> None:
+     @app.command("status")
+     @guarded
+diff --git a/src/etl/errors.py b/src/etl/errors.py
+index e6ef784..717a68b 100644
+--- a/src/etl/errors.py
++++ b/src/etl/errors.py
+@@ -139,6 +139,14 @@ class SchemaNotCurrent(EtlError):
+         )
+ 
+ 
++class SourcesStale(EtlError):
++    """At least one source has had no successful run within its max age."""
++
++    def __init__(self, sources: Sequence[str]) -> None:
++        self.sources = list(sources)
++        super().__init__("no successful run within the max age of: " + ", ".join(self.sources))
++
++
+ EXIT_OK = 0
+ EXIT_UNEXPECTED = 1
+ 
+@@ -153,6 +161,7 @@ EXIT_CODES: dict[type[EtlError], int] = {
+     WatermarkConflict: 14,
+     RunLocked: 15,
+     SchemaNotCurrent: 16,
++    SourcesStale: 17,
+     EtlError: 20,
+ }
+ 
+diff --git a/src/etl/schemas/views.py b/src/etl/schemas/views.py
+index c5592cf..32bbe22 100644
+--- a/src/etl/schemas/views.py
++++ b/src/etl/schemas/views.py
+@@ -109,6 +109,7 @@ class SourceView(View):
+     ambiguous_times: str
+     timestamp_formats: list[str]
+     lookback: timedelta
++    max_age: timedelta
+     required_columns: list[str]
+     optional_columns: list[str]
+     description: str
+@@ -126,6 +127,17 @@ class SourceStatusView(View):
+     last_succeeded_at: datetime | None
+ 
+ 
++class FreshnessView(View):
++    source: str
++    max_age: timedelta
++    last_succeeded_run_id: int | None
++    last_succeeded_at: datetime | None
++    # Time since the last successful run finished; None when no run of the source succeeded.
++    age: timedelta | None
++    # No successful run, or the last one finished more than max_age ago.
++    stale: bool
++
++
+ class RejectView(View):
+     """A rejected row without its values: those may be personal data."""
+ 
+diff --git a/src/etl/sources/registry.py b/src/etl/sources/registry.py
+index 2d7a0fb..42a98f0 100644
+--- a/src/etl/sources/registry.py
++++ b/src/etl/sources/registry.py
+@@ -61,12 +61,17 @@ class SourceSpec:
+     timestamp_formats: tuple[str, ...] = ()
+     # Rows with updated_at at or before (watermark - lookback) are skipped.
+     lookback: timedelta = timedelta(hours=1)
++    # Freshness: the source is stale when its last successful run finished longer ago than
++    # this (`etl sources stale`).
++    max_age: timedelta = timedelta(days=1)
+     description: str = field(default="", compare=False)
+ 
+     def __post_init__(self) -> None:
+         load_zone(self.zone)
+         if self.lookback < timedelta(0):
+             raise ValueError(f"{self.name}: lookback must not be negative")
++        if self.max_age <= timedelta(0):
++            raise ValueError(f"{self.name}: max_age must be positive")
+         overlap = set(self.required_columns) & set(self.optional_columns)
+         if overlap:
+             raise ValueError(f"{self.name}: columns both required and optional: {overlap}")
+@@ -101,6 +106,7 @@ ORDERS = SourceSpec(
+     ambiguous_times=AmbiguousTimePolicy.EARLIER,
+     timestamp_formats=("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M"),
+     lookback=timedelta(hours=6),
++    max_age=timedelta(hours=2),
+     description="Shop order export: one row per order line, local Berlin time",
+ )
+ 
+@@ -112,6 +118,7 @@ CUSTOMERS = SourceSpec(
+     optional_columns=("email", "full_name", "phone", "country", "marketing_opt_in"),
+     zone="UTC",
+     lookback=timedelta(hours=1),
++    max_age=timedelta(hours=26),
+     description="CRM customer export: JSON Lines, optionally gzip-compressed",
+ )
+ 
+@@ -123,6 +130,7 @@ PRODUCTS = SourceSpec(
+     optional_columns=("category", "active"),
+     zone="UTC",
+     lookback=timedelta(hours=1),
++    max_age=timedelta(days=7),
+     description="Catalogue export: UTF-8 CSV, with or without a byte-order mark",
+ )
+ 
+diff --git a/tests/cli/test_sources_commands.py b/tests/cli/test_sources_commands.py
+index d4d52a7..0f8aadb 100644
+--- a/tests/cli/test_sources_commands.py
++++ b/tests/cli/test_sources_commands.py
+@@ -3,7 +3,14 @@ from __future__ import annotations
+ import json
+ 
+ from tests.helpers.db import HeldLock
+-from tests.helpers.factories import product_row, write_products
++from tests.helpers.factories import (
++    customer_obj,
++    order_row,
++    product_row,
++    write_customers,
++    write_orders,
++    write_products,
++)
+ 
+ 
+ def test_sources_list_shows_every_declared_source(cli):
+@@ -22,6 +29,7 @@ def test_sources_show_describes_how_a_file_is_read(cli):
+     assert "naive ones in Europe/Berlin" in result.stdout
+     assert "ambiguous times  earlier" in result.stdout
+     assert "lookback         6:00:00" in result.stdout
++    assert "max age          2:00:00" in result.stdout
+ 
+ 
+ def test_sources_show_as_json(cli):
+@@ -66,3 +74,57 @@ def test_status_shows_a_run_in_progress(cli, db):
+     assert result.exit_code == 0, result.output
+     states = {line.split()[0]: line.split()[1] for line in result.stdout.splitlines()[2:]}
+     assert states == {"customers": "idle", "orders": "running", "products": "idle"}
++
++
++def load_everything(cli, tmp_path):
++    for source, path in [
++        ("customers", write_customers(tmp_path, [customer_obj()])),
++        ("products", write_products(tmp_path, [product_row()])),
++        ("orders", write_orders(tmp_path, [order_row()])),
++    ]:
++        assert cli("run", source, path).exit_code == 0
++
++
++def stale_states(result):
++    return {line.split()[0]: line.split()[1] for line in result.stdout.splitlines()[2:]}
++
++
++def test_sources_without_a_successful_run_are_stale(cli, tmp_path):
++    cli("run", "products", write_products(tmp_path, [product_row(price="abc")] * 3))
++
++    result = cli("sources", "stale")
++
++    assert result.exit_code == 17
++    assert stale_states(result) == {"customers": "STALE", "orders": "STALE", "products": "STALE"}
++    assert "customers, orders, products" in result.stderr
++
++
++def test_sources_loaded_within_their_max_age_are_fresh(cli, clock, tmp_path):
++    load_everything(cli, tmp_path)
++    clock.advance(minutes=90)
++
++    result = cli("sources", "stale")
++
++    assert result.exit_code == 0, result.output
++    assert stale_states(result) == {"customers": "fresh", "orders": "fresh", "products": "fresh"}
++    assert "1:30:00" in result.stdout
++
++
++def test_only_the_sources_past_their_max_age_are_stale(cli, clock, tmp_path):
++    load_everything(cli, tmp_path)
++    clock.advance(hours=3)
++    cli("run", "orders", write_orders(tmp_path, [order_row(updated_at="02.03.2026 11:00:00")]))
++    clock.advance(hours=24)
++
++    result = cli("sources", "stale", "--json")
++
++    assert result.exit_code == 17
++    views = {view["source"]: view for view in json.loads(result.stdout)}
++    assert {name: view["stale"] for name, view in views.items()} == {
++        "customers": True,
++        "orders": True,
++        "products": False,
++    }
++    assert views["customers"]["age"] == "P1DT3H"
++    assert views["orders"]["last_succeeded_run_id"] == 4
++    assert "customers, orders" in result.stderr
+diff --git a/tests/sources/test_registry.py b/tests/sources/test_registry.py
+index 49d5575..ff7cf2e 100644
+--- a/tests/sources/test_registry.py
++++ b/tests/sources/test_registry.py
+@@ -20,6 +20,7 @@ def test_every_source_is_bound_to_a_dataset_and_reads_its_zone():
+         assert spec.required_columns
+         assert spec.tz.key == spec.zone
+         assert spec.lookback >= timedelta(0)
++        assert spec.max_age > timedelta(0)
+ 
+ 
+ def test_specs_refuse_inconsistent_declarations():
+@@ -27,5 +28,7 @@ def test_specs_refuse_inconsistent_declarations():
+         SourceSpec("x", Dataset.ORDERS, CsvFormat(";", ","), ("a",), zone="Nowhere/Town")
+     with pytest.raises(ValueError, match="lookback"):
+         SourceSpec("x", Dataset.ORDERS, CsvFormat(";", ","), ("a",), lookback=timedelta(-1))
++    with pytest.raises(ValueError, match="max_age"):
++        SourceSpec("x", Dataset.ORDERS, CsvFormat(";", ","), ("a",), max_age=timedelta(0))
+     with pytest.raises(ValueError, match="decimal separator"):
+         CsvFormat(",", ",")
+diff --git a/tests/unit/test_errors.py b/tests/unit/test_errors.py
+index a9899a7..e7aece6 100644
+--- a/tests/unit/test_errors.py
++++ b/tests/unit/test_errors.py
+@@ -19,6 +19,7 @@ from etl.errors import (
+     SchemaNotCurrent,
+     SourceFileNotFound,
+     SourceFormatError,
++    SourcesStale,
+     TooManyRejects,
+     UnknownSource,
+     WatermarkConflict,
+@@ -42,6 +43,7 @@ from etl.errors import (
+         (WatermarkConflict("orders"), 14),
+         (RunLocked("orders"), 15),
+         (SchemaNotCurrent("0003", "0004"), 16),
++        (SourcesStale(["orders"]), 17),
+         (EtlError("x"), 20),
+         (ValueError("x"), EXIT_UNEXPECTED),
+     ],

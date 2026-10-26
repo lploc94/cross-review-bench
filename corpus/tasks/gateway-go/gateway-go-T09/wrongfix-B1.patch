@@ -1,0 +1,14 @@
+diff --git a/internal/proxy/mirror.go b/internal/proxy/mirror.go
+index af777ce..cfd7dc3 100644
+--- a/internal/proxy/mirror.go
++++ b/internal/proxy/mirror.go
+@@ -64,6 +64,9 @@ func (h *Handler) mirror(ex *exchange, body *requestBody) {
+ 			h.metrics.mirrors.Inc("failed")
+ 			return
+ 		}
++		// Read the shadow's answer to its end, so the connection goes back to the pool.
++		_, _ = io.Copy(io.Discard, resp.Body)
++		resp.Body.Close()
+ 		h.metrics.mirrors.Inc("ok")
+ 	}()
+ }

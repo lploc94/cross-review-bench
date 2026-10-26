@@ -1,0 +1,59 @@
+diff --git a/src/main/java/com/innkeep/booking/domain/PromoCode.java b/src/main/java/com/innkeep/booking/domain/PromoCode.java
+index 08afaed..ea0f633 100644
+--- a/src/main/java/com/innkeep/booking/domain/PromoCode.java
++++ b/src/main/java/com/innkeep/booking/domain/PromoCode.java
+@@ -10,7 +10,10 @@ import jakarta.persistence.JoinColumn;
+ import jakarta.persistence.ManyToOne;
+ import jakarta.persistence.Table;
+ import java.math.BigDecimal;
++import java.time.Instant;
+ import java.time.LocalDate;
++import java.time.ZoneId;
++import java.time.ZoneOffset;
+ import java.util.ArrayList;
+ import org.hibernate.annotations.DynamicUpdate;
+ 
+@@ -112,9 +115,13 @@ public class PromoCode extends AbstractEntity<Long> {
+     return enabled;
+   }
+ 
+-  /** Whether a booking made on {@code today}, the property's local date, may use the code. */
+-  public boolean isValidOn(LocalDate today) {
+-    return !today.isBefore(validFrom) && today.isBefore(validUntil);
++  /**
++   * Whether a booking made at {@code now} may use the code: from {@code validFrom} at the property
++   * (zone {@code zone}) until the end of {@code validUntil}, both days included.
++   */
++  public boolean isValidAt(Instant now, ZoneId zone) {
++    Instant end = validUntil.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC);
++    return !LocalDate.ofInstant(now, zone).isBefore(validFrom) && now.isBefore(end);
+   }
+ 
+   public boolean hasUsesLeft() {
+diff --git a/src/main/java/com/innkeep/booking/service/PromoService.java b/src/main/java/com/innkeep/booking/service/PromoService.java
+index 7ba7a95..018b52e 100644
+--- a/src/main/java/com/innkeep/booking/service/PromoService.java
++++ b/src/main/java/com/innkeep/booking/service/PromoService.java
+@@ -8,6 +8,7 @@ import com.innkeep.booking.domain.Property;
+ import com.innkeep.booking.domain.ValidationException;
+ import com.innkeep.booking.persistence.PromoCodeRepository;
+ import java.time.Clock;
++import java.time.Instant;
+ import java.time.LocalDate;
+ import java.util.List;
+ import java.util.Locale;
+@@ -98,11 +99,12 @@ public class PromoService {
+         promos
+             .findByPropertyIdAndCode(property.getId(), normalize(code))
+             .orElseThrow(() -> new ValidationException("unknown promo code " + code));
+-    LocalDate today = LocalDate.ofInstant(clock.instant(), property.zone());
++    Instant now = clock.instant();
++    LocalDate today = LocalDate.ofInstant(now, property.zone());
+     if (!promo.isEnabled()) {
+       throw new ValidationException("promo code " + promo.getCode() + " is disabled");
+     }
+-    if (!promo.isValidOn(today)) {
++    if (!promo.isValidAt(now, property.zone())) {
+       throw new ValidationException("promo code " + promo.getCode() + " is not valid on " + today);
+     }
+     if (!promo.hasUsesLeft()) {

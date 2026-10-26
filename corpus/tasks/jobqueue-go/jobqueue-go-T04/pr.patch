@@ -1,0 +1,465 @@
+diff --git a/README.md b/README.md
+index 7c29825..82bb790 100644
+--- a/README.md
++++ b/README.md
+@@ -43,8 +43,11 @@ available ──cancel──▶ cancelled
+   attempt.
+ - `attempts` counts leases. A job is dead once `attempts >= max_attempts`.
+ - Handlers run with the timeout of their type (`JOB_TIMEOUT` unless registered with
+-  `worker.WithTimeout`). A handler that may outlive its lease calls `worker.ExtendLease(ctx)`;
+-  the `sleep` handler shows how.
++  `worker.WithTimeout`). While a handler runs, its worker renews the job's lease every third of
++  `LEASE_DURATION`, so a handler may run longer than one lease. If a renewal finds the lease
++  lost (the reaper gave the job to another worker), the handler's context is cancelled.
++  `jobqueue_lease_renewals_total{queue,result}` counts renewals by result (`renewed`, `lost`,
++  `error`). Handlers can still call `worker.ExtendLease(ctx)` to check that they hold the lease.
+ - A panicking handler fails its attempt with the panic message; the worker carries on.
+ - `Stop` (on SIGTERM or SIGINT) stops leasing and waits for running handlers to return. It does
+   not cancel them.
+@@ -92,8 +95,8 @@ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ | `WORKER_QUEUES` | `default` | comma-separated queues this instance works on |
+ | `WORKER_CONCURRENCY` | `4` | worker goroutines per queue; `0` runs the API only |
+ | `WORKER_POLL_INTERVAL` | `1s` | how often an idle worker looks for jobs |
+-| `LEASE_DURATION` | `5m` | how long a leased job belongs to its worker |
+-| `JOB_TIMEOUT` | `1m` | default handler timeout; must be shorter than `LEASE_DURATION` |
++| `LEASE_DURATION` | `5m` | how long a leased job belongs to its worker without a renewal; at least `3s` |
++| `JOB_TIMEOUT` | `1m` | default handler timeout; may be longer than `LEASE_DURATION` |
+ | `RETRY_DELAY` | `30s` | wait before a failed attempt runs again |
+ | `REAP_INTERVAL` | `30s` | how often expired leases are recovered |
+ | `SCHEDULER_INTERVAL` | `10s` | how often due schedules are fired |
+diff --git a/internal/builtin/builtin.go b/internal/builtin/builtin.go
+index e78e13a..8281ce4 100644
+--- a/internal/builtin/builtin.go
++++ b/internal/builtin/builtin.go
+@@ -49,8 +49,7 @@ func Register(reg *worker.Registry, opts Options) {
+ 	}
+ 	reg.Register(TypeNoop, Noop)
+ 	reg.Register(TypeSleep, Sleep(opts.Clock, opts.LeaseDuration/2), worker.WithTimeout(MaxSleep+time.Minute))
+-	// http.post keeps the registry's default timeout, which the configuration keeps shorter
+-	// than the lease; it does not extend its lease.
++	// http.post keeps the registry's default timeout; the pool renews its lease while it runs.
+ 	reg.Register(TypeHTTPPost, HTTPPost(opts.HTTPClient))
+ }
+ 
+diff --git a/internal/config/config.go b/internal/config/config.go
+index a11eebd..1b2285b 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -19,6 +19,10 @@ import (
+ // minTokenLength is the shortest admin token accepted; shorter tokens are too easy to guess.
+ const minTokenLength = 32
+ 
++// minLeaseDuration is the shortest LEASE_DURATION accepted. Workers renew leases every third
++// of it, so a shorter lease would keep them busy renewing.
++const minLeaseDuration = 3 * time.Second
++
+ // Database is the database connection configuration, the only part `jobqueue migrate` needs.
+ type Database struct {
+ 	URL      string
+@@ -124,10 +128,9 @@ func (c Config) validate(r *reader) {
+ 	if c.RetryDelay < 0 {
+ 		r.fail("RETRY_DELAY", "must not be negative")
+ 	}
+-	// Without lease renewal, a handler that outlives its lease is reaped and run a second time
+-	// while the first run is still going.
+-	if c.JobTimeout > 0 && c.LeaseDuration > 0 && c.JobTimeout >= c.LeaseDuration {
+-		r.fail("JOB_TIMEOUT", "must be shorter than LEASE_DURATION (%s)", c.LeaseDuration)
++	// Workers renew the lease of a running job, so JOB_TIMEOUT may be longer than the lease.
++	if c.LeaseDuration > 0 && c.LeaseDuration < minLeaseDuration {
++		r.fail("LEASE_DURATION", "must be at least %s", minLeaseDuration)
+ 	}
+ }
+ 
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index ad4dc14..dceb050 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -92,13 +92,41 @@ func TestLoadReportsEveryProblem(t *testing.T) {
+ 	}
+ }
+ 
+-func TestJobTimeoutMustBeShorterThanLease(t *testing.T) {
++func TestJobTimeoutMayExceedLease(t *testing.T) {
+ 	vars := base()
+ 	vars["LEASE_DURATION"] = "1m"
+-	vars["JOB_TIMEOUT"] = "1m"
+-	_, err := LoadFrom(env(vars))
+-	if err == nil || !strings.Contains(err.Error(), "JOB_TIMEOUT must be shorter than LEASE_DURATION") {
+-		t.Errorf("error = %v", err)
++	vars["JOB_TIMEOUT"] = "10m"
++	cfg, err := LoadFrom(env(vars))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.JobTimeout != 10*time.Minute || cfg.LeaseDuration != time.Minute {
++		t.Errorf("timeout %s, lease %s", cfg.JobTimeout, cfg.LeaseDuration)
++	}
++}
++
++func TestLeaseDurationMinimum(t *testing.T) {
++	cases := []struct {
++		lease string
++		ok    bool
++	}{
++		{"3s", true},
++		{"10m", true},
++		{"2999ms", false},
++		{"1s", false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.lease, func(t *testing.T) {
++			vars := base()
++			vars["LEASE_DURATION"] = tc.lease
++			_, err := LoadFrom(env(vars))
++			if tc.ok && err != nil {
++				t.Errorf("rejected: %v", err)
++			}
++			if !tc.ok && (err == nil || !strings.Contains(err.Error(), "LEASE_DURATION must be at least 3s")) {
++				t.Errorf("error = %v", err)
++			}
++		})
+ 	}
+ }
+ 
+diff --git a/internal/worker/fake_test.go b/internal/worker/fake_test.go
+index e29d63d..f421cb3 100644
+--- a/internal/worker/fake_test.go
++++ b/internal/worker/fake_test.go
+@@ -21,6 +21,7 @@ type fakeStore struct {
+ 	extended  []extendCall
+ 
+ 	settleErr error // returned by Complete, Fail and Discard when set
++	extendErr error // returned by ExtendLease when set
+ 	leaseErrs int   // the next leaseErrs Lease calls fail
+ }
+ 
+@@ -134,7 +135,7 @@ func (f *fakeStore) ExtendLease(_ context.Context, id int64, workerID string, un
+ 	f.mu.Lock()
+ 	defer f.mu.Unlock()
+ 	f.extended = append(f.extended, extendCall{id: id, workerID: workerID, until: until})
+-	return nil
++	return f.extendErr
+ }
+ 
+ // calls is a copy of what a fakeStore recorded.
+diff --git a/internal/worker/lease.go b/internal/worker/lease.go
+index f9cb6d3..31e9f8a 100644
+--- a/internal/worker/lease.go
++++ b/internal/worker/lease.go
+@@ -27,9 +27,9 @@ func withLease(ctx context.Context, l *lease) context.Context {
+ }
+ 
+ // ExtendLease pushes the lease of the job running under ctx to one lease duration from now.
+-// Handlers that may run longer than the lease call it periodically; without it, the reaper
+-// hands the job to another worker once the lease expires. It returns domain.ErrLeaseLost when
+-// the job has already been reaped.
++// The pool already renews the lease of every running job in the background; a handler calls
++// ExtendLease when it wants to know that it still holds the lease before a step that must not
++// run twice. It returns domain.ErrLeaseLost when the job has already been reaped.
+ func ExtendLease(ctx context.Context) error {
+ 	l, ok := ctx.Value(leaseKey{}).(*lease)
+ 	if !ok {
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index f7ebeed..2393522 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -66,7 +66,9 @@ type PanicError struct {
+ func (e *PanicError) Error() string { return fmt.Sprintf("panic: %v", e.Value) }
+ 
+ // Pool runs Concurrency goroutines per queue. Each repeatedly leases one job, runs its handler
+-// and records the outcome, sleeping PollInterval whenever its queue is empty.
++// and records the outcome, sleeping PollInterval whenever its queue is empty. While a handler
++// runs, the pool renews its job's lease every LeaseDuration/3, so a handler may run for longer
++// than one lease.
+ type Pool struct {
+ 	store    Store
+ 	registry *Registry
+@@ -90,8 +92,8 @@ func NewPool(store Store, registry *Registry, opts Options) (*Pool, error) {
+ 		return nil, errors.New("worker: concurrency must not be negative")
+ 	case opts.PollInterval <= 0:
+ 		return nil, errors.New("worker: poll interval must be positive")
+-	case opts.LeaseDuration <= 0:
+-		return nil, errors.New("worker: lease duration must be positive")
++	case opts.LeaseDuration < time.Second:
++		return nil, errors.New("worker: lease duration must be at least one second")
+ 	case opts.Retry == nil:
+ 		return nil, errors.New("worker: retry policy is required")
+ 	}
+@@ -236,8 +238,15 @@ func (p *Pool) run(queue, workerID string, job domain.Job) {
+ 	defer p.metrics.busy.Add(-1, queue)
+ 
+ 	log := p.log.With("job_id", job.ID, "queue", job.Queue, "type", job.Type, "attempt", job.Attempts, "worker", workerID)
++
++	// The lease is renewed in the background while the handler runs. The first renewal is
++	// timed from the lease itself, before the handler gets a chance to return.
++	jobCtx, cancelJob := context.WithCancelCause(p.ctx)
++	defer cancelJob(nil)
++	go p.renewLease(queue, job.ID, workerID, p.opts.Clock.After(p.renewInterval()), cancelJob, log)
++
+ 	start := p.opts.Clock.Now()
+-	herr := p.execute(job, workerID)
++	herr := p.execute(jobCtx, job, workerID)
+ 	elapsed := p.opts.Clock.Now().Sub(start)
+ 
+ 	var panicErr *PanicError
+@@ -271,13 +280,46 @@ func (p *Pool) run(queue, workerID string, job domain.Job) {
+ 	}
+ }
+ 
+-// execute runs the job's handler with the type's timeout and turns a panic into an error.
+-func (p *Pool) execute(job domain.Job, workerID string) error {
++// renewInterval is how often the lease of a running job is renewed: two renewals in a row may
++// fail before the lease runs out.
++func (p *Pool) renewInterval() time.Duration { return p.opts.LeaseDuration / 3 }
++
++// renewLease extends the lease of a running job when tick fires and then every renewInterval.
++// When the store reports the lease as lost (the reaper gave the job to another worker after
++// renewals failed for too long), the handler's context is cancelled with the store's error as
++// its cause, so that the handler stops working on a job it no longer owns. A renewal that fails
++// for another reason, such as a database hiccup, is retried at the next tick.
++func (p *Pool) renewLease(queue string, jobID int64, workerID string, tick <-chan time.Time, cancel context.CancelCauseFunc, log *slog.Logger) {
++	for {
++		select {
++		case <-p.ctx.Done():
++			return
++		case <-tick:
++		}
++		err := p.store.ExtendLease(p.ctx, jobID, workerID, p.opts.Clock.Now().Add(p.opts.LeaseDuration))
++		switch {
++		case err == nil:
++			p.metrics.renewals.Inc(queue, "renewed")
++		case errors.Is(err, domain.ErrLeaseLost):
++			p.metrics.renewals.Inc(queue, "lost")
++			log.Warn("lease lost while the handler was running, cancelling it", "error", err)
++			cancel(err)
++		default:
++			p.metrics.renewals.Inc(queue, "error")
++			log.Error("renew lease", "error", err)
++		}
++		tick = p.opts.Clock.After(p.renewInterval())
++	}
++}
++
++// execute runs the job's handler under ctx with the type's timeout and turns a panic into an
++// error.
++func (p *Pool) execute(ctx context.Context, job domain.Job, workerID string) error {
+ 	h, ok := p.registry.lookup(job.Type)
+ 	if !ok {
+ 		return fmt.Errorf("no handler registered for job type %q", job.Type)
+ 	}
+-	ctx := withLease(p.ctx, &lease{
++	ctx = withLease(ctx, &lease{
+ 		jobID:    job.ID,
+ 		workerID: workerID,
+ 		store:    p.store,
+@@ -288,8 +330,13 @@ func (p *Pool) execute(job domain.Job, workerID string) error {
+ 	defer cancel()
+ 
+ 	err := invoke(ctx, h.fn, job)
+-	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
++	switch {
++	case err == nil:
++		return nil
++	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+ 		return fmt.Errorf("timed out after %s: %w", h.timeout, err)
++	case errors.Is(context.Cause(ctx), domain.ErrLeaseLost):
++		return fmt.Errorf("stopped after losing the lease: %w", err)
+ 	}
+ 	return err
+ }
+@@ -353,6 +400,7 @@ type poolMetrics struct {
+ 	duration    *metrics.Histogram
+ 	busy        *metrics.Gauge
+ 	leaseErrors *metrics.Counter
++	renewals    *metrics.Counter
+ }
+ 
+ func newPoolMetrics(reg *metrics.Registry) poolMetrics {
+@@ -365,5 +413,7 @@ func newPoolMetrics(reg *metrics.Registry) poolMetrics {
+ 			"Worker goroutines currently running a handler.", "queue"),
+ 		leaseErrors: reg.NewCounter("jobqueue_lease_errors_total",
+ 			"Failed attempts to lease jobs.", "queue"),
++		renewals: reg.NewCounter("jobqueue_lease_renewals_total",
++			"Automatic lease renewals of running jobs by result: renewed, lost or error.", "queue", "result"),
+ 	}
+ }
+diff --git a/internal/worker/pool_test.go b/internal/worker/pool_test.go
+index b001dd8..da5438b 100644
+--- a/internal/worker/pool_test.go
++++ b/internal/worker/pool_test.go
+@@ -3,6 +3,7 @@ package worker_test
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -238,6 +239,74 @@ func TestPoolExtendLeaseFromHandler(t *testing.T) {
+ 	}
+ }
+ 
++func TestPoolRenewsLeaseWhileHandlerRuns(t *testing.T) {
++	started := make(chan struct{})
++	release := make(chan struct{})
++	st := newFakeStore(domain.Job{ID: 4, Type: "long"})
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"long": func(context.Context, domain.Job) error {
++			close(started)
++			<-release
++			return nil
++		},
++	}))
++	h.start(t, context.Background())
++	<-started
++
++	// The lease lasts a minute; it is renewed every 20s, each time for another minute.
++	for i := 1; i <= 3; i++ {
++		h.clock.BlockUntil(1)
++		h.clock.Advance(20 * time.Second)
++		h.clock.BlockUntil(1) // renewed and waiting for the next interval
++		ext := st.snapshot().extended
++		want := t0.Add(time.Duration(i)*20*time.Second + time.Minute)
++		if len(ext) != i || ext[i-1].id != 4 || ext[i-1].workerID != "test/default/0" || !ext[i-1].until.Equal(want) {
++			t.Fatalf("after %d intervals ExtendLease calls = %+v, want the last until %v", i, ext, want)
++		}
++	}
++	close(release)
++	if out := h.next(t); out.State != domain.StateSucceeded {
++		t.Fatalf("outcome = %+v", out)
++	}
++	var buf strings.Builder
++	_ = h.metrics.WriteText(&buf)
++	if !strings.Contains(buf.String(), `jobqueue_lease_renewals_total{queue="default",result="renewed"} 3`) {
++		t.Errorf("renewals not counted:\n%s", buf.String())
++	}
++}
++
++func TestPoolCancelsHandlerWhenLeaseIsLost(t *testing.T) {
++	started := make(chan struct{})
++	cause := make(chan error, 1)
++	st := newFakeStore(domain.Job{ID: 2, Type: "long"})
++	st.extendErr = fmt.Errorf("extend lease of job 2: %w", domain.ErrLeaseLost)
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"long": func(ctx context.Context, _ domain.Job) error {
++			close(started)
++			<-ctx.Done()
++			cause <- context.Cause(ctx)
++			return ctx.Err()
++		},
++	}))
++	h.start(t, context.Background())
++	<-started
++
++	h.clock.BlockUntil(1)
++	h.clock.Advance(20 * time.Second)
++	if err := <-cause; !errors.Is(err, domain.ErrLeaseLost) {
++		t.Fatalf("handler context cancelled with cause %v, want the lost lease", err)
++	}
++	out := h.next(t)
++	if !errors.Is(out.Err, context.Canceled) || !strings.Contains(out.Err.Error(), "stopped after losing the lease") {
++		t.Errorf("outcome error = %v", out.Err)
++	}
++	var buf strings.Builder
++	_ = h.metrics.WriteText(&buf)
++	if !strings.Contains(buf.String(), `jobqueue_lease_renewals_total{queue="default",result="lost"} 1`) {
++		t.Errorf("lost renewal not counted:\n%s", buf.String())
++	}
++}
++
+ func TestExtendLeaseOutsideAJob(t *testing.T) {
+ 	if err := worker.ExtendLease(context.Background()); !errors.Is(err, worker.ErrNoLease) {
+ 		t.Errorf("error = %v, want ErrNoLease", err)
+@@ -387,6 +456,7 @@ func TestNewPoolValidatesOptions(t *testing.T) {
+ 		{"negative concurrency", func(o *worker.Options) { o.Concurrency = -1 }},
+ 		{"zero poll interval", func(o *worker.Options) { o.PollInterval = 0 }},
+ 		{"zero lease", func(o *worker.Options) { o.LeaseDuration = 0 }},
++		{"lease under a second", func(o *worker.Options) { o.LeaseDuration = 900 * time.Millisecond }},
+ 		{"no retry policy", func(o *worker.Options) { o.Retry = nil }},
+ 		{"bad queue", func(o *worker.Options) { o.Queues = []string{"Not A Queue"} }},
+ 	}
+diff --git a/internal/worker/registry.go b/internal/worker/registry.go
+index 6100e2c..86b2a15 100644
+--- a/internal/worker/registry.go
++++ b/internal/worker/registry.go
+@@ -18,8 +18,8 @@ type HandlerFunc func(ctx context.Context, job domain.Job) error
+ // HandlerOption configures a registered handler.
+ type HandlerOption func(*handler)
+ 
+-// WithTimeout sets how long one attempt of the job type may run. Handlers that need longer
+-// than the lease duration must call ExtendLease while they run.
++// WithTimeout sets how long one attempt of the job type may run. It may exceed the lease
++// duration: the pool renews the lease while the handler runs.
+ func WithTimeout(d time.Duration) HandlerOption {
+ 	return func(h *handler) { h.timeout = d }
+ }
+diff --git a/internal/worker/store_test.go b/internal/worker/store_test.go
+index e3a1348..ba68298 100644
+--- a/internal/worker/store_test.go
++++ b/internal/worker/store_test.go
+@@ -50,7 +50,7 @@ func TestPoolWithStoreRetriesThenDeadLetters(t *testing.T) {
+ 		t.Fatalf("after first attempt: %+v", got)
+ 	}
+ 
+-	h.clock.BlockUntil(1) // the worker is idle until the retry is due
++	h.clock.BlockUntil(2) // the worker is idle until the retry is due; the renewal timer is pending
+ 	h.clock.Advance(retryDelay)
+ 	if out := h.next(t); out.State != domain.StateDead {
+ 		t.Fatalf("second attempt outcome = %+v, want dead", out)
+@@ -65,6 +65,56 @@ func TestPoolWithStoreRetriesThenDeadLetters(t *testing.T) {
+ 	}
+ }
+ 
++func TestPoolWithStoreKeepsLongJobFromTheReaper(t *testing.T) {
++	started := make(chan struct{})
++	release := make(chan struct{})
++	reg := registry(map[string]worker.HandlerFunc{
++		"long": func(ctx context.Context, _ domain.Job) error {
++			close(started)
++			select {
++			case <-release:
++				return nil
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++		},
++	})
++	h, st := newStoreHarness(t, reg)
++	ctx := context.Background()
++	job, err := st.Enqueue(ctx, domain.NewJob{Queue: "default", Type: "long"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.start(t, ctx)
++	<-started
++
++	// Four renewals take the clock 80s past the lease of one minute taken at t0.
++	for range 4 {
++		h.clock.BlockUntil(1) // the renewal timer; the worker is busy with the handler
++		h.clock.Advance(20 * time.Second)
++	}
++	h.clock.BlockUntil(1)
++	got, err := st.Get(ctx, job.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := t0.Add(80*time.Second + time.Minute); got.LockedUntil == nil || !got.LockedUntil.Equal(want) {
++		t.Fatalf("locked_until = %v, want %v", got.LockedUntil, want)
++	}
++	reaper, err := worker.NewReaper(st, store.ReapBatchSize, time.Minute, h.clock, logging.Discard(), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n, err := reaper.ReapOnce(ctx); err != nil || n != 0 {
++		t.Fatalf("ReapOnce = %d, %v; want the renewed job left alone", n, err)
++	}
++
++	close(release)
++	if out := h.next(t); out.State != domain.StateSucceeded || out.Job.Attempts != 1 {
++		t.Fatalf("outcome = %+v, want success on the first attempt", out)
++	}
++}
++
+ func TestReaperHandsAbandonedJobToAnotherWorker(t *testing.T) {
+ 	reg := registry(map[string]worker.HandlerFunc{"ok": func(context.Context, domain.Job) error { return nil }})
+ 	h, st := newStoreHarness(t, reg)

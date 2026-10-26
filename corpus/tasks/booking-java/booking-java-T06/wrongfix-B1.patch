@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/innkeep/booking/service/ReservationService.java b/src/main/java/com/innkeep/booking/service/ReservationService.java
+index 5d27073..7761aa3 100644
+--- a/src/main/java/com/innkeep/booking/service/ReservationService.java
++++ b/src/main/java/com/innkeep/booking/service/ReservationService.java
+@@ -263,7 +263,7 @@ public class ReservationService {
+    */
+   private Money refundDue(Reservation reservation, Instant at) {
+     return CancellationPolicy.of(reservation.getProperty())
+-        .refund(reservation.getTotal(), reservation.getCheckIn(), at);
++        .refund(paid(reservation), reservation.getCheckIn(), at);
+   }
+ 
+   /** The number of reservations in each status, zero for the statuses with none. */

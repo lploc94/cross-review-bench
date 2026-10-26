@@ -1,0 +1,24 @@
+diff --git a/src/etl/pipeline/metrics.py b/src/etl/pipeline/metrics.py
+index dfdac00..a2c9ab5 100644
+--- a/src/etl/pipeline/metrics.py
++++ b/src/etl/pipeline/metrics.py
+@@ -95,10 +95,16 @@ def render_metrics(connection: Connection, out: TextIO) -> None:
+     )
+ 
+     _family(out, "etl_rows_total", "counter", "Rows of finished runs per source and kind.")
+-    for run in latest:
++    totals = connection.execute(
++        select(runs.c.source, *(func.sum(runs.c[f"rows_{kind}"]).label(kind) for kind in ROW_KINDS))
++        .where(finished)
++        .group_by(runs.c.source)
++        .order_by(runs.c.source)
++    ).mappings()
++    for total in totals:
+         for kind in ROW_KINDS:
+-            labels = {"source": run["source"], "kind": kind}
+-            _sample(out, "etl_rows_total", labels, int(run[f"rows_{kind}"]))
++            labels = {"source": total["source"], "kind": kind}
++            _sample(out, "etl_rows_total", labels, int(total[kind]))
+ 
+     _family(
+         out,

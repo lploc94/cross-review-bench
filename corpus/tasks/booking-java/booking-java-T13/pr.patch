@@ -1,0 +1,862 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..8defc18 100644
+--- a/README.md
++++ b/README.md
+@@ -31,10 +31,26 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+   is rounded with HALF_EVEN to the currency's minor units.
+ - **Reservations.** Status moves `CONFIRMED` to `CHECKED_IN` (on or after the check-in date, before
+-  check-out) to `COMPLETED`, or to `CANCELLED`. A cancellation made at or before the full-refund
+-  deadline is refunded in full; later ones follow the property policy. Cancelling twice is a
+-  conflict, never a second refund. Charges and refunds are recorded in a ledger with idempotency
+-  keys.
++  check-out) to `COMPLETED`, or to `CANCELLED`, or to `NO_SHOW`. A cancellation made at or before
++  the full-refund deadline is refunded in full; later ones follow the property policy. Cancelling
++  twice is a conflict, never a second refund. Charges and refunds are recorded in a ledger with
++  idempotency keys.
++- **No-shows.** A reservation still `CONFIRMED` once the property's check-out time on the day after
++  its check-in date has passed (in the property's zone) is a no-show. Staff can mark it with
++  `POST /api/v1/admin/reservations/{reference}/no-show` (409 before that moment), and the
++  maintenance job marks it on its next run. Marking waits at most `booking.lock-timeout` for each
++  row it locks (set for that transaction only), so a row another request keeps locked longer makes
++  the staff route answer 503 `busy`. A stay the job cannot close, whatever the failure (a declined
++  refund, a row still locked after the timeout, a database error), is rolled back, skipped and
++  logged as a warning with its reservation id and the exception class, and the job goes on with the
++  others; the next run tries it again under the same refund key. The first night's price lines as
++  booked (the room night and that night's extra-guest fee) are kept as the fee; stay-level lines
++  such as the length-of-stay discount are not counted, and the fee never exceeds the total. The rest
++  of the total, if any, is refunded with the idempotency key `no-show-<reservation id>` and a
++  `REFUND` ledger entry, and the rooms are given back from the second night on. A no-show can no
++  longer be checked in or cancelled. Cancellations keep following the cancellation policy. The rule
++  covers every confirmed stay whose guest never arrived, including stays booked before it existed:
++  the first maintenance run after an upgrade closes those as well.
+ - **Errors.** Every error the API raises is an RFC 9457 problem detail with a
+   `urn:innkeep:problem:<slug>` type. A lock that cannot be taken in time, or a deadlock, is a 503
+   with type `urn:innkeep:problem:busy` and `Retry-After: 1`: send the same request again. An
+@@ -130,6 +146,7 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `POST /api/v1/reservations/{reference}/cancel` | public | cancel and refund |
+ | `GET /api/v1/admin/reservations` | admin | paged list with filters (property, status, dates, guest email, guest name) |
+ | `POST /api/v1/admin/reservations/{reference}/check-in` | admin | check a guest in |
++| `POST /api/v1/admin/reservations/{reference}/no-show` | admin | close a stay whose guest never arrived: fee kept, rest refunded |
+ | `GET /api/v1/admin/reservations/{reference}/ledger` | admin | charges and refunds |
+ | `GET /api/v1/admin/reservations/summary` | admin | reservations per status |
+ | `GET /api/v1/admin/properties/{code}/arrivals`, `.../departures`, `.../in-house` | admin | a day's guests (`date`) |
+@@ -139,7 +156,7 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `POST/GET/PUT/DELETE .../room-types/{roomType}/seasonal-rates[/{id}]` | admin | seasonal rates (same priority may not overlap) |
+ | `GET/PUT .../room-types/{roomType}/inventory`, `PUT .../inventory/range` | admin | inventory per night and for a range |
+ | `GET /api/v1/admin/holds`, `GET /api/v1/admin/holds/summary`, `POST /api/v1/admin/holds/{id}/expire` | admin | hold list, counts, manual expiry |
+-| `POST /api/v1/admin/maintenance/run` | admin | expire holds and complete stays now |
++| `POST /api/v1/admin/maintenance/run` | admin | expire holds, complete stays and mark no-shows now |
+ 
+ The admin routes need `Authorization: Bearer <ADMIN_TOKEN>`. Without it they answer 401 with
+ `WWW-Authenticate: Bearer`. The guest-facing reservation routes are addressed by the booking
+diff --git a/src/main/java/com/innkeep/booking/api/AdminOperationsController.java b/src/main/java/com/innkeep/booking/api/AdminOperationsController.java
+index d367ce2..c2df612 100644
+--- a/src/main/java/com/innkeep/booking/api/AdminOperationsController.java
++++ b/src/main/java/com/innkeep/booking/api/AdminOperationsController.java
+@@ -2,6 +2,7 @@ package com.innkeep.booking.api;
+ 
+ import com.innkeep.booking.api.dto.HoldSummary;
+ import com.innkeep.booking.api.dto.LedgerResponse;
++import com.innkeep.booking.api.dto.NoShowResponse;
+ import com.innkeep.booking.api.dto.PageResponse;
+ import com.innkeep.booking.api.dto.ReservationResponse;
+ import com.innkeep.booking.api.dto.ReservationSummary;
+@@ -117,6 +118,11 @@ public class AdminOperationsController {
+     return ReservationResponse.from(reservations.checkIn(reference));
+   }
+ 
++  @PostMapping("/reservations/{reference}/no-show")
++  public NoShowResponse markNoShow(@PathVariable String reference) {
++    return NoShowResponse.from(reservations.markNoShow(reference));
++  }
++
+   @GetMapping("/reservations/summary")
+   public Map<ReservationStatus, Long> reservationSummary() {
+     return reservations.countByStatus();
+diff --git a/src/main/java/com/innkeep/booking/api/dto/NoShowResponse.java b/src/main/java/com/innkeep/booking/api/dto/NoShowResponse.java
+new file mode 100644
+index 0000000..4013485
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/NoShowResponse.java
+@@ -0,0 +1,20 @@
++package com.innkeep.booking.api.dto;
++
++import com.innkeep.booking.service.NoShowOutcome;
++import java.math.BigDecimal;
++
++/** A reservation closed as a no-show, with the fee kept and the amount refunded. */
++public record NoShowResponse(
++    ReservationResponse reservation,
++    BigDecimal feeAmount,
++    BigDecimal refundAmount,
++    String currency) {
++
++  public static NoShowResponse from(NoShowOutcome outcome) {
++    return new NoShowResponse(
++        ReservationResponse.from(outcome.reservation()),
++        outcome.fee().amount(),
++        outcome.refund().amount(),
++        outcome.refund().currency().getCurrencyCode());
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/Reservation.java b/src/main/java/com/innkeep/booking/domain/Reservation.java
+index d2ced6c..0aff899 100644
+--- a/src/main/java/com/innkeep/booking/domain/Reservation.java
++++ b/src/main/java/com/innkeep/booking/domain/Reservation.java
+@@ -200,6 +200,46 @@ public class Reservation extends AbstractEntity<Long> {
+     this.updatedAt = now;
+   }
+ 
++  /**
++   * The instant from which a guest who never checked in counts as a no-show: the property's
++   * check-out time on the day after the check-in date, in the property's zone.
++   */
++  public Instant noShowFrom() {
++    return checkIn
++        .plusDays(1)
++        .atTime(property.getCheckOutTime())
++        .atZone(property.zone())
++        .toInstant();
++  }
++
++  /** Closes a confirmed reservation whose guest has not arrived by {@link #noShowFrom()}. */
++  public void markNoShow(Instant now) {
++    requireStatus(ReservationStatus.CONFIRMED, "marked a no-show");
++    Instant from = noShowFrom();
++    if (now.isBefore(from)) {
++      throw new ConflictException(
++          "reservation " + reference + " can be marked a no-show from " + from);
++    }
++    this.status = ReservationStatus.NO_SHOW;
++    this.updatedAt = now;
++  }
++
++  /**
++   * What a no-show keeps: the stored price lines of the first night (the room night and that
++   * night's extra-guest fee), never more than the total. Stay-level lines are not counted.
++   */
++  public Money noShowFee() {
++    Currency unit = Currency.getInstance(currency);
++    Money fee = Money.zero(unit);
++    for (PriceLine line : priceLines) {
++      if (checkIn.equals(line.getNight())) {
++        fee = fee.plus(Money.of(line.getAmount(), unit));
++      }
++    }
++    Money total = getTotal();
++    return fee.amount().compareTo(total.amount()) > 0 ? total : fee;
++  }
++
+   /** Marks a checked-in stay as completed once its check-out date has been reached. */
+   public boolean completeIfDeparted(Instant now, LocalDate propertyToday) {
+     if (status != ReservationStatus.CHECKED_IN || propertyToday.isBefore(checkOut)) {
+diff --git a/src/main/java/com/innkeep/booking/domain/ReservationStatus.java b/src/main/java/com/innkeep/booking/domain/ReservationStatus.java
+index 65f54b3..69c37ea 100644
+--- a/src/main/java/com/innkeep/booking/domain/ReservationStatus.java
++++ b/src/main/java/com/innkeep/booking/domain/ReservationStatus.java
+@@ -4,5 +4,6 @@ public enum ReservationStatus {
+   CONFIRMED,
+   CANCELLED,
+   CHECKED_IN,
+-  COMPLETED
++  COMPLETED,
++  NO_SHOW
+ }
+diff --git a/src/main/java/com/innkeep/booking/persistence/ReservationRepository.java b/src/main/java/com/innkeep/booking/persistence/ReservationRepository.java
+index 852830b..c8866c0 100644
+--- a/src/main/java/com/innkeep/booking/persistence/ReservationRepository.java
++++ b/src/main/java/com/innkeep/booking/persistence/ReservationRepository.java
+@@ -63,6 +63,20 @@ public interface ReservationRepository extends JpaRepository<Reservation, Long>
+   List<Reservation> findBatchAfter(
+       @Param("status") ReservationStatus status, @Param("afterId") long afterId, Pageable pageable);
+ 
++  /**
++   * Ids of the stays in a status that check in on or before a date, after a cursor id, in order.
++   */
++  @Query(
++      """
++      select r.id from Reservation r
++       where r.status = :status and r.checkIn <= :lastCheckIn and r.id > :afterId
++       order by r.id""")
++  List<Long> findIdsCheckingInBy(
++      @Param("status") ReservationStatus status,
++      @Param("lastCheckIn") LocalDate lastCheckIn,
++      @Param("afterId") long afterId,
++      Pageable pageable);
++
+   @Query("select r.status as status, count(r) as total from Reservation r group by r.status")
+   List<StatusCount> countByStatus();
+ 
+diff --git a/src/main/java/com/innkeep/booking/service/BookingMaintenanceJob.java b/src/main/java/com/innkeep/booking/service/BookingMaintenanceJob.java
+index e9de9d7..4a494c5 100644
+--- a/src/main/java/com/innkeep/booking/service/BookingMaintenanceJob.java
++++ b/src/main/java/com/innkeep/booking/service/BookingMaintenanceJob.java
+@@ -9,9 +9,10 @@ import org.springframework.scheduling.annotation.Scheduled;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+- * Periodic housekeeping: expires holds whose time has passed (releasing their rooms) and completes
+- * stays whose check-out date has come. Each batch is drained until a pass finds nothing left. Tests
+- * switch the schedule off and call these methods directly.
++ * Periodic housekeeping: expires holds whose time has passed (releasing their rooms), completes
++ * stays whose check-out date has come and closes confirmed stays whose guests never arrived as
++ * no-shows. Each batch is drained until a pass finds nothing left. Tests switch the schedule off
++ * and call these methods directly.
+  */
+ @Component
+ public class BookingMaintenanceJob {
+@@ -34,11 +35,12 @@ public class BookingMaintenanceJob {
+       initialDelayString = "${booking.hold-cleanup-interval}")
+   public MaintenanceReport run() {
+     MaintenanceReport report =
+-        new MaintenanceReport(releaseExpiredHolds(), completeDepartedStays());
++        new MaintenanceReport(releaseExpiredHolds(), completeDepartedStays(), markNoShows());
+     LOG.info(
+         "maintenance pass finished",
+         kv("releasedHolds", report.releasedHolds()),
+-        kv("completedStays", report.completedStays()));
++        kv("completedStays", report.completedStays()),
++        kv("noShows", report.noShows()));
+     return report;
+   }
+ 
+@@ -51,4 +53,9 @@ public class BookingMaintenanceJob {
+   public int completeDepartedStays() {
+     return reservations.completeDepartedStays(config.holdCleanupBatchSize());
+   }
++
++  /** Returns the number of stays marked as no-shows. */
++  public int markNoShows() {
++    return reservations.markNoShows(config.holdCleanupBatchSize());
++  }
+ }
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 9751a26..4cdb5c1 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -24,7 +24,6 @@ import com.innkeep.booking.persistence.InventoryRepository;
+ import com.innkeep.booking.persistence.LedgerEntryRepository;
+ import com.innkeep.booking.persistence.ReservationRepository;
+ import com.innkeep.booking.persistence.SeasonalRateRepository;
+-import jakarta.persistence.EntityManager;
+ import jakarta.persistence.LockTimeoutException;
+ import jakarta.persistence.PessimisticLockException;
+ import java.security.SecureRandom;
+@@ -62,7 +61,7 @@ public class HoldService {
+   private final BookingConfig config;
+   private final Clock clock;
+   private final TransactionTemplate tx;
+-  private final EntityManager entities;
++  private final LockWaits lockWaits;
+   private final OptimisticRetry retry;
+   private final SecureRandom random = new SecureRandom();
+ 
+@@ -78,7 +77,7 @@ public class HoldService {
+       Clock clock,
+       TransactionTemplate tx,
+       OptimisticRetry retry,
+-      EntityManager entities) {
++      LockWaits lockWaits) {
+     this.catalog = catalog;
+     this.inventory = inventory;
+     this.holds = holds;
+@@ -90,7 +89,7 @@ public class HoldService {
+     this.clock = clock;
+     this.tx = tx;
+     this.retry = retry;
+-    this.entities = entities;
++    this.lockWaits = lockWaits;
+   }
+ 
+   /** Prices the stay and holds the rooms for every night, or none of them. */
+@@ -156,10 +155,7 @@ public class HoldService {
+    * the row. The timeout is set for this transaction only.
+    */
+   private Hold lockedGetWithinTimeout(UUID id) {
+-    entities
+-        .createNativeQuery("select set_config('lock_timeout', :limit, true)")
+-        .setParameter("limit", config.lockTimeout().toMillis() + "ms")
+-        .getSingleResult();
++    lockWaits.limitCurrentTransaction();
+     return lockedGet(id);
+   }
+ 
+diff --git a/src/main/java/com/innkeep/booking/service/LockWaits.java b/src/main/java/com/innkeep/booking/service/LockWaits.java
+new file mode 100644
+index 0000000..0becab2
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/LockWaits.java
+@@ -0,0 +1,33 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.config.BookingConfig;
++import jakarta.persistence.EntityManager;
++import org.springframework.stereotype.Component;
++
++/**
++ * Bounds how long the current transaction waits for row locks: every later statement in it gives up
++ * after {@code booking.lock-timeout} instead of waiting for another transaction to finish.
++ */
++@Component
++public class LockWaits {
++
++  private final EntityManager entities;
++  private final BookingConfig config;
++
++  public LockWaits(EntityManager entities, BookingConfig config) {
++    this.entities = entities;
++    this.config = config;
++  }
++
++  /**
++   * Sets {@code lock_timeout} for the current transaction only ({@code set_config(…, true)}), so it
++   * ends with the commit or rollback and never reaches other work on the pooled connection. Call it
++   * inside the transaction, before the first statement that may wait.
++   */
++  public void limitCurrentTransaction() {
++    entities
++        .createNativeQuery("select set_config('lock_timeout', :limit, true)")
++        .setParameter("limit", config.lockTimeout().toMillis() + "ms")
++        .getSingleResult();
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/service/MaintenanceReport.java b/src/main/java/com/innkeep/booking/service/MaintenanceReport.java
+index c4a4fbb..86e92fa 100644
+--- a/src/main/java/com/innkeep/booking/service/MaintenanceReport.java
++++ b/src/main/java/com/innkeep/booking/service/MaintenanceReport.java
+@@ -1,4 +1,4 @@
+ package com.innkeep.booking.service;
+ 
+ /** What one pass of the housekeeping job changed. */
+-public record MaintenanceReport(int releasedHolds, int completedStays) {}
++public record MaintenanceReport(int releasedHolds, int completedStays, int noShows) {}
+diff --git a/src/main/java/com/innkeep/booking/service/NoShowOutcome.java b/src/main/java/com/innkeep/booking/service/NoShowOutcome.java
+new file mode 100644
+index 0000000..6794e47
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/NoShowOutcome.java
+@@ -0,0 +1,7 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.domain.Money;
++import com.innkeep.booking.domain.Reservation;
++
++/** A reservation closed as a no-show: the fee kept and the amount refunded. */
++public record NoShowOutcome(Reservation reservation, Money fee, Money refund) {}
+diff --git a/src/main/java/com/innkeep/booking/service/ReservationService.java b/src/main/java/com/innkeep/booking/service/ReservationService.java
+index 0401253..9c88b21 100644
+--- a/src/main/java/com/innkeep/booking/service/ReservationService.java
++++ b/src/main/java/com/innkeep/booking/service/ReservationService.java
+@@ -19,6 +19,7 @@ import com.innkeep.booking.persistence.StatusCount;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.time.LocalDate;
++import java.time.ZoneOffset;
+ import java.util.EnumMap;
+ import java.util.List;
+ import java.util.Locale;
+@@ -48,6 +49,7 @@ public class ReservationService {
+   private final Clock clock;
+   private final TransactionTemplate tx;
+   private final OptimisticRetry retry;
++  private final LockWaits lockWaits;
+ 
+   public ReservationService(
+       ReservationRepository reservations,
+@@ -56,7 +58,8 @@ public class ReservationService {
+       PaymentGateway payments,
+       Clock clock,
+       TransactionTemplate tx,
+-      OptimisticRetry retry) {
++      OptimisticRetry retry,
++      LockWaits lockWaits) {
+     this.reservations = reservations;
+     this.inventory = inventory;
+     this.ledger = ledger;
+@@ -64,6 +67,7 @@ public class ReservationService {
+     this.clock = clock;
+     this.tx = tx;
+     this.retry = retry;
++    this.lockWaits = lockWaits;
+   }
+ 
+   public Reservation get(String reference) {
+@@ -116,7 +120,7 @@ public class ReservationService {
+                           .refund(reservation.getTotal(), reservation.getCheckIn(), now);
+                   reservation.cancel(now);
+                   reservations.saveAndFlush(reservation);
+-                  releaseBooked(reservation);
++                  releaseBooked(reservation, reservation.getStay().nightDates());
+                   if (refund.isPositive()) {
+                     String gatewayReference =
+                         payments.refund("refund-" + reservation.getId(), refund);
+@@ -194,6 +198,81 @@ public class ReservationService {
+                 }));
+   }
+ 
++  /**
++   * Closes a confirmed reservation whose guest never arrived, once {@link Reservation#noShowFrom()}
++   * has passed. The first night's price lines are kept as the fee and the rest of the total is
++   * refunded; the rooms are given back from the second night on. The admin route and the
++   * maintenance job both end here. Each row lock it needs is waited for at most {@code
++   * booking.lock-timeout}: the route then answers 503 {@code busy}, the job skips the stay.
++   */
++  public NoShowOutcome markNoShow(String reference) {
++    return retry.run(() -> tx.execute(status -> closeAsNoShow(get(reference), clock.instant())));
++  }
++
++  /**
++   * Marks every confirmed stay whose no-show moment has passed and returns how many were marked.
++   * Candidates are read in id order, {@code batchSize} at a time, and each one is its own unit of
++   * work. No zone is a whole day ahead of UTC, so a stay that is due checked in on or before
++   * today's UTC date; the exact moment is checked per stay in its property's zone. A stay whose
++   * unit of work fails for any reason (refund declined, row busy, lost race, a database error) is
++   * rolled back, skipped and logged; the cursor moves past it, so the stays after it are still
++   * marked, and the next run tries it again under the same refund key.
++   */
++  public int markNoShows(int batchSize) {
++    Instant now = clock.instant();
++    LocalDate lastCheckIn = LocalDate.ofInstant(now, ZoneOffset.UTC);
++    int marked = 0;
++    long cursor = 0;
++    List<Long> batch;
++    do {
++      batch =
++          reservations.findIdsCheckingInBy(
++              ReservationStatus.CONFIRMED, lastCheckIn, cursor, PageRequest.of(0, batchSize));
++      for (Long id : batch) {
++        cursor = id;
++        try {
++          marked += retry.run(() -> tx.execute(status -> markNoShowIfDue(id, now)));
++        } catch (RuntimeException e) {
++          LOG.warn("no-show skipped", kv("reservationId", id), kv("error", e.getClass().getName()));
++        }
++      }
++    } while (batch.size() == batchSize);
++    return marked;
++  }
++
++  private int markNoShowIfDue(long id, Instant now) {
++    Reservation reservation = reservations.findById(id).orElse(null);
++    if (reservation == null
++        || reservation.getStatus() != ReservationStatus.CONFIRMED
++        || now.isBefore(reservation.noShowFrom())) {
++      return 0;
++    }
++    closeAsNoShow(reservation, now);
++    return 1;
++  }
++
++  private NoShowOutcome closeAsNoShow(Reservation reservation, Instant now) {
++    lockWaits.limitCurrentTransaction();
++    reservation.markNoShow(now);
++    reservations.saveAndFlush(reservation);
++    List<LocalDate> nights = reservation.getStay().nightDates();
++    releaseBooked(reservation, nights.subList(1, nights.size()));
++    Money fee = reservation.noShowFee();
++    Money refund = reservation.getTotal().minus(fee);
++    if (refund.isPositive()) {
++      String gatewayReference = payments.refund("no-show-" + reservation.getId(), refund);
++      ledger.save(
++          new LedgerEntry(
++              reservation.getId(), LedgerKind.REFUND, refund, "no-show", gatewayReference, now));
++    }
++    LOG.info(
++        "reservation marked as no-show",
++        kv("reservationId", reservation.getId()),
++        kv("feeAmount", fee.amount()),
++        kv("refundAmount", refund.amount()));
++    return new NoShowOutcome(reservation, fee, refund);
++  }
++
+   public ReservationLedger ledger(String reference) {
+     Reservation reservation = get(reference);
+     return new ReservationLedger(
+@@ -231,9 +310,10 @@ public class ReservationService {
+     return counts;
+   }
+ 
+-  private void releaseBooked(Reservation reservation) {
++  /** Gives the reservation's rooms back for the listed nights, which are in ascending order. */
++  private void releaseBooked(Reservation reservation, List<LocalDate> nights) {
+     RoomType type = reservation.getRoomType();
+-    for (LocalDate night : reservation.getStay().nightDates()) {
++    for (LocalDate night : nights) {
+       if (inventory.releaseBooked(type.getId(), night, reservation.getRooms()) == 0) {
+         throw new IllegalStateException(
+             "inventory for "
+diff --git a/src/main/resources/db/migration/V2__no_show.sql b/src/main/resources/db/migration/V2__no_show.sql
+new file mode 100644
+index 0000000..02d42cb
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__no_show.sql
+@@ -0,0 +1,4 @@
++-- A confirmed reservation whose guest never arrived can be closed as a no-show.
++ALTER TABLE reservation DROP CONSTRAINT reservation_status_check;
++ALTER TABLE reservation ADD CONSTRAINT reservation_status_check
++    CHECK (status IN ('CONFIRMED', 'CANCELLED', 'CHECKED_IN', 'COMPLETED', 'NO_SHOW'));
+diff --git a/src/test/java/com/innkeep/booking/api/NoShowApiTest.java b/src/test/java/com/innkeep/booking/api/NoShowApiTest.java
+new file mode 100644
+index 0000000..38dd0e2
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/NoShowApiTest.java
+@@ -0,0 +1,80 @@
++package com.innkeep.booking.api;
++
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.Reservation;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.Instant;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++class NoShowApiTest extends IntegrationTestBase {
++
++  private static final String ADMIN = "/api/v1/admin/reservations/";
++
++  private Reservation reservation;
++
++  @BeforeEach
++  void setUp() {
++    var property = data.harbourHouse();
++    var room = data.roomType(property, "double", 2, "100.00");
++    LocalDate in = LocalDate.parse("2027-06-10");
++    data.rooms(property, room, in, LocalDate.parse("2027-06-12"), 2);
++    reservation = data.book(property, room, in, LocalDate.parse("2027-06-12"), 1);
++  }
++
++  @Test
++  void staffMarkANoShowAndTheLedgerShowsTheRefund() throws Exception {
++    clock.set(Instant.parse("2027-06-11T10:00:00Z"));
++
++    mvc.perform(
++            post(ADMIN + reservation.getReference() + "/no-show")
++                .header("Authorization", ADMIN_AUTH))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.reservation.status").value("NO_SHOW"))
++        .andExpect(jsonPath("$.feeAmount").value(100.00))
++        .andExpect(jsonPath("$.refundAmount").value(110.00))
++        .andExpect(jsonPath("$.currency").value("EUR"));
++
++    mvc.perform(
++            get(ADMIN + reservation.getReference() + "/ledger").header("Authorization", ADMIN_AUTH))
++        .andExpect(jsonPath("$.entries.length()").value(2))
++        .andExpect(jsonPath("$.entries[1].kind").value("REFUND"))
++        .andExpect(jsonPath("$.entries[1].reason").value("no-show"))
++        .andExpect(jsonPath("$.entries[1].amount").value(110.00));
++    mvc.perform(get(ADMIN + "summary").header("Authorization", ADMIN_AUTH))
++        .andExpect(jsonPath("$.NO_SHOW").value(1));
++  }
++
++  @Test
++  void markingTooEarlyOrTwiceIsAConflict() throws Exception {
++    String url = ADMIN + reservation.getReference() + "/no-show";
++    clock.set(Instant.parse("2027-06-10T20:00:00Z"));
++    mvc.perform(post(url).header("Authorization", ADMIN_AUTH))
++        .andExpect(status().isConflict())
++        .andExpect(jsonPath("$.type").value("urn:innkeep:problem:conflict"));
++
++    clock.set(Instant.parse("2027-06-11T10:00:00Z"));
++    mvc.perform(post(url).header("Authorization", ADMIN_AUTH)).andExpect(status().isOk());
++    mvc.perform(post(url).header("Authorization", ADMIN_AUTH)).andExpect(status().isConflict());
++  }
++
++  @Test
++  void theRouteNeedsTheAdminToken() throws Exception {
++    mvc.perform(post(ADMIN + reservation.getReference() + "/no-show"))
++        .andExpect(status().isUnauthorized());
++  }
++
++  @Test
++  void theMaintenanceRunReportsTheNoShows() throws Exception {
++    clock.set(Instant.parse("2027-06-11T10:00:00Z"));
++
++    mvc.perform(post("/api/v1/admin/maintenance/run").header("Authorization", ADMIN_AUTH))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.noShows").value(1));
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/service/ReservationNoShowTest.java b/src/test/java/com/innkeep/booking/service/ReservationNoShowTest.java
+new file mode 100644
+index 0000000..27606f7
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/service/ReservationNoShowTest.java
+@@ -0,0 +1,224 @@
++package com.innkeep.booking.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.innkeep.booking.domain.ConflictException;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.Reservation;
++import com.innkeep.booking.domain.ReservationStatus;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import com.innkeep.booking.support.LogCapture;
++import java.sql.Date;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.support.TransactionTemplate;
++
++class ReservationNoShowTest extends IntegrationTestBase {
++
++  // Thursday 10 June to Sunday 13 June 2027: 100.00, then 110.00 on Friday and Saturday.
++  private static final LocalDate CHECK_IN = LocalDate.parse("2027-06-10");
++  private static final LocalDate CHECK_OUT = LocalDate.parse("2027-06-13");
++  // 11:00 on 11 June in Lisbon (UTC+1 in summer).
++  private static final Instant NO_SHOW_FROM = Instant.parse("2027-06-11T10:00:00Z");
++
++  @Autowired private ReservationService reservations;
++  @Autowired private BookingMaintenanceJob maintenance;
++  @Autowired private PlatformTransactionManager transactions;
++
++  private Property property;
++  private RoomType room;
++  private Reservation reservation;
++
++  @BeforeEach
++  void setUp() {
++    property = data.harbourHouse();
++    room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, CHECK_IN, CHECK_OUT, 3);
++    reservation = data.book(property, room, CHECK_IN, CHECK_OUT, 1);
++  }
++
++  @Test
++  void aStayCannotBeMarkedBeforeTheCheckOutTimeOfTheDayAfterArrival() {
++    clock.set(NO_SHOW_FROM.minusSeconds(1));
++
++    assertThatThrownBy(() -> reservations.markNoShow(reservation.getReference()))
++        .isInstanceOf(ConflictException.class)
++        .hasMessageContaining("no-show");
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CONFIRMED);
++    assertThat(payments.refundCount()).isZero();
++  }
++
++  @Test
++  void theFirstNightIsKeptAndTheRestIsRefundedAndReleased() {
++    clock.set(NO_SHOW_FROM);
++
++    NoShowOutcome outcome = reservations.markNoShow(reservation.getReference());
++
++    assertThat(outcome.reservation().getStatus()).isEqualTo(ReservationStatus.NO_SHOW);
++    assertThat(outcome.fee().amount().toPlainString()).isEqualTo("100.00");
++    assertThat(outcome.refund().amount().toPlainString()).isEqualTo("220.00");
++    assertThat(payments.movements().get(1).key()).isEqualTo("no-show-" + reservation.getId());
++    assertThat(booked(room, CHECK_IN)).isEqualTo(1);
++    assertThat(booked(room, CHECK_IN.plusDays(1))).isZero();
++    assertThat(booked(room, CHECK_IN.plusDays(2))).isZero();
++  }
++
++  @Test
++  void aNoShowIsNeitherCheckedInNorCancelledNorMarkedTwice() {
++    clock.set(NO_SHOW_FROM);
++    reservations.markNoShow(reservation.getReference());
++
++    assertThatThrownBy(() -> reservations.checkIn(reservation.getReference()))
++        .isInstanceOf(ConflictException.class);
++    assertThatThrownBy(() -> reservations.cancel(reservation.getReference()))
++        .isInstanceOf(ConflictException.class);
++    assertThatThrownBy(() -> reservations.markNoShow(reservation.getReference()))
++        .isInstanceOf(ConflictException.class);
++    assertThat(payments.refundCount()).isEqualTo(1);
++  }
++
++  @Test
++  void theJobMarksOnlyDueConfirmedStaysAndOnlyOnce() {
++    Reservation arrived = data.book(property, room, CHECK_IN, CHECK_OUT, 1);
++    Reservation later = data.book(property, room, CHECK_IN.plusDays(1), CHECK_OUT, 1);
++    clock.set(Instant.parse("2027-06-10T16:00:00Z"));
++    reservations.checkIn(arrived.getReference());
++    clock.set(NO_SHOW_FROM);
++
++    assertThat(maintenance.markNoShows()).isEqualTo(1);
++    assertThat(maintenance.markNoShows()).isZero();
++
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.NO_SHOW);
++    assertThat(reservations.get(arrived.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CHECKED_IN);
++    assertThat(reservations.get(later.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CONFIRMED);
++    assertThat(payments.refundCount()).isEqualTo(1);
++  }
++
++  @Test
++  void aDeclinedRefundSkipsThatStayAndTheJobMarksTheOthers() throws Exception {
++    Reservation second = data.book(property, room, CHECK_IN, CHECK_OUT, 1);
++    clock.set(NO_SHOW_FROM);
++    payments.failNextRefund();
++
++    String logged =
++        LogCapture.during(
++            ReservationService.class.getName(),
++            () -> assertThat(maintenance.markNoShows()).isEqualTo(1));
++
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CONFIRMED);
++    assertThat(reservations.get(second.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.NO_SHOW);
++    assertThat(booked(room, CHECK_IN.plusDays(1))).isEqualTo(1);
++    assertThat(logged)
++        .contains("\"reservationId\":" + reservation.getId())
++        .contains("PaymentFailedException")
++        .doesNotContain(reservation.getReference());
++
++    assertThat(maintenance.markNoShows()).isEqualTo(1);
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.NO_SHOW);
++    assertThat(payments.refundCount()).isEqualTo(2);
++  }
++
++  @Test
++  void anyOtherFailureForOneStaySkipsItAndTheJobMarksTheOthers() throws Exception {
++    Reservation second = data.book(property, room, CHECK_IN, CHECK_OUT, 1);
++    clock.set(NO_SHOW_FROM);
++    payments.failNextRefundWith(new IllegalStateException("gateway client misconfigured"));
++
++    String logged =
++        LogCapture.during(
++            ReservationService.class.getName(),
++            () -> assertThat(maintenance.markNoShows()).isEqualTo(1));
++
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CONFIRMED);
++    assertThat(reservations.get(second.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.NO_SHOW);
++    assertThat(logged)
++        .contains("no-show skipped")
++        .contains("\"reservationId\":" + reservation.getId())
++        .contains("IllegalStateException")
++        .doesNotContain("misconfigured")
++        .doesNotContain(reservation.getReference());
++  }
++
++  @Test
++  void aStayWhoseInventoryRowIsBusyIsSkippedWithinTheLockTimeout() throws Exception {
++    RoomType suite = data.roomType(property, "suite", 2, "200.00");
++    data.rooms(property, suite, CHECK_IN, CHECK_OUT, 1);
++    Reservation other = data.book(property, suite, CHECK_IN, CHECK_OUT, 1);
++    clock.set(NO_SHOW_FROM);
++    var locked = new CountDownLatch(1);
++    var release = new CountDownLatch(1);
++    try (var pool = Executors.newSingleThreadExecutor()) {
++      var blocker =
++          pool.submit(
++              () ->
++                  new TransactionTemplate(transactions)
++                      .execute(
++                          status -> {
++                            jdbc.update(
++                                "update inventory set booked = booked"
++                                    + " where room_type_id = ? and night = ?",
++                                room.getId(),
++                                Date.valueOf(CHECK_IN.plusDays(1)));
++                            locked.countDown();
++                            awaitQuietly(release);
++                            return null;
++                          }));
++      assertThat(locked.await(10, TimeUnit.SECONDS)).isTrue();
++
++      assertThat(maintenance.markNoShows()).isEqualTo(1);
++
++      release.countDown();
++      blocker.get(10, TimeUnit.SECONDS);
++    }
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CONFIRMED);
++    assertThat(reservations.get(other.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.NO_SHOW);
++
++    assertThat(maintenance.markNoShows()).isEqualTo(1);
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.NO_SHOW);
++    assertThat(booked(room, CHECK_IN.plusDays(1))).isZero();
++  }
++
++  private static void awaitQuietly(CountDownLatch latch) {
++    try {
++      latch.await(30, TimeUnit.SECONDS);
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++    }
++  }
++
++  @Test
++  void theLogNamesTheReservationIdButNotItsReference() throws Exception {
++    clock.set(NO_SHOW_FROM);
++
++    String logged =
++        LogCapture.during(
++            ReservationService.class.getName(),
++            () -> reservations.markNoShow(reservation.getReference()));
++
++    assertThat(logged)
++        .doesNotContain(reservation.getReference())
++        .contains("\"reservationId\":" + reservation.getId())
++        .contains("\"refundAmount\":220.00");
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/support/RecordingPaymentGateway.java b/src/test/java/com/innkeep/booking/support/RecordingPaymentGateway.java
+index 96e97b0..edf11ae 100644
+--- a/src/test/java/com/innkeep/booking/support/RecordingPaymentGateway.java
++++ b/src/test/java/com/innkeep/booking/support/RecordingPaymentGateway.java
+@@ -13,6 +13,7 @@ public class RecordingPaymentGateway implements PaymentGateway {
+ 
+   private final List<Movement> movements = new ArrayList<>();
+   private boolean failNextCharge;
++  private RuntimeException nextRefundFailure;
+   private Runnable beforeNextCharge;
+ 
+   @Override
+@@ -26,6 +27,11 @@ public class RecordingPaymentGateway implements PaymentGateway {
+ 
+   @Override
+   public synchronized String refund(String idempotencyKey, Money amount) {
++    if (nextRefundFailure != null) {
++      RuntimeException failure = nextRefundFailure;
++      nextRefundFailure = null;
++      throw failure;
++    }
+     movements.add(new Movement("refund", idempotencyKey, amount));
+     return "rec:" + idempotencyKey;
+   }
+@@ -34,6 +40,15 @@ public class RecordingPaymentGateway implements PaymentGateway {
+     this.failNextCharge = true;
+   }
+ 
++  public synchronized void failNextRefund() {
++    failNextRefundWith(new PaymentFailedException("declined", null));
++  }
++
++  /** The next refund throws {@code failure} instead of moving money. */
++  public synchronized void failNextRefundWith(RuntimeException failure) {
++    this.nextRefundFailure = failure;
++  }
++
+   /** Runs once, before the next charge is recorded and outside this gateway's lock. */
+   public synchronized void beforeNextCharge(Runnable hook) {
+     this.beforeNextCharge = hook;
+@@ -50,6 +65,7 @@ public class RecordingPaymentGateway implements PaymentGateway {
+   public synchronized void reset() {
+     movements.clear();
+     failNextCharge = false;
++    nextRefundFailure = null;
+     beforeNextCharge = null;
+   }
+ 

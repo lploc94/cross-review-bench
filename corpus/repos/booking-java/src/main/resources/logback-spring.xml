@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <includeMdcKeyName>requestId</includeMdcKeyName>
+    </encoder>
+  </appender>
+
+  <!-- Hibernate prints the database DETAIL when a statement fails. The detail names the key values
+       (a reservation reference, a hold id, a guest email), so the SQL error loggers are off. The app
+       logs the exception class and the SQLState instead. -->
+  <logger name="org.hibernate.engine.jdbc.spi.SqlExceptionHelper" level="OFF"/>
+  <logger name="org.hibernate.orm.jdbc.error" level="OFF"/>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

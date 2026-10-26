@@ -1,0 +1,18 @@
+diff --git a/src/api/statementCsv.ts b/src/api/statementCsv.ts
+index c0a8bbc..1596847 100644
+--- a/src/api/statementCsv.ts
++++ b/src/api/statementCsv.ts
+@@ -1,3 +1,4 @@
++import { formatMinor } from "../domain/money.js";
+ import type { Statement } from "../services/statementService.js";
+ 
+ const HEADER = ["type", "created_at", "entry_id", "transfer_id", "amount", "balance", "currency"];
+@@ -10,7 +11,7 @@ const HEADER = ["type", "created_at", "entry_id", "transfer_id", "amount", "bala
+  */
+ export function statementCsv(statement: Statement): string {
+   const { account, period } = statement;
+-  const decimal = (amountMinor: bigint) => (Number(amountMinor) / 100).toFixed(2);
++  const decimal = (amountMinor: bigint) => formatMinor(amountMinor, account.currency);
+   const balanceRow = (type: string, at: Date, balance: bigint) => [
+     type,
+     at.toISOString(),

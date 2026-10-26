@@ -1,0 +1,47 @@
+diff --git a/src/repositories/retentionRepo.ts b/src/repositories/retentionRepo.ts
+index 69efbdf..7d48a28 100644
+--- a/src/repositories/retentionRepo.ts
++++ b/src/repositories/retentionRepo.ts
+@@ -110,12 +110,13 @@ export async function findExpiredFiles(db: Queryable, now: Date, limit: number):
+ 
+ /**
+  * Mark an expired file deleted. The rule is read again here, so a file whose rule was removed or
+- * lengthened since findExpiredFiles picked it is left alone.
++ * lengthened since findExpiredFiles picked it is left alone. Returns false when nothing changed
++ * (no longer due, or deleted meanwhile).
+  */
+-export async function expireFile(db: Queryable, id: string, now: Date): Promise<void> {
+-  await db.query(
++export async function expireFile(db: Queryable, id: string, now: Date): Promise<boolean> {
++  const result = await db.query(
+     `UPDATE files SET status = 'deleted', deleted_at = $2, updated_at = $2, next_scan_at = NULL
+-     WHERE id = $1
++     WHERE id = $1 AND files.status <> 'deleted'
+        AND files.created_at <= $2::timestamptz - make_interval(hours => 24 * (
+          SELECT rule.days FROM retention_rules rule
+          WHERE rule.tenant_id = files.tenant_id AND starts_with(files.path, rule.prefix)
+@@ -124,4 +125,5 @@ export async function expireFile(db: Queryable, id: string, now: Date): Promise<
+        ))`,
+     [id, now],
+   );
++  return result.rowCount === 1;
+ }
+diff --git a/src/services/cleanup.ts b/src/services/cleanup.ts
+index a523758..e3b3b47 100644
+--- a/src/services/cleanup.ts
++++ b/src/services/cleanup.ts
+@@ -109,10 +109,12 @@ export class CleanupService {
+       const now = clock.now();
+       const due = await retention.findExpiredFiles(pool, now, settings.batchSize);
+       for (const file of due) {
+-        await withTransaction(pool, async (client) => {
+-          await retention.expireFile(client, file.id, now);
++        const expired = await withTransaction(pool, async (client) => {
++          const changed = await retention.expireFile(client, file.id, now);
+           await tenants.releaseBytes(client, file.tenantId, file.size, logger);
++          return changed;
+         });
++        if (!expired) continue;
+         await this.removeExpiredObject(file, now);
+         total++;
+       }

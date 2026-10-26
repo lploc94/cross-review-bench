@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-go-grype-3809",
+  "repo": "rb-go-grype-3809",
+  "kind": "realbug",
+  "title": "Add Ubuntu ESM vulnerability matching",
+  "description": "Handles Ubuntu ESM as a distro `esm` channel, modeled on the existing RHEL EUS support. When a scanned Ubuntu image is Pro/ESM-enabled, a two-pass match resolves base disclosures against the ESM-channel fixes, so users see `fixed in ...+esm1` instead of a bare wont-fix. Non-Pro scans are unchanged: the same CVEs still show as vulnerable/wont-fix.\r\n\r\nOff by default. Turns on when ESM is detected on the scanned OS or via `--distro ubuntu:XX.YY+esm`.\r\n\r\nThis consumes the `ubuntu:XX.YY+esm` records the ubuntu vunnel provider now emits. No DB schema change: the `os` transformer already splits the channel suffix, same as RHEL EUS.\r\n\r\nCloses #3544\r\n\r\n> [!NOTE]\r\n> FIPS / Realtime / BlueField Pro tiers are intentionally out of scope for now.\r\n ",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "grype/matcher/dpkg/ubuntu_esm.go",
+      "lines": [
+        219,
+        230
+      ],
+      "category": "data-integrity",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "When ESM advisories mark the package fixed, buildPatchedVulnerabilityRecord replaces Fix.Versions with the ESM fix versions but keeps the base disclosure Fix.Available, so the reported fix dates do not describe the reported fix versions: an ESM-only fix (base record wont-fix) has no availability date at all.",
+      "trigger": "Scan an ESM-enabled Ubuntu package whose base disclosure is wont-fix and whose ESM advisory is fixed with a dated Fix.Available entry (e.g. 1.0.0+esm1, 2025-09-09); the merged result reports Fix.Versions [1.0.0+esm1] with Fix.Available empty.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "grype/matcher/dpkg/ubuntu_esm_test.go"
+      ],
+      "hidden_test_cmd": "GOFLAGS=-mod=mod GOPROXY=off go test -count=1 ./grype/matcher/dpkg/ -run ^TestResolveESMDisclosures$"
+    }
+  ]
+}

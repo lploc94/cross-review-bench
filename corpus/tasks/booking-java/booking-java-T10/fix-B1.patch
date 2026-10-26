@@ -1,0 +1,38 @@
+diff --git a/src/main/java/com/innkeep/booking/domain/PricingEngine.java b/src/main/java/com/innkeep/booking/domain/PricingEngine.java
+index 7440301..0759234 100644
+--- a/src/main/java/com/innkeep/booking/domain/PricingEngine.java
++++ b/src/main/java/com/innkeep/booking/domain/PricingEngine.java
+@@ -64,7 +64,6 @@ public final class PricingEngine {
+     var base = Money.of(roomType.getBaseNightlyRate(), currency);
+     var lines = new ArrayList<PriceLine>();
+     var roomCharges = Money.zero(currency);
+-    var planDiscount = Money.zero(currency);
+ 
+     for (LocalDate night : stay.nightDates()) {
+       Money rate =
+@@ -77,7 +76,6 @@ public final class PricingEngine {
+       Money nightly = rate.times(rooms);
+       lines.add(new PriceLine(PriceKind.NIGHTLY_RATE, night, "Room night", nightly.amount()));
+       roomCharges = roomCharges.plus(nightly);
+-      planDiscount = planDiscount.plus(nightly.percent(planPercent));
+     }
+ 
+     if (stay.nights() >= property.getLosMinNights() && property.getLosDiscountPercent() > 0) {
+@@ -99,12 +97,16 @@ public final class PricingEngine {
+     }
+ 
+     if (planPercent > 0) {
++      Money subtotal = Money.zero(currency);
++      for (PriceLine line : lines) {
++        subtotal = subtotal.plus(Money.of(line.getAmount(), currency));
++      }
+       lines.add(
+           new PriceLine(
+               PriceKind.RATE_PLAN_DISCOUNT,
+               null,
+               "Non-refundable rate",
+-              Money.zero(currency).minus(planDiscount).amount()));
++              Money.zero(currency).minus(subtotal.percent(planPercent)).amount()));
+     }
+ 
+     Money total = Money.zero(currency);

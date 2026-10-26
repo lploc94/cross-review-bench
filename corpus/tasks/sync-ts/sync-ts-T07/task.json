@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "sync-ts-T07",
+  "repo": "sync-ts",
+  "kind": "buggy",
+  "title": "Client schema version 2: one row per document field",
+  "description": "The replica keeps each document's fields and their timestamps as two JSON columns of `docs`, so every merged field write re-serialises and rewrites the whole document. This moves fields into their own table.\n\n- Client schema version 2: new `doc_fields(collection, doc_id, field, value, hlc)` table (value as JSON, primary key per field). The migration copies every field out of the version 1 JSON columns (a row whose JSON cannot be read fails the migration with `CorruptStoreError`), drops `docs.fields` and `docs.field_hlcs`, and runs VACUUM so the file gives the space of the dropped columns back.\n- VACUUM cannot run inside a transaction, so `SchemaMigration` gets an optional `transactional` flag (default true). The migrator calls a migration marked `transactional: false` outside its IMMEDIATE transaction and sets `user_version` once `up` has returned; every other migration runs as before.\n- `DocsStore` reads documents by joining `docs` with `doc_fields` (one query for `get`, `list` and `listPage`) and gains `writeFields(collection, id, writes)`, which stores only the given field writes. Local writes and pulled events now store just the writes that won the merge instead of the whole document; `put` stays for whole documents.\n\nTests: migrator tests updated for version 2 and a test that upgrades a version 1 file and reads its documents back; store tests for `writeFields` and a corrupt field value.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/client/src/store/schema.ts",
+      "lines": [
+        96,
+        101
+      ],
+      "category": "data-integrity",
+      "severity": "critical",
+      "difficulty": "L3",
+      "summary": "Migration 2 is marked `transactional: false` because of its final VACUUM, so all of its steps (CREATE TABLE doc_fields, the row-by-row copy, the column drops) run one by one in autocommit, and the migrator sets user_version only after `up` returns. Any failure or crash in the middle (a row with unreadable JSON from an older client, the process killed, a full disk) leaves a half-migrated replica at version 1: doc_fields exists with part of the rows, or the JSON columns are already gone. The next open runs migration 2 again, whose CREATE TABLE (or copy from the dropped columns) fails, so the client can never open the replica again and its unsynced local edits are lost; a crash after the drops but before the version bump has the same effect. Two processes opening the file can also both run the migration, since the IMMEDIATE lock is no longer taken. The data steps and the version bump belong in one transaction, with only VACUUM after the commit.",
+      "trigger": "A version 1 replica with documents notes/a, notes/b, notes/c where notes/b's fields JSON is cut off: SyncClient.open fails with CorruptStoreError and leaves doc_fields holding notes/a's fields at user_version 1; after repairing notes/b, every later open fails with `table doc_fields already exists`. The same happens when VACUUM fails (a full disk) after the column drops: every later open fails with `table doc_fields already exists`.",
+      "testable": true,
+      "hidden_tests": [
+        "packages/client/test/hidden/schemaUpgrade.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run packages/client/test/hidden/schemaUpgrade.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Running migration 2 outside a transaction is safe: better-sqlite3 runs every exec and every statement run in autocommit, so each step of up() in packages/client/src/store/schema.ts is atomic on its own, and the migrator in migrator.ts only bumps user_version after up() has returned, so a failed migration is simply run again on the next open.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

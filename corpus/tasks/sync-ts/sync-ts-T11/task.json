@@ -1,0 +1,81 @@
+{
+  "schema": "crb-task/v1",
+  "id": "sync-ts-T11",
+  "repo": "sync-ts",
+  "kind": "buggy",
+  "title": "Device revocation",
+  "description": "Today a lost or sold laptop keeps its token for good: the only way to lock it out is to delete rows by hand. Any device of a user can now revoke another one, or itself.\n\n- `POST /v1/devices/:id/revoke` (new migration `0005_device_revocation.sql` adds `devices.revoked_at`) marks the device revoked and answers `{ device }`. Revoking a revoked device keeps the first revocation time; a device of another user or an unknown id is 404. The revoked device stays in the device list with `revokedAt` and still counts toward the 50-device limit, and the server forgets its sync position.\n- From then on the device's token is refused with 401 `device_revoked` (new `DeviceRevokedError`). Only `GET /v1/me` still answers it, with the device's `revokedAt`, so the installation can show its user why it stopped syncing. Authentication now reads `revoked_at` with the token hash (same query) and puts it in the `AuthContext`; the new `requireActiveDevice` preHandler in the auth plugin turns it into the 401.\n- Protocol: `deviceSchema` gains `revokedAt`; new `revokeDeviceResponseSchema`.\n- Client: `WireTransport.revokeDevice(id)`. When the server answers `device_revoked`, the client stores the revocation in `meta`, drops its outbox (those changes can no longer reach the server), and `sync()` rejects with the new non-retryable `DeviceRevokedError`, whose `unsynced` counts the local changes that never reached the server. Later syncs reject the same way without sending anything. The replica stays readable.\n\nTests: `packages/server/test/api/devices.test.ts` (revoking another device, pushes refused, `/v1/me` with `revokedAt`, revoking twice, revoking itself, other users' and unknown devices) and `packages/client/test/e2e/revocation.test.ts` (a revoked client stops syncing and reports its unsynced changes; other devices keep syncing). README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/server/src/api/routes/sync.ts",
+      "lines": [
+        18,
+        18
+      ],
+      "category": "security",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "`authenticate` (the onRequest hook every /v1 route runs, api/routes/index.ts) deliberately still accepts a revoked device's token, and the revocation check lives only in the route-level `requireActiveDevice` preHandler, which the PR attaches to POST /v1/sync/push, POST /v1/devices and POST /v1/devices/:id/revoke. GET /v1/sync/pull, GET /v1/sync/status, GET /v1/documents/:collection/:id and GET /v1/devices keep answering a revoked token, although the description says only GET /v1/me does: a stolen device that has been revoked keeps reading the whole change feed and every document of the user.",
+      "trigger": "Revoke a device, then GET /v1/sync/pull?after=0 (or /v1/documents/notes/<id>) with its token: 200 with the user's events.",
+      "testable": true,
+      "hidden_tests": [
+        "packages/server/test/hidden/revokedDeviceReads.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run packages/server/test/hidden/revokedDeviceReads.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Revoked tokens cannot reach any /v1 route: registerRoutes in packages/server/src/api/routes/index.ts adds the `authenticate` onRequest hook to both the /v1/sync scope and the other /v1 routes, and AuthService.authenticate now loads revoked_at with the token, so a revoked device is stopped by the auth plugin before any handler runs; the preHandler on push is only there to return the more specific `device_revoked` code.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "packages/client/src/sync/syncClient.ts",
+      "lines": [
+        354,
+        360
+      ],
+      "category": "error-handling",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "SyncClient.retire takes the number of unsynced changes from what `outbox.clear()` deleted and swallows any error of that DELETE with an empty catch. When the clearing fails (SQLITE_BUSY past the busy timeout from another connection, an I/O error, a read-only file), the error disappears and sync() rejects with a DeviceRevokedError that reports 0 unsynced changes, so the application tells its user nothing was lost while every queued edit silently never reaches the server.",
+      "trigger": "A revoked device with 3 queued edits whose outbox DELETE fails: sync() rejects with DeviceRevokedError { unsynced: 0 } ('0 local changes never reached the server').",
+      "testable": true,
+      "hidden_tests": [
+        "packages/client/test/hidden/revokedUnsyncedCount.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run packages/client/test/hidden/revokedUnsyncedCount.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "Clearing the outbox cannot fail in practice: OutboxStore.clear in packages/client/src/store/outboxStore.ts is a single prepared `DELETE FROM outbox` on the replica's own SQLite file, which openDatabase opens with busy_timeout = 5000, and the revocation mark is written just before it, so even in the impossible case the catch only keeps rows that the revoked mark already prevents from ever being sent.",
+      "justification": null
+    },
+    {
+      "id": "B3",
+      "file": "packages/server/src/services/accountService.ts",
+      "lines": [
+        104,
+        109
+      ],
+      "category": "spec-deviation",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "AccountService.revokeDevice only sets revoked_at; it never deletes the device's device_cursors row, although the description (and the README) say the server forgets a revoked device's sync position. The stale cursor stays in GET /v1/devices and in the admin statistics as if the device were still following the feed.",
+      "trigger": "A device pulls (cursor recorded), another device revokes it: its device_cursors row is still there.",
+      "testable": true,
+      "hidden_tests": [
+        "packages/server/test/hidden/revokedDeviceCursor.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run packages/server/test/hidden/revokedDeviceCursor.test.ts",
+      "fix_patch": "fix-B3.patch",
+      "wrong_fix_patch": "wrongfix-B3.patch",
+      "false_rebuttal": "Deleting the cursor is unnecessary: device_cursors rows carry updated_at and expire on their own, so a revoked device, which never pulls again, drops out of the cursor table without the revoke handler touching it; deleting it inside the revocation transaction would only add a write for nothing.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

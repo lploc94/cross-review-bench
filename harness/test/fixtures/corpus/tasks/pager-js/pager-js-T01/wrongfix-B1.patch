@@ -1,0 +1,13 @@
+diff --git a/src/pager.js b/src/pager.js
+index 960956b..7fde067 100644
+--- a/src/pager.js
++++ b/src/pager.js
+@@ -3,7 +3,7 @@
+ /** Returns page `page` (1-based) of `items`, `size` items per page. */
+ export function paginate(items, page, size) {
+   if (!Number.isInteger(size) || size <= 0) throw new RangeError("size must be a positive integer");
+-  if (!Number.isInteger(page) || page < 0) throw new RangeError("page must be a positive integer");
++  if (!Number.isInteger(page) || page < 0 || Object.is(page, -0)) throw new RangeError("page must be a positive integer");
+   return items.slice((page - 1) * size, page * size);
+ }
+ 

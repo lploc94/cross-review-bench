@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T14",
+  "repo": "uploads-ts",
+  "kind": "clean",
+  "title": "Tags on files",
+  "description": "Folders give every file one place, but tenants want to find files across folders too (everything `to-review`, every `invoices` file wherever it was filed). This adds tags.\n\n- Migration 0004 creates `file_tags(file_id, tenant_id, tag, created_at)` with `UNIQUE (file_id, tag)`, a `CHECK` on the tag format and an index on `(tenant_id, tag)`.\n- A tag is 1 to 64 characters of lower-case letters, digits and `-` (`domain/tags.ts`); anything else is a 400, there is no case folding.\n- `PUT /v1/files/by-id/:id/tags/:tag` and `DELETE` on the same URL (scope `files:write`) add and remove a tag, both idempotent, and answer the file's tags `{ tags }` in byte order; `GET /v1/files/by-id/:id/tags` (scope `files:read`) reads them. Another tenant's file is a 404 as everywhere else.\n- A file has at most 20 tags. The insert is conditional (`INSERT … SELECT … WHERE (SELECT count(*) …) < 20 ON CONFLICT DO NOTHING`) and runs while the file's row is locked (`findLiveFileById` gains the `forUpdate` option `findLiveFileByPath` already has), so concurrent requests cannot go past 20 and a file being deleted gets no new tag. A 21st tag is 409 `too_many_tags`; a tag the file already has is accepted.\n- `GET /v1/files?tag=` lists only files with the tag. The listing query now builds its conditions, so the tag is one more condition (an `EXISTS` on `file_tags`) and the keyset pagination on `(path, id)` with its cursor works unchanged.\n- Tags go with their file: deleting a file and replacing it with `overwrite=true` remove the old file's tags in the same transaction, so the new file starts without tags and deleted files never show up under a tag.\n\nTests in `test/api/tags.test.ts` cover adding, removing and reading tags, validation, the limit (also with 30 requests at once), listing by tag over several pages, tenant isolation, deletion and replacement, and scopes. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["test/hidden/fileTagsBehaviour.test.ts"],
+  "clean_hidden_test_cmd": "npx vitest run test/hidden/fileTagsBehaviour.test.ts"
+}

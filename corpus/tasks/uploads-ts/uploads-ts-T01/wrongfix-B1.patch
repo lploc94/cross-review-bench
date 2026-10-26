@@ -1,0 +1,13 @@
+diff --git a/src/api/routes/sendFile.ts b/src/api/routes/sendFile.ts
+index aab8553..6680555 100644
+--- a/src/api/routes/sendFile.ts
++++ b/src/api/routes/sendFile.ts
+@@ -43,7 +43,7 @@ export async function sendFile(
+     .header("content-disposition", contentDisposition(file.originalName));
+   if (requested.kind === "partial") {
+     const { start, end } = requested.range;
+-    const stream = await files.openContent(file, requested.range);
++    const stream = await files.openContent(file, { start, end: end - 1 });
+     return reply
+       .code(206)
+       .header("content-range", `bytes ${start}-${end}/${file.size}`)

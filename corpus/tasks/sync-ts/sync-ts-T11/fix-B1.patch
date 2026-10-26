@@ -1,0 +1,48 @@
+diff --git a/packages/server/src/api/routes/devices.ts b/packages/server/src/api/routes/devices.ts
+index d8374a4..c46a4c3 100644
+--- a/packages/server/src/api/routes/devices.ts
++++ b/packages/server/src/api/routes/devices.ts
+@@ -20,7 +20,7 @@ export async function deviceRoutes(app: FastifyInstance, options: RouteOptions):
+     };
+   });
+ 
+-  app.get("/devices", async (request) => {
++  app.get("/devices", { preHandler: requireActiveDevice }, async (request) => {
+     const auth = authOf(request);
+     const devices = await accounts.listDevices(auth.userId);
+     return { data: devices.map((device) => serializeDeviceWithCursor(device, auth.deviceId)) };
+diff --git a/packages/server/src/api/routes/documents.ts b/packages/server/src/api/routes/documents.ts
+index efb62af..0ebbe61 100644
+--- a/packages/server/src/api/routes/documents.ts
++++ b/packages/server/src/api/routes/documents.ts
+@@ -1,5 +1,5 @@
+ import type { FastifyInstance } from "fastify";
+-import { authOf } from "../plugins/auth.js";
++import { authOf, requireActiveDevice } from "../plugins/auth.js";
+ import { documentParamsSchema } from "../schemas/documents.js";
+ import { serializeDocument } from "../serializers.js";
+ import { parse } from "../validation.js";
+@@ -9,7 +9,7 @@ import type { RouteOptions } from "./types.js";
+ export async function documentRoutes(app: FastifyInstance, options: RouteOptions): Promise<void> {
+   const { documents } = options.services;
+ 
+-  app.get("/documents/:collection/:id", async (request) => {
++  app.get("/documents/:collection/:id", { preHandler: requireActiveDevice }, async (request) => {
+     const auth = authOf(request);
+     const params = parse(documentParamsSchema, request.params, "params");
+     return serializeDocument(await documents.get(auth, params.collection, params.id));
+diff --git a/packages/server/src/api/routes/sync.ts b/packages/server/src/api/routes/sync.ts
+index a3b8127..f312b4d 100644
+--- a/packages/server/src/api/routes/sync.ts
++++ b/packages/server/src/api/routes/sync.ts
+@@ -15,7 +15,9 @@ export async function syncRoutes(app: FastifyInstance, options: RouteOptions): P
+     defaultLimit: options.limits.pullDefaultLimit,
+   });
+ 
+-  app.post("/push", { preHandler: requireActiveDevice }, async (request): Promise<PushResponse> => {
++  app.addHook("preHandler", requireActiveDevice);
++
++  app.post("/push", async (request): Promise<PushResponse> => {
+     const auth = authOf(request);
+     const body = parse(pushBody, request.body, "body");
+     const result = await push.push(auth, body.mutations);

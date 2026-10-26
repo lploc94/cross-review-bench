@@ -1,0 +1,542 @@
+diff --git a/README.md b/README.md
+index fe7e007..2ee550f 100644
+--- a/README.md
++++ b/README.md
+@@ -23,7 +23,7 @@ stored. Each key carries scopes, and each route requires exactly one of them:
+ | `files:delete` | delete files |
+ | `uploads:write` | resumable upload sessions |
+ | `tenant:read` | read the tenant's usage and quota |
+-| `tenant:admin` | change the quota |
++| `tenant:admin` | change the quota and the upload size limit |
+ 
+ **Paths.** A path is a name chosen by the tenant, such as `reports/2030/q1.pdf`. It is stored in
+ Unicode NFC, so composed and decomposed forms name the same file. Rejected: an empty path, a
+@@ -47,6 +47,13 @@ behind. Replacing a file (`overwrite=true`) needs room for both files until the
+ recorded. Deleting a file, aborting a session and the expiry of a session release their bytes.
+ Lowering the quota below the current usage removes nothing; it only stops new uploads.
+ 
++**Upload size limit.** No file may be larger than `MAX_UPLOAD_BYTES`. A tenant can have a lower
++limit of its own (`maxUploadBytes`, set with `PATCH /v1/tenant`; `null` means `MAX_UPLOAD_BYTES`),
++and when `MAX_UPLOAD_BYTES` is later set below a tenant's limit, the lower value applies. Raw and
++multipart uploads over the limit are refused with 413 `payload_too_large`, announced or not, and a
++resumable session larger than the limit when it is created; `details.limitBytes` is the limit that
++applied. A lower limit leaves stored files and open sessions as they are.
++
+ **Scanning.** A new file is `pending_scan` and cannot be downloaded (409 `file_not_available`)
+ until the scan worker has scanned it: a clean file becomes `available`, an infected one
+ `quarantined` and is never served. A scan that fails (scanner unreachable, unreadable object) is
+@@ -114,7 +121,8 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+   `path_exists`.
+ - **`POST /v1/files`** takes `multipart/form-data` with a `path` field followed by one file part;
+   the part's file name becomes the file's `originalName`.
+-- Both answer 413 `payload_too_large` for more than `MAX_UPLOAD_BYTES`, announced or not.
++- Both answer 413 `payload_too_large` for more than the tenant's upload size limit, announced or
++  not.
+ - **Files** are returned as `{ id, path, size, sha256, contentType, declaredType, originalName,
+   status, image: { width, height } | null, createdAt, updatedAt }`.
+ - **`GET /v1/files`** lists live files in byte order of their paths: `limit` 1 to
+@@ -126,8 +134,10 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+ - **`PATCH`, `HEAD` and `POST /v1/uploads`** answer with `Upload-Offset`, `Upload-Length` and
+   `Upload-Expires` headers. A session that is completed, aborted or expired answers 409
+   `upload_session_state` with its state in `details.state`.
+-- **`PATCH /v1/tenant`** takes `{ "quotaBytes" }`. Tenants are returned as `{ id, name,
+-  quotaBytes, usedBytes, availableBytes, createdAt }`.
++- **`PATCH /v1/tenant`** takes `{ "quotaBytes"?, "maxUploadBytes"? }`, at least one of them;
++  `maxUploadBytes` is 1 to `MAX_UPLOAD_BYTES`, or `null` to remove the tenant's own limit.
++  Tenants are returned as `{ id, name, quotaBytes, usedBytes, availableBytes, maxUploadBytes,
++  createdAt }`.
+ 
+ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ 
+@@ -188,7 +198,7 @@ test/                vitest suites; test/helpers has the app builder, fixtures a
+ | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET` | required for `s3` | path-style requests to `<endpoint>/<bucket>/<key>` |
+ | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | required for `s3` | |
+ | `S3_REQUEST_TIMEOUT_MS` | `30000` | longest wait for a response, and longest pause while sending |
+-| `MAX_UPLOAD_BYTES` | `104857600` (100 MiB) | per file, at most 5 GiB |
++| `MAX_UPLOAD_BYTES` | `104857600` (100 MiB) | per file, at most 5 GiB; tenants can have a lower limit |
+ | `UPLOAD_SESSION_TTL_S` | `86400` | lifetime of a resumable session |
+ | `UPLOAD_CHUNK_LEASE_S` | `600` | longest time one chunk may take |
+ | `SIGNED_URL_MAX_TTL_S` | `604800` | longest signed-link lifetime |
+diff --git a/migrations/0004_tenant_upload_limits.sql b/migrations/0004_tenant_upload_limits.sql
+new file mode 100644
+index 0000000..921f5ab
+--- /dev/null
++++ b/migrations/0004_tenant_upload_limits.sql
+@@ -0,0 +1,4 @@
++-- The largest file a tenant may upload. NULL means the service's MAX_UPLOAD_BYTES; the API only
++-- accepts values up to that setting, and uploads use the lower of the two, so lowering the setting
++-- later still applies to every tenant.
++ALTER TABLE tenants ADD COLUMN max_upload_bytes bigint CHECK (max_upload_bytes > 0);
+diff --git a/src/api/routes/tenant.ts b/src/api/routes/tenant.ts
+index c237648..0967e52 100644
+--- a/src/api/routes/tenant.ts
++++ b/src/api/routes/tenant.ts
+@@ -5,8 +5,10 @@ import { serializeTenant } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+-/** The caller's own tenant: usage, and the quota for keys with `tenant:admin`. */
+-export const tenantRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services }) => {
++/** The caller's own tenant: usage, and the quota and upload limit for keys with `tenant:admin`. */
++export const tenantRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services, limits }) => {
++  const patchTenantBody = patchTenantBodySchema(limits.maxUploadBytes);
++
+   app.get("/tenant", { preHandler: requireScope("tenant:read") }, async (request) => {
+     const { tenantId } = authOf(request);
+     return serializeTenant(await services.tenants.getTenant(tenantId));
+@@ -14,7 +16,7 @@ export const tenantRoutes: FastifyPluginAsync<RouteOptions> = async (app, { serv
+ 
+   app.patch("/tenant", { preHandler: requireScope("tenant:admin") }, async (request) => {
+     const { tenantId } = authOf(request);
+-    const body = parse(patchTenantBodySchema, request.body, "body");
+-    return serializeTenant(await services.tenants.setQuota(tenantId, body.quotaBytes));
++    const body = parse(patchTenantBody, request.body, "body");
++    return serializeTenant(await services.tenants.update(tenantId, body));
+   });
+ };
+diff --git a/src/api/schemas/tenant.ts b/src/api/schemas/tenant.ts
+index 6f66ee4..aca6437 100644
+--- a/src/api/schemas/tenant.ts
++++ b/src/api/schemas/tenant.ts
+@@ -1,6 +1,17 @@
+ import { z } from "zod";
+ import { MAX_QUOTA_BYTES } from "../../domain/tenant.js";
+ 
+-export const patchTenantBodySchema = z.object({
+-  quotaBytes: z.number().int().min(0).max(MAX_QUOTA_BYTES),
+-});
++/**
++ * Either setting or both. `maxUploadBytes` is at most the service's MAX_UPLOAD_BYTES; null goes
++ * back to that setting.
++ */
++export function patchTenantBodySchema(serviceMaxUploadBytes: number) {
++  return z
++    .object({
++      quotaBytes: z.number().int().min(0).max(MAX_QUOTA_BYTES).optional(),
++      maxUploadBytes: z.number().int().min(1).max(serviceMaxUploadBytes).nullable().optional(),
++    })
++    .refine((body) => body.quotaBytes !== undefined || body.maxUploadBytes !== undefined, {
++      error: "give quotaBytes, maxUploadBytes or both",
++    });
++}
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index c862ab1..1a21c42 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -54,6 +54,7 @@ export function serializeTenant(tenant: Tenant) {
+     quotaBytes: tenant.quotaBytes,
+     usedBytes: tenant.usedBytes,
+     availableBytes: availableBytes(tenant),
++    maxUploadBytes: tenant.maxUploadBytes,
+     createdAt: tenant.createdAt.toISOString(),
+   };
+ }
+diff --git a/src/client/uploadsClient.ts b/src/client/uploadsClient.ts
+index 2eb4e3b..f86f0ae 100644
+--- a/src/client/uploadsClient.ts
++++ b/src/client/uploadsClient.ts
+@@ -46,6 +46,8 @@ export interface TenantUsage {
+   readonly quotaBytes: number;
+   readonly usedBytes: number;
+   readonly availableBytes: number;
++  /** The tenant's own upload size limit, or null when the service's limit applies. */
++  readonly maxUploadBytes: number | null;
+   readonly createdAt: string;
+ }
+ 
+diff --git a/src/domain/tenant.ts b/src/domain/tenant.ts
+index 2f46a92..ffba025 100644
+--- a/src/domain/tenant.ts
++++ b/src/domain/tenant.ts
+@@ -4,6 +4,8 @@ export interface Tenant {
+   readonly name: string;
+   readonly quotaBytes: number;
+   readonly usedBytes: number;
++  /** The tenant's own upload size limit; null when the service's MAX_UPLOAD_BYTES applies. */
++  readonly maxUploadBytes: number | null;
+   readonly createdAt: Date;
+ }
+ 
+@@ -13,3 +15,11 @@ export const MAX_QUOTA_BYTES = Number.MAX_SAFE_INTEGER;
+ export function availableBytes(tenant: Tenant): number {
+   return Math.max(tenant.quotaBytes - tenant.usedBytes, 0);
+ }
++
++/**
++ * The largest file the tenant may upload: its own limit, but never more than the service's
++ * (`MAX_UPLOAD_BYTES` may have been lowered since the tenant's limit was set).
++ */
++export function uploadLimitOf(tenant: Pick<Tenant, "maxUploadBytes">, serviceLimit: number): number {
++  return tenant.maxUploadBytes === null ? serviceLimit : Math.min(tenant.maxUploadBytes, serviceLimit);
++}
+diff --git a/src/repositories/tenantRepo.ts b/src/repositories/tenantRepo.ts
+index 2e61c5c..c491dba 100644
+--- a/src/repositories/tenantRepo.ts
++++ b/src/repositories/tenantRepo.ts
+@@ -8,10 +8,11 @@ interface TenantRow {
+   name: string;
+   quota_bytes: string;
+   used_bytes: string;
++  max_upload_bytes: string | null;
+   created_at: Date;
+ }
+ 
+-const COLUMNS = "id, name, quota_bytes, used_bytes, created_at";
++const COLUMNS = "id, name, quota_bytes, used_bytes, max_upload_bytes, created_at";
+ 
+ function mapTenant(row: TenantRow): Tenant {
+   return {
+@@ -19,6 +20,10 @@ function mapTenant(row: TenantRow): Tenant {
+     name: row.name,
+     quotaBytes: toSafeInteger(row.quota_bytes, "tenants.quota_bytes"),
+     usedBytes: toSafeInteger(row.used_bytes, "tenants.used_bytes"),
++    maxUploadBytes:
++      row.max_upload_bytes === null
++        ? null
++        : toSafeInteger(row.max_upload_bytes, "tenants.max_upload_bytes"),
+     createdAt: row.created_at,
+   };
+ }
+@@ -40,14 +45,31 @@ export async function findTenant(db: Queryable, id: string): Promise<Tenant | nu
+   return row ? mapTenant(row) : null;
+ }
+ 
+-export async function updateQuota(
++export interface TenantChanges {
++  readonly quotaBytes?: number;
++  /** null clears the tenant's own limit. */
++  readonly maxUploadBytes?: number | null;
++}
++
++/** Change the given settings in one statement; the others keep their values. */
++export async function updateTenant(
+   db: Queryable,
+   id: string,
+-  quotaBytes: number,
++  changes: TenantChanges,
+ ): Promise<Tenant | null> {
+   const result = await db.query<TenantRow>(
+-    `UPDATE tenants SET quota_bytes = $2 WHERE id = $1 RETURNING ${COLUMNS}`,
+-    [id, quotaBytes],
++    `UPDATE tenants
++     SET quota_bytes = CASE WHEN $2::boolean THEN $3::bigint ELSE quota_bytes END,
++       max_upload_bytes = CASE WHEN $4::boolean THEN $5::bigint ELSE max_upload_bytes END
++     WHERE id = $1
++     RETURNING ${COLUMNS}`,
++    [
++      id,
++      changes.quotaBytes !== undefined,
++      changes.quotaBytes ?? null,
++      changes.maxUploadBytes !== undefined,
++      changes.maxUploadBytes ?? null,
++    ],
+   );
+   const row = firstRow(result.rows);
+   return row ? mapTenant(row) : null;
+diff --git a/src/services/resumable.ts b/src/services/resumable.ts
+index d63970b..348d754 100644
+--- a/src/services/resumable.ts
++++ b/src/services/resumable.ts
+@@ -32,7 +32,7 @@ import * as tenants from "../repositories/tenantRepo.js";
+ import * as sessions from "../repositories/uploadSessionRepo.js";
+ import { MAX_PART_INDEX, type StorageDriver } from "../storage/driver.js";
+ import type { FileCatalog } from "./fileCatalog.js";
+-import type { UploadOutcome } from "./uploadService.js";
++import { tenantUploadLimit, type UploadOutcome } from "./uploadService.js";
+ 
+ export interface ResumableDeps {
+   readonly pool: Pool;
+@@ -87,8 +87,9 @@ export class ResumableUploadService {
+     if (!Number.isSafeInteger(input.size) || input.size < 1) {
+       throw new ValidationError("size must be a positive whole number of bytes");
+     }
+-    if (input.size > this.deps.maxUploadBytes) {
+-      throw new PayloadTooLargeError(this.deps.maxUploadBytes);
++    const maxBytes = await tenantUploadLimit(pool, input.tenantId, this.deps.maxUploadBytes);
++    if (input.size > maxBytes) {
++      throw new PayloadTooLargeError(maxBytes);
+     }
+     let declaredType: string | null = null;
+     if (input.contentType !== undefined) {
+diff --git a/src/services/tenantService.ts b/src/services/tenantService.ts
+index d832f56..d488864 100644
+--- a/src/services/tenantService.ts
++++ b/src/services/tenantService.ts
+@@ -33,17 +33,30 @@ export class TenantService {
+   }
+ 
+   /**
+-   * Change the quota. Lowering it below the current usage is allowed: nothing is removed, but no
+-   * new bytes fit until usage drops under the quota again.
++   * Change the quota, the upload size limit, or both. Lowering the quota below the current usage
++   * is allowed: nothing is removed, but no new bytes fit until usage drops under the quota again.
++   * Likewise a lower upload limit leaves stored files and open upload sessions as they are.
+    */
+-  async setQuota(id: string, quotaBytes: number): Promise<Tenant> {
+-    assertQuota(quotaBytes);
+-    const tenant = await tenants.updateQuota(this.pool, id, quotaBytes);
++  async update(id: string, changes: tenants.TenantChanges): Promise<Tenant> {
++    if (changes.quotaBytes === undefined && changes.maxUploadBytes === undefined) {
++      throw new ValidationError("nothing to change");
++    }
++    if (changes.quotaBytes !== undefined) assertQuota(changes.quotaBytes);
++    if (changes.maxUploadBytes !== undefined && changes.maxUploadBytes !== null) {
++      assertUploadLimit(changes.maxUploadBytes);
++    }
++    const tenant = await tenants.updateTenant(this.pool, id, changes);
+     if (!tenant) throw NotFoundError.resource("tenant", id);
+     return tenant;
+   }
+ }
+ 
++function assertUploadLimit(maxUploadBytes: number): void {
++  if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1) {
++    throw new ValidationError("an upload size limit is a whole number of bytes, at least 1");
++  }
++}
++
+ function assertQuota(quotaBytes: number): void {
+   if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 0 || quotaBytes > MAX_QUOTA_BYTES) {
+     throw new ValidationError(`a quota is a whole number of bytes from 0 to ${MAX_QUOTA_BYTES}`);
+diff --git a/src/services/uploadService.ts b/src/services/uploadService.ts
+index d2d7e75..77c83c3 100644
+--- a/src/services/uploadService.ts
++++ b/src/services/uploadService.ts
+@@ -2,10 +2,16 @@ import { randomUUID } from "node:crypto";
+ import { pipeline, type Readable } from "node:stream";
+ import type { Pool } from "../db/pool.js";
+ import { withTransaction } from "../db/tx.js";
+-import { PathConflictError, PayloadTooLargeError, QuotaExceededError } from "../domain/errors.js";
++import {
++  NotFoundError,
++  PathConflictError,
++  PayloadTooLargeError,
++  QuotaExceededError,
++} from "../domain/errors.js";
+ import type { FileRecord } from "../domain/file.js";
+ import { normalizePath, originalNameFrom, storageKeyFor } from "../domain/paths.js";
+ import { normalizeDeclaredType, OCTET_STREAM, SNIFF_BYTES } from "../domain/sniff.js";
++import { uploadLimitOf } from "../domain/tenant.js";
+ import type { Clock } from "../infra/clock.js";
+ import type { Logger } from "../infra/logger.js";
+ import { UploadMeter } from "../infra/streams.js";
+@@ -40,9 +46,21 @@ export interface UploadServiceDeps {
+   readonly logger: Logger;
+   readonly storage: StorageDriver;
+   readonly catalog: FileCatalog;
++  /** The service-wide limit; a tenant may have a lower one of its own. */
+   readonly maxUploadBytes: number;
+ }
+ 
++/** The upload size limit of a tenant (see uploadLimitOf). */
++export async function tenantUploadLimit(
++  db: Pool,
++  tenantId: string,
++  serviceLimit: number,
++): Promise<number> {
++  const tenant = await tenants.findTenant(db, tenantId);
++  if (!tenant) throw NotFoundError.resource("tenant", tenantId);
++  return uploadLimitOf(tenant, serviceLimit);
++}
++
+ /**
+  * Single-request uploads (PUT with a raw body, POST multipart). The body streams through a meter
+  * (count, sha256, sniffing head, size limit) into the storage driver and is never held in memory.
+@@ -58,8 +76,6 @@ export class UploadService {
+     this.deps = deps;
+   }
+ 
+-  private tooLarge = (): PayloadTooLargeError => new PayloadTooLargeError(this.deps.maxUploadBytes);
+-
+   async upload(input: DirectUpload): Promise<UploadOutcome> {
+     try {
+       return await this.store(input);
+@@ -73,8 +89,10 @@ export class UploadService {
+   private async store(input: DirectUpload): Promise<UploadOutcome> {
+     const { pool, logger, storage, catalog } = this.deps;
+     const path = normalizePath(input.path);
+-    if (input.size !== undefined && input.size > this.deps.maxUploadBytes) {
+-      throw this.tooLarge();
++    const maxBytes = await tenantUploadLimit(pool, input.tenantId, this.deps.maxUploadBytes);
++    const tooLarge = (): PayloadTooLargeError => new PayloadTooLargeError(maxBytes);
++    if (input.size !== undefined && input.size > maxBytes) {
++      throw tooLarge();
+     }
+     if (!input.overwrite && (await files.findLiveFileByPath(pool, input.tenantId, path))) {
+       throw new PathConflictError(path);
+@@ -92,11 +110,7 @@ export class UploadService {
+     const storageKey = storageKeyFor(input.tenantId, fileId);
+     let committed = false;
+     try {
+-      const meter = new UploadMeter({
+-        maxBytes: this.deps.maxUploadBytes,
+-        headBytes: SNIFF_BYTES,
+-        tooLarge: this.tooLarge,
+-      });
++      const meter = new UploadMeter({ maxBytes, headBytes: SNIFF_BYTES, tooLarge });
+       // The callback form destroys the body when the meter fails (or the driver destroys it).
+       const metered = pipeline(input.body, meter, () => undefined);
+       const { bytes } = await storage.put(
+diff --git a/test/api/uploadLimits.test.ts b/test/api/uploadLimits.test.ts
+new file mode 100644
+index 0000000..5d9b3d0
+--- /dev/null
++++ b/test/api/uploadLimits.test.ts
+@@ -0,0 +1,145 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  expectStatus,
++  issueKey,
++  multipartBody,
++  putFile,
++  storeFile,
++  tenantUsage,
++  type ErrorResponse,
++  type SessionBody,
++  type TenantBody,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++describe("per-tenant upload size limits", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeEach(async () => {
++    t = await buildTestApp({ env: { MAX_UPLOAD_BYTES: "8192" } });
++    tenant = await createTenant(t.pool, t.clock, { quotaBytes: 100_000 });
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  function patchTenant(payload: unknown, key: TestTenant = tenant) {
++    return t.app.inject({ method: "PATCH", url: "/v1/tenant", headers: key.headers, payload: payload as object });
++  }
++
++  async function limitUploads(maxUploadBytes: number | null): Promise<TenantBody> {
++    const response = await patchTenant({ maxUploadBytes });
++    expectStatus(response, 200);
++    return response.json<TenantBody>();
++  }
++
++  it("sets, reports and clears the tenant's limit", async () => {
++    const tenantBody = await t.app.inject({ url: "/v1/tenant", headers: tenant.headers });
++    expect(tenantBody.json<TenantBody>().maxUploadBytes).toBeNull();
++
++    expect(await limitUploads(1000)).toMatchObject({ maxUploadBytes: 1000, quotaBytes: 100_000 });
++    expect((await t.app.inject({ url: "/v1/tenant", headers: tenant.headers })).json<TenantBody>()).toMatchObject({
++      maxUploadBytes: 1000,
++    });
++
++    const both = await patchTenant({ quotaBytes: 50_000, maxUploadBytes: 2000 });
++    expectStatus(both, 200);
++    expect(both.json<TenantBody>()).toMatchObject({ quotaBytes: 50_000, maxUploadBytes: 2000 });
++
++    // Changing only the quota keeps the limit.
++    const quotaOnly = await patchTenant({ quotaBytes: 60_000 });
++    expect(quotaOnly.json<TenantBody>()).toMatchObject({ quotaBytes: 60_000, maxUploadBytes: 2000 });
++
++    expect(await limitUploads(null)).toMatchObject({ quotaBytes: 60_000, maxUploadBytes: null });
++  });
++
++  it.each([
++    [{}],
++    [{ maxUploadBytes: 0 }],
++    [{ maxUploadBytes: 8193 }],
++    [{ maxUploadBytes: 1.5 }],
++    [{ maxUploadBytes: "100" }],
++  ])("refuses %j", async (payload) => {
++    expectStatus(await patchTenant(payload), 400);
++  });
++
++  it("needs tenant:admin to change the limit", async () => {
++    const reader = await issueKey(t.pool, t.clock, tenant.tenantId, ["tenant:read"]);
++    expectStatus(await patchTenant({ maxUploadBytes: 100 }, reader), 403);
++  });
++
++  it("refuses raw uploads over the tenant's limit, announced or not", async () => {
++    await limitUploads(1000);
++    const announced = await putFile(t.app, tenant, "big.bin", Buffer.alloc(1001));
++    expectStatus(announced, 413);
++    expect(announced.json<ErrorResponse>().error).toMatchObject({
++      code: "payload_too_large",
++      details: { limitBytes: 1000 },
++    });
++
++    const chunked = await t.app.inject({
++      method: "PUT",
++      url: "/v1/files/big.bin",
++      headers: { ...tenant.headers, "content-type": "application/octet-stream", "transfer-encoding": "chunked" },
++      payload: Buffer.alloc(1500),
++    });
++    expectStatus(chunked, 413);
++    expect(chunked.json<ErrorResponse>().error.details).toEqual({ limitBytes: 1000 });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(0);
++
++    const exact = await storeFile(t.app, tenant, "exact.bin", Buffer.alloc(1000));
++    expect(exact.size).toBe(1000);
++  });
++
++  it("refuses multipart uploads over the tenant's limit", async () => {
++    await limitUploads(1000);
++    const form = multipartBody([
++      { name: "path", value: "big.bin" },
++      { name: "file", filename: "big.bin", contentType: "application/octet-stream", content: Buffer.alloc(1001) },
++    ]);
++    const response = await t.app.inject({
++      method: "POST",
++      url: "/v1/files",
++      headers: { ...tenant.headers, "content-type": form.contentType },
++      payload: form.payload,
++    });
++    expectStatus(response, 413);
++    expect(response.json<ErrorResponse>().error.details).toEqual({ limitBytes: 1000 });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(0);
++  });
++
++  it("refuses resumable sessions larger than the tenant's limit", async () => {
++    await limitUploads(1000);
++    const createSession = (size: number) =>
++      t.app.inject({ method: "POST", url: "/v1/uploads", headers: tenant.headers, payload: { path: "s.bin", size } });
++    const tooLarge = await createSession(1001);
++    expectStatus(tooLarge, 413);
++    expect(tooLarge.json<ErrorResponse>().error.details).toEqual({ limitBytes: 1000 });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(0);
++
++    const fits = await createSession(1000);
++    expectStatus(fits, 201);
++    expect(fits.json<SessionBody>().size).toBe(1000);
++  });
++
++  it("keeps the service's limit for other tenants", async () => {
++    await limitUploads(1000);
++    const other = await createTenant(t.pool, t.clock, { name: "Harbor Logistics", quotaBytes: 100_000 });
++    expectStatus(await putFile(t.app, other, "big.bin", Buffer.alloc(8192)), 201);
++    const over = await putFile(t.app, other, "bigger.bin", Buffer.alloc(8193));
++    expectStatus(over, 413);
++    expect(over.json<ErrorResponse>().error.details).toEqual({ limitBytes: 8192 });
++  });
++
++  it("applies the service's limit when it is lower than the tenant's", async () => {
++    // A limit set while MAX_UPLOAD_BYTES was higher.
++    await t.pool.query("UPDATE tenants SET max_upload_bytes = 20000 WHERE id = $1", [tenant.tenantId]);
++    const over = await putFile(t.app, tenant, "big.bin", Buffer.alloc(8193));
++    expectStatus(over, 413);
++    expect(over.json<ErrorResponse>().error.details).toEqual({ limitBytes: 8192 });
++  });
++});
+diff --git a/test/helpers/fixtures.ts b/test/helpers/fixtures.ts
+index 56fa861..c00a308 100644
+--- a/test/helpers/fixtures.ts
++++ b/test/helpers/fixtures.ts
+@@ -38,6 +38,7 @@ export interface TenantBody {
+   quotaBytes: number;
+   usedBytes: number;
+   availableBytes: number;
++  maxUploadBytes: number | null;
+ }
+ 
+ /** A tenant with a quota (1 MiB by default) and one API key holding `scopes` (all by default). */

@@ -1,0 +1,1055 @@
+diff --git a/README.md b/README.md
+index fe11f01..469f319 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,19 @@ Flyway and PostgreSQL.
+   counts apply the same rule, so titles of documents a user cannot see never appear. A document
+   the caller may not see is a 404 on every route, including the task and decision routes; a 403 is
+   only for a document the caller can see but may not change.
++- **Attachments.** The owner attaches files to a draft: one file per multipart upload, in the part
++  named `file`. Each file is at most `workflow.attachments.max-bytes` (5 MiB by default; larger is
++  413 `too-large`, and the container stops reading such an upload at that size). A request more
++  than 64 KiB over the limit is refused from its declared size with 413 and `Connection: close`
++  before its body is read; a client that keeps writing the body may see the connection closed
++  before it reads the 413 (curl reads it; Java's `HttpClient` reports an `IOException`). A document holds at
++  most `workflow.attachments.max-per-document` files (10 by default; another one is 409), and the part's content
++  type, without parameters, must be in `workflow.attachments.allowed-types` (PDF, PNG, JPEG and
++  plain text; anything else is 415). The file is stored in the database with its size and SHA-256.
++  Once the document is submitted its attachments can no longer be added or removed (409), also
++  after a rejection or a withdrawal. Anyone who can see the document lists and downloads them, under the same 404
++  rule as the document itself; a download is always sent as an attachment with
++  `X-Content-Type-Options: nosniff`.
+ - **Notifications.** Each event is written to an outbox with an idempotency key and the recipient's
+   account id; the address it was sent to is kept for delivery. A user's notifications follow the
+   account, so changing an address keeps them. Dispatch is at-least-once; a redelivered event
+@@ -85,8 +98,12 @@ curl -s -X POST localhost:8080/api/v1/admin/definitions/1/publish -H "Authorizat
+ 
+ Other settings sit under `workflow.*` in `src/main/resources/application.yml`:
+ `business-zone`, `working-start`, `working-end`, `outbox-batch-size`, `outbox-max-attempts`,
+-`outbox-retry-base`, `escalation-batch-size`, `job-interval` and `scheduling-enabled`. Invalid
+-values fail the startup.
++`outbox-retry-base`, `escalation-batch-size`, `job-interval`, `scheduling-enabled`,
++`attachments.max-bytes` (1 to 26214400), `attachments.max-per-document` (1 to 100) and
++`attachments.allowed-types`. Invalid values fail the startup. The multipart limits of the servlet
++container are derived from `attachments.max-bytes`; Boot's `spring.servlet.multipart.*` limits do
++not apply. `server.tomcat.max-part-header-size` is 4KB, so a 200-character file name in any script
++fits in the part's headers.
+ 
+ ## Testing
+ 
+@@ -142,6 +159,10 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `GET /documents/{id}/access` | the owner, the approvers and the explicit grants |
+ | `GET /documents/{id}/permissions` | the explicit grants (anyone who can see the document) |
+ | `PUT /documents/{id}/permissions/{userId}`, `DELETE /documents/{id}/permissions/{userId}` | grant or change, and revoke (owner or admin) |
++| `POST /documents/{id}/attachments` | attach a file to a draft (owner; multipart part `file`; 201, `Location`) |
++| `GET /documents/{id}/attachments` | the document's files: name, type, size, SHA-256, uploader and time |
++| `GET /documents/{id}/attachments/{attachmentId}` | download one file |
++| `DELETE /documents/{id}/attachments/{attachmentId}` | remove a file from a draft (owner) |
+ | `GET /tasks/mine`, `GET /tasks/mine/count` | my open tasks, most urgent first, and how many |
+ | `GET /tasks/decided?cursor=&size=` | tasks I decided (approved or rejected), and only those |
+ | `GET /tasks/{id}` | one task (its assignee, or anyone who can see its document) |
+@@ -179,7 +200,7 @@ Problems follow RFC 9457: `type` is `urn:workflow:problem:<slug>`, and a documen
+ reported as not found. The slugs a client can meet are `invalid-request`, `malformed-request`,
+ `validation-failed`, `not-found`, `no-such-route`, `forbidden`, `invalid-transition`, `conflict`,
+ `concurrent-update`, `unauthorized`, `ambiguous-path`, `method-not-allowed`, `unsupported-media-type`,
+-`not-acceptable` and `unexpected`.
++`not-acceptable`, `too-large` and `unexpected`.
+ 
+ ## Operator rules
+ 
+diff --git a/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java b/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java
+index 7e9360a..654ca2f 100644
+--- a/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java
++++ b/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java
+@@ -4,6 +4,8 @@ import com.papertrail.workflow.domain.ConflictException;
+ import com.papertrail.workflow.domain.ForbiddenException;
+ import com.papertrail.workflow.domain.InvalidTransitionException;
+ import com.papertrail.workflow.domain.NotFoundException;
++import com.papertrail.workflow.domain.TooLargeException;
++import com.papertrail.workflow.domain.UnsupportedTypeException;
+ import com.papertrail.workflow.domain.ValidationException;
+ import jakarta.validation.ConstraintViolationException;
+ import java.net.URI;
+@@ -17,6 +19,7 @@ import org.springframework.core.annotation.Order;
+ import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.http.HttpMethod;
+ import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
+ import org.springframework.http.ProblemDetail;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.http.converter.HttpMessageNotReadableException;
+@@ -30,6 +33,9 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.RestControllerAdvice;
+ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
++import org.springframework.web.multipart.MaxUploadSizeExceededException;
++import org.springframework.web.multipart.MultipartException;
++import org.springframework.web.multipart.support.MissingServletRequestPartException;
+ import org.springframework.web.servlet.resource.NoResourceFoundException;
+ 
+ /**
+@@ -67,6 +73,40 @@ public class ApiExceptionHandler {
+     return problem(HttpStatus.BAD_REQUEST, "invalid-request", "Invalid request", e.getMessage());
+   }
+ 
++  @ExceptionHandler(TooLargeException.class)
++  public ProblemDetail tooLarge(TooLargeException e) {
++    return problem(HttpStatus.PAYLOAD_TOO_LARGE, "too-large", "Too large", e.getMessage());
++  }
++
++  @ExceptionHandler(UnsupportedTypeException.class)
++  public ProblemDetail unsupportedType(UnsupportedTypeException e) {
++    return problem(
++        HttpStatus.UNSUPPORTED_MEDIA_TYPE,
++        "unsupported-media-type",
++        "Unsupported media type",
++        e.getMessage());
++  }
++
++  /** The container stopped reading an upload at the configured file or request size. */
++  @ExceptionHandler(MaxUploadSizeExceededException.class)
++  public ProblemDetail uploadTooLarge(MaxUploadSizeExceededException e) {
++    return problem(
++        HttpStatus.PAYLOAD_TOO_LARGE,
++        "too-large",
++        "Too large",
++        "the upload is larger than the attachment size limit");
++  }
++
++  /** An upload whose multipart body cannot be read, or that has no file part. */
++  @ExceptionHandler({MultipartException.class, MissingServletRequestPartException.class})
++  public ProblemDetail unreadableUpload(Exception e) {
++    return problem(
++        HttpStatus.BAD_REQUEST,
++        "malformed-request",
++        "Malformed request",
++        "send the file as a multipart/form-data part named file");
++  }
++
+   @ExceptionHandler(NoResourceFoundException.class)
+   public ProblemDetail noSuchRoute(NoResourceFoundException e) {
+     return problem(HttpStatus.NOT_FOUND, "no-such-route", "Not found", "no route for this path");
+@@ -160,11 +200,12 @@ public class ApiExceptionHandler {
+ 
+   @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+   public ProblemDetail wrongRequestType(HttpMediaTypeNotSupportedException e) {
++    boolean upload = e.getSupportedMediaTypes().contains(MediaType.MULTIPART_FORM_DATA);
+     return problem(
+         HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+         "unsupported-media-type",
+         "Unsupported media type",
+-        "send the body as application/json");
++        upload ? "send the file as multipart/form-data" : "send the body as application/json");
+   }
+ 
+   @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+diff --git a/src/main/java/com/papertrail/workflow/api/AttachmentController.java b/src/main/java/com/papertrail/workflow/api/AttachmentController.java
+new file mode 100644
+index 0000000..a0c8b95
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/api/AttachmentController.java
+@@ -0,0 +1,79 @@
++package com.papertrail.workflow.api;
++
++import com.papertrail.workflow.domain.DocumentAttachment;
++import com.papertrail.workflow.service.AttachmentService;
++import com.papertrail.workflow.service.Views.AttachmentView;
++import java.io.IOException;
++import java.net.URI;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++import org.springframework.http.ContentDisposition;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestPart;
++import org.springframework.web.bind.annotation.RestController;
++import org.springframework.web.multipart.MultipartFile;
++
++/** Files attached to a document: upload as multipart, list, download and remove. */
++@RestController
++@RequestMapping("/api/v1/documents/{id}/attachments")
++public class AttachmentController {
++
++  private final AttachmentService attachments;
++  private final CurrentPrincipal current;
++
++  public AttachmentController(AttachmentService attachments, CurrentPrincipal current) {
++    this.attachments = attachments;
++    this.current = current;
++  }
++
++  @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
++  public ResponseEntity<AttachmentView> upload(
++      @PathVariable long id, @RequestPart("file") MultipartFile file) throws IOException {
++    AttachmentView view =
++        attachments.add(
++            current.require(),
++            id,
++            file.getOriginalFilename(),
++            file.getContentType(),
++            file.getBytes());
++    return ResponseEntity.created(
++            URI.create("/api/v1/documents/" + id + "/attachments/" + view.id()))
++        .body(view);
++  }
++
++  @GetMapping
++  public List<AttachmentView> list(@PathVariable long id) {
++    return attachments.list(current.require(), id);
++  }
++
++  /**
++   * The file as it was uploaded. It is always sent as a download with {@code nosniff}, so a browser
++   * neither renders it in place nor guesses another type.
++   */
++  @GetMapping("/{attachmentId}")
++  public ResponseEntity<byte[]> download(@PathVariable long id, @PathVariable long attachmentId) {
++    DocumentAttachment file = attachments.download(current.require(), id, attachmentId);
++    ContentDisposition disposition =
++        ContentDisposition.attachment()
++            .filename(file.getFileName(), StandardCharsets.UTF_8)
++            .build();
++    return ResponseEntity.ok()
++        .contentType(MediaType.parseMediaType(file.getContentType()))
++        .header(HttpHeaders.CONTENT_DISPOSITION, disposition.toString())
++        .header("X-Content-Type-Options", "nosniff")
++        .body(file.getContent());
++  }
++
++  @DeleteMapping("/{attachmentId}")
++  public ResponseEntity<Void> remove(@PathVariable long id, @PathVariable long attachmentId) {
++    attachments.remove(current.require(), id, attachmentId);
++    return ResponseEntity.noContent().build();
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/config/AttachmentSettings.java b/src/main/java/com/papertrail/workflow/config/AttachmentSettings.java
+new file mode 100644
+index 0000000..0821938
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/config/AttachmentSettings.java
+@@ -0,0 +1,42 @@
++package com.papertrail.workflow.config;
++
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotEmpty;
++import java.util.List;
++import java.util.Locale;
++import java.util.regex.Pattern;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++import org.springframework.validation.annotation.Validated;
++
++/**
++ * Limits for files attached to documents, under {@code workflow.attachments}: the largest file in
++ * bytes, how many files one document may hold, and the content types accepted.
++ */
++@Validated
++@ConfigurationProperties(prefix = "workflow.attachments")
++public record AttachmentSettings(
++    @DefaultValue("5242880") @Min(1) @Max(26_214_400) int maxBytes,
++    @DefaultValue("10") @Min(1) @Max(100) int maxPerDocument,
++    @DefaultValue({"application/pdf", "image/png", "image/jpeg", "text/plain"}) @NotEmpty
++        List<String> allowedTypes) {
++
++  private static final Pattern MEDIA_TYPE = Pattern.compile("[a-z0-9.+-]{1,49}/[a-z0-9.+-]{1,50}");
++
++  public AttachmentSettings {
++    allowedTypes =
++        allowedTypes == null
++            ? List.of()
++            : allowedTypes.stream()
++                .map(type -> type.trim().toLowerCase(Locale.ROOT))
++                .filter(type -> !type.isEmpty())
++                .toList();
++    for (String type : allowedTypes) {
++      if (!MEDIA_TYPE.matcher(type).matches()) {
++        throw new IllegalArgumentException(
++            "workflow.attachments.allowed-types takes types such as application/pdf");
++      }
++    }
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/config/WebConfig.java b/src/main/java/com/papertrail/workflow/config/WebConfig.java
+index 383d4c1..d670219 100644
+--- a/src/main/java/com/papertrail/workflow/config/WebConfig.java
++++ b/src/main/java/com/papertrail/workflow/config/WebConfig.java
+@@ -6,6 +6,7 @@ import com.papertrail.workflow.api.CurrentPrincipal;
+ import com.papertrail.workflow.api.PathGuardFilter;
+ import com.papertrail.workflow.api.RequestLoggingFilter;
+ import com.papertrail.workflow.service.IdentityService;
++import jakarta.servlet.MultipartConfigElement;
+ import org.springframework.boot.web.servlet.FilterRegistrationBean;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+@@ -24,6 +25,20 @@ public class WebConfig {
+   /** Runs after Boot's OrderedRequestContextFilter (-105), which opens the request scope. */
+   static final int AFTER_REQUEST_CONTEXT = -100;
+ 
++  /** Room in a multipart request for the part headers and boundaries around the one file. */
++  static final long MULTIPART_OVERHEAD = 64 * 1024;
++
++  /**
++   * The container's multipart limits follow {@code workflow.attachments.max-bytes}, so an oversized
++   * upload is stopped while it is read rather than after it has been buffered. Replaces Boot's own
++   * {@code spring.servlet.multipart} limits.
++   */
++  @Bean
++  public MultipartConfigElement multipartConfigElement(AttachmentSettings attachments) {
++    return new MultipartConfigElement(
++        "", attachments.maxBytes(), attachments.maxBytes() + MULTIPART_OVERHEAD, 0);
++  }
++
+   @Bean
+   public FilterRegistrationBean<PathGuardFilter> pathGuardFilter() {
+     var registration = new FilterRegistrationBean<>(new PathGuardFilter());
+diff --git a/src/main/java/com/papertrail/workflow/domain/DocumentAttachment.java b/src/main/java/com/papertrail/workflow/domain/DocumentAttachment.java
+new file mode 100644
+index 0000000..4a7e1ef
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/domain/DocumentAttachment.java
+@@ -0,0 +1,84 @@
++package com.papertrail.workflow.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.FetchType;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.JoinColumn;
++import jakarta.persistence.ManyToOne;
++import jakarta.persistence.Table;
++import java.time.Instant;
++
++/** A file attached to a document, stored with its SHA-256 so a download can be checked. */
++@Entity
++@Table(name = "document_attachment")
++public class DocumentAttachment extends AbstractEntity<Long> {
++
++  @Id
++  @GeneratedValue(strategy = GenerationType.IDENTITY)
++  private Long id;
++
++  @ManyToOne(fetch = FetchType.LAZY, optional = false)
++  @JoinColumn(name = "document_id", nullable = false)
++  private Document document;
++
++  @Column(name = "file_name", nullable = false, length = 200)
++  private String fileName;
++
++  @Column(name = "content_type", nullable = false, length = 100)
++  private String contentType;
++
++  @Column(name = "size_bytes", nullable = false)
++  private int sizeBytes;
++
++  @Column(nullable = false, length = 64)
++  private String sha256;
++
++  @Column(nullable = false)
++  private byte[] content;
++
++  @Column(name = "uploaded_by", nullable = false)
++  private long uploadedBy;
++
++  @Column(name = "uploaded_at", nullable = false)
++  private Instant uploadedAt;
++
++  protected DocumentAttachment() {}
++
++  public DocumentAttachment(
++      Document document,
++      String fileName,
++      String contentType,
++      byte[] content,
++      String sha256,
++      long uploadedBy,
++      Instant uploadedAt) {
++    this.document = document;
++    this.fileName = fileName;
++    this.contentType = contentType;
++    this.content = content;
++    this.sizeBytes = content.length;
++    this.sha256 = sha256;
++    this.uploadedBy = uploadedBy;
++    this.uploadedAt = uploadedAt;
++  }
++
++  @Override
++  public Long getId() {
++    return id;
++  }
++
++  public String getFileName() {
++    return fileName;
++  }
++
++  public String getContentType() {
++    return contentType;
++  }
++
++  public byte[] getContent() {
++    return content;
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java b/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
+index f8667a0..f0055c5 100644
+--- a/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
++++ b/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
+@@ -58,6 +58,12 @@ public final class DocumentStateMachine {
+     document.moveToOrder(order, now);
+   }
+ 
++  /** The owner adds or removes attachments, only while the document is a draft. */
++  public static void requireAttachable(Document document, Principal actor) {
++    requireOwner(document, actor, "change the attachments of");
++    requireStatus(document, DocumentStatus.DRAFT, "change the attachments of");
++  }
++
+   /** The owner or an admin manages who can see the document. */
+   public static void requireManager(Document document, Principal actor) {
+     if (!actor.admin() && !document.isOwnedBy(actor.userId())) {
+diff --git a/src/main/java/com/papertrail/workflow/domain/TooLargeException.java b/src/main/java/com/papertrail/workflow/domain/TooLargeException.java
+new file mode 100644
+index 0000000..83352cf
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/domain/TooLargeException.java
+@@ -0,0 +1,9 @@
++package com.papertrail.workflow.domain;
++
++/** The request carries more data than a limit allows. */
++public class TooLargeException extends WorkflowException {
++
++  public TooLargeException(String message) {
++    super(message);
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/domain/UnsupportedTypeException.java b/src/main/java/com/papertrail/workflow/domain/UnsupportedTypeException.java
+new file mode 100644
+index 0000000..ffbd0ee
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/domain/UnsupportedTypeException.java
+@@ -0,0 +1,9 @@
++package com.papertrail.workflow.domain;
++
++/** The content type of an uploaded file is not one the service accepts. */
++public class UnsupportedTypeException extends WorkflowException {
++
++  public UnsupportedTypeException(String message) {
++    super(message);
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentAttachmentRepository.java b/src/main/java/com/papertrail/workflow/persistence/DocumentAttachmentRepository.java
+new file mode 100644
+index 0000000..af1dffa
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentAttachmentRepository.java
+@@ -0,0 +1,23 @@
++package com.papertrail.workflow.persistence;
++
++import com.papertrail.workflow.domain.DocumentAttachment;
++import com.papertrail.workflow.service.Views.AttachmentView;
++import java.util.List;
++import java.util.Optional;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++public interface DocumentAttachmentRepository extends JpaRepository<DocumentAttachment, Long> {
++
++  /** The document's files, oldest first, read without their content. */
++  @Query(
++      "select new com.papertrail.workflow.service.Views$AttachmentView(a.id, a.fileName,"
++          + " a.contentType, a.sizeBytes, a.sha256, a.uploadedBy, a.uploadedAt)"
++          + " from DocumentAttachment a where a.document.id = :documentId order by a.id")
++  List<AttachmentView> findViews(@Param("documentId") long documentId);
++
++  Optional<DocumentAttachment> findByIdAndDocumentId(long id, long documentId);
++
++  long countByDocumentId(long documentId);
++}
+diff --git a/src/main/java/com/papertrail/workflow/service/AttachmentService.java b/src/main/java/com/papertrail/workflow/service/AttachmentService.java
+new file mode 100644
+index 0000000..65793a5
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/service/AttachmentService.java
+@@ -0,0 +1,152 @@
++package com.papertrail.workflow.service;
++
++import com.papertrail.workflow.config.AttachmentSettings;
++import com.papertrail.workflow.domain.ConflictException;
++import com.papertrail.workflow.domain.Document;
++import com.papertrail.workflow.domain.DocumentAttachment;
++import com.papertrail.workflow.domain.DocumentStateMachine;
++import com.papertrail.workflow.domain.NotFoundException;
++import com.papertrail.workflow.domain.Principal;
++import com.papertrail.workflow.domain.TooLargeException;
++import com.papertrail.workflow.domain.UnsupportedTypeException;
++import com.papertrail.workflow.domain.ValidationException;
++import com.papertrail.workflow.persistence.DocumentAttachmentRepository;
++import com.papertrail.workflow.service.Views.AttachmentView;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.time.Clock;
++import java.time.Instant;
++import java.util.HexFormat;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Files attached to a document. Anyone who can see the document lists and downloads them; only the
++ * owner adds or removes them, and only while the document is a draft. Changes take the document row
++ * lock, so the per-document limit holds under concurrent uploads and no file is added once the
++ * document has been submitted.
++ */
++@Service
++public class AttachmentService {
++
++  static final int MAX_FILE_NAME = 200;
++
++  private final DocumentAttachmentRepository attachments;
++  private final DocumentAccess access;
++  private final EventLog events;
++  private final AttachmentSettings settings;
++  private final Clock clock;
++
++  public AttachmentService(
++      DocumentAttachmentRepository attachments,
++      DocumentAccess access,
++      EventLog events,
++      AttachmentSettings settings,
++      Clock clock) {
++    this.attachments = attachments;
++    this.access = access;
++    this.events = events;
++    this.settings = settings;
++    this.clock = clock;
++  }
++
++  @Transactional
++  public AttachmentView add(
++      Principal actor, long documentId, String fileName, String contentType, byte[] content) {
++    Document document = access.lockVisible(actor, documentId);
++    DocumentStateMachine.requireAttachable(document, actor);
++    String name = cleanName(fileName);
++    if (content.length == 0) {
++      throw new ValidationException("the file is empty");
++    }
++    if (content.length > settings.maxBytes()) {
++      throw new TooLargeException("a file may not exceed " + settings.maxBytes() + " bytes");
++    }
++    String type = baseType(contentType);
++    if (!settings.allowedTypes().contains(type)) {
++      throw new UnsupportedTypeException("accepted file types are " + settings.allowedTypes());
++    }
++    if (attachments.countByDocumentId(documentId) >= settings.maxPerDocument()) {
++      throw new ConflictException(
++          "a document holds at most " + settings.maxPerDocument() + " attachments");
++    }
++    Instant now = clock.instant();
++    String sha256 = sha256(content);
++    long id =
++        attachments
++            .save(
++                new DocumentAttachment(document, name, type, content, sha256, actor.userId(), now))
++            .getId();
++    events.audit(
++        document,
++        actor.userId(),
++        "ATTACHMENT_ADDED",
++        Map.of("attachmentId", id, "sizeBytes", content.length, "type", type),
++        now);
++    return new AttachmentView(id, name, type, content.length, sha256, actor.userId(), now);
++  }
++
++  @Transactional(readOnly = true)
++  public List<AttachmentView> list(Principal actor, long documentId) {
++    access.visible(actor, documentId);
++    return attachments.findViews(documentId);
++  }
++
++  @Transactional(readOnly = true)
++  public DocumentAttachment download(Principal actor, long documentId, long attachmentId) {
++    access.visible(actor, documentId);
++    return find(documentId, attachmentId);
++  }
++
++  @Transactional
++  public void remove(Principal actor, long documentId, long attachmentId) {
++    Document document = access.lockVisible(actor, documentId);
++    DocumentStateMachine.requireAttachable(document, actor);
++    attachments.delete(find(documentId, attachmentId));
++    events.audit(
++        document,
++        actor.userId(),
++        "ATTACHMENT_REMOVED",
++        Map.of("attachmentId", attachmentId),
++        clock.instant());
++  }
++
++  private DocumentAttachment find(long documentId, long attachmentId) {
++    return attachments
++        .findByIdAndDocumentId(attachmentId, documentId)
++        .orElseThrow(() -> new NotFoundException("attachment not found"));
++  }
++
++  /**
++   * The media type without parameters, lower-cased: {@code Text/Plain; charset=x} is text/plain.
++   */
++  static String baseType(String contentType) {
++    String type = contentType == null ? "" : contentType;
++    int semicolon = type.indexOf(';');
++    return (semicolon < 0 ? type : type.substring(0, semicolon)).trim().toLowerCase(Locale.ROOT);
++  }
++
++  /** The last segment of the name the client sent; some browsers send the whole local path. */
++  static String cleanName(String original) {
++    String name = original == null ? "" : original;
++    name = name.substring(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1).strip();
++    if (name.isEmpty()
++        || name.codePointCount(0, name.length()) > MAX_FILE_NAME
++        || name.chars().anyMatch(Character::isISOControl)) {
++      throw new ValidationException(
++          "a file name has 1 to " + MAX_FILE_NAME + " characters and no control characters");
++    }
++    return name;
++  }
++
++  static String sha256(byte[] content) {
++    try {
++      return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
++    } catch (NoSuchAlgorithmException e) {
++      throw new IllegalStateException("SHA-256 is not available", e);
++    }
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..33cfa16 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -245,6 +245,16 @@ public final class Views {
+     }
+   }
+ 
++  /** A file attached to a document, without its content. */
++  public record AttachmentView(
++      long id,
++      String fileName,
++      String contentType,
++      int sizeBytes,
++      String sha256,
++      long uploadedBy,
++      Instant uploadedAt) {}
++
+   /** A due time worked out from a start instant and a working-time allowance. */
+   public record DueView(Instant from, int minutes, Instant dueAt) {}
+ 
+diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
+index 96fef7a..9730475 100644
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -17,6 +17,12 @@ spring:
+       pageable:
+         max-page-size: 100
+ 
++server:
++  tomcat:
++    # Tomcat's default of 512 bytes per part's headers is less than a 200-character file name
++    # takes in UTF-8 (up to 800 bytes); the multipart size limits themselves are in WebConfig.
++    max-part-header-size: 4KB
++
+ management:
+   endpoints:
+     web:
+@@ -37,3 +43,7 @@ workflow:
+   escalation-batch-size: 20
+   job-interval: PT1M
+   scheduling-enabled: true
++  attachments:
++    max-bytes: 5242880
++    max-per-document: 10
++    allowed-types: application/pdf, image/png, image/jpeg, text/plain
+diff --git a/src/main/resources/db/migration/V3__document_attachments.sql b/src/main/resources/db/migration/V3__document_attachments.sql
+new file mode 100644
+index 0000000..3a3c1dd
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__document_attachments.sql
+@@ -0,0 +1,12 @@
++CREATE TABLE document_attachment (
++    id           BIGSERIAL PRIMARY KEY,
++    document_id  BIGINT       NOT NULL REFERENCES document (id),
++    file_name    VARCHAR(200) NOT NULL,
++    content_type VARCHAR(100) NOT NULL,
++    size_bytes   INTEGER      NOT NULL CHECK (size_bytes > 0),
++    sha256       VARCHAR(64)  NOT NULL,
++    content      BYTEA        NOT NULL,
++    uploaded_by  BIGINT       NOT NULL REFERENCES app_user (id),
++    uploaded_at  TIMESTAMPTZ  NOT NULL
++);
++CREATE INDEX document_attachment_document ON document_attachment (document_id, id);
+diff --git a/src/test/java/com/papertrail/workflow/api/AttachmentApiTest.java b/src/test/java/com/papertrail/workflow/api/AttachmentApiTest.java
+new file mode 100644
+index 0000000..e7c0abc
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/AttachmentApiTest.java
+@@ -0,0 +1,159 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.hamcrest.Matchers.containsString;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.papertrail.workflow.domain.PermissionLevel;
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.service.DocumentService;
++import com.papertrail.workflow.service.PermissionService;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.nio.charset.StandardCharsets;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.mock.web.MockMultipartFile;
++import org.springframework.test.web.servlet.ResultActions;
++
++class AttachmentApiTest extends IntegrationTestBase {
++
++  private static final String AUTH = "Authorization";
++  private static final byte[] RECEIPT = "Invented receipt 42.00".getBytes(StandardCharsets.UTF_8);
++
++  @Autowired private DocumentService documents;
++  @Autowired private PermissionService permissions;
++
++  private long owner;
++  private long approver;
++  private long document;
++
++  @BeforeEach
++  void setUp() {
++    owner = data.user("Ines Berg");
++    approver = data.user("Tomas Vale");
++    data.publish("Expenses", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++    document = data.draft(data.principal(owner), "Expenses", "Travel claim");
++  }
++
++  private String path() {
++    return "/api/v1/documents/" + document + "/attachments";
++  }
++
++  private ResultActions upload(long userId, String name, String type, byte[] content)
++      throws Exception {
++    return mvc.perform(
++        multipart(path())
++            .file(new MockMultipartFile("file", name, type, content))
++            .header(AUTH, data.bearer(userId)));
++  }
++
++  private long uploaded(String name) throws Exception {
++    return idFrom(
++        upload(owner, name, "text/plain", RECEIPT).andExpect(status().isCreated()).andReturn());
++  }
++
++  @Test
++  void theOwnerUploadsAndAnApproverDownloadsTheSameBytes() throws Exception {
++    upload(owner, "C:\\Users\\ines\\receipt.txt", "Text/Plain; charset=UTF-8", RECEIPT)
++        .andExpect(status().isCreated())
++        .andExpect(jsonPath("$.fileName").value("receipt.txt"))
++        .andExpect(jsonPath("$.contentType").value("text/plain"))
++        .andExpect(jsonPath("$.sizeBytes").value(RECEIPT.length));
++    long id = jdbc.queryForObject("select id from document_attachment", Long.class);
++    documents.submit(data.principal(owner), document);
++
++    mvc.perform(get(path()).header(AUTH, data.bearer(approver)))
++        .andExpect(jsonPath("$[0].id").value(id))
++        .andExpect(jsonPath("$[0].sha256").value(sha256Of(id)))
++        .andExpect(jsonPath("$[0].content").doesNotExist());
++    byte[] body =
++        mvc.perform(get(path() + "/" + id).header(AUTH, data.bearer(approver)))
++            .andExpect(status().isOk())
++            .andExpect(header().string("Content-Type", "text/plain"))
++            .andExpect(header().string("X-Content-Type-Options", "nosniff"))
++            .andExpect(header().string("Content-Disposition", containsString("receipt.txt")))
++            .andReturn()
++            .getResponse()
++            .getContentAsByteArray();
++    assertThat(body).isEqualTo(RECEIPT);
++  }
++
++  private String sha256Of(long id) {
++    return jdbc.queryForObject(
++        "select encode(sha256(content), 'hex') from document_attachment where id = ?",
++        String.class,
++        id);
++  }
++
++  @Test
++  void strangersGetNotFoundAndViewersOnlyRead() throws Exception {
++    long id = uploaded("receipt.txt");
++    long stranger = data.user("Omar Lind");
++    long viewer = data.user("Nadia Roy");
++    permissions.grant(data.principal(owner), document, viewer, PermissionLevel.VIEW);
++
++    mvc.perform(get(path()).header(AUTH, data.bearer(stranger))).andExpect(status().isNotFound());
++    mvc.perform(get(path() + "/" + id).header(AUTH, data.bearer(stranger)))
++        .andExpect(status().isNotFound());
++    upload(stranger, "x.txt", "text/plain", RECEIPT).andExpect(status().isNotFound());
++    mvc.perform(get(path() + "/" + id).header(AUTH, data.bearer(viewer)))
++        .andExpect(status().isOk());
++    upload(viewer, "x.txt", "text/plain", RECEIPT).andExpect(status().isForbidden());
++    mvc.perform(delete(path() + "/" + id).header(AUTH, data.bearer(viewer)))
++        .andExpect(status().isForbidden());
++  }
++
++  @Test
++  void sizeTypeAndCountLimitsAreProblems() throws Exception {
++    upload(owner, "big.txt", "text/plain", new byte[4097])
++        .andExpect(status().isPayloadTooLarge())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:too-large"));
++    upload(owner, "page.html", "text/html", RECEIPT)
++        .andExpect(status().isUnsupportedMediaType())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:unsupported-media-type"));
++    upload(owner, "empty.txt", "text/plain", new byte[0]).andExpect(status().isBadRequest());
++    upload(owner, "full.txt", "text/plain", new byte[4096]).andExpect(status().isCreated());
++    upload(owner, "b.pdf", "application/pdf", RECEIPT).andExpect(status().isCreated());
++    upload(owner, "c.png", "image/png", RECEIPT).andExpect(status().isCreated());
++
++    upload(owner, "d.png", "image/png", RECEIPT)
++        .andExpect(status().isConflict())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:conflict"));
++  }
++
++  @Test
++  void aFileNameIsCountedInCharactersNotUtf16Units() throws Exception {
++    String wide = Character.toString(0x20000); // two UTF-16 units, one character
++    String name = wide.repeat(200);
++
++    upload(owner, name + wide, "text/plain", RECEIPT).andExpect(status().isBadRequest());
++    upload(owner, name, "text/plain", RECEIPT).andExpect(status().isCreated());
++
++    assertThat(jdbc.queryForObject("select file_name from document_attachment", String.class))
++        .isEqualTo(name);
++  }
++
++  @Test
++  void attachmentsChangeOnlyWhileTheDocumentIsADraft() throws Exception {
++    long first = uploaded("a.txt");
++    long second = uploaded("b.txt");
++    mvc.perform(delete(path() + "/" + first).header(AUTH, data.bearer(owner)))
++        .andExpect(status().isNoContent());
++    documents.submit(data.principal(owner), document);
++
++    upload(owner, "c.txt", "text/plain", RECEIPT)
++        .andExpect(status().isConflict())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:invalid-transition"));
++    mvc.perform(delete(path() + "/" + second).header(AUTH, data.bearer(owner)))
++        .andExpect(status().isConflict());
++    assertThat(jdbc.queryForObject("select count(*) from document_attachment", Integer.class))
++        .isEqualTo(1);
++  }
++}
+diff --git a/src/test/java/com/papertrail/workflow/api/RealHttpTest.java b/src/test/java/com/papertrail/workflow/api/RealHttpTest.java
+index 97a5f8e..dcd53a7 100644
+--- a/src/test/java/com/papertrail/workflow/api/RealHttpTest.java
++++ b/src/test/java/com/papertrail/workflow/api/RealHttpTest.java
+@@ -2,12 +2,19 @@ package com.papertrail.workflow.api;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
++import com.papertrail.workflow.domain.StepKind;
+ import com.papertrail.workflow.support.TestConfig;
+ import com.papertrail.workflow.support.TestData;
++import java.io.BufferedReader;
++import java.io.ByteArrayOutputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStream;
++import java.net.Socket;
+ import java.net.URI;
+ import java.net.http.HttpClient;
+ import java.net.http.HttpRequest;
+ import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -64,6 +71,37 @@ class RealHttpTest {
+     return http.send(request.build(), HttpResponse.BodyHandlers.ofString());
+   }
+ 
++  private HttpResponse<byte[]> upload(String path, String authorization, String part, byte[] file)
++      throws Exception {
++    return upload(path, authorization, part, "statement.pdf", file);
++  }
++
++  /** A multipart upload of one file in the part {@code part}, as a browser form sends it. */
++  private HttpResponse<byte[]> upload(
++      String path, String authorization, String part, String fileName, byte[] file)
++      throws Exception {
++    String boundary = "invented-boundary-7f3a";
++    ByteArrayOutputStream body = new ByteArrayOutputStream();
++    body.writeBytes(
++        ("--"
++                + boundary
++                + "\r\nContent-Disposition: form-data; name=\""
++                + part
++                + "\"; filename=\""
++                + fileName
++                + "\"\r\nContent-Type: application/pdf\r\n\r\n")
++            .getBytes(StandardCharsets.UTF_8));
++    body.writeBytes(file);
++    body.writeBytes(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
++    HttpRequest request =
++        HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
++            .header("Authorization", authorization)
++            .header("Content-Type", "multipart/form-data; boundary=" + boundary)
++            .POST(HttpRequest.BodyPublishers.ofByteArray(body.toByteArray()))
++            .build();
++    return http.send(request, HttpResponse.BodyHandlers.ofByteArray());
++  }
++
+   @Test
+   void aUserRouteAnswersOverRealHttp() throws Exception {
+     long user = data.user("Tomas Vale");
+@@ -127,4 +165,105 @@ class RealHttpTest {
+     // Nothing was created by the refused requests.
+     assertThat(jdbc.queryForObject("select count(*) from app_user", Long.class)).isEqualTo(1L);
+   }
++
++  @Test
++  void anUploadAtTheLimitIsStoredAndTheContainerStopsALargerOne() throws Exception {
++    long owner = data.user("Ines Berg");
++    data.publish("Expenses", TestData.step(1, StepKind.SINGLE, owner, null, 0, 480));
++    long document = data.draft(data.principal(owner), "Expenses", "Travel claim");
++    String bearer = data.bearer(owner);
++    String path = "/api/v1/documents/" + document + "/attachments";
++    byte[] atLimit = new byte[5 * 1024 * 1024];
++    atLimit[0] = '%';
++
++    HttpResponse<byte[]> stored = upload(path, bearer, "file", atLimit);
++    HttpResponse<byte[]> larger = upload(path, bearer, "file", new byte[atLimit.length + 1]);
++    HttpResponse<byte[]> noFilePart = upload(path, bearer, "upload", atLimit);
++    HttpResponse<String> json = send("POST", path, bearer, "{}");
++
++    assertThat(stored.statusCode()).isEqualTo(201);
++    String location = stored.headers().firstValue("Location").orElseThrow();
++    HttpResponse<byte[]> downloaded =
++        http.send(
++            HttpRequest.newBuilder(URI.create("http://localhost:" + port + location))
++                .header("Authorization", bearer)
++                .build(),
++            HttpResponse.BodyHandlers.ofByteArray());
++    assertThat(downloaded.body()).isEqualTo(atLimit);
++    assertThat(larger.statusCode()).isEqualTo(413);
++    assertThat(new String(larger.body(), StandardCharsets.UTF_8)).contains("problem:too-large");
++    assertThat(noFilePart.statusCode()).isEqualTo(400);
++    assertThat(json.statusCode()).isEqualTo(415);
++    assertThat(json.body()).contains("multipart/form-data");
++    assertThat(jdbc.queryForObject("select count(*) from document_attachment", Long.class))
++        .isEqualTo(1L);
++  }
++
++  @Test
++  void aFileNameOfTwoHundredCjkCharactersIsAccepted() throws Exception {
++    long owner = data.user("Ines Berg");
++    data.publish("Expenses", TestData.step(1, StepKind.SINGLE, owner, null, 0, 480));
++    long document = data.draft(data.principal(owner), "Expenses", "Travel claim");
++    String name = "経費精算書".repeat(40);
++
++    HttpResponse<byte[]> stored =
++        upload(
++            "/api/v1/documents/" + document + "/attachments",
++            data.bearer(owner),
++            "file",
++            name,
++            "%PDF-1.7".getBytes(StandardCharsets.UTF_8));
++
++    assertThat(stored.statusCode()).isEqualTo(201);
++    assertThat(jdbc.queryForObject("select file_name from document_attachment", String.class))
++        .isEqualTo(name);
++  }
++
++  /**
++   * A body more than 64 KiB over the limit is refused from its declared size, before it is read.
++   * The client here stops writing after the part headers and reads the answer, as curl does; one
++   * that keeps writing may find the connection closed before it reads the 413.
++   */
++  @Test
++  void anUploadFarOverTheLimitIsRefusedFromItsDeclaredSize() throws Exception {
++    long owner = data.user("Ines Berg");
++    data.publish("Expenses", TestData.step(1, StepKind.SINGLE, owner, null, 0, 480));
++    long document = data.draft(data.principal(owner), "Expenses", "Travel claim");
++    byte[] partHeaders =
++        ("--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"statement.pdf\"\r\n"
++                + "Content-Type: application/pdf\r\n\r\n")
++            .getBytes(StandardCharsets.US_ASCII);
++    long declared = partHeaders.length + 6L * 1024 * 1024 + "\r\n--b--\r\n".length();
++
++    try (Socket socket = new Socket("localhost", port)) {
++      socket.setSoTimeout(10_000);
++      OutputStream out = socket.getOutputStream();
++      out.write(
++          ("POST /api/v1/documents/"
++                  + document
++                  + "/attachments HTTP/1.1\r\n"
++                  + "Host: localhost:"
++                  + port
++                  + "\r\n"
++                  + "Authorization: "
++                  + data.bearer(owner)
++                  + "\r\n"
++                  + "Content-Type: multipart/form-data; boundary=b\r\n"
++                  + "Content-Length: "
++                  + declared
++                  + "\r\n\r\n")
++              .getBytes(StandardCharsets.US_ASCII));
++      out.write(partHeaders);
++      out.flush();
++      var in =
++          new BufferedReader(
++              new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
++
++      assertThat(in.readLine()).startsWith("HTTP/1.1 413");
++      assertThat(in.lines().takeWhile(line -> !line.isEmpty()))
++          .anyMatch(line -> line.equalsIgnoreCase("Connection: close"));
++    }
++    assertThat(jdbc.queryForObject("select count(*) from document_attachment", Long.class))
++        .isZero();
++  }
+ }
+diff --git a/src/test/java/com/papertrail/workflow/support/IntegrationTestBase.java b/src/test/java/com/papertrail/workflow/support/IntegrationTestBase.java
+index e0ee4dd..ebb17ee 100644
+--- a/src/test/java/com/papertrail/workflow/support/IntegrationTestBase.java
++++ b/src/test/java/com/papertrail/workflow/support/IntegrationTestBase.java
+@@ -18,6 +18,8 @@ import org.springframework.test.web.servlet.MvcResult;
+     properties = {
+       "workflow.admin-token=test-admin-token-0123456789",
+       "workflow.scheduling-enabled=false",
++      "workflow.attachments.max-bytes=4096",
++      "workflow.attachments.max-per-document=3",
+       "spring.jpa.properties.hibernate.generate_statistics=true"
+     })
+ @AutoConfigureMockMvc
+@@ -53,7 +55,8 @@ public abstract class IntegrationTestBase {
+   @BeforeEach
+   void resetState() {
+     jdbc.execute(
+-        "TRUNCATE outbox_event, audit_event, document_permission, approval_task, document,"
++        "TRUNCATE outbox_event, audit_event, document_attachment, document_permission,"
++            + " approval_task, document,"
+             + " step_definition, workflow_definition, group_member, user_group, api_token,"
+             + " app_user RESTART IDENTITY CASCADE");
+     clock.set(TestConfig.START);

@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T02",
+  "repo": "gateway-go",
+  "kind": "buggy",
+  "title": "Retry budgets",
+  "description": "Retries of a route are now capped by a retry budget, so that an upstream which keeps failing does not get multiplied by the retries of every request. A route with `retry` can set `budget`: a retry is refused while the retries of the last `window` reach `ratio` times the requests of that window plus `min_per_second` for each second of it. The minimum keeps a route with little traffic able to retry at all.\n\n- Requests and retries are counted in one-second buckets over the window. Each route has its own budget, which is carried over reloads while its settings are unchanged, like the circuit breakers.\n- A retry the budget refuses relays the last response, and `gateway_retry_budget_exhausted_total` counts it.\n- Defaults: ratio 0.2, min_per_second 3, window 10s. `window` must be a whole number of seconds between 1s and 1m.\n- README: the retry paragraph describes the budget.\n\nTests: the allowance with the manual clock, requests counted over the window, the defaults and validation of the new settings, and a route whose retries stop at its budget.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/core/budget.go",
+      "lines": [
+        62,
+        65
+      ],
+      "category": "logic",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "AllowRetry sums every bucket of the ring. A bucket is only emptied when its slot is written in a new second, so after an idle period longer than the window the counts of seconds long gone are still summed: a burst of retries an hour ago exhausts the budget, or old requests allow retries the window does not justify. The sum must skip buckets whose second has left the window.",
+      "trigger": "Budget ratio 0.5, min 1 per second, window 10s: 10 retries at t0 exhaust it; at t0+11s with one request the window holds one request, so 11 retries should be allowed, but the stale 10 retries leave room for one.",
+      "testable": true,
+      "hidden_tests": [
+        "internal/core/budget_idle_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 -run '^TestRetryBudgetIdleSecondsLeaveTheWindow$' ./internal/core/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The sum cannot pick up old seconds: bucket() empties a bucket whenever its slot is written in a new second, so a bucket that still holds an old second is reset before it is used, and AllowRetry only ever adds the buckets of the current window.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

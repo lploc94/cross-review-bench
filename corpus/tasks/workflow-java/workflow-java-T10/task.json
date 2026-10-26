@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T10",
+  "repo": "workflow-java",
+  "kind": "buggy",
+  "title": "Rejection reasons per definition",
+  "description": "Finance wants to report why expense claims bounce, and free-text comments cannot be counted. This lets a definition list its rejection reasons and makes a rejection name one.\n\n- Migration V3 adds `definition_rejection_reason` (definition, position, code, label; codes unique per definition, checked at commit so a list can be reordered) and `approval_task.rejection_reason`.\n- `RejectionReason` is an embeddable record: the code is 1 to 40 upper-case letters, digits or underscores, the label 1 to 120 characters. `WorkflowDefinition` keeps an ordered list of at most 20 (loaded with a subselect, so the definition lists stay at a fixed number of queries), replaced only while the definition is a draft; `revise` copies them to the new draft.\n- `PUT /api/v1/admin/definitions/{id}/rejection-reasons` replaces a draft's list (empty list removes it; 409 once published) and returns the definition, which now shows `rejectionReasons` on the admin and user routes.\n- `POST /tasks/{id}/decision` takes an optional `reason`. On a definition with reasons a rejection must name one of the codes (compared without case); a missing or unknown code is a 400 with the new problem type `invalid-reason`. A reason on an approval, or on a definition without reasons, is the same 400. Definitions without reasons reject exactly as before. The check runs after the document lock and the usual decision guards, so outsiders still get 404.\n- The code is stored on the task, shown as `rejectionReason` in task views and the document's rounds, and written to the `TASK_REJECT` audit row as `reason`.\n- `ApprovalService.decide` keeps its four-argument form for existing callers.\n- README: concept, API rows, problem slug.\n\nTests: replacing and reading the list, duplicate and malformed codes, the 409 after publishing, a rejection with a lower-case code recorded on the task, rounds and audit, a reason on an approval and on a definition without reasons, and a revision keeping the list.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/papertrail/workflow/service/ApprovalService.java",
+      "lines": [181, 185],
+      "category": "error-handling",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "reasonFor resolves the code with `code.strip()` and `orElseThrow(() -> new IllegalArgumentException(...))`. A rejection without a `reason` on a definition that lists reasons dereferences null (NullPointerException), and an unknown or blank code throws IllegalArgumentException. Neither is a WorkflowException, so ApiExceptionHandler's catch-all answers 500 `unexpected` (and logs an error with a stack trace) instead of the 400 `invalid-reason` the PR's README and description promise. Clients cannot tell a bad request from a server failure, and every mistyped code shows up as an internal error.",
+      "trigger": "Definition with reasons MISSING_RECEIPTS and OVER_BUDGET; the approver posts {\"decision\":\"REJECT\",\"reason\":\"WRONG_COLOUR\"} or {\"decision\":\"REJECT\"} (or reason \"   \") and gets 500 urn:workflow:problem:unexpected.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/papertrail/workflow/api/RejectionReasonCodeCheckTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=RejectionReasonCodeCheckTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Bad codes never reach reasonFor: DecisionRequest is validated with @Valid in TaskController, and ApiExceptionHandler maps every request problem to a 400 before the service runs. An IllegalArgumentException from a lookup is also a client error by convention, and Spring's ErrorResponse handling in ApiExceptionHandler.unexpected keeps the status of such framework errors, so the caller sees a 4xx either way.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

@@ -1,0 +1,468 @@
+diff --git a/.env.example b/.env.example
+index 4be4fc9..465911d 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,6 +8,7 @@ REDIS_URL=redis://localhost:6379/0
+ RATE_LIMIT_PER_MINUTE=600
+ OUTBOX_BATCH_SIZE=50
+ OUTBOX_POLL_INTERVAL_MS=1000
++OUTBOX_CONCURRENCY=8
+ OUTBOX_BACKOFF_BASE_MS=5000
+ OUTBOX_BACKOFF_MAX_MS=3600000
+ WEBHOOK_TIMEOUT_MS=5000
+diff --git a/README.md b/README.md
+index 5f08d14..ebc550e 100644
+--- a/README.md
++++ b/README.md
+@@ -69,7 +69,8 @@ Delivery guarantees:
+   doubling up to `OUTBOX_BACKOFF_MAX_MS`). Deduplicate on the event `id`.
+ - **Ordered per aggregate.** Events of the same aggregate (one transfer, one hold) are delivered
+   in creation order, and an event that keeps failing holds back the later events of its
+-  aggregate. Events of different aggregates do not wait for each other.
++  aggregate. Events of different aggregates do not wait for each other: the dispatcher delivers
++  up to `OUTBOX_CONCURRENCY` events at once.
+ 
+ ## API
+ 
+@@ -146,6 +147,7 @@ test/                vitest suites; test/helpers has the app builder and fixture
+ | `RATE_LIMIT_PER_MINUTE` | `600` | per API key |
+ | `OUTBOX_BATCH_SIZE` | `50` | events claimed per dispatcher batch |
+ | `OUTBOX_POLL_INTERVAL_MS` | `1000` | idle wait between batches |
++| `OUTBOX_CONCURRENCY` | `8` | deliveries in flight at once within a batch (1–64) |
+ | `OUTBOX_BACKOFF_BASE_MS`, `OUTBOX_BACKOFF_MAX_MS` | `5000`, `3600000` | retry backoff |
+ | `WEBHOOK_TIMEOUT_MS` | `5000` | per delivery |
+ | `SHUTDOWN_TIMEOUT_MS` | `10000` | graceful shutdown limit |
+diff --git a/src/app.ts b/src/app.ts
+index 45c3ca5..7dabc37 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -102,6 +102,7 @@ export function createOutboxDispatcher(
+     logger: deps.logger.child({ component: "outbox" }),
+     batchSize: deps.config.outbox.batchSize,
+     pollIntervalMs: deps.config.outbox.pollIntervalMs,
++    concurrency: deps.config.outbox.concurrency,
+     backoffBaseMs: deps.config.outbox.backoffBaseMs,
+     backoffMaxMs: deps.config.outbox.backoffMaxMs,
+   });
+diff --git a/src/config/env.ts b/src/config/env.ts
+index 4b4611c..4475f7f 100644
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -28,6 +28,7 @@ const envShape = {
+   RATE_LIMIT_PER_MINUTE: integer(600, 1, 1_000_000),
+   OUTBOX_BATCH_SIZE: integer(50, 1, 1_000),
+   OUTBOX_POLL_INTERVAL_MS: integer(1_000, 10, 600_000),
++  OUTBOX_CONCURRENCY: integer(8, 1, 64),
+   OUTBOX_BACKOFF_BASE_MS: integer(5_000, 1, 3_600_000),
+   OUTBOX_BACKOFF_MAX_MS: integer(3_600_000, 1, 86_400_000),
+   WEBHOOK_TIMEOUT_MS: integer(5_000, 100, 120_000),
+@@ -55,6 +56,8 @@ export interface Config {
+   readonly outbox: {
+     readonly batchSize: number;
+     readonly pollIntervalMs: number;
++    /** Deliveries in flight at once within one batch. */
++    readonly concurrency: number;
+     readonly backoffBaseMs: number;
+     readonly backoffMaxMs: number;
+   };
+@@ -101,6 +104,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
+     outbox: {
+       batchSize: env.OUTBOX_BATCH_SIZE,
+       pollIntervalMs: env.OUTBOX_POLL_INTERVAL_MS,
++      concurrency: env.OUTBOX_CONCURRENCY,
+       backoffBaseMs: env.OUTBOX_BACKOFF_BASE_MS,
+       backoffMaxMs: env.OUTBOX_BACKOFF_MAX_MS,
+     },
+diff --git a/src/repositories/outbox.ts b/src/repositories/outbox.ts
+index f62ab78..8207381 100644
+--- a/src/repositories/outbox.ts
++++ b/src/repositories/outbox.ts
+@@ -52,9 +52,13 @@ export async function insertEvent(
+ 
+ /**
+  * Lock up to `limit` due, undelivered events in id order, skipping rows another dispatcher holds.
+- * An event is only eligible when no earlier event of the same aggregate is still undelivered:
+- * that keeps per-aggregate delivery in creation order, and an event that keeps failing holds
+- * back the later events of its aggregate (but no other aggregate's).
++ *
++ * A batch starts each aggregate at its earliest undelivered event (its head) and takes the later
++ * due events of that aggregate along with it, so a burst on one hold or transfer goes out in one
++ * batch instead of one event per batch. An aggregate whose head is not due (it is waiting for a
++ * retry) contributes nothing, and only the dispatcher that locked a head can claim the events
++ * behind it: that keeps per-aggregate delivery in creation order, and an event that keeps failing
++ * holds back the later events of its aggregate (but no other aggregate's).
+  */
+ export async function claimDueEvents(
+   db: Queryable,
+@@ -62,19 +66,32 @@ export async function claimDueEvents(
+   limit: number,
+ ): Promise<OutboxEvent[]> {
+   const result = await db.query<OutboxRow>(
+-    `SELECT ${COLUMNS} FROM outbox o
+-     WHERE o.delivered_at IS NULL
+-       AND o.next_attempt_at <= $1
+-       AND NOT EXISTS (
+-         SELECT 1 FROM outbox earlier
+-         WHERE earlier.tenant_id = o.tenant_id
+-           AND earlier.aggregate_id = o.aggregate_id
+-           AND earlier.delivered_at IS NULL
+-           AND earlier.id < o.id
+-       )
+-     ORDER BY o.id
++    `WITH heads AS MATERIALIZED (
++       SELECT o.id, o.tenant_id, o.aggregate_id FROM outbox o
++       WHERE o.delivered_at IS NULL
++         AND o.next_attempt_at <= $1
++         AND NOT EXISTS (
++           SELECT 1 FROM outbox earlier
++           WHERE earlier.tenant_id = o.tenant_id
++             AND earlier.aggregate_id = o.aggregate_id
++             AND earlier.delivered_at IS NULL
++             AND earlier.id < o.id
++         )
++       ORDER BY o.id
++       LIMIT $2
++       FOR UPDATE SKIP LOCKED
++     )
++     SELECT ${COLUMNS} FROM outbox
++     WHERE id IN (
++       SELECT later.id FROM outbox later
++       JOIN heads h ON later.tenant_id = h.tenant_id AND later.aggregate_id = h.aggregate_id
++       WHERE later.delivered_at IS NULL
++         AND later.next_attempt_at <= $1
++         AND later.id >= h.id
++     )
++     ORDER BY id
+      LIMIT $2
+-     FOR UPDATE SKIP LOCKED`,
++     FOR UPDATE`,
+     [now, limit],
+   );
+   return result.rows.map(mapEvent);
+diff --git a/src/services/outboxDispatcher.ts b/src/services/outboxDispatcher.ts
+index a731299..a0a8e4f 100644
+--- a/src/services/outboxDispatcher.ts
++++ b/src/services/outboxDispatcher.ts
+@@ -1,3 +1,4 @@
++import { performance } from "node:perf_hooks";
+ import type { Pool, PoolClient } from "../db/pool.js";
+ import { withTransaction } from "../db/tx.js";
+ import type { OutboxEvent } from "../domain/events.js";
+@@ -16,6 +17,8 @@ export interface OutboxDispatcherOptions {
+   readonly logger: Logger;
+   readonly batchSize: number;
+   readonly pollIntervalMs: number;
++  /** Deliveries in flight at once within one batch (OUTBOX_CONCURRENCY). */
++  readonly concurrency: number;
+   readonly backoffBaseMs: number;
+   readonly backoffMaxMs: number;
+ }
+@@ -28,14 +31,18 @@ export interface DispatchSummary {
+ 
+ const MAX_ERROR_LENGTH = 1_000;
+ 
++interface DeliveryFailure {
++  readonly error: unknown;
++}
++
+ /**
+  * Delivers outbox events to the tenant's active webhook endpoints.
+  *
+  * Ordering guarantee: events of the same aggregate (one transfer, one hold) are delivered in the
+  * order they were created, and an event that fails holds back the later events of its aggregate
+- * until it is delivered. `claimDueEvents` enforces this by only claiming an event when no earlier
+- * event of its aggregate is still undelivered; events of different aggregates do not wait for
+- * each other.
++ * until it is delivered. `claimDueEvents` only hands a batch the events of an aggregate starting
++ * at its earliest undelivered one, in id order; events of different aggregates do not wait for
++ * each other, and up to `concurrency` deliveries run at once.
+  *
+  * Delivery is at least once: an event is marked delivered only after every endpoint accepted
+  * it, and a failure at any endpoint retries the event for all of them. Receivers deduplicate on
+@@ -52,29 +59,33 @@ export class OutboxDispatcher {
+   }
+ 
+   /**
+-   * Claim one batch of due events and deliver them one by one, in id order, inside a single
+-   * transaction. The claimed rows stay locked until it commits, so concurrent dispatchers skip
+-   * them instead of delivering them twice.
++   * Claim one batch of due events and deliver it inside a single transaction. Deliveries start
++   * in id order, at most `concurrency` at a time. The claimed rows stay locked until the
++   * transaction commits, so concurrent dispatchers skip them instead of delivering them twice.
+    */
+   async runOnce(): Promise<DispatchSummary> {
+     const { pool, clock, batchSize } = this.options;
+     return withTransaction(pool, async (client) => {
+       const events = await outbox.claimDueEvents(client, clock.now(), batchSize);
+-      const endpointsByTenant = new Map<string, WebhookEndpoint[]>();
++      const endpointsByTenant = await this.loadEndpoints(client, events);
++      // A client runs one query at a time, so the outcomes are written one after another while
++      // the HTTP deliveries overlap.
++      let writes: Promise<unknown> = Promise.resolve();
++      const record = (event: OutboxEvent, failure: DeliveryFailure | null): Promise<boolean> => {
++        const written = writes.then(() => this.record(client, event, failure));
++        writes = written.catch(() => undefined);
++        return written;
++      };
+       let delivered = 0;
+       let failed = 0;
+-      for (const event of events) {
+-        let targets = endpointsByTenant.get(event.tenantId);
+-        if (!targets) {
+-          targets = await endpoints.listActiveEndpoints(client, event.tenantId);
+-          endpointsByTenant.set(event.tenantId, targets);
+-        }
+-        if (await this.deliver(client, event, targets)) {
++      await this.forEachConcurrently(events, async (event) => {
++        const failure = await this.send(event, endpointsByTenant.get(event.tenantId) ?? []);
++        if (await record(event, failure)) {
+           delivered++;
+         } else {
+           failed++;
+         }
+-      }
++      });
+       return { claimed: events.length, delivered, failed };
+     });
+   }
+@@ -105,11 +116,13 @@ export class OutboxDispatcher {
+     const { logger, batchSize, pollIntervalMs } = this.options;
+     while (!this.stopping) {
+       let claimed = 0;
++      const started = performance.now();
+       try {
+         const summary = await this.runOnce();
+         claimed = summary.claimed;
+         if (summary.claimed > 0) {
+-          logger.info(summary, "outbox batch dispatched");
++          const durationMs = Math.round(performance.now() - started);
++          logger.info({ ...summary, durationMs }, "outbox batch dispatched");
+         }
+       } catch (err) {
+         logger.error({ err }, "outbox dispatch failed");
+@@ -134,19 +147,56 @@ export class OutboxDispatcher {
+     });
+   }
+ 
+-  private async deliver(
++  /** The active endpoints of every tenant in the batch, read once per tenant. */
++  private async loadEndpoints(
+     client: PoolClient,
++    events: readonly OutboxEvent[],
++  ): Promise<Map<string, WebhookEndpoint[]>> {
++    const endpointsByTenant = new Map<string, WebhookEndpoint[]>();
++    for (const tenantId of new Set(events.map((event) => event.tenantId))) {
++      endpointsByTenant.set(tenantId, await endpoints.listActiveEndpoints(client, tenantId));
++    }
++    return endpointsByTenant;
++  }
++
++  /**
++   * Run `task` for every item, taking items in order, with at most `concurrency` tasks in flight.
++   * After a task throws no new task starts; the ones in flight finish before the first error is
++   * rethrown, so nothing still uses the transaction's client when it rolls back.
++   */
++  private async forEachConcurrently<T>(
++    items: readonly T[],
++    task: (item: T) => Promise<void>,
++  ): Promise<void> {
++    const errors: unknown[] = [];
++    let next = 0;
++    const worker = async (): Promise<void> => {
++      while (errors.length === 0 && next < items.length) {
++        const item = items[next++] as T;
++        try {
++          await task(item);
++        } catch (err) {
++          errors.push(err);
++        }
++      }
++    };
++    const workers = Math.min(this.options.concurrency, items.length);
++    await Promise.all(Array.from({ length: workers }, () => worker()));
++    if (errors.length > 0) throw errors[0];
++  }
++
++  /** POST the event to each endpoint in turn; the first refusal stops it and is returned. */
++  private async send(
+     event: OutboxEvent,
+     targets: readonly WebhookEndpoint[],
+-  ): Promise<boolean> {
+-    const { clock, sender, logger } = this.options;
++  ): Promise<DeliveryFailure | null> {
++    const { clock, sender } = this.options;
+     const body = JSON.stringify({
+       id: event.id,
+       type: event.eventType,
+       created_at: event.createdAt.toISOString(),
+       data: event.payload,
+     });
+-    let failure: { error: unknown } | null = null;
+     try {
+       for (const endpoint of targets) {
+         await sender.send({
+@@ -161,8 +211,18 @@ export class OutboxDispatcher {
+         });
+       }
+     } catch (error) {
+-      failure = { error };
++      return { error };
+     }
++    return null;
++  }
++
++  /** Mark the event delivered, or count the failed attempt and schedule the next one. */
++  private async record(
++    client: PoolClient,
++    event: OutboxEvent,
++    failure: DeliveryFailure | null,
++  ): Promise<boolean> {
++    const { clock, logger } = this.options;
+     if (failure === null) {
+       await outbox.markDelivered(client, event.id, clock.now());
+       return true;
+diff --git a/test/config/env.test.ts b/test/config/env.test.ts
+index 1834fbe..50fc271 100644
+--- a/test/config/env.test.ts
++++ b/test/config/env.test.ts
+@@ -13,7 +13,13 @@ describe("loadConfig", () => {
+       nodeEnv: "development",
+       port: 3000,
+       rateLimitPerMinute: 600,
+-      outbox: { batchSize: 50, pollIntervalMs: 1000, backoffBaseMs: 5000, backoffMaxMs: 3_600_000 },
++      outbox: {
++        batchSize: 50,
++        pollIntervalMs: 1000,
++        concurrency: 8,
++        backoffBaseMs: 5000,
++        backoffMaxMs: 3_600_000,
++      },
+       webhookTimeoutMs: 5000,
+     });
+   });
+@@ -39,6 +45,14 @@ describe("loadConfig", () => {
+     }
+   });
+ 
++  it("bounds the outbox concurrency", () => {
++    expect(loadConfig({ ...REQUIRED, OUTBOX_CONCURRENCY: "1" }).outbox.concurrency).toBe(1);
++    expect(loadConfig({ ...REQUIRED, OUTBOX_CONCURRENCY: "64" }).outbox.concurrency).toBe(64);
++    for (const value of ["0", "65", "two"]) {
++      expect(() => loadConfig({ ...REQUIRED, OUTBOX_CONCURRENCY: value }), value).toThrow(/OUTBOX_CONCURRENCY/);
++    }
++  });
++
+   it("requires the backoff cap to be at least the base delay", () => {
+     expect(() =>
+       loadConfig({ ...REQUIRED, OUTBOX_BACKOFF_BASE_MS: "10000", OUTBOX_BACKOFF_MAX_MS: "5000" }),
+diff --git a/test/services/outboxDispatcher.test.ts b/test/services/outboxDispatcher.test.ts
+index cee3259..957b31a 100644
+--- a/test/services/outboxDispatcher.test.ts
++++ b/test/services/outboxDispatcher.test.ts
+@@ -1,6 +1,10 @@
+ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { createOutboxDispatcher } from "../../src/app.js";
++import { createLogger } from "../../src/infra/logger.js";
++import { claimDueEvents } from "../../src/repositories/outbox.js";
++import type { WebhookDelivery, WebhookSender } from "../../src/services/webhookSender.js";
+ import { verifySignature } from "../../src/services/webhookSigner.js";
+-import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { buildTestApp, testConfig, type TestApp } from "../helpers/app.js";
+ import {
+   createHold,
+   createTenant,
+@@ -13,6 +17,21 @@ import {
+ 
+ const ENDPOINT = "https://hooks.example.com/ledger";
+ 
++/** Answers every delivery on the next turn of the event loop and counts how many overlap. */
++class OverlapSender implements WebhookSender {
++  inFlight = 0;
++  maxInFlight = 0;
++  readonly eventIds: string[] = [];
++
++  async send(delivery: WebhookDelivery): Promise<void> {
++    this.inFlight++;
++    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
++    await new Promise((resolve) => setImmediate(resolve));
++    this.inFlight--;
++    this.eventIds.push(delivery.headers["x-ledger-event-id"] ?? "");
++  }
++}
++
+ interface OutboxRow {
+   id: string;
+   event_type: string;
+@@ -132,10 +151,70 @@ describe("outbox dispatcher", () => {
+     expect(t.sender.eventTypes()).toEqual(["transfer.posted"]);
+ 
+     t.clock.advanceSeconds(1);
++    // Once the failed event is due again, the event behind it goes out in the same batch.
++    expect(await t.dispatcher.runOnce()).toEqual({ claimed: 2, delivered: 2, failed: 0 });
++    expect(t.sender.eventTypes()).toEqual(["transfer.posted", "hold.created", "hold.captured"]);
++  });
++
++  it("delivers a burst of one aggregate's events in one batch, in creation order", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
+     await t.dispatcher.runOnce();
+-    expect(t.sender.eventTypes()).toEqual(["transfer.posted", "hold.created"]);
++    const hold = (await createHold(t.app, tenant, { account_id: wallet.id, amount: "100" })).json<HoldBody>();
++    const voided = await t.app.inject({
++      method: "POST",
++      url: `/holds/${hold.id}/void`,
++      headers: tenant.headers,
++    });
++    expect(voided.statusCode).toBe(200);
++
++    t.sender.deliveries.length = 0;
++    expect(await t.dispatcher.runOnce()).toEqual({ claimed: 2, delivered: 2, failed: 0 });
++    expect(t.sender.eventTypes()).toEqual(["hold.created", "hold.voided"]);
++    expect((await outboxRows()).every((row) => row.delivered_at !== null)).toBe(true);
++  });
++
++  it("does not let another dispatcher claim events behind an aggregate's locked first event", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
+     await t.dispatcher.runOnce();
+-    expect(t.sender.eventTypes()).toEqual(["transfer.posted", "hold.created", "hold.captured"]);
++    const hold = (await createHold(t.app, tenant, { account_id: wallet.id, amount: "100" })).json<HoldBody>();
++    await t.app.inject({ method: "POST", url: `/holds/${hold.id}/void`, headers: tenant.headers });
++    const merchant = await openAccount(t.app, tenant);
++    await transfer(t.app, tenant, wallet.id, merchant.id, "5");
++
++    const client = await t.pool.connect();
++    try {
++      await client.query("BEGIN");
++      const first = await claimDueEvents(client, t.clock.now(), 50);
++      expect(first.map((event) => event.eventType)).toEqual(["hold.created", "hold.voided", "transfer.posted"]);
++      expect(await claimDueEvents(t.pool, t.clock.now(), 50)).toEqual([]);
++
++      const limited = await claimDueEvents(client, t.clock.now(), 2);
++      expect(limited.map((event) => event.eventType)).toEqual(["hold.created", "hold.voided"]);
++      await client.query("ROLLBACK");
++    } finally {
++      client.release();
++    }
++  });
++
++  it("delivers up to OUTBOX_CONCURRENCY events at once", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    for (let i = 0; i < 6; i++) {
++      const merchant = await openAccount(t.app, tenant);
++      await transfer(t.app, tenant, wallet.id, merchant.id, "1");
++    }
++    const sender = new OverlapSender();
++    const dispatcher = createOutboxDispatcher({
++      pool: t.pool,
++      clock: t.clock,
++      sender,
++      logger: createLogger({ level: "silent" }),
++      config: testConfig({ OUTBOX_CONCURRENCY: "3" }),
++    });
++
++    expect(await dispatcher.runOnce()).toEqual({ claimed: 7, delivered: 7, failed: 0 });
++    expect(sender.maxInFlight).toBe(3);
++    expect(new Set(sender.eventIds).size).toBe(7);
++    expect((await outboxRows()).every((row) => row.delivered_at !== null)).toBe(true);
+   });
+ 
+   it("marks events delivered when the tenant has no active endpoint", async () => {

@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/anchore/grype",
+  "intro_pr": 3546,
+  "intro_merged_at": "2026-07-13T13:19:14Z",
+  "fix_pr": 3809,
+  "fix_merged_at": "2026-10-16T20:25:17Z",
+  "license": "Apache-2.0",
+  "base_commit": "b31a42222f9ec1319374ccb01f5781f9d85a70b9",
+  "intro_commit": "bcfc0e7a0833d44cab553ba6f6d3ea8c1f3dcd6b",
+  "fix_commit": "8ea928e9f642c376b888a0ee63cb579f1bf47486",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

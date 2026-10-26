@@ -1,0 +1,1626 @@
+diff --git a/shortcuts/common/drive_permission_auth.go b/shortcuts/common/drive_permission_auth.go
+new file mode 100644
+index 00000000..119c6587
+--- /dev/null
++++ b/shortcuts/common/drive_permission_auth.go
+@@ -0,0 +1,78 @@
++// Copyright (c) 2026 Lark Technologies Pte. Ltd.
++// SPDX-License-Identifier: MIT
++
++package common
++
++import (
++	"fmt"
++	"net/http"
++
++	"github.com/larksuite/cli/errs"
++	"github.com/larksuite/cli/internal/validate"
++)
++
++const (
++	// DrivePermissionMemberAuthScope is required by the Drive permission auth API.
++	DrivePermissionMemberAuthScope = "docs:permission.member:auth"
++
++	drivePermissionResourceTypeFile = "file"
++	drivePermissionActionExport     = "export"
++)
++
++type drivePermissionMemberAuthResponse struct {
++	AuthResult bool
++}
++
++// CheckDriveFileExportPermission checks whether the runtime's current identity
++// can export one Drive file. It never switches identity and does not treat a
++// malformed success response as a denial.
++func CheckDriveFileExportPermission(runtime *RuntimeContext, token string) (bool, error) {
++	data, err := runtime.CallAPITyped(
++		http.MethodGet,
++		drivePermissionMemberAuthPath(token),
++		map[string]interface{}{
++			"type":   drivePermissionResourceTypeFile,
++			"action": drivePermissionActionExport,
++		},
++		nil,
++	)
++	if err != nil {
++		return false, err
++	}
++
++	response, err := projectDrivePermissionMemberAuthResponse(data)
++	if err != nil {
++		return false, err
++	}
++	return response.AuthResult, nil
++}
++
++func projectDrivePermissionMemberAuthResponse(data map[string]interface{}) (drivePermissionMemberAuthResponse, error) {
++	authResult, ok := data["auth_result"].(bool)
++	if !ok {
++		return drivePermissionMemberAuthResponse{}, errs.NewInternalError(
++			errs.SubtypeInvalidResponse,
++			"Drive permission auth response is missing a boolean auth_result",
++		)
++	}
++	return drivePermissionMemberAuthResponse{AuthResult: authResult}, nil
++}
++
++func drivePermissionMemberAuthPath(token string) string {
++	return fmt.Sprintf(
++		"/open-apis/drive/v1/permissions/%s/members/auth",
++		validate.EncodePathSegment(token),
++	)
++}
++
++// AddDriveFileExportPermissionDryRun appends the permission check used by the
++// real download flow so dry-run output preserves request order and parameters.
++func AddDriveFileExportPermissionDryRun(plan *DryRunAPI, token, desc string) *DryRunAPI {
++	return plan.
++		GET(drivePermissionMemberAuthPath(token)).
++		Params(map[string]interface{}{
++			"type":   drivePermissionResourceTypeFile,
++			"action": drivePermissionActionExport,
++		}).
++		Desc(desc)
++}
+diff --git a/shortcuts/common/drive_permission_auth_test.go b/shortcuts/common/drive_permission_auth_test.go
+new file mode 100644
+index 00000000..8aac8cb4
+--- /dev/null
++++ b/shortcuts/common/drive_permission_auth_test.go
+@@ -0,0 +1,117 @@
++// Copyright (c) 2026 Lark Technologies Pte. Ltd.
++// SPDX-License-Identifier: MIT
++
++package common
++
++import (
++	"net/http"
++	"testing"
++
++	"github.com/larksuite/cli/errs"
++	"github.com/larksuite/cli/internal/httpmock"
++)
++
++func TestCheckDriveFileExportPermissionReturnsAuthResultAndSendsExportQuery(t *testing.T) {
++	runtime, reg := newCallAPITypedRuntime(t)
++	reg.Register(&httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/file_allowed/members/auth",
++		Body: map[string]interface{}{
++			"code": 0,
++			"data": map[string]interface{}{"auth_result": true},
++		},
++		OnMatch: func(req *http.Request) {
++			if got := req.URL.Query().Get("type"); got != drivePermissionResourceTypeFile {
++				t.Errorf("type query = %q, want %q", got, drivePermissionResourceTypeFile)
++			}
++			if got := req.URL.Query().Get("action"); got != drivePermissionActionExport {
++				t.Errorf("action query = %q, want %q", got, drivePermissionActionExport)
++			}
++		},
++	})
++
++	allowed, err := CheckDriveFileExportPermission(runtime, "file_allowed")
++	if err != nil {
++		t.Fatalf("CheckDriveFileExportPermission() error = %v", err)
++	}
++	if !allowed {
++		t.Fatal("CheckDriveFileExportPermission() allowed = false, want true")
++	}
++}
++
++func TestCheckDriveFileExportPermissionReturnsFalseWithoutError(t *testing.T) {
++	runtime, reg := newCallAPITypedRuntime(t)
++	reg.Register(&httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/file_denied/members/auth",
++		Body: map[string]interface{}{
++			"code": 0,
++			"data": map[string]interface{}{"auth_result": false},
++		},
++	})
++
++	allowed, err := CheckDriveFileExportPermission(runtime, "file_denied")
++	if err != nil {
++		t.Fatalf("CheckDriveFileExportPermission() error = %v", err)
++	}
++	if allowed {
++		t.Fatal("CheckDriveFileExportPermission() allowed = true, want false")
++	}
++}
++
++func TestCheckDriveFileExportPermissionRejectsMalformedAuthResult(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		data map[string]interface{}
++	}{
++		{name: "missing", data: map[string]interface{}{}},
++		{name: "string", data: map[string]interface{}{"auth_result": "true"}},
++		{name: "number", data: map[string]interface{}{"auth_result": float64(1)}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			runtime, reg := newCallAPITypedRuntime(t)
++			reg.Register(&httpmock.Stub{
++				Method: http.MethodGet,
++				URL:    "/open-apis/drive/v1/permissions/file_malformed/members/auth",
++				Body: map[string]interface{}{
++					"code": 0,
++					"data": tc.data,
++				},
++			})
++
++			_, err := CheckDriveFileExportPermission(runtime, "file_malformed")
++			problem, ok := errs.ProblemOf(err)
++			if !ok {
++				t.Fatalf("expected typed error, got %T: %v", err, err)
++			}
++			if problem.Category != errs.CategoryInternal || problem.Subtype != errs.SubtypeInvalidResponse {
++				t.Fatalf("problem = category %q subtype %q, want internal/invalid_response", problem.Category, problem.Subtype)
++			}
++		})
++	}
++}
++
++func TestCheckDriveFileExportPermissionPassesThroughTypedAPIError(t *testing.T) {
++	runtime, reg := newCallAPITypedRuntime(t)
++	reg.Register(&httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/file_limited/members/auth",
++		Body: map[string]interface{}{
++			"code":   99991400,
++			"msg":    "rate limited",
++			"log_id": "log-auth-rate-limit",
++		},
++	})
++
++	_, err := CheckDriveFileExportPermission(runtime, "file_limited")
++	problem, ok := errs.ProblemOf(err)
++	if !ok {
++		t.Fatalf("expected typed error, got %T: %v", err, err)
++	}
++	if problem.Category != errs.CategoryAPI || problem.Subtype != errs.SubtypeRateLimit || problem.Code != 99991400 {
++		t.Fatalf("problem = %+v, want api/rate_limit/99991400", problem)
++	}
++	if problem.LogID != "log-auth-rate-limit" || !problem.Retryable {
++		t.Fatalf("problem = %+v, want preserved log_id and retryable", problem)
++	}
++}
+diff --git a/shortcuts/doc/doc_errors.go b/shortcuts/doc/doc_errors.go
+index 770351a8..9f9c0419 100644
+--- a/shortcuts/doc/doc_errors.go
++++ b/shortcuts/doc/doc_errors.go
+@@ -5,6 +5,9 @@ package doc
+ 
+ import (
+ 	"errors"
++	"fmt"
++	"net/http"
++	"strings"
+ 
+ 	"github.com/larksuite/cli/errs"
+ 	"github.com/larksuite/cli/shortcuts/common"
+@@ -20,6 +23,57 @@ func wrapDocNetworkErr(err error, format string, args ...any) error {
+ 	return errs.NewNetworkError(errs.SubtypeNetworkTransport, format, args...).WithCause(err)
+ }
+ 
++// withDocMediaDownloadRecoveryHint keeps the final download error intact while
++// adding recovery guidance for media permission and throttling failures.
++// Whiteboard downloads use a different API and must not be redirected to the
++// media preview shortcut.
++func withDocMediaDownloadRecoveryHint(err error, mediaType string) error {
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem == nil {
++		return err
++	}
++
++	if mediaType != "whiteboard" &&
++		problem.Category == errs.CategoryNetwork &&
++		problem.Code == http.StatusForbidden &&
++		!strings.Contains(problem.Hint, "docs +media-preview") {
++		const tokenArg = "<MEDIA_TOKEN>"
++		hint := fmt.Sprintf("Direct document media download returned HTTP 403. To preview the image or file content, try `lark-cli docs +media-preview --token %s --output <path>`.", tokenArg)
++		appendDocRecoveryHint(problem, hint)
++	}
++
++	if docMediaDownloadIsRateLimit(problem) && !strings.Contains(problem.Hint, "exponential backoff") {
++		const hint = "Document media download was rate limited; stop immediate retries and retry later with exponential backoff."
++		appendDocRecoveryHint(problem, hint)
++	}
++	return err
++}
++
++func docMediaDownloadIsRateLimit(problem *errs.Problem) bool {
++	return problem.Subtype == errs.SubtypeRateLimit ||
++		problem.Code == 99991400 ||
++		problem.Code == http.StatusTooManyRequests
++}
++
++func appendDocRecoveryHint(problem *errs.Problem, hint string) {
++	if strings.TrimSpace(problem.Hint) == "" {
++		problem.Hint = hint
++		return
++	}
++	problem.Hint = strings.TrimSpace(problem.Hint) + "\n" + hint
++}
++
++func docMediaDownloadPermissionDeniedError() error {
++	const tokenArg = "<MEDIA_TOKEN>"
++	return errs.NewPermissionError(
++		errs.SubtypePermissionDenied,
++		"current identity does not have export permission for this document media",
++	).WithHint(
++		"Direct document media download is unavailable. To preview the image or file content, try `lark-cli docs +media-preview --token %s --output <path>`.",
++		tokenArg,
++	)
++}
++
+ // wrapDocInputFileErr wraps a --file Stat/read failure via the shared typed
+ // helper (which sets the cause) and tags it with the --file param so agents
+ // learn which flag to fix. The common helper is flag-agnostic, so the param is
+diff --git a/shortcuts/doc/doc_media_download.go b/shortcuts/doc/doc_media_download.go
+index 1d28481f..1e9e753a 100644
+--- a/shortcuts/doc/doc_media_download.go
++++ b/shortcuts/doc/doc_media_download.go
+@@ -17,12 +17,13 @@ import (
+ )
+ 
+ var DocMediaDownload = common.Shortcut{
+-	Service:     "docs",
+-	Command:     "+media-download",
+-	Description: "Download document media or whiteboard thumbnail (auto-detects extension)",
+-	Risk:        "read",
+-	Scopes:      []string{"docs:document.media:download"},
+-	AuthTypes:   []string{"user", "bot"},
++	Service:           "docs",
++	Command:           "+media-download",
++	Description:       "Download document media or whiteboard thumbnail (auto-detects extension)",
++	Risk:              "read",
++	Scopes:            []string{"docs:document.media:download"},
++	ConditionalScopes: []string{common.DrivePermissionMemberAuthScope},
++	AuthTypes:         []string{"user", "bot"},
+ 	Flags: []common.Flag{
+ 		{Name: "token", Desc: "resource token (file_token or whiteboard_id)", Required: true},
+ 		{Name: "output", Desc: "local save path", Required: true},
+@@ -39,11 +40,22 @@ var DocMediaDownload = common.Shortcut{
+ 				Desc("(when --type=whiteboard) Download whiteboard as image").
+ 				Set("token", token).Set("output", outputPath)
+ 		}
+-		return common.NewDryRunAPI().
++		plan := common.AddDriveFileExportPermissionDryRun(
++			common.NewDryRunAPI(),
++			token,
++			"[1] Check whether the current identity can export the document media",
++		)
++		return plan.
+ 			GET("/open-apis/drive/v1/medias/:token/download").
+-			Desc("(when --type=media) Download document media file").
++			Desc("[2] (when --type=media) Download document media file").
+ 			Set("token", token).Set("output", outputPath)
+ 	},
++	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
++		if runtime.Str("type") == "whiteboard" {
++			return nil
++		}
++		return runtime.EnsureScopes([]string{common.DrivePermissionMemberAuthScope})
++	},
+ 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
+ 		token := runtime.Str("token")
+ 		outputPath := runtime.Str("output")
+@@ -56,6 +68,15 @@ var DocMediaDownload = common.Shortcut{
+ 		if _, err := runtime.ResolveSavePath(outputPath); err != nil {
+ 			return errs.NewValidationError(errs.SubtypeInvalidArgument, "unsafe output path: %s", err).WithParam("--output").WithCause(err)
+ 		}
++		if mediaType != "whiteboard" {
++			allowed, err := common.CheckDriveFileExportPermission(runtime, token)
++			if err != nil {
++				return withDocMediaDownloadRecoveryHint(err, mediaType)
++			}
++			if !allowed {
++				return docMediaDownloadPermissionDeniedError()
++			}
++		}
+ 
+ 		fmt.Fprintf(runtime.IO().ErrOut, "Downloading: %s %s\n", mediaType, common.MaskToken(token))
+ 
+@@ -73,7 +94,7 @@ var DocMediaDownload = common.Shortcut{
+ 			ApiPath:    apiPath,
+ 		})
+ 		if err != nil {
+-			return wrapDocNetworkErr(err, "download failed: %v", err)
++			return withDocMediaDownloadRecoveryHint(wrapDocNetworkErr(err, "download failed: %v", err), mediaType)
+ 		}
+ 		defer resp.Body.Close()
+ 
+diff --git a/shortcuts/doc/doc_media_test.go b/shortcuts/doc/doc_media_test.go
+index b7495dd8..fd83bcbb 100644
+--- a/shortcuts/doc/doc_media_test.go
++++ b/shortcuts/doc/doc_media_test.go
+@@ -16,8 +16,10 @@ import (
+ 
+ 	"github.com/spf13/cobra"
+ 
++	"github.com/larksuite/cli/errs"
+ 	"github.com/larksuite/cli/internal/cmdutil"
+ 	"github.com/larksuite/cli/internal/core"
++	"github.com/larksuite/cli/internal/credential"
+ 	"github.com/larksuite/cli/internal/httpmock"
+ 	"github.com/larksuite/cli/internal/validate"
+ 	"github.com/larksuite/cli/shortcuts/common"
+@@ -29,6 +31,27 @@ func docsTestConfigWithAppID(appID string) *core.CliConfig {
+ 	}
+ }
+ 
++type docMediaScopedTokenResolver struct {
++	scopes string
++}
++
++func (r *docMediaScopedTokenResolver) ResolveToken(context.Context, credential.TokenSpec) (*credential.TokenResult, error) {
++	return &credential.TokenResult{Token: "test-token", Scopes: r.scopes}, nil
++}
++
++func registerDocMediaExportAuth(reg *httpmock.Registry, token string, allowed bool) *httpmock.Stub {
++	stub := &httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/" + token + "/members/auth",
++		Body: map[string]interface{}{
++			"code": 0,
++			"data": map[string]interface{}{"auth_result": allowed},
++		},
++	}
++	reg.Register(stub)
++	return stub
++}
++
+ func mountAndRunDocs(t *testing.T, s common.Shortcut, args []string, f *cmdutil.Factory, stdout *bytes.Buffer) error {
+ 	t.Helper()
+ 	parent := &cobra.Command{Use: "docs"}
+@@ -493,6 +516,7 @@ func TestDocMediaInsertExecuteResolvesWikiBeforeFileCheck(t *testing.T) {
+ 
+ func TestDocMediaDownloadRejectsOverwriteWithoutFlag(t *testing.T) {
+ 	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-overwrite-app"))
++	registerDocMediaExportAuth(reg, "tok_123", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method:  "GET",
+ 		URL:     "/open-apis/drive/v1/medias/tok_123/download",
+@@ -523,6 +547,7 @@ func TestDocMediaDownloadRejectsOverwriteWithoutFlag(t *testing.T) {
+ 
+ func TestDocMediaDownloadRejectsHTTPErrorBeforeWrite(t *testing.T) {
+ 	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-app"))
++	registerDocMediaExportAuth(reg, "tok_123", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method:  "GET",
+ 		URL:     "/open-apis/drive/v1/medias/tok_123/download",
+@@ -549,10 +574,243 @@ func TestDocMediaDownloadRejectsHTTPErrorBeforeWrite(t *testing.T) {
+ 	if _, statErr := os.Stat(filepath.Join(tmpDir, "download.bin")); !os.IsNotExist(statErr) {
+ 		t.Fatalf("download target should not be created, statErr=%v", statErr)
+ 	}
++	problem, ok := errs.ProblemOf(err)
++	if !ok {
++		t.Fatalf("expected typed error, got %T: %v", err, err)
++	}
++	if strings.Contains(problem.Hint, "docs +media-preview") || strings.Contains(problem.Hint, "exponential backoff") {
++		t.Fatalf("hint=%q, want no 403 or rate-limit guidance for HTTP 404", problem.Hint)
++	}
++}
++
++func TestDocMediaDownloadExportDeniedFailsBeforeDownload(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-export-denied-app"))
++	registerDocMediaExportAuth(reg, "media_export_denied", false)
++	downloadCalls := 0
++	reg.Register(&httpmock.Stub{
++		Method:   http.MethodGet,
++		URL:      "/open-apis/drive/v1/medias/media_export_denied/download",
++		Optional: true,
++		OnMatch: func(*http.Request) {
++			downloadCalls++
++		},
++	})
++
++	tmpDir := t.TempDir()
++	withDocsWorkingDir(t, tmpDir)
++	err := mountAndRunDocs(t, DocMediaDownload, []string{
++		"+media-download",
++		"--token", "media_export_denied",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok {
++		t.Fatalf("expected typed error, got %T: %v", err, err)
++	}
++	if problem.Category != errs.CategoryAuthorization || problem.Subtype != errs.SubtypePermissionDenied {
++		t.Fatalf("problem = category %q subtype %q, want authorization/permission_denied", problem.Category, problem.Subtype)
++	}
++	for _, want := range []string{"docs +media-preview", "--token <MEDIA_TOKEN>", "--output <path>"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "media_export_denied") {
++		t.Fatalf("hint=%q, want placeholder media token", problem.Hint)
++	}
++	if downloadCalls != 0 {
++		t.Fatalf("download calls = %d, want 0", downloadCalls)
++	}
++}
++
++func TestDocMediaDownloadHTTP403SuggestsPreview(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-403-app"))
++	registerDocMediaExportAuth(reg, "media_403", true)
++	reg.Register(&httpmock.Stub{
++		Method:  http.MethodGet,
++		URL:     "/open-apis/drive/v1/medias/media_403/download",
++		Status:  http.StatusForbidden,
++		RawBody: []byte("permission denied"),
++	})
++
++	tmpDir := t.TempDir()
++	withDocsWorkingDir(t, tmpDir)
++	err := mountAndRunDocs(t, DocMediaDownload, []string{
++		"+media-download",
++		"--token", "media_403",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Category != errs.CategoryNetwork || problem.Code != http.StatusForbidden {
++		t.Fatalf("problem=%+v ok=%v, want network HTTP 403", problem, ok)
++	}
++	if !strings.Contains(problem.Hint, "docs +media-preview") || !strings.Contains(problem.Hint, "--token <MEDIA_TOKEN>") || !strings.Contains(problem.Hint, "--output <path>") {
++		t.Fatalf("hint=%q, want media preview command with placeholders", problem.Hint)
++	}
++	if strings.Contains(problem.Hint, "media_403") {
++		t.Fatalf("hint=%q, want placeholder media token", problem.Hint)
++	}
++}
++
++func TestDocWhiteboardDownloadSkipsExportAuth(t *testing.T) {
++	f, stdout, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-whiteboard-no-auth-app"))
++	f.Credential = credential.NewCredentialProvider(nil, nil, &docMediaScopedTokenResolver{scopes: "docs:document.media:download"}, nil)
++	reg.Register(&httpmock.Stub{
++		Method:  http.MethodGet,
++		URL:     "/open-apis/board/v1/whiteboards/board_no_auth/download_as_image",
++		Status:  http.StatusOK,
++		RawBody: []byte("png-bytes"),
++		Headers: http.Header{"Content-Type": []string{"image/png"}},
++	})
++
++	tmpDir := t.TempDir()
++	withDocsWorkingDir(t, tmpDir)
++	err := mountAndRunDocs(t, DocMediaDownload, []string{
++		"+media-download",
++		"--token", "board_no_auth",
++		"--type", "whiteboard",
++		"--output", "board",
++		"--as", "bot",
++	}, f, stdout)
++	if err != nil {
++		t.Fatalf("whiteboard download error = %v", err)
++	}
++	if data, readErr := os.ReadFile(filepath.Join(tmpDir, "board.png")); readErr != nil || string(data) != "png-bytes" {
++		t.Fatalf("whiteboard content = %q, err=%v; want png-bytes", string(data), readErr)
++	}
++}
++
++func TestDocMediaDownloadDeclaresConditionalPermissionMemberAuthScope(t *testing.T) {
++	if len(DocMediaDownload.ConditionalScopes) != 1 || DocMediaDownload.ConditionalScopes[0] != common.DrivePermissionMemberAuthScope {
++		t.Fatalf("ConditionalScopes = %v, want [%q]", DocMediaDownload.ConditionalScopes, common.DrivePermissionMemberAuthScope)
++	}
++}
++
++func TestDocWhiteboardDownloadHTTP403DoesNotSuggestMediaPreview(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-whiteboard-403-app"))
++	reg.Register(&httpmock.Stub{
++		Method:  http.MethodGet,
++		URL:     "/open-apis/board/v1/whiteboards/board_403/download_as_image",
++		Status:  http.StatusForbidden,
++		RawBody: []byte("permission denied"),
++	})
++
++	tmpDir := t.TempDir()
++	withDocsWorkingDir(t, tmpDir)
++	err := mountAndRunDocs(t, DocMediaDownload, []string{
++		"+media-download",
++		"--token", "board_403",
++		"--type", "whiteboard",
++		"--output", "blocked.png",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Code != http.StatusForbidden {
++		t.Fatalf("problem=%+v ok=%v, want HTTP 403", problem, ok)
++	}
++	if strings.Contains(problem.Hint, "docs +media-preview") {
++		t.Fatalf("hint=%q, want no media preview guidance for whiteboard", problem.Hint)
++	}
++}
++
++func TestDocMediaDownloadHTTP429SuggestsBackoff(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-429-app"))
++	registerDocMediaExportAuth(reg, "media_rate_limited", true)
++	reg.Register(&httpmock.Stub{
++		Method:  http.MethodGet,
++		URL:     "/open-apis/drive/v1/medias/media_rate_limited/download",
++		Status:  http.StatusTooManyRequests,
++		RawBody: []byte("rate limited"),
++	})
++
++	tmpDir := t.TempDir()
++	withDocsWorkingDir(t, tmpDir)
++	err := mountAndRunDocs(t, DocMediaDownload, []string{
++		"+media-download",
++		"--token", "media_rate_limited",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Category != errs.CategoryNetwork || problem.Code != http.StatusTooManyRequests {
++		t.Fatalf("problem=%+v ok=%v, want network HTTP 429", problem, ok)
++	}
++	for _, want := range []string{"stop immediate retries", "retry later with exponential backoff"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "1 minute") {
++		t.Fatalf("hint=%q, want no fixed retry duration", problem.Hint)
++	}
++}
++
++func TestDocMediaDownloadExportAuthRateLimitPreservesAPIErrorAndSuggestsBackoff(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-auth-429-app"))
++	reg.Register(&httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/media_auth_limited/members/auth",
++		Body: map[string]interface{}{
++			"code":   99991400,
++			"msg":    "rate limited",
++			"log_id": "log-doc-auth-limited",
++		},
++	})
++
++	tmpDir := t.TempDir()
++	withDocsWorkingDir(t, tmpDir)
++	err := mountAndRunDocs(t, DocMediaDownload, []string{
++		"+media-download",
++		"--token", "media_auth_limited",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Category != errs.CategoryAPI || problem.Subtype != errs.SubtypeRateLimit || problem.Code != 99991400 {
++		t.Fatalf("problem=%+v ok=%v, want api/rate_limit/99991400", problem, ok)
++	}
++	if problem.LogID != "log-doc-auth-limited" || !problem.Retryable {
++		t.Fatalf("problem=%+v, want preserved log_id and retryable", problem)
++	}
++	for _, want := range []string{"stop immediate retries", "retry later with exponential backoff"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "1 minute") {
++		t.Fatalf("hint=%q, want no fixed retry duration", problem.Hint)
++	}
++}
++
++func TestDocMediaDownloadTypedRateLimitSuggestsBackoff(t *testing.T) {
++	err := errs.NewAPIError(errs.SubtypeRateLimit, "request trigger frequency limit").
++		WithCode(99991400).
++		WithRetryable().
++		WithHint("upstream hint")
++
++	got := withDocMediaDownloadRecoveryHint(err, "media")
++	problem, ok := errs.ProblemOf(got)
++	if !ok {
++		t.Fatalf("expected typed error, got %T: %v", got, got)
++	}
++	if problem.Category != errs.CategoryAPI || problem.Subtype != errs.SubtypeRateLimit || problem.Code != 99991400 || !problem.Retryable {
++		t.Fatalf("problem=%+v, want preserved API rate-limit metadata", problem)
++	}
++	for _, want := range []string{"upstream hint", "stop immediate retries", "retry later with exponential backoff"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "1 minute") {
++		t.Fatalf("hint=%q, want no fixed retry duration", problem.Hint)
++	}
+ }
+ 
+ func TestDocMediaDownloadAppendsExtensionFromContentDispositionFilename(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-disposition-app"))
++	registerDocMediaExportAuth(reg, "tok_123", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "GET",
+ 		URL:    "/open-apis/drive/v1/medias/tok_123/download",
+@@ -589,6 +847,7 @@ func TestDocMediaDownloadAppendsExtensionFromContentDispositionFilename(t *testi
+ 
+ func TestDocMediaDownloadAppendsExtensionForTrailingDotOutput(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-trailing-dot-app"))
++	registerDocMediaExportAuth(reg, "tok_123", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "GET",
+ 		URL:    "/open-apis/drive/v1/medias/tok_123/download",
+@@ -622,6 +881,57 @@ func TestDocMediaDownloadAppendsExtensionForTrailingDotOutput(t *testing.T) {
+ 	}
+ }
+ 
++func TestDocMediaDownloadDryRunIncludesExportAuthBeforeDownload(t *testing.T) {
++	cmd := &cobra.Command{Use: "docs +media-download"}
++	cmd.Flags().String("token", "", "")
++	cmd.Flags().String("output", "", "")
++	cmd.Flags().String("type", "media", "")
++	if err := cmd.Flags().Set("token", "media_dryrun"); err != nil {
++		t.Fatalf("set --token: %v", err)
++	}
++	if err := cmd.Flags().Set("output", "asset.bin"); err != nil {
++		t.Fatalf("set --output: %v", err)
++	}
++
++	dry := decodeDocDryRun(t, DocMediaDownload.DryRun(context.Background(), common.TestNewRuntimeContext(cmd, nil)))
++	if len(dry.API) != 2 {
++		t.Fatalf("expected 2 API calls, got %d", len(dry.API))
++	}
++	if dry.API[0].Method != http.MethodGet || dry.API[0].URL != "/open-apis/drive/v1/permissions/media_dryrun/members/auth" {
++		t.Fatalf("first API = %+v, want export permission auth", dry.API[0])
++	}
++	if dry.API[0].Params["type"] != "file" || dry.API[0].Params["action"] != "export" {
++		t.Fatalf("first params = %#v, want type=file action=export", dry.API[0].Params)
++	}
++	if dry.API[1].Method != http.MethodGet || dry.API[1].URL != "/open-apis/drive/v1/medias/media_dryrun/download" {
++		t.Fatalf("second API = %+v, want media download", dry.API[1])
++	}
++}
++
++func TestDocWhiteboardDownloadDryRunSkipsExportAuth(t *testing.T) {
++	cmd := &cobra.Command{Use: "docs +media-download"}
++	cmd.Flags().String("token", "", "")
++	cmd.Flags().String("output", "", "")
++	cmd.Flags().String("type", "media", "")
++	if err := cmd.Flags().Set("token", "board_dryrun"); err != nil {
++		t.Fatalf("set --token: %v", err)
++	}
++	if err := cmd.Flags().Set("output", "board.png"); err != nil {
++		t.Fatalf("set --output: %v", err)
++	}
++	if err := cmd.Flags().Set("type", "whiteboard"); err != nil {
++		t.Fatalf("set --type: %v", err)
++	}
++
++	dry := decodeDocDryRun(t, DocMediaDownload.DryRun(context.Background(), common.TestNewRuntimeContext(cmd, nil)))
++	if len(dry.API) != 1 {
++		t.Fatalf("expected 1 API call, got %d", len(dry.API))
++	}
++	if dry.API[0].URL != "/open-apis/board/v1/whiteboards/board_dryrun/download_as_image" {
++		t.Fatalf("API = %+v, want whiteboard download only", dry.API[0])
++	}
++}
++
+ func TestDocMediaPreviewDryRunUsesMediaEndpoint(t *testing.T) {
+ 	cmd := &cobra.Command{Use: "docs +media-preview"}
+ 	cmd.Flags().String("token", "", "")
+@@ -782,6 +1092,7 @@ func TestDocMediaPreviewAppendsExtensionForTrailingDotOutput(t *testing.T) {
+ 
+ func TestDocMediaDownloadAppendsExtensionFromContentTypeMapping(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, docsTestConfigWithAppID("docs-download-content-type-app"))
++	registerDocMediaExportAuth(reg, "tok_123", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "GET",
+ 		URL:    "/open-apis/drive/v1/medias/tok_123/download",
+@@ -819,6 +1130,7 @@ type docDryRunOutput struct {
+ 	Description string `json:"description"`
+ 	API         []struct {
+ 		Desc   string                 `json:"desc"`
++		Method string                 `json:"method"`
+ 		URL    string                 `json:"url"`
+ 		Params map[string]interface{} `json:"params"`
+ 		Body   map[string]interface{} `json:"body"`
+diff --git a/shortcuts/drive/drive_download.go b/shortcuts/drive/drive_download.go
+index 93b6b469..144c3fb5 100644
+--- a/shortcuts/drive/drive_download.go
++++ b/shortcuts/drive/drive_download.go
+@@ -110,7 +110,7 @@ var DriveDownload = common.Shortcut{
+ 	Command:     "+download",
+ 	Description: "Download a file from Drive to local",
+ 	Risk:        "read",
+-	Scopes:      []string{"drive:file:download"},
++	Scopes:      []string{"drive:file:download", common.DrivePermissionMemberAuthScope},
+ 	// Metadata is only required when --output is omitted and the CLI needs the
+ 	// remote title as the pre-download fallback filename.
+ 	ConditionalScopes: []string{driveMetadataReadScope},
+@@ -141,14 +141,18 @@ var DriveDownload = common.Shortcut{
+ 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
+ 		fileToken := runtime.Str("file-token")
+ 		outputPath := runtime.Str("output")
+-		plan := common.NewDryRunAPI()
+-		downloadDesc := "[1] Download file bytes to the explicit output path"
++		plan := common.AddDriveFileExportPermissionDryRun(
++			common.NewDryRunAPI(),
++			fileToken,
++			"[1] Check whether the current identity can export the Drive file",
++		)
++		downloadDesc := "[2] Download file bytes to the explicit output path"
+ 		if outputPath == "" {
+ 			outputPath = "<Content-Disposition filename | metadata title | token>"
+-			downloadDesc = "[2] Download file bytes; Content-Disposition filename wins over metadata title when present"
++			downloadDesc = "[3] Download file bytes; Content-Disposition filename wins over metadata title when present"
+ 			plan.
+ 				POST("/open-apis/drive/v1/metas/batch_query").
+-				Desc("[1] Resolve metadata title before downloading; fails before the download request if metadata scope is missing").
++				Desc("[2] Resolve metadata title before downloading; fails before the download request if metadata scope is missing").
+ 				Body(map[string]interface{}{
+ 					"request_docs": []map[string]interface{}{
+ 						{
+@@ -179,6 +183,14 @@ var DriveDownload = common.Shortcut{
+ 			}
+ 		}
+ 
++		allowed, err := common.CheckDriveFileExportPermission(runtime, fileToken)
++		if err != nil {
++			return withDriveDownloadRecoveryHint(err, fileToken)
++		}
++		if !allowed {
++			return driveDownloadPermissionDeniedError()
++		}
++
+ 		var metadataTitle string
+ 		if outputPath == "" {
+ 			title, err := common.FetchDriveMetaTitle(runtime, fileToken, "file")
+@@ -202,7 +214,7 @@ var DriveDownload = common.Shortcut{
+ 			ApiPath:    fmt.Sprintf("/open-apis/drive/v1/files/%s/download", validate.EncodePathSegment(fileToken)),
+ 		})
+ 		if err != nil {
+-			return withDriveDownloadForbiddenPreviewHint(wrapDriveNetworkErr(err, "download failed: %s", err), fileToken)
++			return withDriveDownloadRecoveryHint(wrapDriveNetworkErr(err, "download failed: %s", err), fileToken)
+ 		}
+ 		defer resp.Body.Close()
+ 
+diff --git a/shortcuts/drive/drive_errors.go b/shortcuts/drive/drive_errors.go
+index 18f09ea1..c8b6b8a0 100644
+--- a/shortcuts/drive/drive_errors.go
++++ b/shortcuts/drive/drive_errors.go
+@@ -42,9 +42,46 @@ func withDriveDownloadForbiddenPreviewHint(err error, _ string) error {
+ 	return err
+ }
+ 
++// withDriveDownloadRecoveryHint preserves the final download error while
++// attaching an actionable recovery path for permission and throttling failures.
++func withDriveDownloadRecoveryHint(err error, fileToken string) error {
++	err = withDriveDownloadForbiddenPreviewHint(err, fileToken)
++	if !driveDownloadIsRateLimit(err) {
++		return err
++	}
++
++	problem, _ := errs.ProblemOf(err)
++	if strings.Contains(problem.Hint, "exponential backoff") {
++		return err
++	}
++	const hint = "Drive download was rate limited; stop immediate retries and retry later with exponential backoff."
++	return appendDriveExportRecoveryHint(err, hint)
++}
++
++func driveDownloadIsRateLimit(err error) bool {
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem == nil {
++		return false
++	}
++	return problem.Subtype == errs.SubtypeRateLimit ||
++		problem.Code == 99991400 ||
++		problem.Code == http.StatusTooManyRequests
++}
++
+ func driveDownloadForbiddenPreviewHint() string {
+ 	const tokenArg = "<FILE_TOKEN>"
+-	return fmt.Sprintf("Direct Drive download returned HTTP 403. To view file content through preview artifacts, try `lark-cli drive +preview --file-token %s --type source_file --output <path>`; for PDF/text/image preview choices, run `lark-cli drive +preview --file-token %s --list-only`.", tokenArg, tokenArg)
++	return fmt.Sprintf("Direct Drive download returned HTTP 403. To view file content through preview artifacts, try `lark-cli drive +preview --file-token %s --type source_file --output <path>`.", tokenArg)
++}
++
++func driveDownloadPermissionDeniedError() error {
++	const tokenArg = "<FILE_TOKEN>"
++	return errs.NewPermissionError(
++		errs.SubtypePermissionDenied,
++		"current identity does not have export permission for this Drive file",
++	).WithHint(
++		"Direct Drive download is unavailable. To view file content through preview artifacts, try `lark-cli drive +preview --file-token %s --type source_file --output <path>`.",
++		tokenArg,
++	)
+ }
+ 
+ // driveInputStatError maps a FileIO.Stat/Open error for input file validation
+diff --git a/shortcuts/drive/drive_io_test.go b/shortcuts/drive/drive_io_test.go
+index 4d83c60c..7dd09601 100644
+--- a/shortcuts/drive/drive_io_test.go
++++ b/shortcuts/drive/drive_io_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"io"
+ 	"mime"
+ 	"mime/multipart"
+ 	"net/http"
+@@ -45,6 +46,19 @@ func driveTestConfig() *core.CliConfig {
+ 	}
+ }
+ 
++func registerDriveDownloadExportAuth(reg *httpmock.Registry, fileToken string, allowed bool) *httpmock.Stub {
++	stub := &httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/" + fileToken + "/members/auth",
++		Body: map[string]interface{}{
++			"code": 0,
++			"data": map[string]interface{}{"auth_result": allowed},
++		},
++	}
++	reg.Register(stub)
++	return stub
++}
++
+ func mountAndRunDrive(t *testing.T, s common.Shortcut, args []string, f *cmdutil.Factory, stdout *bytes.Buffer) error {
+ 	t.Helper()
+ 	return mountAndRunDriveWithContext(t, context.Background(), s, args, f, stdout)
+@@ -1542,6 +1556,7 @@ func TestDriveDownloadRejectsOverwriteWithoutFlag(t *testing.T) {
+ 
+ func TestDriveDownloadAllowsOverwriteFlag(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_123", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method:  "GET",
+ 		URL:     "/open-apis/drive/v1/files/file_123/download",
+@@ -1582,6 +1597,7 @@ func TestDriveDownloadAllowsOverwriteFlag(t *testing.T) {
+ 
+ func TestDriveDownloadHTTP403SuggestsPreview(t *testing.T) {
+ 	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_403", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method:  "GET",
+ 		URL:     "/open-apis/drive/v1/files/file_403/download",
+@@ -1623,10 +1639,14 @@ func TestDriveDownloadHTTP403SuggestsPreview(t *testing.T) {
+ 	if !strings.Contains(problem.Hint, "--type source_file") || !strings.Contains(problem.Hint, "--output <path>") {
+ 		t.Fatalf("hint=%q, want source_file output command", problem.Hint)
+ 	}
++	if strings.Contains(problem.Hint, "--list-only") || strings.Contains(problem.Hint, "PDF/text/image preview choices") {
++		t.Fatalf("hint=%q, want only the source_file recovery command", problem.Hint)
++	}
+ }
+ 
+ func TestDriveDownloadHTTP404DoesNotSuggestPreview(t *testing.T) {
+ 	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_missing", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method:  "GET",
+ 		URL:     "/open-apis/drive/v1/files/file_missing/download",
+@@ -1658,6 +1678,181 @@ func TestDriveDownloadHTTP404DoesNotSuggestPreview(t *testing.T) {
+ 	}
+ }
+ 
++func TestDriveDownloadExportDeniedFailsBeforeDownload(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_export_denied", false)
++	downloadCalls := 0
++	reg.Register(&httpmock.Stub{
++		Method:   http.MethodGet,
++		URL:      "/open-apis/drive/v1/files/file_export_denied/download",
++		Optional: true,
++		OnMatch: func(*http.Request) {
++			downloadCalls++
++		},
++	})
++
++	tmpDir := t.TempDir()
++	withDriveWorkingDir(t, tmpDir)
++
++	err := mountAndRunDrive(t, DriveDownload, []string{
++		"+download",
++		"--file-token", "file_export_denied",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok {
++		t.Fatalf("expected typed error, got %T: %v", err, err)
++	}
++	if problem.Category != errs.CategoryAuthorization || problem.Subtype != errs.SubtypePermissionDenied {
++		t.Fatalf("problem = category %q subtype %q, want authorization/permission_denied", problem.Category, problem.Subtype)
++	}
++	for _, want := range []string{"drive +preview", "--file-token <FILE_TOKEN>", "--type source_file", "--output <path>"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "file_export_denied") || strings.Contains(problem.Hint, "--list-only") {
++		t.Fatalf("hint=%q, want placeholder-only source_file guidance", problem.Hint)
++	}
++	if downloadCalls != 0 {
++		t.Fatalf("download calls = %d, want 0", downloadCalls)
++	}
++	if _, statErr := os.Stat(filepath.Join(tmpDir, "blocked.bin")); !os.IsNotExist(statErr) {
++		t.Fatalf("download target should not be created, statErr=%v", statErr)
++	}
++}
++
++func TestDriveDownloadMalformedExportAuthStopsBeforeDownload(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	reg.Register(&httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/file_auth_malformed/members/auth",
++		Body: map[string]interface{}{
++			"code": 0,
++			"data": map[string]interface{}{"auth_result": "true"},
++		},
++	})
++	downloadCalls := 0
++	reg.Register(&httpmock.Stub{
++		Method:   http.MethodGet,
++		URL:      "/open-apis/drive/v1/files/file_auth_malformed/download",
++		Optional: true,
++		OnMatch: func(*http.Request) {
++			downloadCalls++
++		},
++	})
++
++	tmpDir := t.TempDir()
++	withDriveWorkingDir(t, tmpDir)
++	err := mountAndRunDrive(t, DriveDownload, []string{
++		"+download",
++		"--file-token", "file_auth_malformed",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Category != errs.CategoryInternal || problem.Subtype != errs.SubtypeInvalidResponse {
++		t.Fatalf("problem=%+v ok=%v, want internal/invalid_response", problem, ok)
++	}
++	if downloadCalls != 0 {
++		t.Fatalf("download calls = %d, want 0", downloadCalls)
++	}
++}
++
++func TestDriveDownloadHTTP429SuggestsBackoff(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_download_limited", true)
++	reg.Register(&httpmock.Stub{
++		Method:  http.MethodGet,
++		URL:     "/open-apis/drive/v1/files/file_download_limited/download",
++		Status:  http.StatusTooManyRequests,
++		RawBody: []byte("rate limited"),
++	})
++
++	tmpDir := t.TempDir()
++	withDriveWorkingDir(t, tmpDir)
++	err := mountAndRunDrive(t, DriveDownload, []string{
++		"+download",
++		"--file-token", "file_download_limited",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Category != errs.CategoryNetwork || problem.Code != http.StatusTooManyRequests {
++		t.Fatalf("problem=%+v ok=%v, want network HTTP 429", problem, ok)
++	}
++	for _, want := range []string{"stop immediate retries", "retry later with exponential backoff"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "1 minute") {
++		t.Fatalf("hint=%q, want no fixed retry duration", problem.Hint)
++	}
++}
++
++func TestDriveDownloadExportAuthRateLimitPreservesAPIErrorAndSuggestsBackoff(t *testing.T) {
++	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	reg.Register(&httpmock.Stub{
++		Method: http.MethodGet,
++		URL:    "/open-apis/drive/v1/permissions/file_auth_limited/members/auth",
++		Body: map[string]interface{}{
++			"code":   99991400,
++			"msg":    "rate limited",
++			"log_id": "log-drive-auth-limited",
++		},
++	})
++
++	tmpDir := t.TempDir()
++	withDriveWorkingDir(t, tmpDir)
++	err := mountAndRunDrive(t, DriveDownload, []string{
++		"+download",
++		"--file-token", "file_auth_limited",
++		"--output", "blocked.bin",
++		"--as", "bot",
++	}, f, nil)
++	problem, ok := errs.ProblemOf(err)
++	if !ok || problem.Category != errs.CategoryAPI || problem.Subtype != errs.SubtypeRateLimit || problem.Code != 99991400 {
++		t.Fatalf("problem=%+v ok=%v, want api/rate_limit/99991400", problem, ok)
++	}
++	if problem.LogID != "log-drive-auth-limited" || !problem.Retryable {
++		t.Fatalf("problem=%+v, want preserved log_id and retryable", problem)
++	}
++	for _, want := range []string{"stop immediate retries", "retry later with exponential backoff"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "1 minute") {
++		t.Fatalf("hint=%q, want no fixed retry duration", problem.Hint)
++	}
++}
++
++func TestDriveDownloadTypedRateLimitSuggestsBackoff(t *testing.T) {
++	err := errs.NewAPIError(errs.SubtypeRateLimit, "request trigger frequency limit").
++		WithCode(99991400).
++		WithRetryable().
++		WithHint("upstream hint")
++
++	got := withDriveDownloadRecoveryHint(err, "file_secret")
++	problem, ok := errs.ProblemOf(got)
++	if !ok {
++		t.Fatalf("expected typed error, got %T: %v", got, got)
++	}
++	if problem.Category != errs.CategoryAPI || problem.Subtype != errs.SubtypeRateLimit || problem.Code != 99991400 || !problem.Retryable {
++		t.Fatalf("problem=%+v, want preserved API rate-limit metadata", problem)
++	}
++	for _, want := range []string{"upstream hint", "stop immediate retries", "retry later with exponential backoff"} {
++		if !strings.Contains(problem.Hint, want) {
++			t.Fatalf("hint=%q, want %q", problem.Hint, want)
++		}
++	}
++	if strings.Contains(problem.Hint, "1 minute") {
++		t.Fatalf("hint=%q, want no fixed retry duration", problem.Hint)
++	}
++}
++
+ func TestDriveDownloadDefaultOutputPathSanitizesSlashOnlyNames(t *testing.T) {
+ 	header := http.Header{
+ 		"Content-Disposition": []string{`attachment; filename="////"`},
+@@ -1756,19 +1951,27 @@ func TestDriveDownloadDryRunPlansMetadataWhenOutputOmitted(t *testing.T) {
+ 
+ 	data := decodeDriveEnvelope(t, stdout)
+ 	apis, _ := data["api"].([]interface{})
+-	if len(apis) != 2 {
+-		t.Fatalf("api count = %d, want 2\nstdout=%s", len(apis), stdout.String())
++	if len(apis) != 3 {
++		t.Fatalf("api count = %d, want 3\nstdout=%s", len(apis), stdout.String())
+ 	}
+ 	first, _ := apis[0].(map[string]interface{})
+-	if first["method"] != "POST" || first["url"] != "/open-apis/drive/v1/metas/batch_query" {
+-		t.Fatalf("first api = %#v, want metadata batch_query", first)
++	if first["method"] != "GET" || first["url"] != "/open-apis/drive/v1/permissions/file_dryrun/members/auth" {
++		t.Fatalf("first api = %#v, want export permission auth", first)
++	}
++	firstParams, _ := first["params"].(map[string]interface{})
++	if firstParams["type"] != "file" || firstParams["action"] != "export" {
++		t.Fatalf("first params = %#v, want type=file action=export", firstParams)
+ 	}
+ 	second, _ := apis[1].(map[string]interface{})
+-	if second["method"] != "GET" || second["url"] != "/open-apis/drive/v1/files/file_dryrun/download" {
+-		t.Fatalf("second api = %#v, want file download", second)
++	if second["method"] != "POST" || second["url"] != "/open-apis/drive/v1/metas/batch_query" {
++		t.Fatalf("second api = %#v, want metadata batch_query", second)
+ 	}
+-	if second["desc"] != "[2] Download file bytes; Content-Disposition filename wins over metadata title when present" {
+-		t.Fatalf("second desc = %#v, want metadata-aware step 2", second["desc"])
++	third, _ := apis[2].(map[string]interface{})
++	if third["method"] != "GET" || third["url"] != "/open-apis/drive/v1/files/file_dryrun/download" {
++		t.Fatalf("third api = %#v, want file download", third)
++	}
++	if third["desc"] != "[3] Download file bytes; Content-Disposition filename wins over metadata title when present" {
++		t.Fatalf("third desc = %#v, want metadata-aware step 3", third["desc"])
+ 	}
+ }
+ 
+@@ -1788,15 +1991,19 @@ func TestDriveDownloadDryRunExplicitOutputSkipsMetadata(t *testing.T) {
+ 
+ 	data := decodeDriveEnvelope(t, stdout)
+ 	apis, _ := data["api"].([]interface{})
+-	if len(apis) != 1 {
+-		t.Fatalf("api count = %d, want 1\nstdout=%s", len(apis), stdout.String())
++	if len(apis) != 2 {
++		t.Fatalf("api count = %d, want 2\nstdout=%s", len(apis), stdout.String())
+ 	}
+ 	first, _ := apis[0].(map[string]interface{})
+-	if first["method"] != "GET" || first["url"] != "/open-apis/drive/v1/files/file_dryrun/download" {
+-		t.Fatalf("api = %#v, want file download", first)
++	if first["method"] != "GET" || first["url"] != "/open-apis/drive/v1/permissions/file_dryrun/members/auth" {
++		t.Fatalf("first api = %#v, want export permission auth", first)
++	}
++	second, _ := apis[1].(map[string]interface{})
++	if second["method"] != "GET" || second["url"] != "/open-apis/drive/v1/files/file_dryrun/download" {
++		t.Fatalf("second api = %#v, want file download", second)
+ 	}
+-	if first["desc"] != "[1] Download file bytes to the explicit output path" {
+-		t.Fatalf("api desc = %#v, want explicit-output step 1", first["desc"])
++	if second["desc"] != "[2] Download file bytes to the explicit output path" {
++		t.Fatalf("api desc = %#v, want explicit-output step 2", second["desc"])
+ 	}
+ 	if data["output"] != "report.bin" {
+ 		t.Fatalf("output = %#v, want report.bin", data["output"])
+@@ -1805,7 +2012,7 @@ func TestDriveDownloadDryRunExplicitOutputSkipsMetadata(t *testing.T) {
+ 
+ func TestDriveDownloadOmittedOutputRequiresMetadataScope(t *testing.T) {
+ 	f, _, _, _ := cmdutil.TestFactory(t, driveTestConfig())
+-	f.Credential = credential.NewCredentialProvider(nil, nil, &driveStatusScopedTokenResolver{scopes: "drive:file:download"}, nil)
++	f.Credential = credential.NewCredentialProvider(nil, nil, &driveStatusScopedTokenResolver{scopes: "drive:file:download " + common.DrivePermissionMemberAuthScope}, nil)
+ 
+ 	err := mountAndRunDrive(t, DriveDownload, []string{
+ 		"+download",
+@@ -1824,6 +2031,19 @@ func TestDriveDownloadOmittedOutputRequiresMetadataScope(t *testing.T) {
+ 	}
+ }
+ 
++func TestDriveDownloadDeclaresPermissionMemberAuthScope(t *testing.T) {
++	found := false
++	for _, scope := range DriveDownload.Scopes {
++		if scope == common.DrivePermissionMemberAuthScope {
++			found = true
++			break
++		}
++	}
++	if !found {
++		t.Fatalf("DriveDownload.Scopes = %v, want %q", DriveDownload.Scopes, common.DrivePermissionMemberAuthScope)
++	}
++}
++
+ func TestDriveDownloadRejectsInvalidFileToken(t *testing.T) {
+ 	f, _, _, _ := cmdutil.TestFactory(t, driveTestConfig())
+ 
+@@ -1876,7 +2096,8 @@ func TestDriveDownloadRejectsUnsafeExplicitOutput(t *testing.T) {
+ 
+ func TestDriveDownloadExplicitOutputSkipsMetadataScope(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, driveTestConfig())
+-	f.Credential = credential.NewCredentialProvider(nil, nil, &driveStatusScopedTokenResolver{scopes: "drive:file:download"}, nil)
++	f.Credential = credential.NewCredentialProvider(nil, nil, &driveStatusScopedTokenResolver{scopes: "drive:file:download " + common.DrivePermissionMemberAuthScope}, nil)
++	registerDriveDownloadExportAuth(reg, "file_no_meta_scope", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method:  "GET",
+ 		URL:     "/open-apis/drive/v1/files/file_no_meta_scope/download",
+@@ -1904,6 +2125,7 @@ func TestDriveDownloadExplicitOutputSkipsMetadataScope(t *testing.T) {
+ 
+ func TestDriveDownloadRejectsExistingDefaultOutputWithoutOverwrite(t *testing.T) {
+ 	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_existing_title", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "POST",
+ 		URL:    "/open-apis/drive/v1/metas/batch_query",
+@@ -1953,6 +2175,7 @@ func TestDriveDownloadRejectsExistingDefaultOutputWithoutOverwrite(t *testing.T)
+ 
+ func TestDriveDownloadUsesContentDispositionWhenOutputOmitted(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	authStub := registerDriveDownloadExportAuth(reg, "file_named", true)
+ 	metaStub := &httpmock.Stub{
+ 		Method: "POST",
+ 		URL:    "/open-apis/drive/v1/metas/batch_query",
+@@ -1977,7 +2200,7 @@ func TestDriveDownloadUsesContentDispositionWhenOutputOmitted(t *testing.T) {
+ 			"Content-Disposition": []string{`attachment; filename="server-report.md"`},
+ 		},
+ 		OnMatch: func(req *http.Request) {
+-			metadataSeenBeforeDownload = len(metaStub.CapturedBody) > 0
++			metadataSeenBeforeDownload = len(authStub.CapturedBodies) > 0 && len(metaStub.CapturedBody) > 0
+ 		},
+ 	})
+ 
+@@ -2011,6 +2234,7 @@ func TestDriveDownloadUsesContentDispositionWhenOutputOmitted(t *testing.T) {
+ 
+ func TestDriveDownloadFallsBackToMetadataTitleWhenOutputOmitted(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_title", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "POST",
+ 		URL:    "/open-apis/drive/v1/metas/batch_query",
+@@ -2060,6 +2284,7 @@ func TestDriveDownloadFallsBackToMetadataTitleWhenOutputOmitted(t *testing.T) {
+ 
+ func TestDriveDownloadFallsBackToTokenWhenOutputOmittedAndMetadataEmpty(t *testing.T) {
+ 	f, stdout, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_empty", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "POST",
+ 		URL:    "/open-apis/drive/v1/metas/batch_query",
+@@ -2103,6 +2328,7 @@ func TestDriveDownloadFallsBackToTokenWhenOutputOmittedAndMetadataEmpty(t *testi
+ 
+ func TestDriveDownloadMetadataNonPermissionErrorContinuesWithTokenFallback(t *testing.T) {
+ 	f, stdout, stderr, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_rate_limited", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "POST",
+ 		URL:    "/open-apis/drive/v1/metas/batch_query",
+@@ -2190,6 +2416,7 @@ func TestDriveDownloadMetadataContextErrorStopsBeforeDownload(t *testing.T) {
+ 
+ 			cfg := driveTestConfig()
+ 			f, _, _, _ := cmdutil.TestFactory(t, cfg)
++			permissionRequests := 0
+ 			metadataRequests := 0
+ 			downloadRequests := 0
+ 			f.LarkClient = func() (*lark.Client, error) {
+@@ -2200,6 +2427,15 @@ func TestDriveDownloadMetadataContextErrorStopsBeforeDownload(t *testing.T) {
+ 					lark.WithLogLevel(larkcore.LogLevelError),
+ 					lark.WithOpenBaseUrl(core.ResolveOpenBaseURL(cfg.Brand)),
+ 					lark.WithHttpClient(&http.Client{Transport: driveRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++						if strings.Contains(req.URL.Path, "/permissions/") {
++							permissionRequests++
++							return &http.Response{
++								StatusCode: http.StatusOK,
++								Header:     http.Header{"Content-Type": []string{"application/json"}},
++								Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"auth_result":true}}`)),
++								Request:    req,
++							}, nil
++						}
+ 						if strings.Contains(req.URL.Path, "/metas/batch_query") {
+ 							metadataRequests++
+ 							tc.cancelIn(cancel, req)
+@@ -2227,6 +2463,9 @@ func TestDriveDownloadMetadataContextErrorStopsBeforeDownload(t *testing.T) {
+ 			if metadataRequests != 1 {
+ 				t.Fatalf("metadata requests = %d, want 1", metadataRequests)
+ 			}
++			if permissionRequests != 1 {
++				t.Fatalf("permission requests = %d, want 1", permissionRequests)
++			}
+ 			if downloadRequests != 0 {
+ 				t.Fatalf("download requests = %d, want 0", downloadRequests)
+ 			}
+@@ -2236,6 +2475,7 @@ func TestDriveDownloadMetadataContextErrorStopsBeforeDownload(t *testing.T) {
+ 
+ func TestDriveDownloadMetadataErrorBeforeDownloadWhenOutputOmitted(t *testing.T) {
+ 	f, _, _, reg := cmdutil.TestFactory(t, driveTestConfig())
++	registerDriveDownloadExportAuth(reg, "file_no_meta", true)
+ 	reg.Register(&httpmock.Stub{
+ 		Method: "POST",
+ 		URL:    "/open-apis/drive/v1/metas/batch_query",
+diff --git a/skills/lark-doc/references/lark-doc-media-download.md b/skills/lark-doc/references/lark-doc-media-download.md
+index 2920c320..7602a415 100644
+--- a/skills/lark-doc/references/lark-doc-media-download.md
++++ b/skills/lark-doc/references/lark-doc-media-download.md
+@@ -41,7 +41,8 @@ lark-cli docs +media-download --type whiteboard --token "wbcnxxxxxxxx" --output
+ 
+ ## 排障
+ 
+-- 如果报错返回的信息包含 `HTTP 403`，且目标是图片/文件素材，可以改成调用 [`docs +media-preview`](lark-doc-media-preview.md) 看是否能先预览内容
++- 如果返回 `permission_denied`，或最终下载返回 `HTTP 403`，按错误 `hint` 改用 [`docs +media-preview`](lark-doc-media-preview.md) 预览内容。
++- 如果返回限流错误，停止立即重试，稍后按指数退避重试。
+ 
+ ## 参考
+ 
+diff --git a/skills/lark-drive/references/lark-drive-download.md b/skills/lark-drive/references/lark-drive-download.md
+index c376f501..d4514b24 100644
+--- a/skills/lark-drive/references/lark-drive-download.md
++++ b/skills/lark-drive/references/lark-drive-download.md
+@@ -27,7 +27,8 @@ https://xxx.feishu.cn/drive/file/boxbc_xxx
+ 
+ ## 排障
+ 
+-- 如果返回 `HTTP 403`，可以使用 [lark-drive-preview](lark-drive-preview.md) 下载源文件产物。
++- 如果返回 `permission_denied`，或最终下载返回 `HTTP 403`，按错误 `hint` 使用 `lark-cli drive +preview --file-token <FILE_TOKEN> --type source_file --output <path>` 获取预览产物。
++- 如果返回限流错误，停止立即重试，稍后按指数退避重试。
+ 
+ ## 参考
+ 
+diff --git a/tests/cli_e2e/docs/coverage.md b/tests/cli_e2e/docs/coverage.md
+index 73a9f6b5..ad6a1d0e 100644
+--- a/tests/cli_e2e/docs/coverage.md
++++ b/tests/cli_e2e/docs/coverage.md
+@@ -2,8 +2,8 @@
+ 
+ ## Metrics
+ - Denominator: 12 leaf commands
+-- Covered: 7
+-- Coverage: 58.3%
++- Covered: 9
++- Coverage: 75.0%
+ 
+ ## Summary
+ - TestDocs_CreateAndFetchWorkflow: proves `docs +create` and `docs +fetch`; key `t.Run(...)` proof points are `create as bot` and `fetch as bot`.
+@@ -17,8 +17,9 @@
+ - TestDocsScriptPresentationDecisionListCountsULAndOL proves the compatibility-only `list` requirement aggregates `<ul>` and `<ol>` block counts.
+ - TestDocs_DryRunDefaultsToV2OpenAPI also proves `docs +history-list`, `docs +history-revert`, and `docs +history-revert-status` dry-run endpoint and query/body shapes.
+ - TestDocs_HistoryWorkflow proves the guarded live history flow (`LARK_DOC_HISTORY_E2E=1`): create, update, list prior revisions, revert, poll status when needed, and fetch to verify reverted content.
++- TestDocs_MediaDownloadWorkflow proves `docs +media-insert` and `docs +media-download`: it creates a temporary folder and document, writes a deterministic PNG fixture, inserts it, downloads it by the returned media token, verifies the saved bytes, and cleans up the document and folder.
+ - Setup note: docs workflows create a Drive folder through `drive files create_folder` in `helpers_test.go`; that helper is external to the docs domain and is not counted here.
+-- Blocked area: standalone media and search shortcuts still need dedicated deterministic workflows; local resource authoring through create/update is covered.
++- Blocked area: media preview, search, and whiteboard update still need deterministic fixtures or DSL-specific orchestration; local resource authoring through create/update is covered.
+ 
+ ## Command Table
+ 
+@@ -30,8 +31,8 @@
+ | ✓ | docs +history-revert | shortcut | docs_update_dryrun_test.go::TestDocs_DryRunDefaultsToV2OpenAPI/history revert; docs_history_workflow_test.go::TestDocs_HistoryWorkflow | `--doc`; `--history-version-id`; `--wait-timeout-ms` | live workflow gated by `LARK_DOC_HISTORY_E2E=1` |
+ | ✓ | docs +history-revert-status | shortcut | docs_update_dryrun_test.go::TestDocs_DryRunDefaultsToV2OpenAPI/history revert status; docs_history_workflow_test.go::TestDocs_HistoryWorkflow | `--doc`; `--task-id` | live workflow polls only when revert returns `running` |
+ | ✓ | docs +script | shortcut | docs_script_test.go::TestDocsScriptPresentationDecisionListCountsULAndOL; docs_script_test.go::TestDocsScriptInitDraftCreatesUniqueWorkspacesWithoutXML; docs_script_test.go::TestDocsScriptInitDraftDryRunDoesNotWrite; docs_script_test.go::TestDocsScriptFileNameFlagIsRemoved; docs_script_test.go::TestDocsScriptInitializedDraftAutomaticallyValidatesPresentationDecision; docs_script_test.go::TestDocsScriptInitializedDraftPreflightsBlockedRemoteImage; docs_script_test.go::TestDocsScriptParseRepairsMalformedXMLForProfile; docs_script_test.go::TestDocsScriptStrictFlagIsRemoved; docs_script_test.go::TestDocsScriptMarkdownToXMLIsRemoved; docs_script_test.go::TestDocsScriptCreateTempXMLIsRemoved; docs_script_test.go::TestDocsScriptParseRejectsMarkdownFromFile; docs_create_fetch_test.go::TestDocs_CreateAndFetchWorkflowAsBot/script parse by token | `--command init-draft` with `--presentation-decision <JSON>`, `@file`, or `-`; `--command parse --content @file`; `--doc <URL/token>`; local/online dry-run | initializes `draft_<random>_folder/draft.xml` and reserves the uncreated XML path; validates word-count and planned block minimums; treats compatibility type `list` as the combined `<ul>` and `<ol>` count; preflights local/remote resources; returns `ok:true` with `assessment.status:failed` and structured diagnostics when checks do not pass; deduplicates same-cause image failures into `image_indices[]`; requires normal authentication for local parse, rejects Markdown input, and fetches online input as XML |
+-| ✕ | docs +media-download | shortcut |  | none | no media fixture workflow yet |
+-| ✕ | docs +media-insert | shortcut |  | none | requires deterministic upload fixture and rollback assertions |
++| ✓ | docs +media-download | shortcut | docs_media_download_dryrun_test.go::TestDocsMediaDownloadDryRun_PlansExportAuthBeforeMediaDownload; docs_media_download_dryrun_test.go::TestDocsMediaDownloadDryRun_WhiteboardSkipsExportAuth; docs_media_download_workflow_test.go::TestDocs_MediaDownloadWorkflow | `--token`; `--output`; `--type whiteboard` dry-run | dry-run pins permission-check ordering and whiteboard bypass; live workflow creates a media fixture and verifies downloaded bytes |
++| ✓ | docs +media-insert | shortcut | docs_media_download_workflow_test.go::TestDocs_MediaDownloadWorkflow | `--doc`; `--file`; `--type image` | live workflow asserts the returned media token and uses it to retrieve the inserted image |
+ | ✕ | docs +media-preview | shortcut |  | none | requires deterministic media fixture |
+ | ✕ | docs +search | shortcut |  | none | search results are ambient and not yet stabilized for E2E |
+ | ✓ | docs +update | shortcut | docs_update_test.go::TestDocs_UpdateWorkflow/update-title-and-content as bot; docs_local_resources_workflow_test.go::testDocsLocalResourcesWorkflow/append, block_replace, and overwrite image/source; docs_local_resources_dryrun_test.go::TestDocs_LocalResourcesDryRun/update append, overwrite, and block_replace; docs_update_dryrun_test.go::TestDocs_DryRunDefaultsToV2OpenAPI/update | `--doc`; `--command overwrite`, `append`, or `block_replace`; `--doc-format markdown` or `--doc-format xml`; `--content`; local `<img path>` / `<source path>`; optional `--reference-map` -> body `reference_map` | local resources are covered under both bot and user identities |
+diff --git a/tests/cli_e2e/docs/docs_media_download_dryrun_test.go b/tests/cli_e2e/docs/docs_media_download_dryrun_test.go
+new file mode 100644
+index 00000000..c6339623
+--- /dev/null
++++ b/tests/cli_e2e/docs/docs_media_download_dryrun_test.go
+@@ -0,0 +1,75 @@
++// Copyright (c) 2026 Lark Technologies Pte. Ltd.
++// SPDX-License-Identifier: MIT
++
++package docs
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	clie2e "github.com/larksuite/cli/tests/cli_e2e"
++	"github.com/stretchr/testify/require"
++)
++
++func TestDocsMediaDownloadDryRun_PlansExportAuthBeforeMediaDownload(t *testing.T) {
++	setDocsDryRunEnv(t)
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	t.Cleanup(cancel)
++
++	result, err := clie2e.RunCmd(ctx, clie2e.Request{
++		Args: []string{
++			"docs", "+media-download",
++			"--token", "mediaDryRunDownload",
++			"--output", "./artifacts/media.bin",
++			"--dry-run",
++		},
++		DefaultAs: "bot",
++	})
++	require.NoError(t, err)
++	result.AssertExitCode(t, 0)
++
++	out := result.Stdout
++	if got := clie2e.DryRunGet(out, "api.#").Int(); got != 2 {
++		t.Fatalf("api count=%d, want 2\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.0.url").String(); got != "/open-apis/drive/v1/permissions/mediaDryRunDownload/members/auth" {
++		t.Fatalf("api.0.url=%q, want permission auth\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.0.params.type").String(); got != "file" {
++		t.Fatalf("api.0.params.type=%q, want file\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.0.params.action").String(); got != "export" {
++		t.Fatalf("api.0.params.action=%q, want export\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.1.url").String(); got != "/open-apis/drive/v1/medias/mediaDryRunDownload/download" {
++		t.Fatalf("api.1.url=%q, want media download\nstdout:\n%s", got, out)
++	}
++}
++
++func TestDocsMediaDownloadDryRun_WhiteboardSkipsExportAuth(t *testing.T) {
++	setDocsDryRunEnv(t)
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	t.Cleanup(cancel)
++
++	result, err := clie2e.RunCmd(ctx, clie2e.Request{
++		Args: []string{
++			"docs", "+media-download",
++			"--token", "boardDryRunDownload",
++			"--type", "whiteboard",
++			"--output", "./artifacts/board.png",
++			"--dry-run",
++		},
++		DefaultAs: "bot",
++	})
++	require.NoError(t, err)
++	result.AssertExitCode(t, 0)
++
++	out := result.Stdout
++	if got := clie2e.DryRunGet(out, "api.#").Int(); got != 1 {
++		t.Fatalf("api count=%d, want 1\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.0.url").String(); got != "/open-apis/board/v1/whiteboards/boardDryRunDownload/download_as_image" {
++		t.Fatalf("api.0.url=%q, want whiteboard download only\nstdout:\n%s", got, out)
++	}
++}
+diff --git a/tests/cli_e2e/docs/docs_media_download_workflow_test.go b/tests/cli_e2e/docs/docs_media_download_workflow_test.go
+new file mode 100644
+index 00000000..9475008d
+--- /dev/null
++++ b/tests/cli_e2e/docs/docs_media_download_workflow_test.go
+@@ -0,0 +1,98 @@
++// Copyright (c) 2026 Lark Technologies Pte. Ltd.
++// SPDX-License-Identifier: MIT
++
++package docs
++
++import (
++	"bytes"
++	"context"
++	"image"
++	"image/color"
++	"image/png"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/larksuite/cli/internal/vfs"
++	clie2e "github.com/larksuite/cli/tests/cli_e2e"
++	"github.com/larksuite/cli/tests/cli_e2e/drive"
++	"github.com/stretchr/testify/require"
++	"github.com/tidwall/gjson"
++)
++
++// TestDocs_MediaDownloadWorkflow creates a document-owned image fixture, then
++// downloads the same media through docs +media-download and verifies its bytes.
++func TestDocs_MediaDownloadWorkflow(t *testing.T) {
++	clie2e.SkipWithoutTenantAccessToken(t)
++	parentT := t
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
++	t.Cleanup(cancel)
++
++	const defaultAs = "bot"
++	suffix := clie2e.GenerateSuffix()
++	folderToken := drive.CreateDriveFolder(t, parentT, ctx, "lark-cli-e2e-docs-media-"+suffix, defaultAs, "")
++	docToken := createDocWithRetry(t, parentT, ctx, folderToken, "lark-cli-e2e-docs-media-"+suffix, "media fixture "+suffix, defaultAs)
++	workDir := t.TempDir()
++
++	imageBytes := buildMediaDownloadFixture(t)
++	fixtureName := "fixture-" + suffix + ".png"
++	require.NoError(t, vfs.WriteFile(filepath.Join(workDir, fixtureName), imageBytes, 0o600))
++
++	insertResult, err := clie2e.RunCmd(ctx, clie2e.Request{
++		Args: []string{
++			"docs", "+media-insert",
++			"--doc", docToken,
++			"--file", fixtureName,
++			"--type", "image",
++		},
++		WorkDir:   workDir,
++		DefaultAs: defaultAs,
++	})
++	require.NoError(t, err)
++	insertResult.AssertExitCode(t, 0)
++	insertResult.AssertStdoutStatus(t, true)
++
++	mediaToken := gjson.Get(insertResult.Stdout, "data.file_token").String()
++	require.NotEmpty(t, mediaToken, "media insert should return data.file_token; stdout:\n%s", insertResult.Stdout)
++
++	downloadResult, err := clie2e.RunCmd(ctx, clie2e.Request{
++		Args: []string{
++			"docs", "+media-download",
++			"--token", mediaToken,
++			"--output", "downloaded.png",
++		},
++		WorkDir:   workDir,
++		DefaultAs: defaultAs,
++	})
++	require.NoError(t, err)
++	downloadResult.AssertExitCode(t, 0)
++	downloadResult.AssertStdoutStatus(t, true)
++
++	savedPath := gjson.Get(downloadResult.Stdout, "data.saved_path").String()
++	require.NotEmpty(t, savedPath, "media download should return data.saved_path; stdout:\n%s", downloadResult.Stdout)
++	require.Equal(t, "downloaded.png", filepath.Base(savedPath))
++	relPath, err := filepath.Rel(workDir, savedPath)
++	require.NoError(t, err)
++	require.NotEqual(t, "..", relPath)
++	require.NotContains(t, relPath, ".."+string(filepath.Separator))
++
++	downloaded, err := vfs.ReadFile(savedPath)
++	require.NoError(t, err)
++	require.Equal(t, imageBytes, downloaded)
++	require.Equal(t, int64(len(downloaded)), gjson.Get(downloadResult.Stdout, "data.size_bytes").Int())
++	require.Contains(t, gjson.Get(downloadResult.Stdout, "data.content_type").String(), "image/")
++}
++
++func buildMediaDownloadFixture(t *testing.T) []byte {
++	t.Helper()
++
++	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
++	img.Set(0, 0, color.RGBA{R: 0xff, A: 0xff})
++	img.Set(1, 0, color.RGBA{G: 0xff, A: 0xff})
++	img.Set(0, 1, color.RGBA{B: 0xff, A: 0xff})
++	img.Set(1, 1, color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff})
++
++	var encoded bytes.Buffer
++	require.NoError(t, png.Encode(&encoded, img))
++	return encoded.Bytes()
++}
+diff --git a/tests/cli_e2e/drive/drive_download_dryrun_test.go b/tests/cli_e2e/drive/drive_download_dryrun_test.go
+index 72af67d5..596e12a6 100644
+--- a/tests/cli_e2e/drive/drive_download_dryrun_test.go
++++ b/tests/cli_e2e/drive/drive_download_dryrun_test.go
+@@ -30,29 +30,41 @@ func TestDriveDownloadDryRun_DefaultNamePlansMetadataBeforeDownload(t *testing.T
+ 	result.AssertExitCode(t, 0)
+ 
+ 	out := result.Stdout
+-	if got := clie2e.DryRunGet(out, "api.#").Int(); got != 2 {
+-		t.Fatalf("api count=%d, want 2\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.#").Int(); got != 3 {
++		t.Fatalf("api count=%d, want 3\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.0.method").String(); got != "GET" {
++		t.Fatalf("api.0.method=%q, want GET\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.0.method").String(); got != "POST" {
+-		t.Fatalf("api.0.method=%q, want POST\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.0.url").String(); got != "/open-apis/drive/v1/permissions/fileDryRunDownload/members/auth" {
++		t.Fatalf("api.0.url=%q, want permission auth\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.0.url").String(); got != "/open-apis/drive/v1/metas/batch_query" {
+-		t.Fatalf("api.0.url=%q, want metas batch_query\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.0.params.type").String(); got != "file" {
++		t.Fatalf("api.0.params.type=%q, want file\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.0.body.request_docs.0.doc_token").String(); got != "fileDryRunDownload" {
+-		t.Fatalf("api.0.body.request_docs.0.doc_token=%q, want file token\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.0.params.action").String(); got != "export" {
++		t.Fatalf("api.0.params.action=%q, want export\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.0.body.request_docs.0.doc_type").String(); got != "file" {
+-		t.Fatalf("api.0.body.request_docs.0.doc_type=%q, want file\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.1.method").String(); got != "POST" {
++		t.Fatalf("api.1.method=%q, want POST\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.1.method").String(); got != "GET" {
+-		t.Fatalf("api.1.method=%q, want GET\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.1.url").String(); got != "/open-apis/drive/v1/metas/batch_query" {
++		t.Fatalf("api.1.url=%q, want metas batch_query\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.1.url").String(); got != "/open-apis/drive/v1/files/fileDryRunDownload/download" {
+-		t.Fatalf("api.1.url=%q, want file download endpoint\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.1.body.request_docs.0.doc_token").String(); got != "fileDryRunDownload" {
++		t.Fatalf("api.1.body.request_docs.0.doc_token=%q, want file token\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.1.body.request_docs.0.doc_type").String(); got != "file" {
++		t.Fatalf("api.1.body.request_docs.0.doc_type=%q, want file\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.1.desc").String(); got != "[2] Download file bytes; Content-Disposition filename wins over metadata title when present" {
+-		t.Fatalf("api.1.desc=%q, want metadata-aware step 2\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.2.method").String(); got != "GET" {
++		t.Fatalf("api.2.method=%q, want GET\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.2.url").String(); got != "/open-apis/drive/v1/files/fileDryRunDownload/download" {
++		t.Fatalf("api.2.url=%q, want file download endpoint\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.2.desc").String(); got != "[3] Download file bytes; Content-Disposition filename wins over metadata title when present" {
++		t.Fatalf("api.2.desc=%q, want metadata-aware step 3\nstdout:\n%s", got, out)
+ 	}
+ 	if got := clie2e.DryRunGet(out, "output").String(); got != "<Content-Disposition filename | metadata title | token>" {
+ 		t.Fatalf("output=%q, want filename priority placeholder\nstdout:\n%s", got, out)
+@@ -78,17 +90,20 @@ func TestDriveDownloadDryRun_ExplicitOutputSkipsMetadata(t *testing.T) {
+ 	result.AssertExitCode(t, 0)
+ 
+ 	out := result.Stdout
+-	if got := clie2e.DryRunGet(out, "api.#").Int(); got != 1 {
+-		t.Fatalf("api count=%d, want 1\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.#").Int(); got != 2 {
++		t.Fatalf("api count=%d, want 2\nstdout:\n%s", got, out)
+ 	}
+ 	if got := clie2e.DryRunGet(out, "api.0.method").String(); got != "GET" {
+ 		t.Fatalf("api.0.method=%q, want GET\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.0.url").String(); got != "/open-apis/drive/v1/files/fileDryRunDownload/download" {
+-		t.Fatalf("api.0.url=%q, want file download endpoint\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.0.url").String(); got != "/open-apis/drive/v1/permissions/fileDryRunDownload/members/auth" {
++		t.Fatalf("api.0.url=%q, want permission auth\nstdout:\n%s", got, out)
++	}
++	if got := clie2e.DryRunGet(out, "api.1.url").String(); got != "/open-apis/drive/v1/files/fileDryRunDownload/download" {
++		t.Fatalf("api.1.url=%q, want file download endpoint\nstdout:\n%s", got, out)
+ 	}
+-	if got := clie2e.DryRunGet(out, "api.0.desc").String(); got != "[1] Download file bytes to the explicit output path" {
+-		t.Fatalf("api.0.desc=%q, want explicit-output step 1\nstdout:\n%s", got, out)
++	if got := clie2e.DryRunGet(out, "api.1.desc").String(); got != "[2] Download file bytes to the explicit output path" {
++		t.Fatalf("api.1.desc=%q, want explicit-output step 2\nstdout:\n%s", got, out)
+ 	}
+ 	if got := clie2e.DryRunGet(out, "output").String(); got != "./artifacts/report.bin" {
+ 		t.Fatalf("output=%q, want explicit output\nstdout:\n%s", got, out)

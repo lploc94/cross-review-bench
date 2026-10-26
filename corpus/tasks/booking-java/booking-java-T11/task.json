@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T11",
+  "repo": "booking-java",
+  "kind": "buggy",
+  "title": "Show quotes and reservations in a display currency",
+  "description": "Guests from outside the euro area keep asking what a stay costs in their own currency, and the guest site currently converts our EUR totals itself with whatever rate it has. This moves the conversion into the service so every channel shows the same indicative figure.\n\n- New setting `booking.display-rates`: per property currency, the display currencies and the rate for each (`EUR: {USD: 1.085, JPY: 162}`). It is optional; at startup every code must be an ISO 4217 currency with minor units and every rate positive, otherwise the app does not start.\n- `POST /api/v1/properties/{code}/quotes?display=USD` and `GET /api/v1/reservations/{reference}?display=USD` add a `display` block: `currency`, `rate`, `indicative: true`, the converted `total` and every price line converted. The property-currency fields are unchanged and `display` is left out when the parameter is not given. Codes are case-insensitive; the property's own currency is always available at rate 1; a currency without a configured rate is a 400 `invalid-request`.\n- Each amount is converted on its own and rounded to the display currency's minor units (cents for USD, whole yen for JPY), so the lines can differ from the total by one minor unit. Nothing is charged or refunded in the display currency.\n- `DisplayRate` (domain) does the conversion, `DisplayCurrencyService` looks the rate up, `DisplayPriceResponse` is the new block.\n- README: concept, setting with an example, API table.\n\nTests: config validation (codes, metals without minor units, non-positive rates), conversion and rounding per currency, and API tests for quotes and reservations in USD, JPY and the property currency, plus the 400s. The test context configures EUR→USD and EUR→JPY.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/innkeep/booking/domain/DisplayRate.java",
+      "lines": [21, 21],
+      "category": "spec-deviation",
+      "severity": "low",
+      "difficulty": "L1",
+      "summary": "DisplayRate.convert rounds the converted amount with RoundingMode.HALF_UP, while the PR's README (and the rest of the service, Money and PricingEngine) promises HALF_EVEN to the display currency's minor units. Every converted amount that lands exactly halfway between two minor units is rounded up instead of to the even neighbour, so displayed totals and lines are one cent (or one yen) too high on ties.",
+      "trigger": "Display rate EUR→USD 1.085 and a quote of 101.00 EUR (or 1.00 EUR): 109.585 is shown as 109.59 instead of 109.58; EUR→JPY 162 on 100.25 EUR gives 16241 instead of 16240.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/innkeep/booking/api/DisplayAmountRoundingTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=DisplayAmountRoundingTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "HALF_UP and HALF_EVEN only differ on an exact tie, and DisplayRate.convert never gets one: every amount it receives comes from a Money (domain/Money.java), whose constructor already rounds with HALF_EVEN, so the service's banker's rounding has been applied before the rate is multiplied in and the display figures follow the same rule as everything else.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

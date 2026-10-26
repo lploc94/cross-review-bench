@@ -1,0 +1,330 @@
+diff --git a/README.md b/README.md
+index 7c29825..7addd96 100644
+--- a/README.md
++++ b/README.md
+@@ -46,8 +46,10 @@ available ──cancel──▶ cancelled
+   `worker.WithTimeout`). A handler that may outlive its lease calls `worker.ExtendLease(ctx)`;
+   the `sleep` handler shows how.
+ - A panicking handler fails its attempt with the panic message; the worker carries on.
+-- `Stop` (on SIGTERM or SIGINT) stops leasing and waits for running handlers to return. It does
+-  not cancel them.
++- On SIGTERM or SIGINT the pool stops leasing and waits up to `WORKER_DRAIN_TIMEOUT` for running
++  handlers to return (`Pool.Shutdown`). Handlers still running then see their context cancelled;
++  their attempts are recorded as failed, so the jobs are retried instead of waiting for the reaper.
++  `Pool.Stop` waits without a deadline.
+ 
+ ## Running
+ 
+@@ -92,6 +94,7 @@ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ | `WORKER_QUEUES` | `default` | comma-separated queues this instance works on |
+ | `WORKER_CONCURRENCY` | `4` | worker goroutines per queue; `0` runs the API only |
+ | `WORKER_POLL_INTERVAL` | `1s` | how often an idle worker looks for jobs |
++| `WORKER_DRAIN_TIMEOUT` | `30s` | how long running jobs may take to finish on shutdown before they are cancelled |
+ | `LEASE_DURATION` | `5m` | how long a leased job belongs to its worker |
+ | `JOB_TIMEOUT` | `1m` | default handler timeout; must be shorter than `LEASE_DURATION` |
+ | `RETRY_DELAY` | `30s` | wait before a failed attempt runs again |
+diff --git a/cmd/jobqueue/main.go b/cmd/jobqueue/main.go
+index 7ff6a35..ef59031 100644
+--- a/cmd/jobqueue/main.go
++++ b/cmd/jobqueue/main.go
+@@ -185,7 +185,8 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 	}
+ 
+ 	// The worker pool does not take the signal context: in-flight jobs must not be cancelled
+-	// by SIGTERM. Stop drains it below.
++	// by SIGTERM. Shutdown drains it below and cancels what is still running after
++	// WORKER_DRAIN_TIMEOUT.
+ 	if err := workers.Start(context.Background()); err != nil {
+ 		listener.Close()
+ 		return err
+@@ -221,7 +222,11 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+ 		logger.Warn("http server did not shut down cleanly", "error", err)
+ 	}
+-	workers.Stop()
++	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.WorkerDrainTimeout)
++	defer cancelDrain()
++	if err := workers.Shutdown(drainCtx); err != nil {
++		logger.Warn("jobs still running after WORKER_DRAIN_TIMEOUT were cancelled", "timeout", cfg.WorkerDrainTimeout, "error", err)
++	}
+ 	background.Wait()
+ 	logger.Info("shutdown complete")
+ 	return runErr
+diff --git a/internal/config/config.go b/internal/config/config.go
+index a11eebd..fcd49ba 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -37,6 +37,7 @@ type Config struct {
+ 	WorkerQueues       []string
+ 	WorkerConcurrency  int
+ 	WorkerPollInterval time.Duration
++	WorkerDrainTimeout time.Duration // how long running jobs may take to finish on shutdown
+ 	LeaseDuration      time.Duration
+ 	JobTimeout         time.Duration // default handler timeout for types registered without one
+ 	RetryDelay         time.Duration
+@@ -65,6 +66,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
+ 		WorkerQueues:       r.list("WORKER_QUEUES", []string{"default"}),
+ 		WorkerConcurrency:  r.int("WORKER_CONCURRENCY", 4, 0, 256),
+ 		WorkerPollInterval: r.duration("WORKER_POLL_INTERVAL", time.Second),
++		WorkerDrainTimeout: r.duration("WORKER_DRAIN_TIMEOUT", 30*time.Second),
+ 		LeaseDuration:      r.duration("LEASE_DURATION", 5*time.Minute),
+ 		JobTimeout:         r.duration("JOB_TIMEOUT", time.Minute),
+ 		RetryDelay:         r.duration("RETRY_DELAY", 30*time.Second),
+@@ -111,6 +113,7 @@ func (c Config) validate(r *reader) {
+ 	}{
+ 		{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout},
+ 		{"WORKER_POLL_INTERVAL", c.WorkerPollInterval},
++		{"WORKER_DRAIN_TIMEOUT", c.WorkerDrainTimeout},
+ 		{"LEASE_DURATION", c.LeaseDuration},
+ 		{"JOB_TIMEOUT", c.JobTimeout},
+ 		{"REAP_INTERVAL", c.ReapInterval},
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index ad4dc14..6442949 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -102,6 +102,41 @@ func TestJobTimeoutMustBeShorterThanLease(t *testing.T) {
+ 	}
+ }
+ 
++func TestWorkerDrainTimeout(t *testing.T) {
++	cases := []struct {
++		value   string
++		want    time.Duration
++		wantErr string
++	}{
++		{"", 30 * time.Second, ""},
++		{"2m", 2 * time.Minute, ""},
++		{"0s", 0, "WORKER_DRAIN_TIMEOUT must be positive"},
++		{"-5s", 0, "WORKER_DRAIN_TIMEOUT must be positive"},
++		{"soon", 0, "WORKER_DRAIN_TIMEOUT must be a duration"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.value, func(t *testing.T) {
++			vars := base()
++			if tc.value != "" {
++				vars["WORKER_DRAIN_TIMEOUT"] = tc.value
++			}
++			cfg, err := LoadFrom(env(vars))
++			if tc.wantErr != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
++					t.Errorf("error = %v, want %q", err, tc.wantErr)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if cfg.WorkerDrainTimeout != tc.want {
++				t.Errorf("WorkerDrainTimeout = %s, want %s", cfg.WorkerDrainTimeout, tc.want)
++			}
++		})
++	}
++}
++
+ func TestBlankValuesUseDefaults(t *testing.T) {
+ 	vars := base()
+ 	vars["HTTP_ADDR"] = "   "
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index f7ebeed..4990e8b 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -10,6 +10,7 @@ import (
+ 	"log/slog"
+ 	"runtime/debug"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/relaywork/jobqueue/internal/clock"
+@@ -79,6 +80,12 @@ type Pool struct {
+ 	ctx     context.Context
+ 	quit    chan struct{}
+ 	wg      sync.WaitGroup
++
++	// handlerCtx is the parent of every handler's context; Shutdown cancels it through
++	// cancelHandlers once its deadline has passed.
++	handlerCtx     context.Context
++	cancelHandlers context.CancelFunc
++	running        atomic.Int64 // jobs between lease and settle
+ }
+ 
+ // NewPool validates opts and returns a pool that is not running yet.
+@@ -120,7 +127,7 @@ func NewPool(store Store, registry *Registry, opts Options) (*Pool, error) {
+ }
+ 
+ // Start launches the pool's goroutines. Cancelling ctx aborts the pool: leasing stops and
+-// running handlers see their context cancelled. For a graceful stop, call Stop instead.
++// running handlers see their context cancelled. For a graceful stop, call Shutdown instead.
+ func (p *Pool) Start(ctx context.Context) error {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+@@ -134,6 +141,7 @@ func (p *Pool) Start(ctx context.Context) error {
+ 	}
+ 	p.started = true
+ 	p.ctx = ctx
++	p.handlerCtx, p.cancelHandlers = context.WithCancel(ctx)
+ 	for _, queue := range p.opts.Queues {
+ 		for i := range p.opts.Concurrency {
+ 			workerID := fmt.Sprintf("%s/%s/%d", p.opts.ID, queue, i)
+@@ -146,19 +154,46 @@ func (p *Pool) Start(ctx context.Context) error {
+ 	return nil
+ }
+ 
+-// Stop stops leasing new jobs and waits for the handlers that are running to return and for
+-// their outcomes to be recorded. Running handlers are not interrupted. Stop may be called more
+-// than once and before Start.
+-func (p *Pool) Stop() {
++// Shutdown stops leasing new jobs and waits for the handlers that are running to return and
++// for their outcomes to be recorded. If ctx is done before they have, Shutdown cancels the
++// contexts of the handlers still running, waits until each of them has returned and its outcome
++// has been recorded, and returns ctx's error. A cancelled attempt is recorded like any failed
++// attempt, so the job is retried later instead of waiting for its lease to expire.
++//
++// Shutdown may be called more than once and before Start.
++func (p *Pool) Shutdown(ctx context.Context) error {
+ 	p.mu.Lock()
+ 	select {
+ 	case <-p.quit:
+ 	default:
+ 		close(p.quit)
+ 	}
++	cancelHandlers := p.cancelHandlers
+ 	p.mu.Unlock()
+-	p.wg.Wait()
+-	p.log.Info("worker pool stopped")
++
++	drained := make(chan struct{})
++	go func() {
++		p.wg.Wait()
++		close(drained)
++	}()
++	select {
++	case <-drained:
++		p.log.Info("worker pool stopped")
++		return nil
++	case <-ctx.Done():
++	}
++
++	p.log.Warn("drain deadline passed, cancelling running jobs", "running", p.running.Load())
++	if cancelHandlers != nil {
++		cancelHandlers()
++	}
++	return fmt.Errorf("worker: drain: %w", ctx.Err())
++}
++
++// Stop is Shutdown without a deadline: running handlers are not interrupted, however long they
++// take.
++func (p *Pool) Stop() {
++	_ = p.Shutdown(context.Background())
+ }
+ 
+ // work is the loop of one goroutine.
+@@ -186,7 +221,7 @@ func (p *Pool) work(queue, workerID string) {
+ 			}
+ 			continue
+ 		}
+-		// A job leased here is processed even if Stop was called in the meantime: it is
++		// A job leased here is processed even if Shutdown was called in the meantime: it is
+ 		// already running in the database.
+ 		for _, job := range jobs {
+ 			p.run(queue, workerID, job)
+@@ -234,6 +269,8 @@ func (p *Pool) idle(d time.Duration) bool {
+ func (p *Pool) run(queue, workerID string, job domain.Job) {
+ 	p.metrics.busy.Add(1, queue)
+ 	defer p.metrics.busy.Add(-1, queue)
++	p.running.Add(1)
++	defer p.running.Add(-1)
+ 
+ 	log := p.log.With("job_id", job.ID, "queue", job.Queue, "type", job.Type, "attempt", job.Attempts, "worker", workerID)
+ 	start := p.opts.Clock.Now()
+@@ -277,7 +314,7 @@ func (p *Pool) execute(job domain.Job, workerID string) error {
+ 	if !ok {
+ 		return fmt.Errorf("no handler registered for job type %q", job.Type)
+ 	}
+-	ctx := withLease(p.ctx, &lease{
++	ctx := withLease(p.handlerCtx, &lease{
+ 		jobID:    job.ID,
+ 		workerID: workerID,
+ 		store:    p.store,
+diff --git a/internal/worker/pool_test.go b/internal/worker/pool_test.go
+index b001dd8..235ffde 100644
+--- a/internal/worker/pool_test.go
++++ b/internal/worker/pool_test.go
+@@ -279,6 +279,77 @@ func TestPoolStopWaitsForRunningHandler(t *testing.T) {
+ 	}
+ }
+ 
++func TestPoolShutdownReturnsOnceDrained(t *testing.T) {
++	started := make(chan struct{})
++	release := make(chan struct{})
++	st := newFakeStore(domain.Job{ID: 1, Type: "block"})
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"block": func(ctx context.Context, _ domain.Job) error {
++			close(started)
++			<-release
++			return ctx.Err() // the deadline has not passed: no cancellation
++		},
++	}))
++	h.start(t, context.Background())
++	<-started
++
++	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() { done <- h.pool.Shutdown(ctx) }()
++	close(release)
++	if err := <-done; err != nil {
++		t.Fatalf("Shutdown = %v, want nil once the handler returned", err)
++	}
++	if got := st.snapshot().completed; len(got) != 1 {
++		t.Errorf("completed = %v", got)
++	}
++}
++
++func TestPoolShutdownCancelsHandlersAfterDeadline(t *testing.T) {
++	started := make(chan struct{})
++	st := newFakeStore(domain.Job{ID: 1, Type: "wait"}, domain.Job{ID: 2, Type: "wait"})
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"wait": func(ctx context.Context, _ domain.Job) error {
++			started <- struct{}{}
++			<-ctx.Done()
++			return ctx.Err()
++		},
++	}), func(o *worker.Options) { o.Concurrency = 2 })
++	h.start(t, context.Background())
++	<-started
++	<-started
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel() // the drain deadline has passed
++	if err := h.pool.Shutdown(ctx); !errors.Is(err, context.Canceled) {
++		t.Fatalf("Shutdown = %v, want the context's error", err)
++	}
++	for range 2 {
++		out := h.next(t)
++		if !errors.Is(out.Err, context.Canceled) || out.State != domain.StateAvailable {
++			t.Errorf("outcome = %+v, want a cancelled attempt to be retried", out)
++		}
++	}
++	for _, f := range st.snapshot().failed {
++		if !f.retryAt.Equal(t0.Add(retryDelay)) || f.ctxErr != nil {
++			t.Errorf("Fail call = %+v, want a retry recorded with a live context", f)
++		}
++	}
++}
++
++func TestPoolShutdownBeforeStart(t *testing.T) {
++	h := newHarness(t, newFakeStore(), registry(nil))
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	if err := h.pool.Shutdown(ctx); err != nil {
++		t.Fatalf("Shutdown = %v", err)
++	}
++	if err := h.pool.Start(context.Background()); err == nil {
++		t.Error("Start after Shutdown succeeded")
++	}
++}
++
+ func TestPoolStopEndsIdleWorkersAndLeasesNothingMore(t *testing.T) {
+ 	st := newFakeStore()
+ 	h := newHarness(t, st, registry(nil), func(o *worker.Options) { o.Concurrency = 3 })

@@ -1,0 +1,13 @@
+diff --git a/packages/server/src/api/routes/sync.ts b/packages/server/src/api/routes/sync.ts
+index a3b8127..bfc1b6a 100644
+--- a/packages/server/src/api/routes/sync.ts
++++ b/packages/server/src/api/routes/sync.ts
+@@ -22,7 +22,7 @@ export async function syncRoutes(app: FastifyInstance, options: RouteOptions): P
+     return { acked: result.acked, serverHlc: result.serverHlc };
+   });
+ 
+-  app.get("/pull", async (request): Promise<PullResponse> => {
++  app.get("/pull", { preHandler: requireActiveDevice }, async (request): Promise<PullResponse> => {
+     const auth = authOf(request);
+     const query = parse(pullQuery, request.query, "query");
+     const page = await pull.pull(auth, query.after, query.limit);

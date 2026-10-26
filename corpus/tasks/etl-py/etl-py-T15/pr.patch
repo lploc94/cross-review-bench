@@ -1,0 +1,779 @@
+diff --git a/README.md b/README.md
+index 2ae945d..0761148 100644
+--- a/README.md
++++ b/README.md
+@@ -45,6 +45,21 @@ keys that become equal get a suffix (`#2`, `#3`, ...) so no value is lost. When
+ `MAX_REJECT_RATIO` of the rows read, the run fails (`TooManyRejects`). Rejects are written in
+ their own transactions, so they stay recorded when the run fails.
+ 
++Once the cause is fixed (a currency or a calling code added), `etl rejects reprocess
++<run-id>` loads a `customers` or `products` run's rejected rows again as a new run of that
++source, with the path `rejects of run N`. Every reject that kept the row's fields is fed
++through the normaliser and the loader; rows the reader could not split are left out, and a
++payload that may have been changed to be stored (one holding U+FFFD, or the text `inf`,
++`-inf` or `nan` that stands for a non-finite number) is rejected again rather than read as
++the row the source sent. The rows are taken whatever the watermark, which does not move:
++newer-wins still keeps any stored row that is newer. The future-skew limit counts from when
++the rows were read from the source, the start of the file run they came from (a reprocess
++run records it in `etl.runs.source_read_at` and passes it on), not from now: a time written
++by a clock that ran ahead would otherwise outrank later changes. The reject ratio does not
++apply; rows rejected again are recorded under the new run. Only succeeded runs qualify (the other rows of
++a failed run were not loaded either: run its file again). Orders are refused: a version is
++loaded whole, and lines rejected along with another line keep only `{order_id, position}`.
++
+ **Incremental loads.** `etl.watermarks` keeps, per source, the newest `updated_at` loaded so
+ far. A run takes the rows with `updated_at > watermark - lookback` and skips the others; the
+ lookback picks up rows that reach an export late. The watermark moves forward to the newest row
+@@ -106,6 +121,7 @@ etl status [--source S] [--json]             per source: running?, watermark, la
+ etl runs list [--source S] [--status S] [--limit N] [--json]
+ etl runs show <run-id> [--json]              counts, check results, reject reasons
+ etl rejects list <run-id> [--reason R] [--after LINE] [--limit N] [--json]
++etl rejects reprocess <run-id> [--json]      load a run's rejected rows again (not orders)
+ etl rejects prune --before D [--source S] [--yes]
+ etl checks list [--source S] [--json]        declared checks and their last results
+ etl checks run [--source S] [--json]         evaluate the checks now, record nothing
+diff --git a/migrations/versions/0005_runs_source_read_at.py b/migrations/versions/0005_runs_source_read_at.py
+new file mode 100644
+index 0000000..cf2b55b
+--- /dev/null
++++ b/migrations/versions/0005_runs_source_read_at.py
+@@ -0,0 +1,27 @@
++"""runs: source_read_at, when a reprocess run's rows were read from their source
++
++Revision ID: 0005
++Revises: 0004
++Create Date: 2026-10-14 09:00:00+00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "0005"
++down_revision: str | None = "0004"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    # NULL for a file run, which reads its source when it starts.
++    op.add_column(
++        "runs", sa.Column("source_read_at", sa.DateTime(timezone=True), nullable=True), schema="etl"
++    )
++
++
++def downgrade() -> None:
++    op.drop_column("runs", "source_read_at", schema="etl")
+diff --git a/src/etl/api/rejects.py b/src/etl/api/rejects.py
+index 11ea28e..3cfcc58 100644
+--- a/src/etl/api/rejects.py
++++ b/src/etl/api/rejects.py
+@@ -1,4 +1,5 @@
+-"""Operations on rejected rows: list a run's rejects, and delete old ones.
++"""Operations on rejected rows: list a run's rejects, feed them through again, and delete old
++ones.
+ 
+ Rejects keep the raw values of the rows they refused, personal data included, so they are
+ listed without their values and deleted once they are older than the retention an operator
+@@ -13,7 +14,7 @@ from etl.api.context import AppContext
+ from etl.domain.timestamps import start_of_day
+ from etl.errors import InvalidRequest, RunNotFound
+ from etl.logging import get_logger
+-from etl.schemas.views import PruneView, RejectView
++from etl.schemas.views import PruneView, RejectView, RunView
+ from etl.sources.registry import get_source
+ from etl.store import rejects, runs
+ 
+@@ -45,6 +46,17 @@ def list_rejects(
+     ]
+ 
+ 
++def reprocess_rejects(context: AppContext, run_id: int) -> RunView:
++    """Load the rejected rows of run `run_id` again, as a new run of its source, and return
++    that run (see Pipeline.reprocess)."""
++    result = context.pipeline().reprocess(run_id)
++    with context.engine.connect() as connection:
++        record = runs.get(connection, result.run_id)
++    if record is None:
++        raise RunNotFound(result.run_id)
++    return RunView.of(record)
++
++
+ def prune_rejects(context: AppContext, *, before: date, source: str | None = None) -> PruneView:
+     """Delete the rejects recorded before the start of `before` (a day in the reporting zone).
+ 
+diff --git a/src/etl/cli/rejects.py b/src/etl/cli/rejects.py
+index 2243b87..b6ca88a 100644
+--- a/src/etl/cli/rejects.py
++++ b/src/etl/cli/rejects.py
+@@ -1,4 +1,4 @@
+-"""`etl rejects list <run-id>` and `etl rejects prune`."""
++"""`etl rejects list <run-id>`, `etl rejects reprocess <run-id>` and `etl rejects prune`."""
+ 
+ from typing import Annotated
+ 
+@@ -7,6 +7,7 @@ import typer
+ from etl.api import rejects as rejects_api
+ from etl.cli.common import app_context, guarded, require_day
+ from etl.cli.output import echo_json, format_time, render_table
++from etl.cli.run import describe_run
+ 
+ rejects_app = typer.Typer(help="Rejected rows.", no_args_is_help=True)
+ 
+@@ -39,6 +40,24 @@ def list_command(
+         typer.echo(f"more may follow: --after {views[-1].line_no}")
+ 
+ 
++@rejects_app.command("reprocess")
++@guarded
++def reprocess_command(
++    ctx: typer.Context,
++    run_id: Annotated[int, typer.Argument(help="Run whose rejected rows to load again.")],
++    as_json: Annotated[bool, typer.Option("--json", help="Print the new run as JSON.")] = False,
++) -> None:
++    """Load a run's rejected rows again as a new run, once their cause is fixed.
++
++    customers and products only. Rows rejected again are recorded under the new run.
++    """
++    view = rejects_api.reprocess_rejects(app_context(ctx), run_id)
++    if as_json:
++        echo_json(view)
++    else:
++        typer.echo(describe_run(view))
++
++
+ @rejects_app.command("prune")
+ @guarded
+ def prune_command(
+diff --git a/src/etl/infra/tables.py b/src/etl/infra/tables.py
+index efeba2d..fd0b53d 100644
+--- a/src/etl/infra/tables.py
++++ b/src/etl/infra/tables.py
+@@ -46,6 +46,9 @@ runs = Table(
+     Column("status", Text, nullable=False),
+     Column("started_at", TZ, nullable=False),
+     Column("finished_at", TZ, nullable=True),
++    # A run that reprocessed rejects: when their rows were read from the source, by the file
++    # run they came from. NULL for a file run, which reads its source when it starts.
++    Column("source_read_at", TZ, nullable=True),
+     Column("rows_read", Integer, nullable=False, server_default=text("0")),
+     Column("rows_skipped", Integer, nullable=False, server_default=text("0")),
+     Column("rows_loaded", Integer, nullable=False, server_default=text("0")),
+diff --git a/src/etl/pipeline/extract.py b/src/etl/pipeline/extract.py
+index 27965f1..124d1c7 100644
+--- a/src/etl/pipeline/extract.py
++++ b/src/etl/pipeline/extract.py
+@@ -14,6 +14,8 @@ from etl.sources.registry import SourceSpec
+ from etl.transform.fields import RowRejected
+ from etl.transform.normalise import KeyOf, Normaliser, RefuseMalformed, VersionOf
+ 
++IN_THE_FUTURE = "updated_at is in the future"
++
+ 
+ @dataclass(slots=True)
+ class ExtractCounts:
+@@ -79,7 +81,7 @@ def extract[R: Record](
+             reject(item, error.reason, error.column)
+             continue
+         if record.updated_at > not_after:
+-            reject(item, "updated_at is in the future", "updated_at")
++            reject(item, IN_THE_FUTURE, "updated_at")
+             continue
+         if not window.admits(record.updated_at):
+             counts.skipped += 1
+diff --git a/src/etl/pipeline/replay.py b/src/etl/pipeline/replay.py
+new file mode 100644
+index 0000000..d3bd085
+--- /dev/null
++++ b/src/etl/pipeline/replay.py
+@@ -0,0 +1,45 @@
++"""Rejected rows read back from `etl.rejects`, to go through their source's normaliser again."""
++
++from __future__ import annotations
++
++from collections.abc import Iterator
++from contextlib import contextmanager
++
++from sqlalchemy import Connection
++
++from etl.pipeline.sink import kept_as_read
++from etl.sources.base import MalformedRow, SourceItem, SourceRow
++from etl.store import rejects
++
++CHANGED_WHEN_STORED = "the stored row may have been changed to make it storable; not read again"
++
++
++@contextmanager
++def replay_rejects(
++    connection: Connection, run_id: int, *, page: int
++) -> Iterator[Iterator[SourceItem]]:
++    """The rejected rows of run `run_id` as source rows, in file order, read `page` at a time.
++
++    Only rejects whose payload is the row's fields are rows again; those holding what a
++    reader could not split (a list of fields, a raw line) are left out. A payload that
++    safe_payload may have changed to make it storable (sink.kept_as_read) may not be the row
++    the source sent: it comes back as a malformed row, so that it is rejected again with the
++    reason why.
++    """
++    yield _rows(connection, run_id, page)
++
++
++def _rows(connection: Connection, run_id: int, page: int) -> Iterator[SourceItem]:
++    after = None
++    while True:
++        stored = rejects.payloads(connection, run_id, after=after, limit=page)
++        for item in stored:
++            if not isinstance(item.payload, dict):
++                continue
++            if not kept_as_read(item.payload):
++                yield MalformedRow(item.line_no, CHANGED_WHEN_STORED, item.payload)
++                continue
++            yield SourceRow(item.line_no, item.payload)
++        if len(stored) < page:
++            return
++        after = stored[-1]
+diff --git a/src/etl/pipeline/runner.py b/src/etl/pipeline/runner.py
+index 5f697fe..b43b818 100644
+--- a/src/etl/pipeline/runner.py
++++ b/src/etl/pipeline/runner.py
+@@ -10,24 +10,30 @@
+    and the finished run; commit.
+ 4. On any failure the warehouse writes roll back, and the run is recorded as failed with its
+    counts, check results and error.
++
++A reprocess run (`Pipeline.reprocess`) goes through the same steps with the rejected rows of
++an earlier run instead of a file.
+ """
+ 
+ from __future__ import annotations
+ 
+ import itertools
+-from collections.abc import Mapping, Sequence
++from collections.abc import Callable, Iterator, Mapping, Sequence
++from contextlib import AbstractContextManager
+ from dataclasses import dataclass, field
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from typing import Any
+ 
+-from sqlalchemy import Engine, MetaData, func, select
++from sqlalchemy import Connection, Engine, MetaData, func, select
+ 
+ from etl.config import Settings
+ from etl.domain.records import RejectedGroups
+ from etl.errors import (
+     EtlError,
++    InvalidRequest,
+     QualityCheckFailed,
++    RunNotFound,
+     SourceFileNotFound,
+     TooManyRejects,
+     describe_error,
+@@ -38,11 +44,13 @@ from etl.load.base import LoadContext
+ from etl.logging import get_logger
+ from etl.pipeline.datasets import DATASETS, DatasetBinding
+ from etl.pipeline.extract import ExtractCounts, extract
++from etl.pipeline.replay import replay_rejects
+ from etl.pipeline.sink import RejectSink
+ from etl.pipeline.window import IncrementalWindow
+ from etl.quality.checks import Check
+ from etl.quality.registry import CHECKS, checks_for
+ from etl.quality.runner import CheckResult, blocking_failures, run_checks
++from etl.sources.base import SourceItem
+ from etl.sources.readers import open_reader
+ from etl.sources.registry import SOURCES, Dataset, SourceSpec, get_source
+ from etl.store import check_results, runs, watermarks
+@@ -62,6 +70,22 @@ class RunResult:
+     abandoned_runs: list[int]
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class _Input:
++    """Where a run's rows come from."""
++
++    # Recorded as the run's path.
++    path: str
++    # Opens the rows; called with the connection of the load transaction.
++    open: Callable[[Connection], AbstractContextManager[Iterator[SourceItem]]]
++    # A file is read incrementally: rows inside the window, the reject ratio enforced, the
++    # watermark moved. Rejects fed again are none of that (see Pipeline.reprocess).
++    incremental: bool = True
++    # When the rows were read from the source, recorded on the run; the future-skew limit
++    # counts from it. None: they are read now.
++    read_at: datetime | None = None
++
++
+ @dataclass(slots=True)
+ class _Attempt:
+     """What a run has done so far; recorded whether it succeeds or fails."""
+@@ -105,19 +129,67 @@ class Pipeline:
+         """Load `path` as a file of `source`. Raises an EtlError (with `run_id` set once the
+         run was recorded) when the run fails."""
+         spec = get_source(source, self._sources)
+-        binding = self._datasets[spec.dataset]
+         if not path.is_file():
+             raise SourceFileNotFound(str(path))
++        return self._run(spec, _Input(str(path), lambda _: open_reader(spec, path)))
++
++    def reprocess(self, run_id: int) -> RunResult:
++        """Feed the rejected rows of run `run_id` through its source's normaliser and loader
++        again, as a new run of that source, once the cause of the rejects is fixed.
++
++        Rows rejected again are recorded under the new run. Only rejects that kept the row's
++        fields are fed again (not rows the reader could not split). Every such row is taken,
++        whatever the watermark: rejected rows are often older than the window, and the
++        loaders keep a stored row unless the incoming one is strictly newer. The watermark
++        does not move, and the reject ratio does not apply (every row was rejected once).
++
++        An `updated_at` the source wrote ahead of its clock must not outrank later changes:
++        the future-skew limit counts from when the rows were read from the source (the start
++        of the file run they came from, carried over by reprocess runs), not from now.
++        """
++        with self._engine.connect() as connection:
++            original = runs.get(connection, run_id)
++        if original is None:
++            raise RunNotFound(run_id)
++        if original.status is not RunStatus.SUCCEEDED:
++            raise InvalidRequest(
++                f"run {run_id} {original.status}: the rest of its file was not loaded, so loading"
++                " its rejects alone would load a part of it; run the file again instead"
++            )
++        spec = get_source(original.source, self._sources)
++        if self._datasets[spec.dataset].version_of is not None:
++            raise InvalidRequest(
++                f"{spec.name} rejects cannot be reprocessed: a version is loaded whole, and the"
++                " rows rejected along with another row of their version keep only its key;"
++                " load the corrected file instead"
++            )
++        page = self._settings.batch_size
++        return self._run(
++            spec,
++            _Input(
++                f"rejects of run {run_id}",
++                lambda connection: replay_rejects(connection, run_id, page=page),
++                incremental=False,
++                read_at=original.rows_read_at,
++            ),
++        )
++
++    def _run(self, spec: SourceSpec, source_input: _Input) -> RunResult:
++        binding = self._datasets[spec.dataset]
+         with source_lock(self._engine, spec.name):
+             started_at = self._clock.now()
+             with self._engine.begin() as connection:
+                 abandoned = runs.abandon_running(connection, source=spec.name, now=started_at)
+                 run_id = runs.start(
+-                    connection, source=spec.name, path=str(path), started_at=started_at
++                    connection,
++                    source=spec.name,
++                    path=source_input.path,
++                    started_at=started_at,
++                    source_read_at=source_input.read_at,
+                 )
+             if abandoned:
+                 log.warning("run.abandoned_runs_closed", source=spec.name, run_ids=abandoned)
+-            log.info("run.started", source=spec.name, run_id=run_id, path=str(path))
++            log.info("run.started", source=spec.name, run_id=run_id, path=source_input.path)
+             attempt = _Attempt(
+                 run_id=run_id,
+                 sink=RejectSink(
+@@ -129,7 +201,7 @@ class Pipeline:
+                 ),
+             )
+             try:
+-                high_water = self._load(spec, binding, path, attempt)
++                high_water = self._load(spec, binding, source_input, attempt)
+             except BaseException as error:
+                 self._record_failure(spec, attempt, error)
+                 if isinstance(error, EtlError):
+@@ -158,23 +230,24 @@ class Pipeline:
+         self,
+         spec: SourceSpec,
+         binding: DatasetBinding[Any],
+-        path: Path,
++        source_input: _Input,
+         attempt: _Attempt,
+     ) -> datetime | None:
+         """The transactional part of a run. Returns the watermark after the run."""
+         loader = binding.loader
+         now = self._clock.now()
+-        not_after = now + timedelta(seconds=self._settings.max_future_skew_seconds)
++        read_at = source_input.read_at if source_input.read_at is not None else now
++        not_after = read_at + timedelta(seconds=self._settings.max_future_skew_seconds)
+         counts = attempt.extracted
++        incremental = source_input.incremental
+         with self._engine.connect() as connection, connection.begin():
+             previous = watermarks.read(connection, spec.name)
+-            window = IncrementalWindow(
+-                previous.high_water if previous is not None else None, spec.lookback
+-            )
++            stored = previous.high_water if previous is not None else None
++            window = IncrementalWindow(stored if incremental else None, spec.lookback)
+             stage = loader.stage_table(MetaData())
+             stage.create(connection)
+ 
+-            with open_reader(spec, path) as items:
++            with source_input.open(connection) as items:
+                 records = extract(
+                     items,
+                     spec=spec,
+@@ -196,7 +269,7 @@ class Pipeline:
+                 counts.rejected += 1
+                 counts.staged -= 1
+             attempt.sink.flush()
+-            if counts.reject_ratio > self._settings.max_reject_ratio:
++            if incremental and counts.reject_ratio > self._settings.max_reject_ratio:
+                 raise TooManyRejects(
+                     spec.name,
+                     rejected=counts.rejected,
+@@ -217,7 +290,7 @@ class Pipeline:
+             if blocking:
+                 raise QualityCheckFailed(blocking)
+ 
+-            high_water = window.advance(newest)
++            high_water = window.advance(newest) if incremental else None
+             if high_water is not None:
+                 watermarks.advance(
+                     connection, spec.name, expected=window.high_water, new=high_water, now=now
+@@ -234,7 +307,7 @@ class Pipeline:
+                 finished_at=finished_at,
+                 counts=attempt.counts(loaded=stats.written),
+             )
+-        return high_water if high_water is not None else window.high_water
++        return high_water if high_water is not None else stored
+ 
+     def _record_failure(self, spec: SourceSpec, attempt: _Attempt, error: BaseException) -> None:
+         """Record the failed run. Problems doing so are logged, never raised over `error`."""
+diff --git a/src/etl/pipeline/sink.py b/src/etl/pipeline/sink.py
+index 46ffb34..580026e 100644
+--- a/src/etl/pipeline/sink.py
++++ b/src/etl/pipeline/sink.py
+@@ -49,6 +49,23 @@ def safe_payload(value: Any) -> Any:
+     return value
+ 
+ 
++# What safe_payload writes in place of a value jsonb cannot hold.
++_NON_FINITE = frozenset({str(math.inf), str(-math.inf), str(math.nan)})
++
++
++def kept_as_read(value: Any) -> bool:
++    """Whether a stored payload can be trusted to be what the reader produced: it holds no
++    U+FFFD (in a key or a value) and no text that names a non-finite number, the marks
++    safe_payload leaves where it changed something."""
++    if isinstance(value, str):
++        return _REPLACEMENT not in value and value not in _NON_FINITE
++    if isinstance(value, dict):
++        return all(kept_as_read(key) and kept_as_read(item) for key, item in value.items())
++    if isinstance(value, list):
++        return all(kept_as_read(item) for item in value)
++    return True
++
++
+ def _unused_key(name: Any, taken: set[Any]) -> Any:
+     if name not in taken:
+         return name
+diff --git a/src/etl/store/rejects.py b/src/etl/store/rejects.py
+index 3f5ea07..384d00a 100644
+--- a/src/etl/store/rejects.py
++++ b/src/etl/store/rejects.py
+@@ -7,7 +7,7 @@ from dataclasses import dataclass
+ from datetime import datetime
+ from typing import Any
+ 
+-from sqlalchemy import Connection, delete, func, insert, select
++from sqlalchemy import Connection, delete, func, insert, select, tuple_
+ 
+ from etl.infra.tables import rejects
+ 
+@@ -79,6 +79,33 @@ def for_run(
+     ]
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class StoredPayload:
++    id: int
++    line_no: int
++    payload: Any
++
++
++def payloads(
++    connection: Connection, run_id: int, *, after: StoredPayload | None, limit: int
++) -> list[StoredPayload]:
++    """The payloads of a run's rejects in file order, `limit` at a time; `after` is the last
++    one of the previous page."""
++    statement = (
++        select(rejects.c.id, rejects.c.line_no, rejects.c.payload)
++        .where(rejects.c.run_id == run_id)
++        .order_by(rejects.c.line_no, rejects.c.id)
++        .limit(limit)
++    )
++    if after is not None:
++        statement = statement.where(
++            tuple_(rejects.c.line_no, rejects.c.id) > tuple_(after.line_no, after.id)
++        )
++    return [
++        StoredPayload(row.id, row.line_no, row.payload) for row in connection.execute(statement)
++    ]
++
++
+ def delete_before(connection: Connection, *, before: datetime, source: str | None = None) -> int:
+     """Delete rejects recorded before `before` (of one source, when given); return how many."""
+     statement = delete(rejects).where(rejects.c.created_at < before)
+diff --git a/src/etl/store/runs.py b/src/etl/store/runs.py
+index a5405d5..c4b3e1c 100644
+--- a/src/etl/store/runs.py
++++ b/src/etl/store/runs.py
+@@ -33,6 +33,7 @@ class RunRecord:
+     status: RunStatus
+     started_at: datetime
+     finished_at: datetime | None
++    source_read_at: datetime | None
+     rows_read: int
+     rows_skipped: int
+     rows_loaded: int
+@@ -48,6 +49,7 @@ class RunRecord:
+             status=RunStatus(row["status"]),
+             started_at=row["started_at"],
+             finished_at=row["finished_at"],
++            source_read_at=row["source_read_at"],
+             rows_read=row["rows_read"],
+             rows_skipped=row["rows_skipped"],
+             rows_loaded=row["rows_loaded"],
+@@ -55,14 +57,32 @@ class RunRecord:
+             error=row["error"],
+         )
+ 
++    @property
++    def rows_read_at(self) -> datetime:
++        """When the run's rows were read from their source."""
++        return self.source_read_at if self.source_read_at is not None else self.started_at
++
+ 
+ ABANDONED = "abandoned: the process running it stopped before it finished"
+ 
+ 
+-def start(connection: Connection, *, source: str, path: str, started_at: datetime) -> int:
++def start(
++    connection: Connection,
++    *,
++    source: str,
++    path: str,
++    started_at: datetime,
++    source_read_at: datetime | None = None,
++) -> int:
+     run_id = connection.execute(
+         insert(runs)
+-        .values(source=source, path=path, status=RunStatus.RUNNING, started_at=started_at)
++        .values(
++            source=source,
++            path=path,
++            status=RunStatus.RUNNING,
++            started_at=started_at,
++            source_read_at=source_read_at,
++        )
+         .returning(runs.c.id)
+     ).scalar_one()
+     return int(run_id)
+diff --git a/tests/cli/test_rejects_commands.py b/tests/cli/test_rejects_commands.py
+index e86cc33..f2e8bc4 100644
+--- a/tests/cli/test_rejects_commands.py
++++ b/tests/cli/test_rejects_commands.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import json
+ 
++from etl.domain import money
+ from etl.infra.tables import rejects
+ from tests.helpers.db import count
+ from tests.helpers.factories import customer_obj, product_row, write_customers, write_products
+@@ -93,3 +94,17 @@ def test_rejects_prune_asks_first_and_refuses_future_days(cli, db, tmp_path):
+     assert "future" in future.stderr
+     assert malformed.exit_code == 2
+     assert count(db, rejects) == 3
++
++
++def test_rejects_reprocess_prints_the_new_run(cli, monkeypatch, tmp_path):
++    unknown = product_row(sku="S-9", currency="RSD")
++    path = write_products(tmp_path, [*(product_row(sku=f"S-{n}") for n in range(3)), unknown])
++    cli("run", "products", path)
++    monkeypatch.setitem(money.CURRENCIES, "RSD", money.Currency("RSD", 2))
++
++    result = cli("rejects", "reprocess", "1")
++
++    assert result.exit_code == 0, result.output
++    assert result.stdout.splitlines()[0] == "run 2: products succeeded"
++    assert "file      rejects of run 1" in result.stdout
++    assert cli("rejects", "reprocess", "7").exit_code == 4
+diff --git a/tests/pipeline/test_reprocess.py b/tests/pipeline/test_reprocess.py
+new file mode 100644
+index 0000000..b64a665
+--- /dev/null
++++ b/tests/pipeline/test_reprocess.py
+@@ -0,0 +1,166 @@
++"""Rejected rows fed through their source's normaliser and loader again."""
++
++from __future__ import annotations
++
++import pytest
++
++from etl.domain import money
++from etl.errors import InvalidRequest, RunNotFound, TooManyRejects
++from etl.infra.tables import customers, products, rejects, runs
++from etl.pipeline.extract import IN_THE_FUTURE
++from etl.pipeline.replay import CHANGED_WHEN_STORED
++from tests.helpers.db import count, rows
++from tests.helpers.factories import (
++    customer_obj,
++    order_row,
++    product_row,
++    write_customers,
++    write_orders,
++    write_products,
++)
++
++AHEAD = "2026-04-01T10:00:00Z"  # two hours after the clock
++
++
++def add_currency(monkeypatch, code):
++    monkeypatch.setitem(money.CURRENCIES, code, money.Currency(code, 2))
++
++
++def test_rows_rejected_for_a_cause_now_gone_are_loaded_as_a_new_run(
++    pipeline, db, monkeypatch, tmp_path
++):
++    first = pipeline.run(
++        "products",
++        write_products(
++            tmp_path,
++            [
++                *(product_row(sku=f"SKU-{n}") for n in (1, 4, 5, 6, 7, 8)),
++                product_row(sku="SKU-2", currency="RSD"),
++                product_row(sku="SKU-3", currency="RSD"),
++            ],
++        ),
++    )
++    add_currency(monkeypatch, "RSD")
++
++    result = pipeline.reprocess(first.run_id)
++
++    assert (result.counts.read, result.counts.loaded, result.counts.rejected) == (2, 2, 0)
++    assert result.high_water == first.high_water
++    loaded = {row["product_id"]: row["run_id"] for row in rows(db, products)}
++    assert loaded == {"SKU-2": 2, "SKU-3": 2} | {f"SKU-{n}": 1 for n in (1, 4, 5, 6, 7, 8)}
++    (run,) = rows(db, runs, id=result.run_id)
++    assert (run["source"], run["path"], run["status"]) == (
++        "products",
++        f"rejects of run {first.run_id}",
++        "succeeded",
++    )
++    assert count(db, rejects, run_id=first.run_id) == 2
++
++
++def test_rows_dated_ahead_of_their_run_stay_rejected(pipeline, db, clock, monkeypatch, tmp_path):
++    first = pipeline.run(
++        "products",
++        write_products(
++            tmp_path,
++            [
++                *(product_row(sku=f"SKU-{n}") for n in range(1, 7)),
++                product_row(sku="SKU-A", name="Ahead", updated_at=AHEAD),
++                product_row(sku="SKU-B", currency="RSD", updated_at=AHEAD),
++            ],
++            name="first.csv",
++        ),
++    )
++    clock.advance(hours=1)
++    pipeline.run(
++        "products",
++        write_products(
++            tmp_path,
++            [product_row(sku="SKU-A", name="Changed later", updated_at="2026-04-01T08:30:00Z")],
++            name="second.csv",
++        ),
++    )
++    add_currency(monkeypatch, "RSD")
++    clock.advance(hours=3)
++
++    result = pipeline.reprocess(first.run_id)
++    again = pipeline.reprocess(result.run_id)
++
++    assert (result.counts.read, result.counts.rejected, result.counts.loaded) == (2, 2, 0)
++    assert {item["reason"] for item in rows(db, rejects, run_id=result.run_id)} == {IN_THE_FUTURE}
++    assert (again.counts.rejected, again.counts.loaded) == (2, 0)
++    names = {row["product_id"]: row["name"] for row in rows(db, products)}
++    assert names["SKU-A"] == "Changed later"
++    assert "SKU-B" not in names
++
++
++def test_reprocessing_a_reprocess_run_counts_the_skew_from_the_file_run(
++    pipeline, db, clock, monkeypatch, tmp_path
++):
++    first = pipeline.run(
++        "products",
++        write_products(
++            tmp_path,
++            [
++                *(product_row(sku=f"SKU-{n}") for n in range(1, 8)),
++                product_row(sku="SKU-X", name="Ahead", currency="RSD", updated_at=AHEAD),
++            ],
++            name="first.csv",
++        ),
++    )
++    clock.advance(hours=1)
++    pipeline.run(
++        "products",
++        write_products(
++            tmp_path,
++            [product_row(sku="SKU-X", name="Changed later", updated_at="2026-04-01T08:30:00Z")],
++            name="second.csv",
++        ),
++    )
++    clock.advance(days=2)
++    early = pipeline.reprocess(first.run_id)  # RSD still unknown: rejected again
++    clock.advance(days=1)
++    add_currency(monkeypatch, "RSD")
++
++    result = pipeline.reprocess(early.run_id)
++
++    assert (result.counts.read, result.counts.rejected, result.counts.loaded) == (1, 1, 0)
++    assert [item["reason"] for item in rows(db, rejects, run_id=result.run_id)] == [IN_THE_FUTURE]
++    names = {row["product_id"]: row["name"] for row in rows(db, products)}
++    assert names["SKU-X"] == "Changed later"
++    read_at = {row["id"]: row["source_read_at"] for row in rows(db, runs)}
++    (started,) = [row["started_at"] for row in rows(db, runs, id=first.run_id)]
++    assert read_at == {first.run_id: None, 2: None, early.run_id: started, result.run_id: started}
++
++
++def test_rows_that_fail_again_are_rejected_under_the_new_run(pipeline, db, tmp_path):
++    objects = [customer_obj(customer_id=f"C-{n}") for n in range(9)]
++    objects += [customer_obj(customer_id="B-1", email="nobody"), customer_obj(customer_id="B-\x00")]
++    first = pipeline.run("customers", write_customers(tmp_path, objects, raw_lines={2: "{oops"}))
++
++    result = pipeline.reprocess(first.run_id)
++
++    assert (result.counts.read, result.counts.rejected, result.counts.loaded) == (2, 2, 0)
++    again = rows(db, rejects, run_id=result.run_id, order_by="line_no")
++    assert [(item["line_no"], item["reason"]) for item in again] == [
++        (11, "email: not an email address"),
++        (12, CHANGED_WHEN_STORED),
++    ]
++    assert count(db, customers) == 9
++
++
++def test_orders_failed_runs_and_unknown_runs_are_refused(pipeline, db, tmp_path):
++    pipeline.run("customers", write_customers(tmp_path, [customer_obj()]))
++    lines = [order_row(order_id=f"O-{n}") for n in range(3)]
++    orders = pipeline.run(
++        "orders", write_orders(tmp_path, [*lines, order_row(order_id="O-9", currency="ABC")])
++    )
++    with pytest.raises(TooManyRejects):
++        pipeline.run("products", write_products(tmp_path, [product_row(price="abc")]))
++
++    with pytest.raises(InvalidRequest, match="orders rejects cannot be reprocessed"):
++        pipeline.reprocess(orders.run_id)
++    with pytest.raises(InvalidRequest, match="run 3 failed"):
++        pipeline.reprocess(3)
++    with pytest.raises(RunNotFound):
++        pipeline.reprocess(99)
++    assert count(db, runs) == 3

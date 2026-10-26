@@ -1,0 +1,44 @@
+diff --git a/src/repositories/fileRepo.ts b/src/repositories/fileRepo.ts
+index bc3aaeb..4d8ddbc 100644
+--- a/src/repositories/fileRepo.ts
++++ b/src/repositories/fileRepo.ts
+@@ -152,21 +152,23 @@ export async function findLiveFileBySignedId(
+ }
+ 
+ /**
+- * The oldest available file with these bytes on this storage driver, locked against deletion
++ * The tenant's oldest available file with these bytes on this driver, locked against deletion
+  * (FOR SHARE) until the caller's transaction ends, so its object outlives the lookup. A file that
+  * another transaction is deleting or replacing is skipped rather than waited for.
+  */
+ export async function findAvailableBySha256(
+   db: Queryable,
++  tenantId: string,
+   content: { sha256: string; size: number; storageDriver: string },
+ ): Promise<FileRecord | null> {
+   const result = await db.query<FileRow>(
+     `SELECT ${COLUMNS} FROM files
+-     WHERE sha256 = $1 AND size = $2 AND storage_driver = $3 AND status = 'available'
++     WHERE tenant_id = $1 AND sha256 = $2 AND size = $3 AND storage_driver = $4
++       AND status = 'available'
+      ORDER BY created_at, id
+      LIMIT 1
+      FOR SHARE SKIP LOCKED`,
+-    [content.sha256, content.size, content.storageDriver],
++    [tenantId, content.sha256, content.size, content.storageDriver],
+   );
+   const row = firstRow(result.rows);
+   return row ? mapFile(row) : null;
+diff --git a/src/services/fileCatalog.ts b/src/services/fileCatalog.ts
+index 7e95679..e43a68a 100644
+--- a/src/services/fileCatalog.ts
++++ b/src/services/fileCatalog.ts
+@@ -101,7 +101,7 @@ export class FileCatalog {
+         await tenants.releaseBytes(client, stored.tenantId, replaced.size, this.deps.logger);
+       }
+     }
+-    const twin = await files.findAvailableBySha256(client, {
++    const twin = await files.findAvailableBySha256(client, stored.tenantId, {
+       sha256: stored.sha256,
+       size: stored.size,
+       storageDriver: this.deps.storage.name,

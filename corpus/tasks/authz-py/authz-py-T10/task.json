@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T10",
+  "repo": "authz-py",
+  "kind": "buggy",
+  "title": "Account lockout after repeated wrong passwords",
+  "description": "The login rate limit is per (email, client IP), so someone guessing one account's password from many addresses is never slowed down. This adds a per-account lockout.\n\n- After `LOCKOUT_THRESHOLD` wrong passwords in a row (default 5) the account is locked for `LOCKOUT_SECONDS` (default 900). A locked account cannot sign in, even with the correct password, until the lock expires.\n- A refused login of a locked account answers like any other failed login (401 `invalid_credentials`, no `Retry-After`), so lockout does not reveal which addresses have accounts, as the README promises for logins.\n- Migration 0006 adds `users.failed_logins` and `users.locked_until`. A wrong password is counted in its own transaction with the user row locked (`UserRepository.get(..., for_update=True)`), so concurrent attempts cannot lose counts. Wrong passwords during a lock are counted but do not extend it, so guessing during a lock does not push its end further out; the first failure after a lock has expired starts the count over; a successful login resets the count and clears the lock. Already open sessions are not affected.\n- Logs: `auth.login_failed` with `reason=locked` during a lock, `auth.account_locked` (warning) when a lock starts.\n- Settings, `.env.example` and README updated.\n\nTests: `tests/api/test_account_lockout.py` (lock at the threshold, success resets the count, failures during a lock do not extend it, count starts over after expiry, a locked account answers like an unknown address). The two login rate-limit tests ended with a correct-password login after ten wrong ones, which now lock the account; they finish with a wrong password and check for the 401 instead.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/authz/services/auth.py",
+      "lines": [
+        101,
+        117
+      ],
+      "category": "security",
+      "severity": "high",
+      "difficulty": "L1",
+      "summary": "AuthService.login consults the lock only on the wrong-password path (_record_failure uses is_locked to decide whether to count and what to log). When the password is right, login goes straight to opening a session and even clears failed_logins and locked_until, so a locked account signs in with the correct password at any time during the lock. The lockout never stops a brute-force attack: the guess that hits the password succeeds as if there were no lock, contrary to the PR description and README.",
+      "trigger": "Five wrong passwords lock the account; a login with the correct password a second later returns 200 with tokens and clears the lock.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_locked_account_sign_in.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_locked_account_sign_in.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Guessing during a lock cannot get anywhere: logins are already rate limited before the password is checked (AuthService._throttle with LOGIN_RATE_LIMIT, 10 attempts per 5 minutes), so an attacker gets at most a handful of guesses during a 15-minute lock, and only the account owner, who knows the password, gets through.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

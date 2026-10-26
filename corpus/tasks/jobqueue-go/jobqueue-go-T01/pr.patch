@@ -1,0 +1,583 @@
+diff --git a/README.md b/README.md
+index 7c29825..3d80180 100644
+--- a/README.md
++++ b/README.md
+@@ -73,6 +73,7 @@ curl -s -X POST localhost:8080/v1/queues/default/jobs \
+   -d '{"type":"http.post","payload":{"url":"https://example.com/hook","body":{"event":"paid"}}}'
+ 
+ export JOBQUEUE_TOKEN=$ADMIN_TOKEN
++go run ./cmd/jobctl enqueue-batch -queue default -file jobs.ndjson   # one job object per line
+ go run ./cmd/jobctl list -queue default
+ go run ./cmd/jobctl wait 1
+ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+@@ -110,6 +111,7 @@ with status 400 (malformed body), 401, 404, 409 (wrong state), 413, 415 or 422 (
+ | Route | |
+ |---|---|
+ | `POST /v1/queues/{queue}/jobs` | enqueue `{type, payload?, priority?, max_attempts?, run_at?}`; 201 |
++| `POST /v1/queues/{queue}/jobs/batch` | enqueue `{jobs: [...]}`, 1 to 500 jobs of the same shape, all or none; 201 with `{jobs}` in request order; 422 names the job, e.g. `jobs[2].type` |
+ | `GET /v1/jobs/{id}` | one job |
+ | `GET /v1/jobs?queue=&state=&after=&limit=` | jobs by ascending id; `next_after` is the cursor of the next page |
+ | `POST /v1/jobs/{id}/cancel` | cancel an available job |
+diff --git a/cmd/jobctl/commands.go b/cmd/jobctl/commands.go
+index db41117..bf6389b 100644
+--- a/cmd/jobctl/commands.go
++++ b/cmd/jobctl/commands.go
+@@ -1,12 +1,15 @@
+ package main
+ 
+ import (
++	"bufio"
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"flag"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"strconv"
+ 	"strings"
+ 	"text/tabwriter"
+@@ -20,13 +23,14 @@ const defaultURL = "http://localhost:8080"
+ type command func(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error
+ 
+ var commands = map[string]command{
+-	"enqueue": enqueueCmd,
+-	"get":     getCmd,
+-	"list":    listCmd,
+-	"cancel":  cancelCmd,
+-	"dead":    deadCmd,
+-	"requeue": requeueCmd,
+-	"wait":    waitCmd,
++	"enqueue":       enqueueCmd,
++	"enqueue-batch": enqueueBatchCmd,
++	"get":           getCmd,
++	"list":          listCmd,
++	"cancel":        cancelCmd,
++	"dead":          deadCmd,
++	"requeue":       requeueCmd,
++	"wait":          waitCmd,
+ 
+ 	"schedules":       schedulesCmd,
+ 	"schedule":        scheduleCmd,
+@@ -94,6 +98,73 @@ func enqueueCmd(ctx context.Context, c *client.Client, args []string, stdout, st
+ 	return printJSON(stdout, job)
+ }
+ 
++// stdin is where enqueue-batch reads jobs from when -file is "-".
++var stdin io.Reader = os.Stdin
++
++// enqueueBatchCmd enqueues the jobs of an NDJSON file in one request: one object per line with
++// the fields of enqueue's request body. Blank lines are skipped.
++func enqueueBatchCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
++	fs := newFlags("enqueue-batch", stderr)
++	queue := fs.String("queue", "default", "queue name")
++	file := fs.String("file", "-", `NDJSON file of jobs, one {"type", "payload", "priority", "max_attempts", "run_at"} object per line ("-": stdin)`)
++	if err := parse(fs, args); err != nil {
++		return err
++	}
++	if fs.NArg() > 0 {
++		fmt.Fprintln(stderr, "jobctl enqueue-batch: no arguments are accepted")
++		fs.Usage()
++		return errUsage
++	}
++	in := stdin
++	if *file != "-" {
++		f, err := os.Open(*file)
++		if err != nil {
++			return err
++		}
++		defer f.Close()
++		in = f
++	}
++	reqs, err := readJobLines(in)
++	if err != nil {
++		return err
++	}
++	jobs, err := c.EnqueueBatch(ctx, *queue, reqs)
++	if err != nil {
++		return err
++	}
++	for _, j := range jobs {
++		fmt.Fprintf(stdout, "enqueued job %d (%s/%s)\n", j.ID, j.Queue, j.Type)
++	}
++	return nil
++}
++
++// readJobLines decodes one enqueue request per non-blank line of r.
++func readJobLines(r io.Reader) ([]client.EnqueueRequest, error) {
++	sc := bufio.NewScanner(r)
++	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
++	var reqs []client.EnqueueRequest
++	for n := 1; sc.Scan(); n++ {
++		line := bytes.TrimSpace(sc.Bytes())
++		if len(line) == 0 {
++			continue
++		}
++		dec := json.NewDecoder(bytes.NewReader(line))
++		dec.DisallowUnknownFields()
++		var req client.EnqueueRequest
++		if err := dec.Decode(&req); err != nil {
++			return nil, fmt.Errorf("line %d: %w", n, err)
++		}
++		reqs = append(reqs, req)
++	}
++	if err := sc.Err(); err != nil {
++		return nil, fmt.Errorf("read jobs: %w", err)
++	}
++	if len(reqs) == 0 {
++		return nil, errors.New("no jobs to enqueue")
++	}
++	return reqs, nil
++}
++
+ func getCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
+ 	ids, err := parseIDs("get", args, stderr, 1)
+ 	if err != nil {
+diff --git a/cmd/jobctl/main.go b/cmd/jobctl/main.go
+index 09ee0c0..260fbfe 100644
+--- a/cmd/jobctl/main.go
++++ b/cmd/jobctl/main.go
+@@ -1,6 +1,7 @@
+ // Command jobctl manages jobs through the jobqueue HTTP API.
+ //
+ //	jobctl enqueue -queue default -type http.post -payload '{"url":"https://example.com/hook"}'
++//	jobctl enqueue-batch -queue imports -file jobs.ndjson
+ //	jobctl get 42
+ //	jobctl list -queue default -state available
+ //	jobctl cancel 42
+@@ -35,6 +36,7 @@ const usage = `usage: jobctl <command> [flags] [args]
+ 
+ commands:
+   enqueue  -queue Q -type T [-payload JSON] [-priority N] [-max-attempts N] [-delay D]
++  enqueue-batch    [-queue Q] [-file NDJSON]
+   get      ID
+   list     [-queue Q] [-state S] [-after ID] [-limit N]
+   cancel   ID
+diff --git a/cmd/jobctl/main_test.go b/cmd/jobctl/main_test.go
+index 192d594..05c6103 100644
+--- a/cmd/jobctl/main_test.go
++++ b/cmd/jobctl/main_test.go
+@@ -6,6 +6,8 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
++	"path/filepath"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -70,6 +72,33 @@ func TestEnqueueCommand(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnqueueBatchCommand(t *testing.T) {
++	file := filepath.Join(t.TempDir(), "jobs.ndjson")
++	lines := "{\"type\":\"row.import\",\"payload\":{\"row\":1}}\n\n{\"type\":\"row.import\",\"priority\":2}\n"
++	if err := os.WriteFile(file, []byte(lines), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	api := &fakeAPI{routes: map[string][]response{"POST /v1/queues/imports/jobs/batch": {{201, `{"jobs":[` + jobJSON(7, "available") + `,` + jobJSON(8, "available") + `]}`}}}}
++	code, out, errOut := runCLI(t, api, "enqueue-batch", "-queue", "imports", "-file", file)
++	if code != 0 {
++		t.Fatalf("exit %d: %s", code, errOut)
++	}
++	if out != "enqueued job 7 (default/noop)\nenqueued job 8 (default/noop)\n" {
++		t.Errorf("stdout = %q", out)
++	}
++	want := `POST /v1/queues/imports/jobs/batch? {"jobs":[{"type":"row.import","payload":{"row":1}},{"type":"row.import","priority":2}]}`
++	if got := api.requests[0]; got != want {
++		t.Errorf("request = %s", got)
++	}
++
++	stdin = strings.NewReader("{\"type\":\"noop\"}\n{\"type\":\"noop\",\"colour\":\"red\"}\n")
++	t.Cleanup(func() { stdin = os.Stdin })
++	code, _, errOut = runCLI(t, api, "enqueue-batch")
++	if code != 1 || !strings.Contains(errOut, "line 2") || len(api.requests) != 1 {
++		t.Errorf("unknown field: exit %d, stderr %q, %d requests", code, errOut, len(api.requests))
++	}
++}
++
+ func TestListCommandPrintsTable(t *testing.T) {
+ 	page := `{"jobs":[` + jobJSON(1, "dead") + `],"next_after":1}`
+ 	api := &fakeAPI{routes: map[string][]response{"GET /v1/jobs": {{200, page}}}}
+@@ -150,6 +179,7 @@ func TestUsageErrors(t *testing.T) {
+ 		{"get", "abc"},
+ 		{"cancel", "1", "2"},
+ 		{"enqueue"},
++		{"enqueue-batch", "extra"},
+ 		{"list", "-bogus"},
+ 		{"schedule-put", "name"},
+ 		{"wait", "-interval", "0s", "1"},
+diff --git a/internal/api/api_test.go b/internal/api/api_test.go
+index f354e18..f73d82f 100644
+--- a/internal/api/api_test.go
++++ b/internal/api/api_test.go
+@@ -145,6 +145,7 @@ func TestV1RoutesRequireTheToken(t *testing.T) {
+ 	srv := newServer(t, stubStore{}, clock.NewManual(t0), nil)
+ 	routes := []struct{ method, path string }{
+ 		{http.MethodPost, "/v1/queues/default/jobs"},
++		{http.MethodPost, "/v1/queues/default/jobs/batch"},
+ 		{http.MethodGet, "/v1/jobs"},
+ 		{http.MethodGet, "/v1/jobs/1"},
+ 		{http.MethodPost, "/v1/jobs/1/cancel"},
+diff --git a/internal/api/batch.go b/internal/api/batch.go
+new file mode 100644
+index 0000000..98630b6
+--- /dev/null
++++ b/internal/api/batch.go
+@@ -0,0 +1,54 @@
++package api
++
++import (
++	"net/http"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++// maxBatchBodyBytes bounds a batch request body. Each payload is still limited to
++// domain.MaxPayloadBytes.
++const maxBatchBodyBytes = 8 << 20
++
++type enqueueBatchRequest struct {
++	Jobs []enqueueRequest `json:"jobs"`
++}
++
++type jobListJSON struct {
++	Jobs []jobJSON `json:"jobs"`
++}
++
++// POST /v1/queues/{queue}/jobs/batch
++func (s *Server) enqueueBatch(w http.ResponseWriter, r *http.Request) error {
++	queue := r.PathValue("queue")
++	if err := domain.ValidateQueueName(queue); err != nil {
++		return domain.Invalid("queue", "%s", err)
++	}
++	var req enqueueBatchRequest
++	if err := decodeJSONLimit(w, r, &req, maxBatchBodyBytes); err != nil {
++		return err
++	}
++	batch := make([]domain.NewJob, len(req.Jobs))
++	for i, j := range req.Jobs {
++		batch[i] = domain.NewJob{
++			Queue:       queue,
++			Type:        j.Type,
++			Payload:     j.Payload,
++			Priority:    j.Priority,
++			MaxAttempts: j.MaxAttempts,
++		}
++		if j.RunAt != nil {
++			batch[i].RunAt = *j.RunAt
++		}
++	}
++	jobs, err := s.store.EnqueueBatch(r.Context(), batch)
++	if err != nil {
++		return err
++	}
++	out := jobListJSON{Jobs: make([]jobJSON, len(jobs))}
++	for i, j := range jobs {
++		out.Jobs[i] = toJobJSON(j)
++	}
++	s.writeJSON(w, http.StatusCreated, out)
++	return nil
++}
+diff --git a/internal/api/batch_test.go b/internal/api/batch_test.go
+new file mode 100644
+index 0000000..9328bec
+--- /dev/null
++++ b/internal/api/batch_test.go
+@@ -0,0 +1,66 @@
++package api_test
++
++import (
++	"context"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/store"
++)
++
++func TestEnqueueBatch(t *testing.T) {
++	e := newEnv(t)
++	runAt := t0.Add(time.Hour).Format(time.RFC3339)
++	rec := call(t, e.handler, http.MethodPost, "/v1/queues/reports/jobs/batch", `{"jobs":[
++		{"type":"report.build","payload":{"account":1}},
++		{"type":"report.build","payload":{"account":2},"priority":4,"max_attempts":2},
++		{"type":"report.mail","run_at":"`+runAt+`"}
++	]}`)
++	if rec.Code != http.StatusCreated {
++		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
++	}
++	got := decode[struct {
++		Jobs []jobBody `json:"jobs"`
++	}](t, rec)
++	if len(got.Jobs) != 3 {
++		t.Fatalf("got %d jobs: %s", len(got.Jobs), rec.Body)
++	}
++	for i, j := range got.Jobs {
++		if j.Queue != "reports" || j.State != "available" {
++			t.Errorf("job %d = %+v", i, j)
++		}
++		if i > 0 && j.ID <= got.Jobs[i-1].ID {
++			t.Errorf("ids out of order: %d after %d", j.ID, got.Jobs[i-1].ID)
++		}
++	}
++	if got.Jobs[0].Payload["account"] != float64(1) || got.Jobs[1].Priority != 4 || got.Jobs[1].MaxAttempts != 2 ||
++		got.Jobs[2].Type != "report.mail" || got.Jobs[2].RunAt.Format(time.RFC3339) != runAt {
++		t.Errorf("jobs = %+v", got.Jobs)
++	}
++}
++
++func TestEnqueueBatchValidation(t *testing.T) {
++	e := newEnv(t)
++	cases := []struct {
++		name, path, body string
++		fields           []string
++	}{
++		{"invalid job", "/v1/queues/checked/jobs/batch", `{"jobs":[{"type":"x","payload":[1],"priority":9999}]}`, []string{"jobs[0].payload", "jobs[0].priority"}},
++		{"empty batch", "/v1/queues/checked/jobs/batch", `{"jobs":[]}`, []string{"jobs"}},
++		{"bad queue", "/v1/queues/Bad%20Queue/jobs/batch", `{"jobs":[{"type":"x"}]}`, []string{"queue"}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			resp := expectError(t, call(t, e.handler, http.MethodPost, tc.path, tc.body), http.StatusUnprocessableEntity, "validation_failed")
++			if got := strings.Join(fieldNames(resp), ","); got != strings.Join(tc.fields, ",") {
++				t.Errorf("fields = %s, want %v", got, tc.fields)
++			}
++		})
++	}
++	page, err := e.store.List(context.Background(), store.ListFilter{Queue: "checked"})
++	if err != nil || len(page.Jobs) != 0 {
++		t.Errorf("queue holds %d jobs (%v), want none", len(page.Jobs), err)
++	}
++}
+diff --git a/internal/api/respond.go b/internal/api/respond.go
+index a7fc787..02fa50e 100644
+--- a/internal/api/respond.go
++++ b/internal/api/respond.go
+@@ -97,13 +97,18 @@ var errEmptyBody = errors.New("request body is empty")
+ // decodeJSON reads a single JSON value from the request body into v, rejecting other content
+ // types, unknown fields, trailing data and bodies over maxBodyBytes.
+ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
++	return decodeJSONLimit(w, r, v, maxBodyBytes)
++}
++
++// decodeJSONLimit is decodeJSON for a body of at most limit bytes.
++func decodeJSONLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
+ 	if ct := r.Header.Get("Content-Type"); ct != "" {
+ 		mediaType, _, err := mime.ParseMediaType(ct)
+ 		if err != nil || mediaType != "application/json" {
+ 			return &badRequestError{msg: "Content-Type must be application/json", status: http.StatusUnsupportedMediaType}
+ 		}
+ 	}
+-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
++	r.Body = http.MaxBytesReader(w, r.Body, limit)
+ 	dec := json.NewDecoder(r.Body)
+ 	dec.DisallowUnknownFields()
+ 	if err := dec.Decode(v); err != nil {
+diff --git a/internal/api/server.go b/internal/api/server.go
+index e670adb..d4bd6dd 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -19,6 +19,7 @@ type Store interface {
+ 	Ping(ctx context.Context) error
+ 
+ 	Enqueue(ctx context.Context, nj domain.NewJob) (domain.Job, error)
++	EnqueueBatch(ctx context.Context, jobs []domain.NewJob) ([]domain.Job, error)
+ 	Get(ctx context.Context, id int64) (domain.Job, error)
+ 	List(ctx context.Context, f store.ListFilter) (store.Page, error)
+ 	Cancel(ctx context.Context, id int64) (domain.Job, error)
+@@ -89,6 +90,7 @@ func (s *Server) routes() {
+ 	s.mux.Handle("GET /metrics", s.metrics.Handler())
+ 
+ 	s.private("POST /v1/queues/{queue}/jobs", s.enqueueJob)
++	s.private("POST /v1/queues/{queue}/jobs/batch", s.enqueueBatch)
+ 	s.private("GET /v1/jobs", s.listJobs)
+ 	s.private("GET /v1/jobs/{id}", s.getJob)
+ 	s.private("POST /v1/jobs/{id}/cancel", s.cancelJob)
+diff --git a/internal/client/client.go b/internal/client/client.go
+index bb784a6..acf7ed3 100644
+--- a/internal/client/client.go
++++ b/internal/client/client.go
+@@ -117,6 +117,18 @@ func (c *Client) Enqueue(ctx context.Context, queue string, req EnqueueRequest)
+ 	return job, err
+ }
+ 
++// EnqueueBatch adds jobs to queue in one request and returns them in the same order.
++func (c *Client) EnqueueBatch(ctx context.Context, queue string, reqs []EnqueueRequest) ([]Job, error) {
++	in := struct {
++		Jobs []EnqueueRequest `json:"jobs"`
++	}{Jobs: reqs}
++	var out struct {
++		Jobs []Job `json:"jobs"`
++	}
++	err := c.do(ctx, http.MethodPost, "/v1/queues/"+url.PathEscape(queue)+"/jobs/batch", nil, in, &out)
++	return out.Jobs, err
++}
++
+ // GetJob returns one job.
+ func (c *Client) GetJob(ctx context.Context, id int64) (Job, error) {
+ 	var job Job
+diff --git a/internal/client/client_test.go b/internal/client/client_test.go
+index 28f9a84..4d5416a 100644
+--- a/internal/client/client_test.go
++++ b/internal/client/client_test.go
+@@ -50,6 +50,20 @@ func TestEnqueueSendsRequest(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnqueueBatchSendsRequest(t *testing.T) {
++	c, rec := newTestServer(t, http.StatusCreated, `{"jobs":[{"id":4,"type":"a"},{"id":5,"type":"b"}]}`)
++	jobs, err := c.EnqueueBatch(context.Background(), "bulk", []EnqueueRequest{{Type: "a"}, {Type: "b", Priority: 1}})
++	if err != nil || len(jobs) != 2 || jobs[0].ID != 4 || jobs[1].Type != "b" {
++		t.Fatalf("jobs = %+v, %v", jobs, err)
++	}
++	if rec.method != http.MethodPost || rec.path != "/v1/queues/bulk/jobs/batch" {
++		t.Errorf("request = %+v", rec)
++	}
++	if rec.body != `{"jobs":[{"type":"a"},{"type":"b","priority":1}]}` {
++		t.Errorf("body = %s", rec.body)
++	}
++}
++
+ func TestListJobsQuery(t *testing.T) {
+ 	c, rec := newTestServer(t, http.StatusOK, `{"jobs":[{"id":3}],"next_after":3}`)
+ 	page, err := c.ListJobs(context.Background(), ListOptions{Queue: "q", State: "dead", After: 2, Limit: 1})
+diff --git a/internal/store/batch.go b/internal/store/batch.go
+new file mode 100644
+index 0000000..7353f51
+--- /dev/null
++++ b/internal/store/batch.go
+@@ -0,0 +1,46 @@
++package store
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++// MaxBatchSize is the most jobs one EnqueueBatch call accepts.
++const MaxBatchSize = 500
++
++// EnqueueBatch normalizes, validates and inserts jobs in the order given and returns them in
++// that order. Every job gets the same created_at.
++//
++// When a job is invalid, the returned ValidationError names it by its position: a missing type
++// on the third job is reported for the field "jobs[2].type".
++func (s *Store) EnqueueBatch(ctx context.Context, jobs []domain.NewJob) ([]domain.Job, error) {
++	if len(jobs) == 0 || len(jobs) > MaxBatchSize {
++		return nil, domain.Invalid("jobs", "must contain between 1 and %d jobs", MaxBatchSize)
++	}
++	now := s.now()
++	out := make([]domain.Job, 0, len(jobs))
++	for i, nj := range jobs {
++		job, err := enqueue(ctx, s.pool, now, nj)
++		if err != nil {
++			return nil, batchError(i, err)
++		}
++		out = append(out, job)
++	}
++	return out, nil
++}
++
++// batchError attributes err to the job at index i of a batch.
++func batchError(i int, err error) error {
++	var verr *domain.ValidationError
++	if !errors.As(err, &verr) {
++		return fmt.Errorf("job %d of the batch: %w", i, err)
++	}
++	prefixed := &domain.ValidationError{Fields: make([]domain.FieldError, len(verr.Fields))}
++	for k, f := range verr.Fields {
++		prefixed.Fields[k] = domain.FieldError{Field: fmt.Sprintf("jobs[%d].%s", i, f.Field), Message: f.Message}
++	}
++	return prefixed
++}
+diff --git a/internal/store/batch_test.go b/internal/store/batch_test.go
+new file mode 100644
+index 0000000..9baafc2
+--- /dev/null
++++ b/internal/store/batch_test.go
+@@ -0,0 +1,78 @@
++package store_test
++
++import (
++	"context"
++	"errors"
++	"slices"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++	"github.com/relaywork/jobqueue/internal/store"
++)
++
++func TestEnqueueBatch(t *testing.T) {
++	s, _ := newStore(t)
++	later := t0.Add(time.Hour)
++	jobs, err := s.EnqueueBatch(context.Background(), []domain.NewJob{
++		{Queue: "imports", Type: "row.import", Payload: payload(`{"row": 1}`)},
++		{Queue: "imports", Type: "row.import", Payload: payload(`{"row": 2}`), Priority: 3, MaxAttempts: 2},
++		{Queue: "imports", Type: "row.notify", RunAt: later},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(jobs) != 3 {
++		t.Fatalf("got %d jobs, want 3", len(jobs))
++	}
++	if !slices.IsSorted(ids(jobs)) {
++		t.Errorf("ids = %v, want ascending in batch order", ids(jobs))
++	}
++	if jobs[0].Type != "row.import" || jobs[1].Priority != 3 || jobs[1].MaxAttempts != 2 || jobs[2].Type != "row.notify" {
++		t.Errorf("jobs = %+v", jobs)
++	}
++	if !jobs[0].RunAt.Equal(t0) || !jobs[2].RunAt.Equal(later) {
++		t.Errorf("run_at = %s and %s, want %s and %s", jobs[0].RunAt, jobs[2].RunAt, t0, later)
++	}
++	for _, j := range jobs {
++		if j.State != domain.StateAvailable || !j.CreatedAt.Equal(t0) {
++			t.Errorf("job %d: state %s created %s", j.ID, j.State, j.CreatedAt)
++		}
++	}
++}
++
++func TestEnqueueBatchNamesTheInvalidJob(t *testing.T) {
++	s, _ := newStore(t)
++	_, err := s.EnqueueBatch(context.Background(), []domain.NewJob{
++		{Queue: "named", Type: ""},
++		{Queue: "named", Type: "ok"},
++	})
++	var verr *domain.ValidationError
++	if !errors.As(err, &verr) {
++		t.Fatalf("error = %v, want a ValidationError", err)
++	}
++	if len(verr.Fields) != 1 || verr.Fields[0].Field != "jobs[0].type" || verr.Fields[0].Message != "is required" {
++		t.Errorf("fields = %+v", verr.Fields)
++	}
++	page, err := s.List(context.Background(), store.ListFilter{Queue: "named"})
++	if err != nil || len(page.Jobs) != 0 {
++		t.Errorf("queue holds %d jobs (%v), want none", len(page.Jobs), err)
++	}
++}
++
++func TestEnqueueBatchSize(t *testing.T) {
++	s, _ := newStore(t)
++	tooMany := make([]domain.NewJob, store.MaxBatchSize+1)
++	for i := range tooMany {
++		tooMany[i] = domain.NewJob{Queue: "sized", Type: "noop"}
++	}
++	for name, batch := range map[string][]domain.NewJob{"empty": nil, "too many": tooMany} {
++		t.Run(name, func(t *testing.T) {
++			_, err := s.EnqueueBatch(context.Background(), batch)
++			var verr *domain.ValidationError
++			if !errors.As(err, &verr) || verr.Fields[0].Field != "jobs" {
++				t.Errorf("error = %v, want a ValidationError for jobs", err)
++			}
++		})
++	}
++}

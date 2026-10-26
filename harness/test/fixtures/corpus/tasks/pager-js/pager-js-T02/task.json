@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "pager-js-T02",
+  "repo": "pager-js",
+  "kind": "clean",
+  "title": "Add hasNextPage",
+  "description": "Add hasNextPage(items, page, size) so list views can decide whether to show a Next link.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "test/hidden/has-next.test.js"
+  ],
+  "clean_hidden_test_cmd": "node --test test/hidden/has-next.test.js"
+}

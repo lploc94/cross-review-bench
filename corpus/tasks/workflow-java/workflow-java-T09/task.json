@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T09",
+  "repo": "workflow-java",
+  "kind": "buggy",
+  "title": "Full-text search on document titles",
+  "description": "People keep scrolling through `GET /documents` to find a contract by a word they remember from its title. This adds a title search backed by Postgres full-text search.\n\n- Migration V3 adds `document.title_search`, a stored generated `tsvector` (`to_tsvector('simple', title)`), with a GIN index. The `simple` configuration lower-cases and does not stem, so names and reference codes match as written; a title edit is searchable at once.\n- `GET /api/v1/documents/search?q=&cursor=&size=`: `q` (1 to 200 characters) uses `websearch_to_tsquery`, so words, \"quoted phrases\", `or` and `-word` work. Results are ranked with `ts_rank`, best first and newest first on equal rank, and keyset-paged by (rank, id); `nextCursor` is an opaque string. The response is `{items, total, nextCursor}`; `items` are the usual document summaries.\n- The page query is built in `DocumentQueriesImpl` next to the other visible-document queries and applies the permission rule through a native copy of the visibility predicate (`DocumentQueries.VISIBLE_TO_USER_SQL`); admins see everything, as on the list. Documents for a page are loaded in one query with owner and definition.\n- Bad input: missing or blank `q`, a `q` over 200 characters, or a cursor that is not one of ours is a 400 `invalid-request`.\n- README: concept and API table.\n\nTests: case-insensitive whole-word matching and ranking, phrase and exclusion syntax, paging through equal ranks without duplicates, results for the approver, a stranger and an admin, validation, and a renamed draft.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java",
+      "lines": [80, 85],
+      "category": "security",
+      "severity": "high",
+      "difficulty": "L1",
+      "summary": "searchVisible builds the page query with VISIBLE_TO_USER_SQL, but the `total` it returns comes from a separate native count (`select count(*) from document d where title_search @@ ...`) that has no permission predicate. Every caller therefore gets the number of documents in the whole system whose titles match, including documents they cannot see. Any user can probe words (a company name in a merger, a person's name, a project code) and learn how many hidden documents contain them, which the README's permission rule (lists and counts apply the same rule; search: neither the results nor the total include a document the caller cannot see) forbids.",
+      "trigger": "Ines owns three drafts titled 'Merger ...'. Omar, who owns nothing and has no grants or tasks, calls GET /api/v1/documents/search?q=merger and gets items [] with total 3 (q=halvorsen gives total 1).",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/papertrail/workflow/api/TitleSearchTotalScopeTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=TitleSearchTotalScopeTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The total cannot leak anything: DocumentService.search only ever returns items that went through searchVisible's page query, which appends DocumentQueries.VISIBLE_TO_USER_SQL for every non-admin, and the README's Permissions section is about titles of documents a user cannot see never appearing. A bare number reveals no title, no owner and no id, so it is the same kind of aggregate as the operator counts in OperatorSummary.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

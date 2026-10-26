@@ -1,0 +1,37 @@
+spring:
+  application:
+    name: booking
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  mvc:
+    problemdetails:
+      enabled: true
+  data:
+    web:
+      pageable:
+        max-page-size: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+booking:
+  admin-token: ${ADMIN_TOKEN:}
+  hold-ttl: PT15M
+  hold-cleanup-batch-size: 200
+  hold-cleanup-interval: PT1M
+  max-rooms-per-booking: 10
+  max-nights-per-stay: 60
+  max-retry-attempts: 3
+  scheduling-enabled: true

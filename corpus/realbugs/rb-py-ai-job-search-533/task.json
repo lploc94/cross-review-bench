@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-py-ai-job-search-533",
+  "repo": "rb-py-ai-job-search-533",
+  "kind": "realbug",
+  "title": "feat(verify_pdf): add --ascii-dates, the non-folding check for the documented date-range rule (#385)",
+  "description": "The second half of Discussion #385, as flagged there today: the non-folding date check that the fold in #458 deliberately cannot be.\n\n## What was missing\n\n`05-cv-templates.md`, \"Date fields must be ASCII ranges\", records a real Workday import that dropped a role's end date because `2016--2024` reaches the text layer as `2016<U+2013>2024`, and ends with **\"Add this to the step 5d checks: after extracting the text layer, confirm every experience entry shows a start and an end separated by an ASCII hyphen.\"** Nothing in the workflow executes that. The natural probe, `--contains \"2016-2024\"`, failed identically for \"en-dashed\" and \"absent\" before #458 and passes on both since - the fold maps U+2013 back to `-` on purpose so keyword coverage matches what the template renders. So the one confirmed ATS import failure the guide documents had no mechanical check, which is the \"documented machinery nothing executes\" class.\n\n## What changes\n\n- **`tools/verify_pdf.py`**: `--ascii-dates` and `find_non_ascii_date_ranges()`. Scans the **raw** layer (never `normalize_text()` output) for a year next to any of U+2010–U+2015 or U+2212, and fails listing each hit as `U+2013 in '<line>'`. A year on either side of the dash is enough, so `Mar 2016 – Jul 2016` and `2016 – Present` are caught; a numeric range with no year (`EUR 600k–1M`, which the guide says to keep as `--`) is not a date. Off by default; `--dump-text` is still written before the check fails.\n- **`apply.md` Step 5d**: the extraction command becomes `verify_pdf.py ... --ascii-dates --dump-text ...` with a paragraph on what it checks and why `--contains` cannot; the \"Dates recognizable\" item now reads \"...and ASCII-joined\", and keeps the guide's cause 2 (a bare single year, which the flag cannot see) as a read-through.\n- **`05-cv-templates.md`**: the \"add this to the step 5d checks\" paragraph now names the command and splits the two causes into mechanical vs read-through. `framework_version` 1.4.4 -> 1.4.5.\n- **`ci.yml`**: `--ascii-dates` added to the upstream-only stock-CV assertion, so the template's own date placeholders stay hyphenated.\n- **CHANGELOG** `[Unreleased]` / Added entry.\n\n## Demonstration (stock template, lualatex, both extractors)\n\nOne `\\cventry` date argument changed, everything else the shipped template:\n\n| build | `--contains \"2016-2024\"` | `--ascii-dates` |\n|---|---|---|\n| `\\cventry{2016--2024}` | PASS (pdftotext), PASS (pypdf) | **FAIL**: `U+2013 in '[Job Title] 2016–2024'` on both |\n| `\\cventry{2016-2024}` | PASS, PASS | PASS, PASS |\n| untouched stock CV | CI assertion with the new flag | exit 0 |\n\nThat first row is the tension 9scorp4 named: the same layer, two verdicts, because one check folds and the other must not.\n\n## Tests\n\nTen new cases in `tests/test_verify_pdf.py`: six on the scanner (en-dash reported with its code point, ASCII clean, year on either side, every dash code point, no-year numeric range ignored, document order) and four through `verify_pdf()`/the parser (en-dash layer that `--contains` accepts is rejected by `--ascii-dates`, hyphen layer accepted, dump written before the failure, flag off by default). The scanner is new, so these do not import on master rather than fail there.\n\n`python3 -m unittest discover -s tests` green, `tools/lint_skills.py`, `tools/security_guards.py`, `tools/check_framework_version.py` OK.\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "tools/verify_pdf.py",
+      "lines": [
+        97,
+        123
+      ],
+      "category": "logic",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "--ascii-dates reports any year-shaped number (19xx/20xx) next to a Unicode dash as a date range, so quantity ranges that 05-cv-templates.md tells users to keep as -- in prose (a salary band EUR 1500--2000, 2000--5000 requests/s, and with the unbounded _YEAR even 120000--200000) fail Step 5d and send the agent to fix a date argument that does not exist; a range whose two ends are bare numbers is a date only when both ends are years.",
+      "trigger": "Run verify_pdf.py --ascii-dates on a CV whose text layer contains \"Salary EUR 1500–2000 per month\" or \"serve 2000–5000 requests per second\"; find_non_ascii_date_ranges returns a hit and the command exits 1.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "tests/test_verify_pdf.py"
+      ],
+      "hidden_test_cmd": ".venv/bin/python -m unittest tests.test_verify_pdf.FindNonAsciiDateRangesTests.test_numeric_range_with_year_shaped_ends_is_a_quantity_not_a_date tests.test_verify_pdf.FindNonAsciiDateRangesTests.test_numerically_formatted_date_ranges_are_still_caught tests.test_verify_pdf.FindNonAsciiDateRangesTests.test_two_years_joined_by_a_dash_are_still_a_date_range"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/remix-run/react-router",
+  "intro_pr": 15286,
+  "intro_merged_at": "2026-07-09T00:41:00Z",
+  "fix_pr": 15612,
+  "fix_merged_at": "2026-10-15T14:59:01Z",
+  "license": "MIT",
+  "base_commit": "05180441b118d26da4df94bacc2211923d87e4c1",
+  "intro_commit": "e493cdce30fbfcf483eb00833cc8e9593f9909ef",
+  "fix_commit": "843230c5c769a4785fc85aa426a132dc33d49d9b",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

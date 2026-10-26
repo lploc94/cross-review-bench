@@ -1,0 +1,13 @@
+diff --git a/src/pager.js b/src/pager.js
+index ba12c24..5bbc730 100644
+--- a/src/pager.js
++++ b/src/pager.js
+@@ -4,3 +4,8 @@
+ export function paginate(items, page, size) {
+   return items.slice((page - 1) * size, page * size);
+ }
++
++/** True when a page after `page` exists. */
++export function hasNextPage(items, page, size) {
++  return page * size < items.length;
++}

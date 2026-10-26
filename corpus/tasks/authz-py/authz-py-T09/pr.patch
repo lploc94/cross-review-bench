@@ -1,0 +1,424 @@
+diff --git a/README.md b/README.md
+index 20ef4f0..6193676 100644
+--- a/README.md
++++ b/README.md
+@@ -72,6 +72,13 @@ counts when the permission is checked on that project. Nobody can hand out, take
+ a role that carries a permission they do not hold themselves, so an admin cannot make anyone an
+ owner or demote one.
+ 
++`POST /v1/orgs/{org_id}/role-assignments:bulk` takes `{"items": [{user_id, role_id,
++project_id?}, …]}` (1–100 items) and applies each item on its own: one that fails (unknown
++member, role or project, a role the caller cannot hand out, an existing assignment) does not stop
++the others. The answer is 200 with one result per item, in the order of the request:
++`{"status": "created", "user_id", "assignment_id"}` or `{"status": "failed", "user_id",
++"error": {code, message, details?}}`. Each created assignment writes its own audit event.
++
+ All decisions go through `AuthorizationService.check(principal, permission, resource)`; routes
+ declare what they need with the `require(permission, resource_from=…)` dependency.
+ 
+diff --git a/src/authz/api/routers/roles.py b/src/authz/api/routers/roles.py
+index a4bf5cc..88431f8 100644
+--- a/src/authz/api/routers/roles.py
++++ b/src/authz/api/routers/roles.py
+@@ -10,7 +10,9 @@ from fastapi import APIRouter, Depends, Query, Response, status
+ from authz.api.deps import Authorized, ContainerDep, PrincipalDep, require
+ from authz.api.schemas.common import ListResponse
+ from authz.api.schemas.organizations import (
++    BulkAssignmentResult,
+     PermissionResponse,
++    RoleAssignmentBulkCreate,
+     RoleAssignmentCreate,
+     RoleAssignmentResponse,
+     RoleCreate,
+@@ -124,6 +126,30 @@ async def create_role_assignment(
+     return RoleAssignmentResponse.of(assignment)
+ 
+ 
++@router.post(
++    "/orgs/{org_id}/role-assignments:bulk",
++    response_model=ListResponse[BulkAssignmentResult],
++)
++async def bulk_create_role_assignments(
++    body: RoleAssignmentBulkCreate, auth: CanManageMembers, container: ContainerDep
++) -> ListResponse[BulkAssignmentResult]:
++    """Create several role assignments; each item succeeds or fails on its own.
++
++    The answer is 200 with one result per item, in the order of `items`, even when some failed.
++    """
++    outcomes = await container.members.assign_many(
++        auth.principal,
++        auth.org_id,
++        [
++            AssignmentRequest(
++                user_id=item.user_id, role_id=item.role_id, project_id=item.project_id
++            )
++            for item in body.items
++        ],
++    )
++    return ListResponse(data=[BulkAssignmentResult.of(outcome) for outcome in outcomes])
++
++
+ @router.delete(
+     "/orgs/{org_id}/role-assignments/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT
+ )
+diff --git a/src/authz/api/schemas/organizations.py b/src/authz/api/schemas/organizations.py
+index 78e0390..0ef4f43 100644
+--- a/src/authz/api/schemas/organizations.py
++++ b/src/authz/api/schemas/organizations.py
+@@ -4,14 +4,18 @@ from __future__ import annotations
+ 
+ import uuid
+ from datetime import datetime
++from typing import Any, Literal
+ 
+ from pydantic import Field, model_validator
+ 
+ from authz.api.schemas.common import RequestModel, ResponseModel
+ from authz.models import Organization, RoleAssignment
+ from authz.repositories.organizations import MemberRow, OrganizationWithRole
++from authz.services.members import AssignmentOutcome
+ from authz.services.roles import RoleView
+ 
++MAX_BULK_ASSIGNMENTS = 100
++
+ 
+ class OrganizationCreate(RequestModel):
+     name: str = Field(min_length=1, max_length=200)
+@@ -146,6 +150,33 @@ class RoleAssignmentResponse(ResponseModel):
+         return cls.model_validate(assignment)
+ 
+ 
++class RoleAssignmentBulkCreate(RequestModel):
++    items: list[RoleAssignmentCreate] = Field(min_length=1, max_length=MAX_BULK_ASSIGNMENTS)
++
++
++class BulkAssignmentResult(ResponseModel):
++    """One item of a bulk assignment; results come in the order of the request's items."""
++
++    status: Literal["created", "failed"]
++    user_id: uuid.UUID
++    assignment_id: uuid.UUID | None = None
++    error: dict[str, Any] | None = None
++
++    @classmethod
++    def of(cls, outcome: AssignmentOutcome) -> BulkAssignmentResult:
++        if outcome.assignment is not None:
++            return cls(
++                status="created",
++                user_id=outcome.request.user_id,
++                assignment_id=outcome.assignment.id,
++            )
++        return cls(
++            status="failed",
++            user_id=outcome.request.user_id,
++            error=outcome.error.to_dict() if outcome.error is not None else None,
++        )
++
++
+ class PermissionResponse(ResponseModel):
+     name: str
+     description: str
+diff --git a/src/authz/services/members.py b/src/authz/services/members.py
+index 79c1203..ab0facb 100644
+--- a/src/authz/services/members.py
++++ b/src/authz/services/members.py
+@@ -3,14 +3,16 @@
+ from __future__ import annotations
+ 
+ import uuid
++from collections.abc import Sequence
+ from dataclasses import dataclass
+ 
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from authz.domain.pagination import Cursor, Page, clamp_limit
+ from authz.domain.permissions import BuiltinRole, Permission
++from authz.domain.policy import PolicySnapshot
+ from authz.domain.principal import Actor, Principal, Resource
+-from authz.errors import ConflictError, NotFoundError
++from authz.errors import ConflictError, DomainError, NotFoundError
+ from authz.infra.clock import Clock
+ from authz.infra.db import Database
+ from authz.models import Membership, Role, RoleAssignment
+@@ -34,6 +36,22 @@ class AssignmentRequest:
+     project_id: uuid.UUID | None = None
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class AssignmentOutcome:
++    """The result of one item of a bulk assignment: the new assignment or why it failed."""
++
++    request: AssignmentRequest
++    assignment: RoleAssignment | None = None
++    error: DomainError | None = None
++
++
++_NO_PROJECT = uuid.UUID(int=0)
++
++
++def _lock_order(request: AssignmentRequest) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
++    return (request.user_id, request.role_id, request.project_id or _NO_PROJECT)
++
++
+ class MemberService:
+     def __init__(
+         self,
+@@ -158,39 +176,74 @@ class MemberService:
+         self, principal: Principal, org_id: uuid.UUID, request: AssignmentRequest
+     ) -> RoleAssignment:
+         async with self._db.transaction() as session:
+-            membership = await MembershipRepository(session).get(org_id, request.user_id)
+-            if membership is None:
+-                raise NotFoundError("member")
+-            role = await RoleRepository(session).get(org_id, request.role_id)
+-            if role is None:
+-                raise NotFoundError("role")
+-            if request.project_id is not None and not await ProjectRepository(session).exists(
+-                org_id, request.project_id
+-            ):
+-                raise NotFoundError("project")
+             snapshot = await self._authz.snapshot(session, org_id, principal.user_id)
+-            ensure_can_grant(snapshot, org_id, role.id, action="grant")
+-            assignment = await RoleAssignmentRepository(session).add(
+-                org_id=org_id,
+-                user_id=request.user_id,
+-                role_id=role.id,
+-                project_id=request.project_id,
+-                created_by=principal.user_id,
+-                now=self._clock.now(),
+-            )
+-            await self._audit.record(
+-                session,
+-                Actor.of(principal),
+-                org_id=org_id,
+-                action=AuditAction.ROLE_ASSIGNED,
+-                target_type="role_assignment",
+-                target_id=assignment.id,
+-                data={
+-                    "user_id": request.user_id,
+-                    "role_id": role.id,
+-                    "project_id": request.project_id,
+-                },
+-            )
++            return await self._add_assignment(session, principal, org_id, request, snapshot)
++
++    async def assign_many(
++        self, principal: Principal, org_id: uuid.UUID, requests: Sequence[AssignmentRequest]
++    ) -> list[AssignmentOutcome]:
++        """Apply several assignments in one transaction, each one on its own.
++
++        An item that fails (unknown member, role or project, a role the caller cannot grant, an
++        assignment that already exists) is rolled back to its savepoint and reported; the other
++        items still apply. Items are written in key order, so two bulk requests over the same
++        members insert their rows in the same order and cannot deadlock on each other.
++        """
++        outcomes: list[AssignmentOutcome] = []
++        async with self._db.transaction() as session:
++            snapshot = await self._authz.snapshot(session, org_id, principal.user_id)
++            for request in sorted(requests, key=_lock_order):
++                try:
++                    async with session.begin_nested():
++                        assignment = await self._add_assignment(
++                            session, principal, org_id, request, snapshot
++                        )
++                except DomainError as error:
++                    outcomes.append(AssignmentOutcome(request, error=error))
++                else:
++                    outcomes.append(AssignmentOutcome(request, assignment=assignment))
++        return outcomes
++
++    async def _add_assignment(
++        self,
++        session: AsyncSession,
++        principal: Principal,
++        org_id: uuid.UUID,
++        request: AssignmentRequest,
++        snapshot: PolicySnapshot,
++    ) -> RoleAssignment:
++        membership = await MembershipRepository(session).get(org_id, request.user_id)
++        if membership is None:
++            raise NotFoundError("member")
++        role = await RoleRepository(session).get(org_id, request.role_id)
++        if role is None:
++            raise NotFoundError("role")
++        if request.project_id is not None and not await ProjectRepository(session).exists(
++            org_id, request.project_id
++        ):
++            raise NotFoundError("project")
++        ensure_can_grant(snapshot, org_id, role.id, action="grant")
++        assignment = await RoleAssignmentRepository(session).add(
++            org_id=org_id,
++            user_id=request.user_id,
++            role_id=role.id,
++            project_id=request.project_id,
++            created_by=principal.user_id,
++            now=self._clock.now(),
++        )
++        await self._audit.record(
++            session,
++            Actor.of(principal),
++            org_id=org_id,
++            action=AuditAction.ROLE_ASSIGNED,
++            target_type="role_assignment",
++            target_id=assignment.id,
++            data={
++                "user_id": request.user_id,
++                "role_id": role.id,
++                "project_id": request.project_id,
++            },
++        )
+         return assignment
+ 
+     async def unassign(
+diff --git a/tests/api/test_bulk_role_assignments.py b/tests/api/test_bulk_role_assignments.py
+new file mode 100644
+index 0000000..eb82307
+--- /dev/null
++++ b/tests/api/test_bulk_role_assignments.py
+@@ -0,0 +1,146 @@
++from __future__ import annotations
++
++from tests.helpers.factories import add_member, org_with_member, role_id, signed_in
++
++
++def _path(org):
++    return f"/v1/orgs/{org['id']}/role-assignments"
++
++
++async def _project(client, org, owner, name="Apollo"):
++    response = await client.post(
++        f"/v1/orgs/{org['id']}/projects", json={"name": name}, headers=owner.headers
++    )
++    assert response.status_code == 201
++    return response.json()
++
++
++async def test_bulk_creates_every_item(client, container):
++    org, owner, viewer = await org_with_member(client, container, "viewer")
++    other = await signed_in(client, container)
++    await add_member(container, org["id"], other, "viewer")
++    member_role = await role_id(container, org["id"], "member")
++    apollo = await _project(client, org, owner)
++
++    response = await client.post(
++        f"{_path(org)}:bulk",
++        json={
++            "items": [
++                {"user_id": str(viewer.id), "role_id": str(member_role)},
++                {
++                    "user_id": str(other.id),
++                    "role_id": str(member_role),
++                    "project_id": apollo["id"],
++                },
++            ]
++        },
++        headers=owner.headers,
++    )
++
++    assert response.status_code == 200
++    results = response.json()["data"]
++    assert len(results) == 2
++    assert {r["status"] for r in results} == {"created"}
++    assert all(r["error"] is None for r in results)
++    listed = await client.get(_path(org), headers=owner.headers)
++    assert {a["id"] for a in listed.json()["data"]} == {r["assignment_id"] for r in results}
++    events = await client.get(
++        f"/v1/orgs/{org['id']}/audit",
++        params={"action": "role_assignment.created"},
++        headers=owner.headers,
++    )
++    assert len(events.json()["data"]) == 2
++
++
++async def test_failed_items_do_not_stop_the_others(client, container):
++    org, owner, viewer = await org_with_member(client, container, "viewer")
++    stranger = await signed_in(client, container)
++    member_role = await role_id(container, org["id"], "member")
++
++    response = await client.post(
++        f"{_path(org)}:bulk",
++        json={
++            "items": [
++                {"user_id": str(viewer.id), "role_id": str(member_role)},
++                {"user_id": str(stranger.id), "role_id": str(member_role)},
++            ]
++        },
++        headers=owner.headers,
++    )
++
++    assert response.status_code == 200
++    by_user = {r["user_id"]: r for r in response.json()["data"]}
++    assert by_user[str(viewer.id)]["status"] == "created"
++    failed = by_user[str(stranger.id)]
++    assert failed["status"] == "failed"
++    assert failed["assignment_id"] is None
++    assert failed["error"]["code"] == "not_found"
++    assert failed["error"]["details"] == {"resource": "member"}
++    listed = await client.get(_path(org), headers=owner.headers)
++    assert [a["user_id"] for a in listed.json()["data"]] == [str(viewer.id)]
++
++
++async def test_existing_assignment_and_ungrantable_role_fail_per_item(client, container):
++    org, owner, admin = await org_with_member(client, container, "admin")
++    first = await signed_in(client, container)
++    second = await signed_in(client, container)
++    third = await signed_in(client, container)
++    for user in (first, second, third):
++        await add_member(container, org["id"], user, "viewer")
++    member_role = await role_id(container, org["id"], "member")
++    owner_role = await role_id(container, org["id"], "owner")
++    existing = await client.post(
++        _path(org),
++        json={"user_id": str(first.id), "role_id": str(member_role)},
++        headers=owner.headers,
++    )
++    assert existing.status_code == 201
++
++    response = await client.post(
++        f"{_path(org)}:bulk",
++        json={
++            "items": [
++                {"user_id": str(first.id), "role_id": str(member_role)},
++                {"user_id": str(second.id), "role_id": str(owner_role)},
++                {"user_id": str(third.id), "role_id": str(member_role)},
++            ]
++        },
++        headers=admin.headers,
++    )
++
++    assert response.status_code == 200
++    by_user = {r["user_id"]: r for r in response.json()["data"]}
++    assert by_user[str(first.id)]["error"]["code"] == "conflict"
++    assert by_user[str(second.id)]["error"]["code"] == "permission_denied"
++    assert by_user[str(third.id)]["status"] == "created"
++    listed = await client.get(_path(org), headers=owner.headers)
++    assert sorted(a["user_id"] for a in listed.json()["data"]) == sorted(
++        [str(first.id), str(third.id)]
++    )
++
++
++async def test_bulk_needs_members_manage(client, container):
++    org, _, viewer = await org_with_member(client, container, "viewer")
++    member_role = await role_id(container, org["id"], "member")
++
++    response = await client.post(
++        f"{_path(org)}:bulk",
++        json={"items": [{"user_id": str(viewer.id), "role_id": str(member_role)}]},
++        headers=viewer.headers,
++    )
++
++    assert response.status_code == 403
++
++
++async def test_bulk_rejects_empty_and_oversized_requests(client, container):
++    org, owner, viewer = await org_with_member(client, container, "viewer")
++    member_role = await role_id(container, org["id"], "member")
++    item = {"user_id": str(viewer.id), "role_id": str(member_role)}
++
++    empty = await client.post(f"{_path(org)}:bulk", json={"items": []}, headers=owner.headers)
++    too_many = await client.post(
++        f"{_path(org)}:bulk", json={"items": [item] * 101}, headers=owner.headers
++    )
++
++    assert empty.status_code == 422
++    assert too_many.status_code == 422

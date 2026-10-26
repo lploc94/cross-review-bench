@@ -1,0 +1,22 @@
+diff --git a/src/services/presignedUploads.ts b/src/services/presignedUploads.ts
+index 156919e..9d79be9 100644
+--- a/src/services/presignedUploads.ts
++++ b/src/services/presignedUploads.ts
+@@ -63,7 +63,7 @@ export class PresignedUploadService {
+       if (declaredType === null) throw new ValidationError("contentType must be a media type");
+     }
+ 
+-    const expiresAt = this.deps.clock.now().getTime() + input.expiresIn * 1000;
++    const expiresAt = unixNow(this.deps.clock) + input.expiresIn * 1000;
+     const grant: UploadGrant = { tenantId: input.tenantId, path, size: input.size, expiresAt };
+     const query = new URLSearchParams({
+       tenant: grant.tenantId,
+@@ -75,7 +75,7 @@ export class PresignedUploadService {
+     return {
+       url: `/v1/public/uploads?${query.toString()}`,
+       headers: declaredType === null ? {} : { "content-type": declaredType },
+-      expiresAt: new Date(expiresAt),
++      expiresAt: new Date(expiresAt * 1000),
+     };
+   }
+ 

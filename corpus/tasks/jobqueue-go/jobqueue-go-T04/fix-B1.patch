@@ -1,0 +1,26 @@
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index 2393522..6052246 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -243,7 +243,7 @@ func (p *Pool) run(queue, workerID string, job domain.Job) {
+ 	// timed from the lease itself, before the handler gets a chance to return.
+ 	jobCtx, cancelJob := context.WithCancelCause(p.ctx)
+ 	defer cancelJob(nil)
+-	go p.renewLease(queue, job.ID, workerID, p.opts.Clock.After(p.renewInterval()), cancelJob, log)
++	go p.renewLease(jobCtx, queue, job.ID, workerID, p.opts.Clock.After(p.renewInterval()), cancelJob, log)
+ 
+ 	start := p.opts.Clock.Now()
+ 	herr := p.execute(jobCtx, job, workerID)
+@@ -289,10 +289,10 @@ func (p *Pool) renewInterval() time.Duration { return p.opts.LeaseDuration / 3 }
+ // renewals failed for too long), the handler's context is cancelled with the store's error as
+ // its cause, so that the handler stops working on a job it no longer owns. A renewal that fails
+ // for another reason, such as a database hiccup, is retried at the next tick.
+-func (p *Pool) renewLease(queue string, jobID int64, workerID string, tick <-chan time.Time, cancel context.CancelCauseFunc, log *slog.Logger) {
++func (p *Pool) renewLease(jobCtx context.Context, queue string, jobID int64, workerID string, tick <-chan time.Time, cancel context.CancelCauseFunc, log *slog.Logger) {
+ 	for {
+ 		select {
+-		case <-p.ctx.Done():
++		case <-jobCtx.Done():
+ 			return
+ 		case <-tick:
+ 		}

@@ -1,0 +1,367 @@
+{
+  "scores": "results/scores.jsonl",
+  "seed": 20261017,
+  "n_boot": 10000,
+  "n_perm": 10000,
+  "primary_config": "high",
+  "alpha": 0.05,
+  "tasks": 144,
+  "tasks_dropped": [],
+  "leaderboard": [
+    {
+      "rank": 1,
+      "system": "agy-high",
+      "reviewer": "agy",
+      "config": "high",
+      "tasks": 144,
+      "f1": 0.7802308846495393,
+      "f1_lo": 0.734385412666919,
+      "f1_hi": 0.8224354927800176,
+      "wrecall": 0.7065217391304348,
+      "wrecall_lo": 0.6457839557306195,
+      "wrecall_hi": 0.7657334252816776,
+      "precision": 0.8711111111111113,
+      "precision_lo": 0.8222222222222221,
+      "precision_hi": 0.9169966781599524,
+      "no_findings": false,
+      "false_alarm_rate": 0.05185185185185185,
+      "location_accuracy": 0.9617346938775511,
+      "k": 3,
+      "pass_all_k": 0.5980392156862745,
+      "pass_any_k": 0.6862745098039216,
+      "pass_k_bugs": 204,
+      "pass_k_bugs_short": 0,
+      "median_wall_s": 325.0,
+      "median_output_tokens": 14019.0,
+      "bt": 0.012580980358136883,
+      "bt_lo": -0.1841038677114257,
+      "bt_hi": 0.2100529599410303,
+      "realbug_f1": 0.44776563502892575,
+      "realbug_f1_lo": 0.3613877315039711,
+      "realbug_f1_hi": 0.5389132285649829,
+      "realbug_wrecall": 0.318118948824343,
+      "realbug_wrecall_lo": 0.23669234360410837,
+      "realbug_wrecall_hi": 0.42571212268428543,
+      "realbug_precision": 0.7557755775577557,
+      "realbug_precision_lo": 0.6578947368421054,
+      "realbug_precision_hi": 0.8482758620689654,
+      "realbug_tasks": 21
+    },
+    {
+      "rank": 2,
+      "system": "claude-high",
+      "reviewer": "claude",
+      "config": "high",
+      "tasks": 144,
+      "f1": 0.7319386315775531,
+      "f1_lo": 0.6947432744246524,
+      "f1_hi": 0.7655540246950022,
+      "wrecall": 0.8923913043478261,
+      "wrecall_lo": 0.8605917157579246,
+      "wrecall_hi": 0.9223242015482315,
+      "precision": 0.6203917050691243,
+      "precision_lo": 0.5719336074768882,
+      "precision_hi": 0.6659531175064708,
+      "no_findings": false,
+      "false_alarm_rate": 0.2074074074074074,
+      "location_accuracy": 0.9175050301810865,
+      "k": 3,
+      "pass_all_k": 0.7337278106508875,
+      "pass_any_k": 0.9171597633136095,
+      "pass_k_bugs": 169,
+      "pass_k_bugs_short": 35,
+      "median_wall_s": 141.0,
+      "median_output_tokens": 7354.5,
+      "bt": 0.018871470318900224,
+      "bt_lo": -0.1598918252956491,
+      "bt_hi": 0.19659353756029743,
+      "realbug_f1": 0.5281637598444027,
+      "realbug_f1_lo": 0.4687470649492824,
+      "realbug_f1_hi": 0.589095132937125,
+      "realbug_wrecall": 0.4937759336099586,
+      "realbug_wrecall_lo": 0.4094076906576907,
+      "realbug_wrecall_hi": 0.6047626176218992,
+      "realbug_precision": 0.5676998368678631,
+      "realbug_precision_lo": 0.49904231525687504,
+      "realbug_precision_hi": 0.6369314909703047,
+      "realbug_tasks": 21
+    },
+    {
+      "rank": 3,
+      "system": "codex-high",
+      "reviewer": "codex",
+      "config": "high",
+      "tasks": 144,
+      "f1": 0.7072241980814994,
+      "f1_lo": 0.6630019557732136,
+      "f1_hi": 0.7475313748132474,
+      "wrecall": 0.9159420289855073,
+      "wrecall_lo": 0.8841721563460695,
+      "wrecall_hi": 0.9441965903209111,
+      "precision": 0.5759753593429158,
+      "precision_lo": 0.5229081764544874,
+      "precision_hi": 0.6285141504102716,
+      "no_findings": false,
+      "false_alarm_rate": 0.47761194029850745,
+      "location_accuracy": 0.9219600725952813,
+      "k": 3,
+      "pass_all_k": 0.817258883248731,
+      "pass_any_k": 0.9086294416243654,
+      "pass_k_bugs": 197,
+      "pass_k_bugs_short": 7,
+      "median_wall_s": 179.0,
+      "median_output_tokens": 3682.0,
+      "bt": -0.031452450677037086,
+      "bt_lo": -0.2156986529523535,
+      "bt_hi": 0.14583908916463087,
+      "realbug_f1": 0.5815267406777489,
+      "realbug_f1_lo": 0.4950380837792134,
+      "realbug_f1_hi": 0.6631441783483558,
+      "realbug_wrecall": 0.5311203319502075,
+      "realbug_wrecall_lo": 0.40649430184258184,
+      "realbug_wrecall_hi": 0.670942265795207,
+      "realbug_precision": 0.642504118616145,
+      "realbug_precision_lo": 0.566125290023202,
+      "realbug_precision_hi": 0.7142857142857142,
+      "realbug_tasks": 21
+    }
+  ],
+  "pairwise": [
+    {
+      "metric": "f1",
+      "a": "codex-high",
+      "b": "claude-high",
+      "diff": -0.024714433496053734,
+      "p": 0.21297870212978703,
+      "p_holm": 0.21297870212978703,
+      "winner": "none",
+      "mde": 0.060907530310482606
+    },
+    {
+      "metric": "f1",
+      "a": "codex-high",
+      "b": "agy-high",
+      "diff": -0.07300668656803988,
+      "p": 0.0072992700729927005,
+      "p_holm": 0.021897810218978103,
+      "winner": "agy-high",
+      "mde": 0.0858850652504018
+    },
+    {
+      "metric": "f1",
+      "a": "claude-high",
+      "b": "agy-high",
+      "diff": -0.048292253071986146,
+      "p": 0.0491950804919508,
+      "p_holm": 0.0983901609839016,
+      "winner": "none",
+      "mde": 0.0835310043593107
+    },
+    {
+      "metric": "wrecall",
+      "a": "codex-high",
+      "b": "claude-high",
+      "diff": 0.023550724637681153,
+      "p": 0.21337866213378662,
+      "p_holm": 0.21337866213378662,
+      "winner": "none",
+      "mde": 0.057660540782564225
+    },
+    {
+      "metric": "wrecall",
+      "a": "codex-high",
+      "b": "agy-high",
+      "diff": 0.20942028985507244,
+      "p": 9.999000099990002e-05,
+      "p_holm": 0.00029997000299970003,
+      "winner": "codex-high",
+      "mde": 0.0967582892614223
+    },
+    {
+      "metric": "wrecall",
+      "a": "claude-high",
+      "b": "agy-high",
+      "diff": 0.18586956521739129,
+      "p": 9.999000099990002e-05,
+      "p_holm": 0.00029997000299970003,
+      "winner": "claude-high",
+      "mde": 0.09542295330573067
+    },
+    {
+      "metric": "precision",
+      "a": "codex-high",
+      "b": "claude-high",
+      "diff": -0.04441634572620856,
+      "p": 0.07179282071792821,
+      "p_holm": 0.07179282071792821,
+      "winner": "none",
+      "mde": 0.07363995054766498
+    },
+    {
+      "metric": "precision",
+      "a": "codex-high",
+      "b": "agy-high",
+      "diff": -0.2951357517681955,
+      "p": 9.999000099990002e-05,
+      "p_holm": 0.00029997000299970003,
+      "winner": "agy-high",
+      "mde": 0.09476509296792664
+    },
+    {
+      "metric": "precision",
+      "a": "claude-high",
+      "b": "agy-high",
+      "diff": -0.25071940604198695,
+      "p": 9.999000099990002e-05,
+      "p_holm": 0.00029997000299970003,
+      "winner": "agy-high",
+      "mde": 0.09904879602341803
+    }
+  ],
+  "realbug_tasks_dropped": [
+    "rb-py-lmcache-4748",
+    "rb-ts-codex-security-1729",
+    "rb-ts-oh-my-opencode-slim-1366"
+  ],
+  "kendall_tau_realbugs": {
+    "tau": -1.0,
+    "p": 0.3333333333333333,
+    "systems": 3
+  },
+  "loo_repo": [
+    {
+      "left_out": "none",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:authz-py",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:booking-java",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:etl-py",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:gateway-go",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:jobqueue-go",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:ledger-ts",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:sync-ts",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:uploads-ts",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "repo:workflow-java",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    }
+  ],
+  "loo_judge": [
+    {
+      "left_out": "none",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "judge:agy",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "judge:claude",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    },
+    {
+      "left_out": "judge:codex",
+      "ranking": [
+        "agy-high",
+        "claude-high",
+        "codex-high"
+      ]
+    }
+  ],
+  "unplanted": [
+    {
+      "system": "codex-high",
+      "pooled_bugs": 60,
+      "found_any": 48,
+      "wrecall": 0.7285223367697595
+    },
+    {
+      "system": "claude-high",
+      "pooled_bugs": 60,
+      "found_any": 47,
+      "wrecall": 0.5549828178694158
+    },
+    {
+      "system": "agy-high",
+      "pooled_bugs": 60,
+      "found_any": 14,
+      "wrecall": 0.1546391752577319
+    }
+  ]
+}

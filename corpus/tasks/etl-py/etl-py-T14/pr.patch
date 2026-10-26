@@ -1,0 +1,465 @@
+diff --git a/README.md b/README.md
+index 2ae945d..6637340 100644
+--- a/README.md
++++ b/README.md
+@@ -82,6 +82,10 @@ newer data.
+ A PostgreSQL advisory lock per source stops two runs of one source at once (`RunLocked`); a
+ run left `running` by a process that died is marked failed by the next run. Everything a run
+ writes to the warehouse, the watermark and its check results commit together or not at all.
++`runs prune` deletes runs that finished more than DAYS × 24 hours ago, with their rejects and
++check results, except runs a warehouse row still names (`run_id`), the latest succeeded run of
++each source (the row-count delta checks compare with it) and runs in progress. It asks for
++confirmation first (`--yes` skips the question); `--dry-run` only counts them.
+ 
+ **Quality checks.** Declared per table in `src/etl/quality/registry.py`: not-null, unique,
+ accepted values, referential (every order's customer exists) and row-count delta against the
+@@ -105,6 +109,7 @@ etl run <source> <path> [--json]             load one export file
+ etl status [--source S] [--json]             per source: running?, watermark, latest runs
+ etl runs list [--source S] [--status S] [--limit N] [--json]
+ etl runs show <run-id> [--json]              counts, check results, reject reasons
++etl runs prune --older-than DAYS [--dry-run] [--yes]
+ etl rejects list <run-id> [--reason R] [--after LINE] [--limit N] [--json]
+ etl rejects prune --before D [--source S] [--yes]
+ etl checks list [--source S] [--json]        declared checks and their last results
+diff --git a/migrations/versions/0005_run_references.py b/migrations/versions/0005_run_references.py
+new file mode 100644
+index 0000000..c8ae251
+--- /dev/null
++++ b/migrations/versions/0005_run_references.py
+@@ -0,0 +1,27 @@
++"""warehouse: indexes on run_id of the dimensions, for run history pruning
++
++Revision ID: 0005
++Revises: 0004
++Create Date: 2026-10-12 09:00:00+00:00
++"""
++
++from collections.abc import Sequence
++
++from alembic import op
++
++revision: str = "0005"
++down_revision: str | None = "0004"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    # `etl runs prune` looks for rows that still name a run, and deleting a run makes the
++    # server check every foreign key to it; orders already have ix_orders_run_id.
++    op.create_index("ix_products_run_id", "products", ["run_id"], schema="warehouse")
++    op.create_index("ix_customers_run_id", "customers", ["run_id"], schema="warehouse")
++
++
++def downgrade() -> None:
++    op.drop_index("ix_customers_run_id", table_name="customers", schema="warehouse")
++    op.drop_index("ix_products_run_id", table_name="products", schema="warehouse")
+diff --git a/src/etl/api/runs.py b/src/etl/api/runs.py
+index 5bf04c3..53c6d0f 100644
+--- a/src/etl/api/runs.py
++++ b/src/etl/api/runs.py
+@@ -1,17 +1,28 @@
+-"""Operations on runs: start one, list them, show one."""
++"""Operations on runs: start one, list them, show one, prune old ones."""
+ 
+ from __future__ import annotations
+ 
++from datetime import timedelta
+ from pathlib import Path
+ 
+ from etl.api.context import AppContext
+ from etl.errors import InvalidRequest, RunNotFound
+-from etl.schemas.views import CheckResultView, RejectReasonView, RunDetail, RunView
++from etl.logging import get_logger
++from etl.schemas.views import (
++    CheckResultView,
++    RejectReasonView,
++    RunDetail,
++    RunsPruneView,
++    RunView,
++)
+ from etl.sources.registry import get_source
+ from etl.store import check_results, rejects, runs
+ from etl.store.runs import RunStatus
+ 
+ MAX_LIST_LIMIT = 1000
++MAX_RETENTION_DAYS = 36_500
++
++log = get_logger(__name__)
+ 
+ 
+ def run_source(context: AppContext, source: str, path: Path) -> RunView:
+@@ -57,3 +68,35 @@ def show_run(context: AppContext, run_id: int) -> RunDetail:
+             for reason in reasons
+         ],
+     )
++
++
++def prune_runs(
++    context: AppContext, *, older_than_days: int, dry_run: bool = False
++) -> RunsPruneView:
++    """Delete the runs that finished more than `older_than_days` times 24 hours ago and that
++    nothing needs any more (store.runs.prunable), with their rejects and check results. With
++    `dry_run`, only count them."""
++    if not 1 <= older_than_days <= MAX_RETENTION_DAYS:
++        raise InvalidRequest(f"--older-than must be between 1 and {MAX_RETENTION_DAYS} days")
++    before = context.clock.now() - timedelta(days=older_than_days)
++    with context.engine.begin() as connection:
++        run_ids = runs.prunable(connection, finished_before=before, lock=not dry_run)
++        if dry_run:
++            counts = runs.dependants(connection, run_ids)
++        else:
++            counts = runs.delete_runs(connection, run_ids)
++    if not dry_run:
++        log.info(
++            "runs.pruned",
++            before=before.isoformat(),
++            runs=counts.runs,
++            rejects=counts.rejects,
++            check_results=counts.check_results,
++        )
++    return RunsPruneView(
++        before=before,
++        dry_run=dry_run,
++        runs=counts.runs,
++        rejects=counts.rejects,
++        check_results=counts.check_results,
++    )
+diff --git a/src/etl/cli/runs.py b/src/etl/cli/runs.py
+index d994fc1..563e00d 100644
+--- a/src/etl/cli/runs.py
++++ b/src/etl/cli/runs.py
+@@ -1,4 +1,4 @@
+-"""`etl runs list` and `etl runs show <id>`."""
++"""`etl runs list`, `etl runs show <id>` and `etl runs prune`."""
+ 
+ from typing import Annotated
+ 
+@@ -80,3 +80,41 @@ def show_command(
+             "\nrejects\n" + render_table(["reason", "rows", "first line"], rows, right=(1, 2))
+         )
+     typer.echo("\n".join(parts))
++
++
++@runs_app.command("prune")
++@guarded
++def prune_command(
++    ctx: typer.Context,
++    older_than: Annotated[
++        int,
++        typer.Option(
++            "--older-than",
++            metavar="DAYS",
++            help="Delete runs that finished more than DAYS days (of 24 hours) ago.",
++            min=1,
++            max=runs_api.MAX_RETENTION_DAYS,
++        ),
++    ],
++    dry_run: Annotated[
++        bool, typer.Option("--dry-run", help="Only count what would be deleted.")
++    ] = False,
++    yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
++) -> None:
++    """Delete old runs with their rejects and check results.
++
++    Runs that warehouse rows still name, the latest succeeded run of each source and runs in
++    progress are kept.
++    """
++    question = (
++        f"Delete the runs that finished more than {older_than} days ago, with their rejects"
++        " and check results?"
++    )
++    if not dry_run and not yes and not typer.confirm(question):
++        raise typer.Abort()
++    view = runs_api.prune_runs(app_context(ctx), older_than_days=older_than, dry_run=dry_run)
++    verb = "would delete" if view.dry_run else "deleted"
++    typer.echo(
++        f"{verb} {view.runs} runs finished before {format_time(view.before)}"
++        f" ({view.rejects} rejects, {view.check_results} check results)"
++    )
+diff --git a/src/etl/infra/tables.py b/src/etl/infra/tables.py
+index efeba2d..c9b0e2c 100644
+--- a/src/etl/infra/tables.py
++++ b/src/etl/infra/tables.py
+@@ -128,6 +128,7 @@ products = Table(
+     Column("updated_at", TZ, nullable=False),
+     Column("loaded_at", TZ, nullable=False),
+     Column("run_id", BigInteger, ForeignKey("etl.runs.id"), nullable=False),
++    Index("ix_products_run_id", "run_id"),
+     schema=WAREHOUSE_SCHEMA,
+ )
+ 
+@@ -158,6 +159,7 @@ customers = Table(
+         postgresql_where=text("is_current"),
+     ),
+     Index("ix_customers_customer_id_valid_from", "customer_id", "valid_from"),
++    Index("ix_customers_run_id", "run_id"),
+     schema=WAREHOUSE_SCHEMA,
+ )
+ 
+diff --git a/src/etl/schemas/views.py b/src/etl/schemas/views.py
+index c5592cf..c868442 100644
+--- a/src/etl/schemas/views.py
++++ b/src/etl/schemas/views.py
+@@ -140,6 +140,15 @@ class PruneView(View):
+     deleted: int
+ 
+ 
++class RunsPruneView(View):
++    # Runs that finished before this instant were considered.
++    before: datetime
++    dry_run: bool
++    runs: int
++    rejects: int
++    check_results: int
++
++
+ class DatabaseView(View):
+     server_version: str
+     current_revision: str | None
+diff --git a/src/etl/store/runs.py b/src/etl/store/runs.py
+index a5405d5..f638165 100644
+--- a/src/etl/store/runs.py
++++ b/src/etl/store/runs.py
+@@ -2,13 +2,28 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Sequence
+ from dataclasses import dataclass
+ from datetime import datetime
+ from enum import StrEnum
++from typing import Any
+ 
+-from sqlalchemy import Connection, RowMapping, insert, select, update
++from sqlalchemy import (
++    BigInteger,
++    Column,
++    Connection,
++    RowMapping,
++    bindparam,
++    delete,
++    exists,
++    func,
++    insert,
++    select,
++    update,
++)
++from sqlalchemy.dialects.postgresql import ARRAY
+ 
+-from etl.infra.tables import runs
++from etl.infra.tables import check_results, metadata, rejects, runs
+ 
+ 
+ class RunStatus(StrEnum):
+@@ -157,3 +172,94 @@ def last_succeeded(connection: Connection, source: str) -> RunRecord | None:
+         .first()
+     )
+     return RunRecord.from_row(row) if row is not None else None
++
++
++@dataclass(frozen=True, slots=True)
++class PruneCounts:
++    runs: int = 0
++    rejects: int = 0
++    check_results: int = 0
++
++
++def _keeping_columns() -> list[Column[Any]]:
++    """Columns whose rows keep the run they name: the foreign keys to etl.runs that do not
++    cascade (`run_id` of the warehouse tables). Rejects and check results go with their run."""
++    return [
++        fk.parent
++        for table in metadata.sorted_tables
++        for fk in table.foreign_keys
++        if fk.column is runs.c.id and (fk.ondelete or "").upper() != "CASCADE"
++    ]
++
++
++def prunable(connection: Connection, *, finished_before: datetime, lock: bool) -> list[int]:
++    """Ids of the runs that finished before `finished_before` and that nothing needs any more:
++    no warehouse row names them, and none is the latest succeeded run of its source (row-count
++    delta checks compare with what that run observed). Runs in progress are never included.
++
++    With `lock`, the rows stay locked until the transaction ends.
++    """
++    latest_succeeded = (
++        select(func.max(runs.c.id))
++        .where(runs.c.status == RunStatus.SUCCEEDED)
++        .group_by(runs.c.source)
++    )
++    statement = (
++        select(runs.c.id)
++        .where(
++            runs.c.status != RunStatus.RUNNING,
++            runs.c.finished_at < finished_before,
++            runs.c.id.not_in(latest_succeeded),
++            *(~exists().where(column == runs.c.id) for column in _keeping_columns()),
++        )
++        .order_by(runs.c.id)
++    )
++    if lock:
++        statement = statement.with_for_update()
++    return [int(run_id) for run_id in connection.execute(statement).scalars()]
++
++
++def _among(run_ids: Sequence[int]) -> Any:
++    # One array parameter, however many runs there are.
++    return select(func.unnest(bindparam("run_ids", list(run_ids), ARRAY(BigInteger))))
++
++
++def dependants(connection: Connection, run_ids: Sequence[int]) -> PruneCounts:
++    """How many runs, rejects and check results deleting `run_ids` would remove."""
++    if not run_ids:
++        return PruneCounts()
++    among = _among(run_ids)
++    counted = connection.execute(
++        select(
++            select(func.count())
++            .select_from(rejects)
++            .where(rejects.c.run_id.in_(among))
++            .scalar_subquery(),
++            select(func.count())
++            .select_from(check_results)
++            .where(check_results.c.run_id.in_(among))
++            .scalar_subquery(),
++        )
++    ).one()
++    return PruneCounts(runs=len(run_ids), rejects=int(counted[0]), check_results=int(counted[1]))
++
++
++def delete_runs(connection: Connection, run_ids: Sequence[int]) -> PruneCounts:
++    """Delete the runs `run_ids` with their rejects and check results.
++
++    The foreign keys of rejects and check results cascade; they are deleted first anyway, so
++    that they can be counted.
++    """
++    if not run_ids:
++        return PruneCounts()
++    among = _among(run_ids)
++    deleted_rejects = connection.execute(delete(rejects).where(rejects.c.run_id.in_(among)))
++    deleted_checks = connection.execute(
++        delete(check_results).where(check_results.c.run_id.in_(among))
++    )
++    deleted_runs = connection.execute(delete(runs).where(runs.c.id.in_(among)))
++    return PruneCounts(
++        runs=deleted_runs.rowcount,
++        rejects=deleted_rejects.rowcount,
++        check_results=deleted_checks.rowcount,
++    )
+diff --git a/tests/cli/test_runs_commands.py b/tests/cli/test_runs_commands.py
+index 3c8c178..f1b4c41 100644
+--- a/tests/cli/test_runs_commands.py
++++ b/tests/cli/test_runs_commands.py
+@@ -86,3 +86,38 @@ def test_runs_show_of_an_unknown_run_exits_with_not_found(cli, db):
+ 
+     assert result.exit_code == 4
+     assert "run 999 does not exist" in result.stderr
++
++
++def test_runs_prune_reports_what_it_deletes(cli, clock, tmp_path):
++    cli("run", "products", write_products(tmp_path, [product_row()]))
++    cli("run", "products", write_products(tmp_path, [product_row(price="abc")] * 3))
++    clock.advance(days=8)
++
++    dry = cli("runs", "prune", "--older-than", "7", "--dry-run")
++    pruned = cli("runs", "prune", "--older-than", "7", "--yes")
++
++    assert dry.exit_code == 0, dry.output
++    assert dry.stdout.strip() == (
++        "would delete 1 runs finished before 2026-04-02 08:00:00Z (3 rejects, 0 check results)"
++    )
++    assert pruned.stdout.startswith("deleted 1 runs")
++    assert json.loads(cli("runs", "list", "--json").stdout)[0]["id"] == 1
++    assert cli("runs", "prune", "--older-than", "0").exit_code == 2
++
++
++def test_runs_prune_asks_before_deleting(cli, clock, tmp_path):
++    cli("run", "products", write_products(tmp_path, [product_row()]))
++    cli("run", "products", write_products(tmp_path, [product_row(price="abc")] * 3))
++    clock.advance(days=8)
++
++    declined = cli("runs", "prune", "--older-than", "7", input="n\n")
++
++    assert declined.exit_code == 1
++    assert "Delete the runs that finished more than 7 days ago" in declined.stdout
++    assert len(json.loads(cli("runs", "list", "--json").stdout)) == 2
++
++    accepted = cli("runs", "prune", "--older-than", "7", input="y\n")
++
++    assert accepted.exit_code == 0, accepted.output
++    assert "deleted 1 runs" in accepted.stdout
++    assert len(json.loads(cli("runs", "list", "--json").stdout)) == 1
+diff --git a/tests/pipeline/test_run_pruning.py b/tests/pipeline/test_run_pruning.py
+new file mode 100644
+index 0000000..e54a5e3
+--- /dev/null
++++ b/tests/pipeline/test_run_pruning.py
+@@ -0,0 +1,67 @@
++from __future__ import annotations
++
++from datetime import timedelta
++
++import pytest
++
++from etl.api.runs import prune_runs
++from etl.errors import InvalidRequest, TooManyRejects
++from etl.infra.tables import check_results, products, rejects, runs
++from tests.helpers.db import count, rows
++from tests.helpers.factories import product_row, write_products
++
++
++def product_history(pipeline, clock, tmp_path):
++    """Runs 1 and 2 are superseded, run 3 failed, run 4 holds the product."""
++    for updated_at in ("2026-03-01T09:00:00Z", "2026-03-02T09:00:00Z"):
++        pipeline.run("products", write_products(tmp_path, [product_row(updated_at=updated_at)]))
++        clock.advance(hours=1)
++    with pytest.raises(TooManyRejects):
++        pipeline.run("products", write_products(tmp_path, [product_row(price="abc")] * 3))
++    clock.advance(hours=1)
++    pipeline.run(
++        "products", write_products(tmp_path, [product_row(updated_at="2026-03-03T09:00Z")])
++    )
++
++
++def test_runs_nothing_needs_are_deleted_with_their_rejects_and_checks(
++    pipeline, context, clock, tmp_path
++):
++    product_history(pipeline, clock, tmp_path)
++    clock.advance(days=31)
++
++    view = prune_runs(context, older_than_days=30)
++
++    assert (view.runs, view.rejects, view.check_results) == (3, 3, 8)
++    assert view.before == clock.now() - timedelta(days=30)
++    assert [run["id"] for run in rows(context.engine, runs)] == [4]
++    assert count(context.engine, rejects) == 0
++    assert {row["run_id"] for row in rows(context.engine, check_results)} == {4}
++    assert [row["run_id"] for row in rows(context.engine, products)] == [4]
++
++
++def test_recent_runs_are_kept(pipeline, context, clock, tmp_path):
++    product_history(pipeline, clock, tmp_path)
++    clock.advance(days=29)
++
++    view = prune_runs(context, older_than_days=30)
++
++    assert view.runs == 0
++    assert count(context.engine, runs) == 4
++
++
++def test_a_dry_run_counts_without_deleting(pipeline, context, clock, tmp_path):
++    product_history(pipeline, clock, tmp_path)
++    clock.advance(days=31)
++
++    dry = prune_runs(context, older_than_days=30, dry_run=True)
++
++    assert (dry.dry_run, dry.runs, dry.rejects, dry.check_results) == (True, 3, 3, 8)
++    assert count(context.engine, runs) == 4
++    assert count(context.engine, rejects) == 3
++
++
++def test_the_retention_must_be_a_positive_number_of_days(context, db):
++    for days in (0, -1, 36_501):
++        with pytest.raises(InvalidRequest, match="--older-than"):
++            prune_runs(context, older_than_days=days)

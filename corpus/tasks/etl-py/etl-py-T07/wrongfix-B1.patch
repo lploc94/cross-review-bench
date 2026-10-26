@@ -1,0 +1,32 @@
+diff --git a/src/etl/errors.py b/src/etl/errors.py
+index d36b39e..416a46d 100644
+--- a/src/etl/errors.py
++++ b/src/etl/errors.py
+@@ -94,9 +94,25 @@ class SchemaMismatch(EtlError):
+         super().__init__(f"{source}: " + "; ".join(problems))
+ 
+ 
+-class SchemaDrift(SchemaMismatch):
++class SchemaDrift(EtlError):
+     """The header names undeclared columns or lacks declared optional ones, and the source's
+-    drift policy is `fail`. Nothing was loaded; the drift is recorded with the failed run."""
++    drift policy is `fail`. Nothing was loaded; the drift is recorded with the failed run.
++
++    Not a SchemaMismatch: the file has every required column, so it must not exit like a file
++    that lacks some."""
++
++    def __init__(
++        self, source: str, *, missing: Sequence[str] = (), undeclared: Sequence[str] = ()
++    ) -> None:
++        self.source = source
++        self.missing = list(missing)
++        self.undeclared = list(undeclared)
++        problems = []
++        if self.missing:
++            problems.append("missing columns: " + ", ".join(self.missing))
++        if self.undeclared:
++            problems.append("undeclared columns: " + ", ".join(self.undeclared))
++        super().__init__(f"{source}: " + "; ".join(problems))
+ 
+ 
+ class TooManyRejects(EtlError):

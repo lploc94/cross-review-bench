@@ -1,0 +1,15 @@
+export { ClientClosedError, PULL_LIMIT, PUSH_BATCH, SyncClient } from "./sync/syncClient.js";
+export type { ListPage, LocalWrite, SyncClientOptions, SyncResult, TypedDocument } from "./sync/syncClient.js";
+export { INITIAL_SYNC_STATE, describeSyncError, type SyncState, type SyncStateListener } from "./sync/syncState.js";
+export { ChangeEmitter, rethrowLater, type ChangeListener, type DocumentChange } from "./sync/changes.js";
+export { checkPage } from "./sync/pullPhase.js";
+export { IN_MEMORY, openDatabase, type SqliteDatabase } from "./store/database.js";
+export { CorruptStoreError, SchemaVersionError } from "./store/errors.js";
+export { META_KEYS } from "./store/metaStore.js";
+export { migrate, schemaVersion, type MigrationOutcome } from "./store/migrator.js";
+export { CLIENT_MIGRATIONS, CLIENT_SCHEMA_VERSION, type SchemaMigration } from "./store/schema.js";
+export { HttpError, InvalidResponseError, NetworkError, ProtocolMismatchError, isRetryableStatus } from "./transport/errors.js";
+export { DEFAULT_HTTP_TIMEOUT_MS, HttpTransport, type HttpTransportOptions } from "./transport/httpTransport.js";
+export type { SyncTransport } from "./transport/transport.js";
+export { DEVICES_PATH, ME_PATH, PULL_PATH, PUSH_PATH, STATUS_PATH, WireTransport, decode, errorFromResponse } from "./transport/wire.js";
+export type { WireRequest, WireResponse } from "./transport/wire.js";

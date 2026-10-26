@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T08",
+  "repo": "booking-java",
+  "kind": "buggy",
+  "title": "Channel allotments: rooms kept for a sales channel until a release day",
+  "description": "Tour operators and OTAs we work with want a guaranteed share of rooms on their dates, handed back to us if they have not sold them a few days before the stay. This adds channel allotments.\n\n- New table `allotment` (V2): rooms of one room type kept for a channel on one night, with the day they are released (`release_on` = night minus `releaseDays`).\n- `PUT /api/v1/admin/properties/{code}/room-types/{roomType}/allotments/{channel}` with `{from, to, rooms, releaseDays}` (`to` exclusive, as for inventory ranges) sets or replaces the allotment for every night of the range. Each night needs an inventory row with at least `rooms` rooms in total; channel names are lowercase letters, digits and dashes.\n- Until its release day (property-local date) an allotment's rooms are out of public sale: the availability search, the calendar and `POST /api/v1/properties/{code}/holds` no longer count them as free. Public holds use a new conditional update, `InventoryRepository.holdRoomsForSale`, that subtracts the unreleased allotments in the same statement, so the check stays atomic. From the release day on the rooms are sold like any others.\n- `POST /api/v1/admin/properties/{code}/channels/{channel}/holds` (admin, same body as a public hold) creates a hold for a channel: on each night it first takes what is left of that channel's unreleased allotment (row lock, ascending nights as before) and public rooms for the rest. The hold is then confirmed or released through the usual routes; rooms it took go back to public sale, not to the allotment.\n- Availability now reads per-night inventory (`findForProperty`) instead of the per-type summary query, which is removed.\n- README: allotments concept and the two routes.\n\nTests: kept rooms before and on the release day (availability, calendar, public hold), channel holds using their own allotment first and not another channel's, replacing an allotment, and the admin API (rows and release days, invalid channel, more rooms than the total, a night without inventory, the channel hold route).",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/innkeep/booking/service/AllotmentService.java",
+      "lines": [
+        141,
+        142
+      ],
+      "category": "boundary",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "AllotmentService.today(), which both holdNights (public and channel holds) and kept (availability search and calendar) use for the release check, is LocalDate.now(clock). The clock is Clock.systemUTC() (ClockConfig), so today is the UTC date, while release_on is a property-local date and the rest of the service compares with LocalDate.ofInstant(clock.instant(), property.zone()) (HoldService.create, confirm). For properties east of UTC the rooms are released up to a day late (after local midnight but before UTC midnight they are still kept); west of UTC they are released up to a day early, in the local evening before the release day.",
+      "trigger": "Property in Pacific/Auckland, 2 rooms on 2027-05-05 all kept for a channel with releaseDays 3 (release_on 2027-05-02). At 2027-05-01T12:30Z it is 00:30 on May 2 in Auckland, so the rooms should be on sale, but availability shows none and a public hold for them is refused (409). Mirror case: America/Los_Angeles at 2027-05-02T03:00Z (20:00 on May 1 locally) already sells the kept rooms.",
+      "testable": true,
+      "hidden_tests": [
+        "src/test/java/com/innkeep/booking/service/AllotmentReleaseDayTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=AllotmentReleaseDayTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "There is no time zone issue in the release check. release_on is a plain DATE computed from the night, and the night is already the property's local date, so comparing it with LocalDate.now(clock) is a date-to-date comparison; the clock bean from ClockConfig is the service's single time source and the same one HoldService uses, so the release check and the hold path cannot disagree about what today is.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

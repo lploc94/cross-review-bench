@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T13",
+  "repo": "jobqueue-go",
+  "kind": "clean",
+  "title": "Job progress reporting from handlers",
+  "description": "Long jobs (exports, imports, the `sleep` load test) are a black box until they finish: the API only says `running`. Handlers can now report how far they have got.\n\n- `worker.ReportProgress(ctx, percent, message)` from inside a handler: percent 0–100, an optional message of at most 200 bytes (valid UTF-8, no NUL). Each report replaces the previous one. Outside a job it returns `ErrNoLease`; an invalid report is a `domain.ValidationError`.\n- `store.ReportProgress` writes it to a new `jobs.progress jsonb` column (migration 0003) as `{percent, message, updated_at}`, conditional on `state = 'running' AND locked_by = $worker` like `ExtendLease`, so a worker whose job was reaped gets `ErrLeaseLost` and cannot overwrite the next attempt's progress.\n- The progress stays after the attempt ends (a failed or dead job shows how far it got); `Lease` clears it for the next attempt and `Requeue` clears it too.\n- `GET /v1/jobs/{id}` (and every job in listings) includes `progress`, null until the attempt reports. `client.Job.Progress`; `jobctl wait` prints each new report to stderr.\n- The `sleep` built-in reports progress every time it extends its lease (`slept 1m0s of 2m30s`).\n\nTests: validation, store reports (owner, other worker, after completion, cleared on the next lease and on requeue), the pool passing the lease to `ReportProgress`, the sleep handler against the real store with the manual clock, the API representation and `jobctl wait`. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["internal/store/progress_owner_test.go"],
+  "clean_hidden_test_cmd": "go test -count=1 -run '^(TestProgressOfAReapedAttemptIsRejected|TestProgressLimits)$' ./internal/store/"
+}

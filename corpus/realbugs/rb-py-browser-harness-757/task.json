@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-py-browser-harness-757",
+  "repo": "rb-py-browser-harness-757",
+  "kind": "realbug",
+  "title": "Add consent-based browser recordings and reusable video production",
+  "description": "## Summary\n\n- add consent-based local browser action recording, exact recording provenance, and `recordings` status/latest/enable/disable commands\n- add `browser-harness video init|review|export` for short explanatory videos made from captured frames\n- preserve the established visual style: raw browser frames, cursor-led camera, fast click results, concise subtitles, causal explanation cards, and verified outcome cards\n- keep fresh installs off by default while treating natural “record/show/demo” requests as task-level opt-in\n\n## One skill, one feature\n\nVideo is now part of browser-harness itself rather than a separately installed skill:\n\n- the main `SKILL.md` owns capture/consent behavior and links one short `interaction-skills/make-video.md` guide\n- renderer constants live in code; there is no `openai.yaml`, separate skill package, or editable “house style” JSON\n- initialization, compilation, review, and export are normal installed CLI functionality\n- the wheel ships the renderer template, so the feature works outside a repository checkout\n\nThis revision removed 1,130 lines from the previous version. The PR now has 13 changed files, four of which are the actual new product implementation: recorder, video compiler/CLI, renderer/exporter, and HTML renderer. It adds no test files or test changes.\n\n## Editorial regression guard\n\nThe canonical guide now retains the full editing contract from the pre-consolidation skill: causal intent → action → result sequencing, sticky narration that spans 2–3 changing screenshots, authentic captured clicks/cursor/typing, complete evidence coverage, useful Observed → Mistake → Correction detours, semantic routes, and verified outcomes. The compiler rejects mechanical one-caption-per-frame cuts, and accepts up to two pixels of harmless viewport drift so a real click is not discarded for a one-pixel browser resize.\n\nThe renderer template is byte-for-byte unchanged from the pre-consolidation implementation, and all pacing/motion constants remain identical.\n\n## Safety and authenticity\n\n- source URLs are dropped at ingest and recording sources are content-hashed\n- typed text is private by default; reviewed non-password evidence requires explicit `showTyping`\n- selected source/result frames must share a viewport, allowing only two pixels of harmless browser resize drift, so page-coordinate masks cannot drift materially\n- export rejects changed evidence, briefs, compositions, renderers, or review artifacts\n- captured evidence is never reenacted; post-task recordings require timestamp/page verification\n- privacy detection is documented as a backstop, not a guarantee; every used full-resolution frame must be reviewed\n\n## Performance and validation\n\nCold-agent validation using only the main skill and make-video guide:\n\n- `video init`: passed\n- `video review`: 0 errors/warnings\n- independent clean agent produced a 16.19s H.264 MP4 with six action frames, two narration cues, all five requested result screens, and the real captured click\n- the previously good cut still passes, while the mechanical five-screens/five-captions cut is now rejected\n- visual style and normal/reduced-motion sequences preserved\n- wheel build includes the CLI modules and renderer template\n- skill validation and Python compilation passed\n\nThe dominant export cost remains the required real-time canvas capture.\n\n## Release\n\nThis PR bumps browser-harness from `0.1.5` to `0.1.6`.\n\n\n## Live-browser cleanup\n\nReview and export now restore media emulation and the original live-browser attachment before closing their editor tab. Export always restores Chrome’s default download behavior and fails clearly if that restoration cannot be confirmed. `BH_RECORD=0` now refuses explicit recording instead of producing an unusable boundary-only trace. These changes do not touch the renderer, compiler, pacing, camera, or editorial heuristics.\n\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/browser_harness/video_render.py",
+      "lines": [
+        334,
+        335
+      ],
+      "category": "logic",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "_start_export always points Chrome download behavior at the recording directory and passes only webm.name, while export() polls for output.with_suffix(\".webm\") next to the requested --output; for a nested or absolute --output (exports/video.mp4, /elsewhere/video.mp4) the webm lands in the recording directory, the poll never sees it and the export times out (and a nested output directory is never created).",
+      "trigger": "Run browser-harness video export with --output exports/video.mp4 (or an absolute path outside the recording directory) after a successful review.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "tests/unit/test_video_render.py"
+      ],
+      "hidden_test_cmd": ".venv/bin/python -m pytest -q -p no:cacheprovider tests/unit/test_video_render.py"
+    }
+  ]
+}

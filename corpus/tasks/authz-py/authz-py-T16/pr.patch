@@ -1,0 +1,217 @@
+diff --git a/README.md b/README.md
+index 20ef4f0..75f43e6 100644
+--- a/README.md
++++ b/README.md
+@@ -28,9 +28,11 @@ two tokens:
+   whose session was revoked or has expired, answers 401.
+ 
+ `POST /v1/auth/logout` revokes the current session; `GET /v1/sessions` lists the caller's open
+-sessions and `DELETE /v1/sessions/{id}` revokes one of them. Login failures all look alike (same
+-status, body and, through a dummy argon2 verification for unknown addresses, similar timing), so
+-the API does not reveal which addresses have accounts.
++sessions and `DELETE /v1/sessions/{id}` revokes one of them. `POST /v1/sessions/revoke-others`
++signs out everywhere else: it revokes every other open session of the caller and answers their
++ids (`{"revoked": [...]}`); the current session stays signed in. Login failures all look alike
++(same status, body and, through a dummy argon2 verification for unknown addresses, similar
++timing), so the API does not reveal which addresses have accounts.
+ 
+ **Rate limits.** Fixed-window counters in Redis (INCR and EXPIRE in one Lua script): logins per
+ (email, client IP), refreshes per client IP. Over the limit the API answers 429 with
+@@ -96,6 +98,7 @@ cursor.
+ | GET, PATCH | `/v1/me` | access token |
+ | GET | `/v1/sessions` | access token |
+ | DELETE | `/v1/sessions/{session_id}` | access token (own sessions) |
++| POST | `/v1/sessions/revoke-others` | access token |
+ | GET | `/v1/permissions` | access token |
+ | POST, GET | `/v1/orgs` | access token |
+ | GET | `/v1/orgs/{org_id}` | `org:read` |
+diff --git a/src/authz/api/routers/account.py b/src/authz/api/routers/account.py
+index 860a161..494b74d 100644
+--- a/src/authz/api/routers/account.py
++++ b/src/authz/api/routers/account.py
+@@ -7,7 +7,12 @@ import uuid
+ from fastapi import APIRouter, Response, status
+ 
+ from authz.api.deps import ContainerDep, PrincipalDep
+-from authz.api.schemas.auth import ProfileUpdate, SessionResponse, UserResponse
++from authz.api.schemas.auth import (
++    ProfileUpdate,
++    RevokedSessionsResponse,
++    SessionResponse,
++    UserResponse,
++)
+ from authz.api.schemas.common import ListResponse
+ 
+ router = APIRouter(prefix="/v1", tags=["account"])
+@@ -34,6 +39,13 @@ async def list_sessions(
+     return ListResponse(data=[SessionResponse.of(view) for view in views])
+ 
+ 
++@router.post("/sessions/revoke-others", response_model=RevokedSessionsResponse)
++async def revoke_other_sessions(
++    principal: PrincipalDep, container: ContainerDep
++) -> RevokedSessionsResponse:
++    return RevokedSessionsResponse(revoked=await container.sessions.revoke_others(principal))
++
++
+ @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+ async def revoke_session(
+     session_id: uuid.UUID, principal: PrincipalDep, container: ContainerDep
+diff --git a/src/authz/api/schemas/auth.py b/src/authz/api/schemas/auth.py
+index ab2fd1e..9f6d8f0 100644
+--- a/src/authz/api/schemas/auth.py
++++ b/src/authz/api/schemas/auth.py
+@@ -80,3 +80,7 @@ class SessionResponse(ResponseModel):
+             expires_at=row.expires_at,
+             current=view.current,
+         )
++
++
++class RevokedSessionsResponse(ResponseModel):
++    revoked: list[uuid.UUID]
+diff --git a/src/authz/repositories/sessions.py b/src/authz/repositories/sessions.py
+index ec3e179..8bad952 100644
+--- a/src/authz/repositories/sessions.py
++++ b/src/authz/repositories/sessions.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import uuid
+ from datetime import datetime
+ 
+-from sqlalchemy import select
++from sqlalchemy import select, update
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from authz.models import RefreshToken, Session
+@@ -79,6 +79,24 @@ class SessionRepository:
+         await self._session.flush()
+         return True
+ 
++    async def revoke_all_except(
++        self, user_id: uuid.UUID, keep: uuid.UUID, now: datetime, reason: str
++    ) -> list[uuid.UUID]:
++        """Revoke every active session of a user but `keep`, in one statement; their ids."""
++        result = await self._session.execute(
++            update(Session)
++            .where(
++                Session.user_id == user_id,
++                Session.id != keep,
++                Session.revoked_at.is_(None),
++                Session.expires_at > now,
++            )
++            .values(revoked_at=now, revoked_reason=reason)
++            .returning(Session.id)
++            .execution_options(synchronize_session=False)
++        )
++        return list(result.scalars())
++
+ 
+ class RefreshTokenRepository:
+     def __init__(self, session: AsyncSession) -> None:
+diff --git a/src/authz/services/users.py b/src/authz/services/users.py
+index cb7343e..f90bd9b 100644
+--- a/src/authz/services/users.py
++++ b/src/authz/services/users.py
+@@ -118,3 +118,19 @@ class SessionService:
+                 raise NotFoundError("session")
+             await sessions.revoke(row, self._clock.now(), "revoked_by_user")
+         log.info("session.revoked", user_id=str(principal.user_id), session_id=str(session_id))
++
++    async def revoke_others(self, principal: Principal) -> list[uuid.UUID]:
++        """Sign the caller out everywhere else: revoke every other active session of theirs."""
++        if principal.session_id is None:
++            raise InvalidInputError("only a login session can sign out the other sessions")
++        async with self._db.transaction() as session:
++            revoked = await SessionRepository(session).revoke_all_except(
++                principal.user_id, principal.session_id, self._clock.now(), "revoked_others"
++            )
++        log.info(
++            "session.revoked_others",
++            user_id=str(principal.user_id),
++            kept_session_id=str(principal.session_id),
++            revoked=len(revoked),
++        )
++        return revoked
+diff --git a/tests/api/test_sessions.py b/tests/api/test_sessions.py
+index d6a75ee..e3bc0aa 100644
+--- a/tests/api/test_sessions.py
++++ b/tests/api/test_sessions.py
+@@ -1,7 +1,12 @@
+ from __future__ import annotations
+ 
++import uuid
++
++from sqlalchemy import update
++
++from authz.models import Session
+ from tests.helpers.clock import FrozenClock
+-from tests.helpers.factories import login, signed_in
++from tests.helpers.factories import bearer, login, signed_in
+ 
+ 
+ async def test_lists_own_active_sessions_and_marks_the_current_one(client, container):
+@@ -53,3 +58,65 @@ async def test_refresh_updates_last_used(client, container, clock: FrozenClock):
+     listed = (await client.get("/v1/sessions", headers=headers)).json()["data"]
+ 
+     assert listed[0]["last_used_at"] > listed[0]["created_at"]
++
++
++async def test_revoking_the_other_sessions_keeps_the_current_one(client, container):
++    me = await signed_in(client, container, "omar@example.com")
++    phone = (await login(client, me.email, device_label="Phone")).json()
++    tablet = (await login(client, me.email, device_label="Tablet")).json()
++
++    response = await client.post("/v1/sessions/revoke-others", headers=me.headers)
++
++    assert response.status_code == 200
++    assert set(response.json()["revoked"]) == {phone["session_id"], tablet["session_id"]}
++    listed = await client.get("/v1/sessions", headers=me.headers)
++    assert [item["id"] for item in listed.json()["data"]] == [me.session_id]
++    for other in (phone, tablet):
++        probe = await client.get("/v1/me", headers=bearer(other["access_token"]))
++        assert probe.status_code == 401
++        refreshed = await client.post(
++            "/v1/auth/refresh", json={"refresh_token": other["refresh_token"]}
++        )
++        assert refreshed.status_code == 401
++    kept = await client.post("/v1/auth/refresh", json={"refresh_token": me.refresh_token})
++    assert kept.status_code == 200
++
++
++async def test_revoking_the_other_sessions_leaves_other_users_alone(client, container):
++    me = await signed_in(client, container)
++    someone = await signed_in(client, container)
++
++    response = await client.post("/v1/sessions/revoke-others", headers=me.headers)
++
++    assert response.json()["revoked"] == []
++    assert (await client.get("/v1/me", headers=someone.headers)).status_code == 200
++
++
++async def test_ended_sessions_are_left_as_they_are(client, container, clock: FrozenClock):
++    me = await signed_in(client, container)
++    phone = (await login(client, me.email, device_label="Phone")).json()
++    await client.delete(f"/v1/sessions/{phone['session_id']}", headers=me.headers)
++    laptop = (await login(client, me.email, device_label="Laptop")).json()
++    async with container.db.transaction() as session:
++        await session.execute(
++            update(Session)
++            .where(Session.id == uuid.UUID(laptop["session_id"]))
++            .values(expires_at=clock.now())
++        )
++
++    response = await client.post("/v1/sessions/revoke-others", headers=me.headers)
++
++    assert response.json()["revoked"] == []
++    async with container.db.read() as session:
++        revoked = await session.get(Session, uuid.UUID(phone["session_id"]))
++        expired = await session.get(Session, uuid.UUID(laptop["session_id"]))
++    assert revoked is not None
++    assert revoked.revoked_reason == "revoked_by_user"
++    assert expired is not None
++    assert expired.revoked_at is None
++
++
++async def test_revoking_the_other_sessions_needs_a_token(client):
++    response = await client.post("/v1/sessions/revoke-others")
++
++    assert response.status_code == 401

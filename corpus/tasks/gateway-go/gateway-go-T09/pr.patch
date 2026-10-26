@@ -1,0 +1,374 @@
+diff --git a/README.md b/README.md
+index c9415f9..e2d1abd 100644
+--- a/README.md
++++ b/README.md
+@@ -92,6 +92,7 @@ Every response the gateway produces itself is JSON:
+                           "open_duration": "30s", "half_open_probes": 1},
+       "health_check": {"path": "/healthz", "interval": "10s", "timeout": "2s",
+                        "healthy_threshold": 2, "unhealthy_threshold": 3},
++      "mirror": {"url": "http://orders-shadow.internal:8080", "percent": 5},
+       "transforms": {
+         "request":  {"add": {"X-Env": "prod"}, "remove": ["X-Debug"], "rename": {"X-Ver": "X-Version"}},
+         "response": {"remove": ["Server"]}
+@@ -103,7 +104,12 @@ Every response the gateway produces itself is JSON:
+ 
+ Only `id`, one of `path` or `path_prefix`, and `upstreams` are required; the values above for
+ `retry`, `circuit_breaker` and `health_check` are the defaults filled in when the object is present.
+-`auth` defaults to `none` and `timeout` to `30s`. Transforms run rename, then remove, then add; they
++`auth` defaults to `none` and `timeout` to `30s`. `mirror` sends a copy of `percent` (1 to 100)
++of the route's requests to `url`, with the same path, query and forwarded headers. Only requests
++whose body is held in memory are copied (see step 6; a streamed body is not). The copy runs in
++the background: the shadow's response is discarded and never reaches the client, and a failing
++shadow changes nothing. At most 64 copies run at once; a copy beyond that is dropped. Results are
++counted in `gateway_mirror_requests_total{result}` (`ok`, `failed`, `dropped`). Transforms run rename, then remove, then add; they
+ may not touch hop-by-hop fields, `Host`, `Content-Length`, `Trailer` or the headers the gateway
+ owns (`X-Request-Id`, `X-Forwarded-For`, `-Proto` and `-Host`, `X-Consumer-Id`).
+ 
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..2ef0178 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -76,6 +76,7 @@ type Route struct {
+ 	CircuitBreaker *CircuitBreaker `json:"circuit_breaker,omitempty"`
+ 	HealthCheck    *HealthCheck    `json:"health_check,omitempty"`
+ 	Transforms     *Transforms     `json:"transforms,omitempty"`
++	Mirror         *Mirror         `json:"mirror,omitempty"`
+ }
+ 
+ // Upstream is one backend of a route.
+@@ -119,6 +120,13 @@ type HealthCheck struct {
+ 	UnhealthyThreshold int      `json:"unhealthy_threshold,omitempty"`
+ }
+ 
++// Mirror sends a copy of a Percent share of the requests to a shadow upstream. Only requests
++// whose body is held in memory are mirrored; the shadow's responses are discarded.
++type Mirror struct {
++	URL     string `json:"url"`
++	Percent int    `json:"percent"`
++}
++
+ // Transforms change the headers of forwarded requests and of the responses returned to clients.
+ type Transforms struct {
+ 	Request  *HeaderTransform `json:"request,omitempty"`
+diff --git a/internal/config/routes_test.go b/internal/config/routes_test.go
+index d62f5f0..d8002e1 100644
+--- a/internal/config/routes_test.go
++++ b/internal/config/routes_test.go
+@@ -117,6 +117,8 @@ func TestValidationNamesRouteAndField(t *testing.T) {
+ 		{"rate window", `{"id":"a","path":"/a","rate_limit":{"requests":1,"window":"500ms"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.window: must be a whole number of milliseconds`},
+ 		{"rate requests", `{"id":"a","path":"/a","rate_limit":{"requests":0,"window":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.requests: must be at least 1`},
+ 		{"retry attempts", `{"id":"a","path":"/a","retry":{"attempts":11},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.attempts: must be between 1 and 10`},
++		{"mirror url", `{"id":"a","path":"/a","mirror":{"url":"ftp://m","percent":5},"upstreams":[{"url":"http://a"}]}`, `route "a": mirror.url: must be an absolute http or https URL`},
++		{"mirror percent", `{"id":"a","path":"/a","mirror":{"url":"http://m","percent":0},"upstreams":[{"url":"http://a"}]}`, `route "a": mirror.percent: must be between 1 and 100, got 0`},
+ 		{"retry status", `{"id":"a","path":"/a","retry":{"attempts":2,"on_status":[404]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_status[0]: must be a 5xx status`},
+ 		{"retry error", `{"id":"a","path":"/a","retry":{"attempts":2,"on_errors":["dns"]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_errors[0]: must be`},
+ 		{"backoff order", `{"id":"a","path":"/a","retry":{"attempts":2,"backoff":"2s","max_backoff":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.max_backoff: must not be shorter than retry.backoff`},
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..cdec1c3 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -138,6 +138,19 @@ func (r *Route) validate(p routeProblems) {
+ 		t.Request.validate(p, "transforms.request")
+ 		t.Response.validate(p, "transforms.response")
+ 	}
++	if r.Mirror != nil {
++		r.Mirror.validate(p)
++	}
++}
++
++func (m *Mirror) validate(p routeProblems) {
++	u, err := url.Parse(m.URL)
++	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
++		p.add("mirror.url", "must be an absolute http or https URL, got %q", m.URL)
++	}
++	if m.Percent < 1 || m.Percent > 100 {
++		p.add("mirror.percent", "must be between 1 and 100, got %d", m.Percent)
++	}
+ }
+ 
+ // checkMatchPath returns why a configured path cannot be matched, or "".
+diff --git a/internal/core/route.go b/internal/core/route.go
+index 9872989..6c2ef68 100644
+--- a/internal/core/route.go
++++ b/internal/core/route.go
+@@ -28,6 +28,7 @@ type Route struct {
+ 	Request     HeaderTransform // applied to forwarded requests
+ 	Response    HeaderTransform // applied to responses returned to the client
+ 	Upstreams   []*Upstream
++	Mirror      *MirrorPolicy // nil when the route mirrors nothing
+ 
+ 	balancer *Balancer
+ 	spec     config.Route
+@@ -89,6 +90,12 @@ func (r *Route) ForwardPath(u *url.URL) (path, rawPath string) {
+ // Next picks the upstream for the next attempt, see Balancer.Next.
+ func (r *Route) Next(skip func(*Upstream) bool) *Upstream { return r.balancer.Next(skip) }
+ 
++// MirrorPolicy sends a copy of Percent of the requests to URL.
++type MirrorPolicy struct {
++	URL     *url.URL
++	Percent int
++}
++
+ // HeaderTransform is a compiled config.HeaderTransform.
+ type HeaderTransform struct {
+ 	Rename [][2]string // from, to; in a stable order
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..24bf7a1 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -207,6 +207,13 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		r.Request = compileTransform(t.Request)
+ 		r.Response = compileTransform(t.Response)
+ 	}
++	if m := spec.Mirror; m != nil {
++		u, err := url.Parse(m.URL)
++		if err != nil {
++			return nil, fmt.Errorf("mirror url %q: %w", m.URL, err)
++		}
++		r.Mirror = &MirrorPolicy{URL: u, Percent: m.Percent}
++	}
+ 	for _, us := range spec.Upstreams {
+ 		u, err := url.Parse(us.URL)
+ 		if err != nil {
+diff --git a/internal/proxy/handler.go b/internal/proxy/handler.go
+index 5767e69..654bda0 100644
+--- a/internal/proxy/handler.go
++++ b/internal/proxy/handler.go
+@@ -60,6 +60,8 @@ type Handler struct {
+ 	metrics   proxyMetrics
+ 	trusted   trustedProxies
+ 	bodyLimit int64
++	// mirrorSlots holds one token per mirrored request in flight.
++	mirrorSlots chan struct{}
+ }
+ 
+ // New validates the options and returns a handler.
+@@ -89,6 +91,8 @@ func New(o Options) (*Handler, error) {
+ 		metrics:   newProxyMetrics(reg),
+ 		trusted:   trustedProxies(o.TrustedProxies),
+ 		bodyLimit: o.BodyBufferLimit,
++
++		mirrorSlots: make(chan struct{}, maxMirrorsInFlight),
+ 	}, nil
+ }
+ 
+@@ -165,6 +169,7 @@ func (h *Handler) serve(w *statusRecorder, ex *exchange) {
+ 			return
+ 		}
+ 	}
++	h.mirror(ex, body)
+ 	h.forward(w, ex, body)
+ }
+ 
+diff --git a/internal/proxy/metrics.go b/internal/proxy/metrics.go
+index da058ba..55821b9 100644
+--- a/internal/proxy/metrics.go
++++ b/internal/proxy/metrics.go
+@@ -12,6 +12,7 @@ type proxyMetrics struct {
+ 	rateLimited     *metrics.Counter
+ 	rateLimitErrors *metrics.Counter
+ 	authFailures    *metrics.Counter
++	mirrors         *metrics.Counter
+ }
+ 
+ func newProxyMetrics(reg *metrics.Registry) proxyMetrics {
+@@ -28,5 +29,7 @@ func newProxyMetrics(reg *metrics.Registry) proxyMetrics {
+ 			"Requests let through because the rate limiter failed, by route.", "route"),
+ 		authFailures: reg.NewCounter("gateway_auth_failures_total",
+ 			"Requests rejected with 401, by route and error code.", "route", "code"),
++		mirrors: reg.NewCounter("gateway_mirror_requests_total",
++			"Mirrored copies of requests by result: ok (the shadow answered below 500), failed (the shadow answered 5xx or could not be reached) or dropped (too many mirrors in flight).", "result"),
+ 	}
+ }
+diff --git a/internal/proxy/mirror.go b/internal/proxy/mirror.go
+new file mode 100644
+index 0000000..af777ce
+--- /dev/null
++++ b/internal/proxy/mirror.go
+@@ -0,0 +1,69 @@
++package proxy
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++)
++
++// maxMirrorsInFlight bounds the mirrored requests that run at once. A request that would exceed
++// it is dropped and counted, so a slow shadow upstream cannot grow the gateway's memory.
++const maxMirrorsInFlight = 64
++
++// mirror starts a copy of the request for the route's shadow upstream, when the route samples
++// it and its body is held in memory. The copy runs in its own goroutine: the client's response
++// neither waits for it nor depends on it.
++func (h *Handler) mirror(ex *exchange, body *requestBody) {
++	m := ex.route.Mirror
++	if m == nil || !body.replayable || int(h.rand.Int64N(100)) >= m.Percent {
++		return
++	}
++	select {
++	case h.mirrorSlots <- struct{}{}:
++	default:
++		h.metrics.mirrors.Inc("dropped")
++		return
++	}
++
++	r := ex.req
++	target := *m.URL
++	path, rawPath := ex.route.ForwardPath(r.URL)
++	target.Path, target.RawPath = joinPath(m.URL, path, rawPath)
++	target.RawQuery = r.URL.RawQuery
++	target.ForceQuery = false
++	target.Fragment, target.RawFragment = "", ""
++
++	buf := body.content()
++	out := (&http.Request{
++		Method:     r.Method,
++		URL:        &target,
++		Proto:      "HTTP/1.1",
++		ProtoMajor: 1,
++		ProtoMinor: 1,
++		Header:     outboundHeader(r.Header, ex.route, ex.strip, ex.client, ex.id, ex.consumer.ID),
++		Host:       target.Host,
++	})
++	if len(buf) > 0 {
++		out.Body = io.NopCloser(bytes.NewReader(buf))
++		out.ContentLength = int64(len(buf))
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), ex.route.Timeout)
++	out = out.WithContext(ctx)
++
++	go func() {
++		defer cancel()
++		defer func() { <-h.mirrorSlots }()
++		resp, err := h.transport.RoundTrip(out)
++		if err != nil {
++			h.metrics.mirrors.Inc("failed")
++			h.log.Debug("mirror request failed", "route", ex.route.ID, "error", err, "request_id", ex.id)
++			return
++		}
++		if resp.StatusCode >= 500 {
++			h.metrics.mirrors.Inc("failed")
++			return
++		}
++		h.metrics.mirrors.Inc("ok")
++	}()
++}
+diff --git a/internal/proxy/mirror_test.go b/internal/proxy/mirror_test.go
+new file mode 100644
+index 0000000..47243ca
+--- /dev/null
++++ b/internal/proxy/mirror_test.go
+@@ -0,0 +1,111 @@
++package proxy
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// mirrorRoutes mirrors every request of the orders route, which retries non-idempotent
++// methods, so its bodies are buffered.
++const mirrorRoutes = `{"routes":[{"id":"orders","path_prefix":"/orders","upstreams":[{"url":"http://up.test"}],
++	"retry":{"attempts":2,"non_idempotent":true},
++	"mirror":{"url":"http://shadow.test/base","percent":100}}]}`
++
++// waitShadow waits until the shadow upstream has answered, or fails the test.
++func waitShadow(t *testing.T, done <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("the mirror request never reached the shadow upstream")
++	}
++}
++
++func TestMirrorSendsBufferedCopy(t *testing.T) {
++	done := make(chan struct{})
++	var once sync.Once
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		if r.URL.Host == "shadow.test" {
++			defer once.Do(func() { close(done) })
++			return reply(r, 202, "shadow"), nil
++		}
++		return reply(r, 200, "from "+r.URL.Host), nil
++	}}
++	f := newFixture(t, mirrorRoutes, fixtureOptions{transport: tr})
++
++	w := f.do(httptest.NewRequest(http.MethodPost, "/orders/9?x=1", strings.NewReader(`{"id":9}`)))
++	if w.Code != http.StatusOK || w.Body.String() != "from up.test" {
++		t.Fatalf("client got %d %q; the upstream's answer must be relayed", w.Code, w.Body.String())
++	}
++	waitShadow(t, done)
++
++	var shadow *sent
++	for _, c := range tr.sent() {
++		if strings.Contains(c.url, "shadow.test") {
++			shadow = &c
++		}
++	}
++	if shadow == nil {
++		t.Fatal("no request reached the shadow upstream")
++	}
++	if shadow.method != http.MethodPost || shadow.url != "http://shadow.test/base/orders/9?x=1" {
++		t.Errorf("shadow request = %s %s, want POST to the shadow base with the same path and query", shadow.method, shadow.url)
++	}
++	if shadow.body != `{"id":9}` || shadow.length != 8 {
++		t.Errorf("shadow body = %q (length %d), want the buffered body", shadow.body, shadow.length)
++	}
++	if shadow.header.Get("X-Request-Id") == "" {
++		t.Error("shadow request lacks the gateway's request id")
++	}
++	if !f.has(`gateway_mirror_requests_total{result="ok"} 1`) {
++		t.Error("a shadow answer below 500 is not counted as ok")
++	}
++}
++
++func TestMirrorFailureDoesNotChangeTheResponse(t *testing.T) {
++	done := make(chan struct{})
++	var once sync.Once
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		if r.URL.Host == "shadow.test" {
++			defer once.Do(func() { close(done) })
++			return reply(r, 503, "busy"), nil
++		}
++		return reply(r, 200, "fine"), nil
++	}}
++	f := newFixture(t, mirrorRoutes, fixtureOptions{transport: tr})
++
++	w := f.get("/orders/1")
++	if w.Code != http.StatusOK || w.Body.String() != "fine" {
++		t.Fatalf("client got %d %q while the shadow failed", w.Code, w.Body.String())
++	}
++	waitShadow(t, done)
++	if !f.has(`gateway_mirror_requests_total{result="failed"} 1`) {
++		t.Error("a shadow 5xx is not counted as failed")
++	}
++}
++
++func TestMirrorDropsCopiesBeyondTheLimit(t *testing.T) {
++	release := make(chan struct{})
++	defer close(release)
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		if r.URL.Host == "shadow.test" {
++			<-release // the shadow never answers while the test runs
++		}
++		return reply(r, 200, "ok"), nil
++	}}
++	f := newFixture(t, `{"routes":[{"id":"a","path_prefix":"/","upstreams":[{"url":"http://up.test"}],
++		"mirror":{"url":"http://shadow.test","percent":100}}]}`, fixtureOptions{transport: tr})
++
++	for i := range maxMirrorsInFlight + 1 {
++		if w := f.get("/x"); w.Code != http.StatusOK {
++			t.Fatalf("request %d: client got %d", i, w.Code)
++		}
++	}
++	if !f.has(`gateway_mirror_requests_total{result="dropped"} 1`) {
++		t.Errorf("the copy beyond %d in flight was not dropped and counted", maxMirrorsInFlight)
++	}
++}

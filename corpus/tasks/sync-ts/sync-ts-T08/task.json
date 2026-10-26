@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "sync-ts-T08",
+  "repo": "sync-ts",
+  "kind": "buggy",
+  "title": "Pull filtered by collection",
+  "description": "Some clients only need part of a user's data (a task widget has no use for notes), but today every replica pulls every collection. This adds a collection filter to pull and a matching client option.\n\n- `GET /v1/sync/pull?collections=notes,tasks`: only the events of those collections (comma-separated known names, each at most once; anything else is a 400). Without the parameter nothing changes.\n- With the filter, the server reads the feed in pages until it has a full page of matching events or reaches the end. At the end of the feed `nextAfter` moves past the other collections' events it examined, so the next pull does not read them again; `nextAfter` can therefore be later than the last event returned (documented on `pullResponseSchema`).\n- Client: `SyncClient.open({ collections })` keeps a replica of some collections. It pulls only their events and refuses local writes to the others. The set is stored in `meta` when the database is created; opening it with a different set fails with `collections_mismatch`, since the cursor has already moved past the other collections. Replicas created before keep syncing everything. When the set is every collection, no filter is sent.\n- `checkPage` accepts a `nextAfter` past the last event for filtered pulls (never before it).\n\nTests: server pull tests for the filter, the end-of-feed `nextAfter`, a full filtered page and invalid lists; client tests for a replica of one collection against the server, refused writes, the stored set, invalid options, the request and the relaxed page check, and the query string of `HttpTransport`. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/server/src/services/pullService.ts",
+      "lines": [81, 81],
+      "category": "boundary",
+      "severity": "high",
+      "difficulty": "L1",
+      "summary": "When a filtered page is full, nextAfter is the seq of matching[limit], the extra event that was read to detect hasMore and is not returned, instead of matching[limit - 1], the last event returned. The client continues after it, so every full filtered page loses one event of the requested collections: that write never reaches the replica.",
+      "trigger": "A replica of `notes` with pullLimit 3 syncing a feed with 7 note events: it receives 6; the 4th note is skipped.",
+      "testable": true,
+      "hidden_tests": ["packages/client/test/hidden/filteredPullPages.test.ts"],
+      "hidden_test_cmd": "npx vitest run packages/client/test/hidden/filteredPullPages.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "matching[limit] is the last event of the page: the loop in filteredPage reads `limit + 1` rows and stops as soon as more than `limit` events match, so matching holds limit + 1 events and its index `limit` is the last one, which is exactly what nextAfter must point at.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "packages/server/src/services/pullService.ts",
+      "lines": [72, 77],
+      "category": "performance",
+      "severity": "low",
+      "difficulty": "L2",
+      "summary": "The collection filter is applied in JavaScript: filteredPage fetches the unfiltered feed through listEventsAfter in batches of limit + 1 rows and keeps looping until a page of matching events is full or the feed ends, instead of putting `collection = ANY(...)` into the SQL. A filtered pull costs one round trip per limit + 1 events of other collections (and transfers all of them), so a replica of a small collection next to a large one issues hundreds of queries per pull.",
+      "trigger": "A user with 200 task events and then one note; a pull of `notes` with limit 10 issues 19 event queries instead of one.",
+      "testable": true,
+      "hidden_tests": ["packages/server/test/hidden/filteredPullQueries.test.ts"],
+      "hidden_test_cmd": "npx vitest run packages/server/test/hidden/filteredPullQueries.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "The loop is bounded by the page: it stops at `limit` (`matching.length > limit` in filteredPage), so a pull reads at most one page more than it returns, the same as the unfiltered path, which also reads limit + 1 rows.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T05",
+  "repo": "uploads-ts",
+  "kind": "buggy",
+  "title": "Retention policies per folder",
+  "description": "Tenants that store logs, exports or scratch files want them gone after a while without running their own delete scripts. This adds retention rules per folder, applied by the cleanup job.\n\n- Migration 0004: `retention_rules(tenant_id, prefix, days)`, one rule per tenant and prefix; the prefix is a folder ending with `/`, days from 1 to 36500.\n- `PUT /v1/retention/<folder>/` with `{\"days\"}` creates or changes a rule, `DELETE /v1/retention/<folder>/` removes it (both `tenant:admin`), `GET /v1/retention` lists them (`tenant:read`). Prefixes are validated with the new `normalizeFolderPrefix` (a valid path plus `/`). A tenant has at most 100 rules; `RetentionService.setRule` locks the tenant row while counting so concurrent requests cannot pass the limit.\n- When several of a tenant's rules match a path, the one with the longest prefix applies (`logs/` at 30 days, `logs/audit/` at 3650 days). Days count as 24 hours regardless of the database session's time zone.\n- New cleanup step `applyRetention`, between session expiry and the purge step: `retentionRepo.findExpiredFiles` picks up to `CLEANUP_BATCH_SIZE` live files whose rule says they are due, oldest first; each one is marked deleted and its bytes released in a transaction of its own (no long transaction across a whole batch), then its object is removed. `retentionRepo.expireFile` reads the rule again in its UPDATE, so a file whose rule was removed or lengthened after the batch was picked stays. An object that cannot be removed is left to `purgeDeletedObjects`. `CleanupReport` gains `expiredFiles`.\n- README: Retention paragraph, API table and rule format.\n\nTests in `test/api/retention.test.ts`: rule CRUD and tenant isolation, validation, scopes and the rule limit, the age boundary with released bytes and removed objects, longest-prefix precedence, files of every live status in several batches, other tenants untouched, and rules removed or lengthened while the job is running.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/cleanup.ts",
+      "lines": [
+        110,
+        117
+      ],
+      "category": "concurrency",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "applyRetention selects the due files without any lock, then for each one runs retentionRepo.expireFile, whose UPDATE matches the row by id alone (no `AND status <> 'deleted'`, row count ignored), and calls releaseBytes(file.size) unconditionally. When the file is deleted by someone else between the SELECT and the UPDATE - a user's DELETE /v1/files/<path>, an overwrite (FileCatalog.register), or a second instance running the same cleanup step - the UPDATE waits for that transaction, then marks the already-deleted row again and the job releases its bytes a second time. used_bytes drops below the bytes the tenant actually stores, so the quota no longer holds (the tenant can upload that much extra), and the object is removed twice and deleted_at rewritten. Because the row count is ignored, the same happens when expireFile's own rule re-check matches nothing (the rule was removed or lengthened after the SELECT): the file stays live but its bytes are released and its object removed.",
+      "trigger": "Rule old/ 30 days, files old/a (100 B), old/b (200 B), keep/c (1000 B), clock 31 days later. A user's delete of old/a is in progress (row marked deleted, 100 B released, not yet committed) when the cleanup job selects; it commits while the job waits on the row: used_bytes ends at 900 instead of 1000. Two cleanup runs that pick the same files end at 700.",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/retentionRace.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run test/hidden/retentionRace.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A double release cannot hurt the books: tenantRepo.releaseBytes updates used_bytes with GREATEST(used_bytes - $2, 0) and logs when it releases more than is used, so a second release of an already-released file is clamped and reported rather than corrupting the tenant's usage.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

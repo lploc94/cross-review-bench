@@ -1,0 +1,10 @@
+{
+  "language": "go",
+  "test_cmd": "go test -count=1 ./...",
+  "typecheck_cmd": "go build ./... && go vet ./...",
+  "lint_cmd": "go tool staticcheck ./...",
+  "deps_cmd": null,
+  "warm_cmd": "go test -count=1 ./...",
+  "services": ["postgres"],
+  "allow_words": []
+}

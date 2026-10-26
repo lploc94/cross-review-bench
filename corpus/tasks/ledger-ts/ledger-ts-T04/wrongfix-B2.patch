@@ -1,0 +1,14 @@
+diff --git a/src/api/statementCsv.ts b/src/api/statementCsv.ts
+index c0a8bbc..0416aeb 100644
+--- a/src/api/statementCsv.ts
++++ b/src/api/statementCsv.ts
+@@ -10,7 +10,8 @@ const HEADER = ["type", "created_at", "entry_id", "transfer_id", "amount", "bala
+  */
+ export function statementCsv(statement: Statement): string {
+   const { account, period } = statement;
+-  const decimal = (amountMinor: bigint) => (Number(amountMinor) / 100).toFixed(2);
++  const digits = account.currency === "JPY" || account.currency === "VND" ? 0 : 2;
++  const decimal = (amountMinor: bigint) => (Number(amountMinor) / 10 ** digits).toFixed(digits);
+   const balanceRow = (type: string, at: Date, balance: bigint) => [
+     type,
+     at.toISOString(),

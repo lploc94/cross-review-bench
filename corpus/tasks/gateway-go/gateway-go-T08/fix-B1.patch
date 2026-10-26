@@ -1,0 +1,13 @@
+diff --git a/internal/store/quota.go b/internal/store/quota.go
+index b36369f..e9413eb 100644
+--- a/internal/store/quota.go
++++ b/internal/store/quota.go
+@@ -38,7 +38,7 @@ func (s *Store) SetQuotaZone(loc *time.Location) { s.zone = loc }
+ func (s *Store) ConsumeQuota(ctx context.Context, consumerID string, limit int64) (core.QuotaDecision, error) {
+ 	now := s.clock.Now()
+ 	local := now.In(s.zone)
+-	day := now.UTC().Format("2006-01-02")
++	day := local.Format("2006-01-02")
+ 	end := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, s.zone)
+ 	left := end.Sub(now)
+ 	n, err := quotaScript.Run(ctx, s.rdb, []string{s.key("quota", consumerID, day)}, limit, left.Milliseconds()).Int64()

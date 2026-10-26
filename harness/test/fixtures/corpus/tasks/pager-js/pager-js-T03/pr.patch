@@ -1,0 +1,16 @@
+diff --git a/src/pager.js b/src/pager.js
+index ba12c24..e29c88a 100644
+--- a/src/pager.js
++++ b/src/pager.js
+@@ -4,3 +4,11 @@
+ export function paginate(items, page, size) {
+   return items.slice((page - 1) * size, page * size);
+ }
++
++/** Inclusive index range { first, last } shown on page `page`; null when the page is empty. */
++export function pageRange(items, page, size) {
++  const first = (page - 1) * size;
++  if (first >= items.length) return null;
++  const last = Math.min(first + size, items.length) - 1;
++  return { first, last };
++}

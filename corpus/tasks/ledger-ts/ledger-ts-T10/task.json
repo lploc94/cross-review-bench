@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T10",
+  "repo": "ledger-ts",
+  "kind": "buggy",
+  "title": "Daily transfer limits per API key",
+  "description": "Several tenants hand narrowly scoped API keys to partner integrations and want to cap how much such a key can move per day, so a leaked or misbehaving key cannot drain a wallet.\n\n- Migration 0009: `api_keys.daily_transfer_limit_minor` + `daily_transfer_limit_currency` (both set or both null), and `transfers.api_key_id` recording the key that posted a transfer through `POST /transfers` (hold captures leave it null), with an index on `(api_key_id, currency, created_at)`.\n- `POST /transfers` checks the calling key's limit in the transfer's currency inside the posting transaction. The day is the UTC day: the allowance resets at 00:00 UTC. Usage is the sum of the key's transfers in that currency since the start of the day. The key row is locked (`FOR UPDATE`, only for keys that have a limit in that currency) so concurrent requests of one key cannot overshoot together.\n- Over the limit the API answers 422 `limit_exceeded` with `limit`, `currency`, `used`, `remaining`, `requested` and `resets_at` in the error details. Idempotent replays are not checked again since they post nothing.\n- `ApiKeyService.setDailyTransferLimit` and `npm run api-keys -- limit --tenant … --id … --amount … --currency …` (or `--clear`); `list` shows the limit.\n\nTests in `test/api/transferLimits.test.ts` (on the default UTC test clock): refusal with remaining amount, other keys and other currencies not counted, replays not counted, a new allowance on the next day, concurrent requests of one key, removing a limit. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/domain/transferLimit.ts",
+      "lines": [20, 22],
+      "category": "spec-deviation",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "dailyWindow truncates the clock time with setHours, i.e. to midnight in the server's local time zone, not 00:00 UTC as specified: on any non-UTC host the allowance resets at local midnight and resets_at is wrong, so a key can spend twice its limit across a UTC day boundary or is blocked after it.",
+      "trigger": "Server process with a non-UTC TZ (e.g. America/Los_Angeles) and transfers by a limited key on both sides of 00:00 UTC or of local midnight.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/dailyLimitWindow.test.ts"],
+      "hidden_test_cmd": "TZ=America/Los_Angeles npx vitest run test/hidden/dailyLimitWindow.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The window is UTC on every deployment: `loadConfig` in src/config/env.ts pins the process to TZ=UTC at startup before anything reads the clock, so `setHours(0, 0, 0, 0)` truncates to 00:00 UTC exactly like `setUTCHours` would.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T04",
+  "repo": "etl-py",
+  "kind": "buggy",
+  "title": "EUR reference rates and the daily sales report in EUR",
+  "description": "Finance wants the daily sales report in one currency: today each row is per day, country and currency, so a day with EUR, USD and GBP orders gives three rows nobody can add up. This loads the ECB-style EUR reference rates into the warehouse and adds a converted daily sales report.\n\n- Migration 0005 adds `etl.fx_rates(day, currency, rate_to_eur NUMERIC(20, 12), loaded_at)`, primary key (day, currency), rates positive (`infra/tables.py`, `store/fx_rates.py`: `upsert_many`, `between`).\n- `etl fx load <file>` (`api/fx.py:load_rates`) reads a CSV `day,currency,rate_to_eur` (UTF-8, BOM allowed) and loads the whole file or nothing: EUR itself, a rate that is not positive, has more than 12 decimals or is 1e8 or more, a duplicate (day, currency), a bad header or an unparsable line are refused with the line number (exit 2). A rate loaded again for the same day replaces the old one. `--json` prints the rates, first and last day and currencies loaded.\n- `etl report daily-sales ... --in EUR` (`api/reports.py`, `reports/daily_sales.py:daily_sales_in`) converts every order at the rate of its day (the day in the reporting zone) and adds up the currencies of each day and country into one EUR row, rounded half-even to cents once per cell. The report file name gets an `_EUR` suffix and the report records `converted_to`. Only EUR is offered for now (any other code is refused, exit 2); a missing rate fails with `FxRateMissing` naming the currencies and days (exit 4).\n\nTests in tests/reports/test_fx_conversion.py: loading and reloading rates, the refusals, one EUR row per day and country, the zone deciding the rate's day, the missing-rate error, the CLI and the file name. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/etl/reports/daily_sales.py",
+      "lines": [
+        89,
+        107
+      ],
+      "category": "data-integrity",
+      "severity": "high",
+      "difficulty": "L1",
+      "summary": "daily_sales_in converts each group's revenue with float(row.revenue) * float(rate) and adds the cell with math.fsum over floats, then rounds Decimal(str(sum)) half-even to cents. Order totals are exact NUMERIC values and the rates exact NUMERIC(20, 12), but the product and the sum go through binary floating point, so a converted amount that lies exactly on a half cent (common with three-decimal rates such as 0.925) lands slightly above or below it and rounds the wrong way, and sums of several currencies carry the float error into the cent. The EUR report therefore disagrees with the exact half-even result the PR documents, by a cent per affected cell, and finance totals do not reconcile with the Decimal amounts stored in the warehouse.",
+      "trigger": "Rate USD 0.925 on 2 and 3 March 2026. 2 March DE: 12.50 EUR + 9.00 USD = 12.50 + 8.325 = 20.825 exact, half-even 20.82, the report says 20.83. 3 March DE: 2.60 USD = 2.405, half-even 2.40, the report says 2.41. 3 March FR: 21.40 USD = 19.795, half-even 19.80, the report says 19.79. 4 March DE: 12.50 EUR + 5.80 USD = 12.50 + 5.365 = 17.865 exact, half-even 17.86, the report says 17.87.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_eur_conversion_rounding.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_eur_conversion_rounding.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The result is rounded to cents, so float error does not matter: a double carries about 16 significant digits, so for any order total the error of float(total) * float(rate) is many orders of magnitude below half a cent, math.fsum adds the parts without accumulating error, and quantize(ROUND_HALF_EVEN) to two decimals removes whatever is left.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

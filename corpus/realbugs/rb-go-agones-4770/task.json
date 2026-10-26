@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-go-agones-4770",
+  "repo": "rb-go-agones-4770",
+  "kind": "realbug",
+  "title": "fix: mark GameServer Unhealthy when the game container terminates and the Pod stays Running",
+  "description": "**What type of PR is this?**\r\n\r\n/kind bug\r\n\r\n**What this PR does / Why we need it**:\r\n\r\nI have a cluster with a Fleet that provisiones GameServers with a game container and several other sidecar containers. We had an issue where our main game container OOMKilled, but the pod stayed and was not replaced by Agones.\r\n\r\nIn `failedContainer`, when SidecarContainers is enabled, then it falls back to the Kubernetes behavior which requires every container in the pod to fail before the pod is marked as Failed. \r\n\r\nThis PR makes it so `failedContainer` reports the pod as Failed when the primary game container has terminated.\r\n\r\n**Which issue(s) this PR fixes**:\r\n\r\nN/A\r\n\r\n**Did you use AI tools in preparing this PR?**:\r\n\r\nUsed for codegen & verifying the fix works\r\n\r\n**Special notes for your reviewer**:\r\n\r\nN/A",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "pkg/gameservers/health.go",
+      "lines": [
+        309,
+        311
+      ],
+      "category": "logic",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "With SidecarContainers enabled, the new before-Ready branch in skipUnhealthyGameContainer returns failedContainer(pod), which the same PR makes true exactly when the game container has terminated with a non-zero exit code under RestartPolicy Never. A true result means skip, so syncGameServer never marks a GameServer that is still Scheduled/Starting/RequestReady as Unhealthy; the container can never restart and other containers keep the Pod Running, so the GameServer stays stuck and is never replaced.",
+      "trigger": "Enable the SidecarContainers feature, create a GameServer whose Pod has the game container plus another long-lived container, and have the game container exit non-zero (e.g. OOMKilled, exit 137) before the GameServer reaches Ready; the Pod stays Running and the health controller leaves the GameServer in its pre-Ready state instead of moving it to Unhealthy.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "pkg/gameservers/health_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 ./pkg/gameservers/ -run '^TestHealthControllerSyncGameServer$'"
+    }
+  ]
+}

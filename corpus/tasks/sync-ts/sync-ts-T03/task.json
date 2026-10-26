@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "sync-ts-T03",
+  "repo": "sync-ts",
+  "kind": "buggy",
+  "title": "Push: accept the valid mutations of a batch and report the rejected ones",
+  "description": "Today one invalid mutation fails the whole push with a 422, so a single bad entry in a device's outbox (typically a field written by a newer app version that this server does not know yet) blocks every later edit of that device until someone clears the outbox by hand. Push now applies what it can and reports the rest.\n\n- Protocol: the push answer gains `rejected: [{ index, code, message, issues }]`, `index` being the mutation's position in the request's `mutations`. `acked` lists the mutations that are now recorded (rejected ones are not). `rejected` defaults to `[]` when an answer lacks it. Envelope errors are still 400 and a timestamp too far ahead still fails the whole request with 422 `clock_drift`.\n- Server: inside the push transaction, after taking the user lock, the mutation ids already recorded for the user are looked up (`findRecordedMutations`). Those are acknowledged as before and are no longer validated again, so a mutation that was accepted once stays accepted even if the rules for its fields change in a later deploy. The others are validated one by one: invalid ones (unknown collection or field, wrong value type, an id repeated in the request) are not recorded and come back in `rejected` with the same code and message the 422 used to carry; the valid ones are applied in the same transaction as before. Rejections are logged at info level.\n- Client: schema version 2 adds `outbox.rejected_code`. The push phase removes acknowledged entries and marks rejected ones (code, and the message in `last_error`); marked entries are skipped by later batches and by `pendingCount()`, stay applied to the local replica, and are listed by the new `SyncClient.rejectedMutations()`. An answer whose rejection points outside the batch, or at a mutation the same answer acknowledges, breaks the protocol and fails the sync with `InvalidResponseError` before the outbox is touched. `syncctl status` prints the number of rejected mutations.\n\nTests: server push tests rewritten for partial acceptance (unknown collection, wrong type with the field named, unknown fields and impossible dates not recorded on a second try, repeated ids); `packages/client/test/e2e/rejections.test.ts` (an outbox entry the server rejects is marked and not sent again while the rest syncs; malformed rejections are refused); a migrator test for version 2. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/server/src/services/pushService.ts",
+      "lines": [163, 167],
+      "category": "api-contract",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "PushService.check drops the already recorded mutations first and then numbers the remaining ones, so a rejection's `index` (and the index in its message) is the position among the not-yet-recorded mutations, while the protocol (pushRejectionSchema in shared/src/core/protocol.ts) and the client (pushPhase.ts maps `batch[index]`) use the position in the request. Whenever a recorded mutation precedes the invalid one, which is exactly what a client re-sending a batch after a lost answer does, the index points at another mutation. The client finds that mutation in `acked`, refuses the answer with InvalidResponseError before touching the outbox, and the next sync sends the same batch and gets the same wrong index: that device's push phase fails forever, so its later edits never reach the server and it never pulls again. A client that did not check would mark the wrong entry and keep re-sending the invalid one.",
+      "trigger": "Outbox [n1, n2 (field this server does not know), n3, n4] with a push batch of 3: the first push's answer is lost after the server applied n1 and n3; the retry gets `rejected: [{ index: 0 }]` instead of index 1, and every later sync fails with invalid_response while n4 stays queued. Directly: push [recorded, valid, invalid] answers index 1 instead of 2.",
+      "testable": true,
+      "hidden_tests": ["packages/client/test/hidden/pushRejectionIndex.test.ts"],
+      "hidden_test_cmd": "npx vitest run packages/client/test/hidden/pushRejectionIndex.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Recorded mutations never reach the rejection path: the client deletes every acknowledged entry from the outbox as soon as a push answer arrives (pushOutbox in packages/client/src/sync/pushPhase.ts calls outbox.remove(acked)), so a batch never contains a mutation the server has already recorded and the position among the unrecorded mutations is the position in the request.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

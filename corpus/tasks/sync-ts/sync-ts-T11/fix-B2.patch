@@ -1,0 +1,16 @@
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 4236fa4..5cbd5ed 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -351,9 +351,9 @@ export class SyncClient {
+   private retire(cause: HttpError): DeviceRevokedError {
+     const { meta, outbox, clock } = this.parts;
+     meta.set(META_KEYS.revokedAt, String(clock.now()));
+-    let unsynced = 0;
++    const unsynced = outbox.count();
+     try {
+-      unsynced = outbox.clear();
++      outbox.clear();
+     } catch {
+       // The replica is marked revoked, so whatever stays in the outbox is never sent.
+     }

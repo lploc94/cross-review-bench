@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/react-hook-form/react-hook-form",
+  "intro_pr": 13730,
+  "intro_merged_at": "2026-09-10T21:32:08Z",
+  "fix_pr": 13732,
+  "fix_merged_at": "2026-09-11T06:31:39Z",
+  "license": "MIT",
+  "base_commit": "a02fb6269ead3830367c8940f16d6388b95bb6d0",
+  "intro_commit": "cdcbfcabd1e071cf6bbf2742df87c6cc02874df2",
+  "fix_commit": "d2b757f1effcd930fd84d74f214a8710e110095a",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

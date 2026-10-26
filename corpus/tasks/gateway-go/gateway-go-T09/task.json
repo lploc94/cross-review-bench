@@ -1,0 +1,34 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T09",
+  "repo": "gateway-go",
+  "kind": "buggy",
+  "title": "Mirror a share of requests to a shadow upstream",
+  "description": "Before a new backend takes real traffic, operators want to see how it behaves under the same requests the current one serves. This adds traffic mirroring: a route can send a copy of a share of its requests to a shadow upstream and throw the answer away.\n\n- Routes file `mirror: {url, percent}` (`url` an absolute http or https URL, `percent` between 1 and 100). The copy keeps the request's method, path, query and forwarded headers and goes to the shadow base URL with the route's path rules applied.\n- Only requests whose body is held in memory are mirrored, which is the case for bodies the route buffers for retries or signing; a streamed body is passed through once and is not copied.\n- The copy runs in its own goroutine. The client's response does not wait for it, and a shadow that fails, times out or answers with a 5xx changes nothing the client sees.\n- At most 64 copies run at once. A copy beyond that is dropped and counted.\n- Metric `gateway_mirror_requests_total{result}` with `ok`, `failed` and `dropped`.\n- Validation names the route and field, as for the other settings. README documents the field.\n\nTests: the copy's method, path, query and body, a failing shadow, the in-flight limit, and the validation messages.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/proxy/mirror.go",
+      "lines": [63, 67],
+      "category": "performance",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "The mirror goroutine drops the shadow's response without reading its body or closing it, and returns, which cancels the copy's context. A connection whose response was not read to its end cannot go back to the transport's pool, so the cancellation closes it: no connection to the shadow is ever reused. Every mirrored copy dials a new TCP connection (and does a new TLS handshake for an https shadow), and the closed connections linger in TIME_WAIT on the gateway, at the rate of the share of production traffic the feature copies. The body must be read to its end, up to a bound, and closed on every path before the context ends, as internal/health/checker.go does with health check responses.",
+      "trigger": "A route with mirror percent 100 and a keep-alive shadow that answers 200 or 503 with a body: five copies sent one after another open five connections to the shadow instead of reusing one.",
+      "testable": true,
+      "hidden_tests": [
+        "internal/proxy/mirror_reuse_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 -run '^TestMirrorReusesShadowConnections$' ./internal/proxy/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Connections to the shadow are pooled already: the copy goes through the gateway's shared upstream transport, which keeps idle connections per host (MaxIdleConnsPerHost in cmd/gateway/main.go), and the response is dropped as soon as its status is known, so nothing holds the connection; reading a body nobody uses would only cost time.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

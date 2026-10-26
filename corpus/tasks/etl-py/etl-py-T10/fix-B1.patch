@@ -1,0 +1,32 @@
+diff --git a/src/etl/load/orders.py b/src/etl/load/orders.py
+index 31b23d6..21f1e45 100644
+--- a/src/etl/load/orders.py
++++ b/src/etl/load/orders.py
+@@ -11,6 +11,7 @@ An order whose customer the warehouse does not know yet gets a placeholder custo
+ 
+ from __future__ import annotations
+ 
++from datetime import UTC, datetime
+ from typing import Any
+ 
+ from sqlalchemy import (
+@@ -54,6 +55,10 @@ from etl.load.customers import lock_customers
+ from etl.load.upsert import execute_counting, newer_wins_upsert
+ from etl.transform.dedup import latest_order_lines, latest_per_key
+ 
++# A placeholder's valid_from and updated_at: before any CRM change time, so the CRM row
++# is always newer and replaces it.
++PLACEHOLDER_SINCE = datetime(1970, 1, 1, tzinfo=UTC)
++
+ # Order columns repeated on every line; the lines of one version must agree on them.
+ ORDER_COLUMNS = ("customer_id", "status", "country", "currency", "ordered_at")
+ 
+@@ -200,7 +205,7 @@ def _add_placeholder_customers(
+ ) -> int:
+     """Create a current placeholder version for each customer of `headers` that has no current
+     version, and return how many were created."""
+-    since = literal(context.loaded_at, TZ)
++    since = literal(PLACEHOLDER_SINCE, TZ)
+     known = exists().where(customers.c.customer_id == headers.c.customer_id, customers.c.is_current)
+     unknown = (
+         select(

@@ -1,0 +1,360 @@
+diff --git a/.env.example b/.env.example
+index dea4cd1..4ed70fe 100644
+--- a/.env.example
++++ b/.env.example
+@@ -12,6 +12,8 @@ LOGIN_RATE_LIMIT=10
+ LOGIN_RATE_WINDOW_SECONDS=300
+ REFRESH_RATE_LIMIT=60
+ REFRESH_RATE_WINDOW_SECONDS=60
++LOCKOUT_THRESHOLD=5
++LOCKOUT_SECONDS=900
+ INVITATION_TTL_SECONDS=604800
+ PUBLIC_BASE_URL=http://localhost:8000
+ TRUST_PROXY_HEADERS=false
+diff --git a/README.md b/README.md
+index 20ef4f0..e3b412a 100644
+--- a/README.md
++++ b/README.md
+@@ -32,6 +32,14 @@ sessions and `DELETE /v1/sessions/{id}` revokes one of them. Login failures all
+ status, body and, through a dummy argon2 verification for unknown addresses, similar timing), so
+ the API does not reveal which addresses have accounts.
+ 
++**Account lockout.** After `LOCKOUT_THRESHOLD` wrong passwords in a row an account is locked for
++`LOCKOUT_SECONDS`: a locked account cannot sign in, even with the correct password, until the
++lock expires. A refused login of a locked account looks like any other failed login (401
++`invalid_credentials`), so lockout does not reveal which addresses have accounts either. Wrong
++passwords during a lock are counted (`users.failed_logins`) but do not extend it, the first one
++after it expires starts the count over, and a successful login resets it. Sessions that are
++already open keep working.
++
+ **Rate limits.** Fixed-window counters in Redis (INCR and EXPIRE in one Lua script): logins per
+ (email, client IP), refreshes per client IP. Over the limit the API answers 429 with
+ `Retry-After`.
+@@ -180,6 +188,7 @@ tests/                 pytest suites; tests/helpers has the clock, test doubles
+ | `ARGON2_TIME_COST`, `ARGON2_MEMORY_COST_KIB`, `ARGON2_PARALLELISM` | `3`, `65536`, `4` | |
+ | `LOGIN_RATE_LIMIT`, `LOGIN_RATE_WINDOW_SECONDS` | `10`, `300` | per email and IP |
+ | `REFRESH_RATE_LIMIT`, `REFRESH_RATE_WINDOW_SECONDS` | `60`, `60` | per IP |
++| `LOCKOUT_THRESHOLD`, `LOCKOUT_SECONDS` | `5`, `900` | wrong passwords in a row; lock length |
+ | `INVITATION_TTL_SECONDS` | `604800` | 7 days |
+ | `PUBLIC_BASE_URL` | `http://localhost:8000` | base of links in emails; https in production |
+ | `TRUST_PROXY_HEADERS` | `false` | take the client IP from `X-Forwarded-For` |
+diff --git a/migrations/versions/0006_account_lockout.py b/migrations/versions/0006_account_lockout.py
+new file mode 100644
+index 0000000..1b9df8e
+--- /dev/null
++++ b/migrations/versions/0006_account_lockout.py
+@@ -0,0 +1,31 @@
++"""account lockout
++
++Revision ID: 0006
++Revises: 0005
++Create Date: 2026-10-12 10:00:00+00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "0006"
++down_revision: str | None = "0005"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++TZ = sa.DateTime(timezone=True)
++
++
++def upgrade() -> None:
++    op.add_column(
++        "users",
++        sa.Column("failed_logins", sa.Integer(), nullable=False, server_default="0"),
++    )
++    op.add_column("users", sa.Column("locked_until", TZ, nullable=True))
++
++
++def downgrade() -> None:
++    op.drop_column("users", "locked_until")
++    op.drop_column("users", "failed_logins")
+diff --git a/src/authz/config.py b/src/authz/config.py
+index 9ee6ede..a7642f9 100644
+--- a/src/authz/config.py
++++ b/src/authz/config.py
+@@ -58,6 +58,8 @@ class Settings(BaseSettings):
+     login_rate_window_seconds: int = Field(default=300, ge=1, le=86_400)
+     refresh_rate_limit: int = Field(default=60, ge=1, le=100_000)
+     refresh_rate_window_seconds: int = Field(default=60, ge=1, le=86_400)
++    lockout_threshold: int = Field(default=5, ge=1, le=1_000)
++    lockout_seconds: int = Field(default=900, ge=1, le=7 * 86_400)
+ 
+     invitation_ttl_seconds: int = Field(default=7 * 86_400, ge=60, le=90 * 86_400)
+     public_base_url: str = "http://localhost:8000"
+diff --git a/src/authz/container.py b/src/authz/container.py
+index db4b112..67b9780 100644
+--- a/src/authz/container.py
++++ b/src/authz/container.py
+@@ -123,6 +123,8 @@ def build_container(
+             refresh_rule=RateLimitRule(
+                 "refresh", settings.refresh_rate_limit, settings.refresh_rate_window_seconds
+             ),
++            lockout_threshold=settings.lockout_threshold,
++            lockout_duration=timedelta(seconds=settings.lockout_seconds),
+         ),
+     )
+ 
+diff --git a/src/authz/models/user.py b/src/authz/models/user.py
+index c16bf5c..5d6e056 100644
+--- a/src/authz/models/user.py
++++ b/src/authz/models/user.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import uuid
+ from datetime import datetime
+ 
+-from sqlalchemy import ForeignKey, Index, Text, Uuid, text
++from sqlalchemy import ForeignKey, Index, Integer, Text, Uuid, text
+ from sqlalchemy.orm import Mapped, mapped_column
+ 
+ from authz.models.base import Base, OptionalTimestamp, Timestamp, UuidPk
+@@ -22,11 +22,16 @@ class User(Base):
+     created_at: Mapped[Timestamp]
+     updated_at: Mapped[Timestamp]
+     disabled_at: Mapped[OptionalTimestamp]
++    failed_logins: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
++    locked_until: Mapped[OptionalTimestamp]
+ 
+     @property
+     def is_active(self) -> bool:
+         return self.disabled_at is None
+ 
++    def is_locked(self, now: datetime) -> bool:
++        return self.locked_until is not None and now < self.locked_until
++
+ 
+ class Session(Base):
+     """A login on one device. Refresh tokens rotate inside it; revoking it ends them all."""
+diff --git a/src/authz/repositories/users.py b/src/authz/repositories/users.py
+index b326e5b..8a4810b 100644
+--- a/src/authz/repositories/users.py
++++ b/src/authz/repositories/users.py
+@@ -17,8 +17,8 @@ class UserRepository:
+     def __init__(self, session: AsyncSession) -> None:
+         self._session = session
+ 
+-    async def get(self, user_id: uuid.UUID) -> User | None:
+-        return await self._session.get(User, user_id)
++    async def get(self, user_id: uuid.UUID, *, for_update: bool = False) -> User | None:
++        return await self._session.get(User, user_id, with_for_update=for_update)
+ 
+     async def get_by_email(self, email: str) -> User | None:
+         """Look a user up by an already normalised address."""
+@@ -63,6 +63,18 @@ class UserRepository:
+             .values(password_hash=password_hash, updated_at=now)
+         )
+ 
++    async def set_login_failures(
++        self, user: User, failed_logins: int, locked_until: datetime | None
++    ) -> None:
++        user.failed_logins = failed_logins
++        user.locked_until = locked_until
++        await self._session.flush()
++
++    async def clear_login_failures(self, user_id: uuid.UUID) -> None:
++        await self._session.execute(
++            update(User).where(User.id == user_id).values(failed_logins=0, locked_until=None)
++        )
++
+     async def set_display_name(self, user: User, display_name: str, now: datetime) -> None:
+         user.display_name = display_name
+         user.updated_at = now
+diff --git a/src/authz/services/auth.py b/src/authz/services/auth.py
+index 7161777..6139497 100644
+--- a/src/authz/services/auth.py
++++ b/src/authz/services/auth.py
+@@ -40,6 +40,8 @@ class AuthPolicy:
+     session_ttl: timedelta
+     login_rule: RateLimitRule
+     refresh_rule: RateLimitRule
++    lockout_threshold: int
++    lockout_duration: timedelta
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -97,7 +99,7 @@ class AuthService:
+             log.info("auth.login_failed", reason="unknown_email")
+             raise InvalidCredentials()
+         if not await self._hasher.verify(user.password_hash, password):
+-            log.info("auth.login_failed", reason="bad_password", user_id=str(user.id))
++            await self._record_failure(user.id)
+             raise InvalidCredentials()
+         if user.disabled_at is not None:
+             log.info("auth.login_failed", reason="disabled", user_id=str(user.id))
+@@ -107,15 +109,47 @@ class AuthService:
+         if self._hasher.needs_rehash(user.password_hash):
+             new_hash = await self._hasher.hash(password)
+         async with self._db.transaction() as session:
++            users = UserRepository(session)
+             if new_hash is not None:
+-                await UserRepository(session).set_password_hash(
+-                    user.id, new_hash, self._clock.now()
+-                )
++                await users.set_password_hash(user.id, new_hash, self._clock.now())
+                 log.info("auth.password_rehashed", user_id=str(user.id))
++            if user.failed_logins or user.locked_until is not None:
++                await users.clear_login_failures(user.id)
+             pair = await self._open_session(session, user, client)
+         log.info("auth.login", user_id=str(pair.user_id), session_id=str(pair.session_id))
+         return pair
+ 
++    async def _record_failure(self, user_id: uuid.UUID) -> None:
++        """Count a wrong password and lock the account once the count reaches the threshold.
++
++        Failures while the account is locked are counted but do not extend the lock; the first
++        failure after a lock has expired starts the count over.
++        """
++        now = self._clock.now()
++        async with self._db.transaction() as session:
++            users = UserRepository(session)
++            user = await users.get(user_id, for_update=True)
++            if user is None:
++                return
++            if user.is_locked(now):
++                await users.set_login_failures(user, user.failed_logins + 1, user.locked_until)
++                log.info("auth.login_failed", reason="locked", user_id=str(user_id))
++                return
++            failures = 1 if user.locked_until is not None else user.failed_logins + 1
++            locked_until = None
++            if failures >= self._policy.lockout_threshold:
++                locked_until = now + self._policy.lockout_duration
++            await users.set_login_failures(user, failures, locked_until)
++        if locked_until is None:
++            log.info("auth.login_failed", reason="bad_password", user_id=str(user_id))
++        else:
++            log.warning(
++                "auth.account_locked",
++                user_id=str(user_id),
++                failures=failures,
++                locked_until=locked_until.isoformat(),
++            )
++
+     async def _open_session(
+         self, session: AsyncSession, user: User, client: ClientInfo
+     ) -> TokenPair:
+diff --git a/tests/api/test_account_lockout.py b/tests/api/test_account_lockout.py
+new file mode 100644
+index 0000000..9de6e96
+--- /dev/null
++++ b/tests/api/test_account_lockout.py
+@@ -0,0 +1,89 @@
++from __future__ import annotations
++
++from datetime import timedelta
++
++from authz.models import User
++from authz.repositories.users import UserRepository
++from tests.helpers.clock import FrozenClock
++from tests.helpers.factories import login, make_user
++
++WRONG = "not the password at all"
++
++
++async def _stored(container, user: User) -> User:
++    async with container.db.read() as session:
++        row = await UserRepository(session).get(user.id)
++    assert row is not None
++    return row
++
++
++async def _fail(client, user: User, times: int, *, ip: str = "198.51.100.20") -> None:
++    for _ in range(times):
++        response = await login(client, user.email, WRONG, ip=ip)
++        assert response.status_code == 401
++
++
++async def test_threshold_of_wrong_passwords_locks_the_account(client, container, clock):
++    user = await make_user(container)
++    threshold = container.settings.lockout_threshold
++
++    await _fail(client, user, threshold - 1)
++    assert (await _stored(container, user)).locked_until is None
++    await _fail(client, user, 1)
++
++    stored = await _stored(container, user)
++    assert stored.failed_logins == threshold
++    assert stored.locked_until == clock.now() + timedelta(
++        seconds=container.settings.lockout_seconds
++    )
++
++
++async def test_successful_login_resets_the_count(client, container):
++    user = await make_user(container)
++    threshold = container.settings.lockout_threshold
++
++    await _fail(client, user, threshold - 1, ip="198.51.100.21")
++    assert (await login(client, user.email, ip="198.51.100.21")).status_code == 200
++    await _fail(client, user, threshold - 1, ip="198.51.100.22")
++
++    stored = await _stored(container, user)
++    assert stored.failed_logins == threshold - 1
++    assert stored.locked_until is None
++
++
++async def test_failures_during_a_lock_do_not_extend_it(client, container, clock: FrozenClock):
++    user = await make_user(container)
++    threshold = container.settings.lockout_threshold
++    await _fail(client, user, threshold)
++    locked_until = (await _stored(container, user)).locked_until
++
++    clock.advance(seconds=60)
++    await _fail(client, user, 1)
++
++    stored = await _stored(container, user)
++    assert stored.failed_logins == threshold + 1
++    assert stored.locked_until == locked_until
++
++
++async def test_count_starts_over_after_the_lock_expires(client, container, clock: FrozenClock):
++    user = await make_user(container)
++    await _fail(client, user, container.settings.lockout_threshold)
++
++    clock.advance(seconds=container.settings.lockout_seconds)
++    await _fail(client, user, 1, ip="198.51.100.23")
++
++    stored = await _stored(container, user)
++    assert stored.failed_logins == 1
++    assert stored.locked_until is None
++
++
++async def test_locked_account_answers_like_an_unknown_address(client, container):
++    user = await make_user(container)
++    await _fail(client, user, container.settings.lockout_threshold)
++
++    locked = await login(client, user.email, WRONG, ip="198.51.100.24")
++    unknown = await login(client, "nobody@example.com", WRONG, ip="198.51.100.24")
++
++    assert locked.status_code == unknown.status_code == 401
++    assert locked.json() == unknown.json()
++    assert "retry-after" not in locked.headers
+diff --git a/tests/api/test_rate_limits.py b/tests/api/test_rate_limits.py
+index 27d3716..e7db5ea 100644
+--- a/tests/api/test_rate_limits.py
++++ b/tests/api/test_rate_limits.py
+@@ -17,8 +17,8 @@ async def test_login_is_limited_per_email_and_ip(client, container, clock: Froze
+     assert blocked.json()["error"]["code"] == "rate_limited"
+     retry_after = int(blocked.headers["retry-after"])
+     assert 0 < retry_after <= container.settings.login_rate_window_seconds
+-    other_ip = await login(client, "zoe@example.com", ip="192.0.2.2")
+-    assert other_ip.status_code == 200
++    other_ip = await login(client, "zoe@example.com", "a wrong password", ip="192.0.2.2")
++    assert other_ip.status_code == 401
+ 
+ 
+ async def test_login_limit_resets_in_the_next_window(client, container, clock: FrozenClock):
+@@ -29,7 +29,8 @@ async def test_login_limit_resets_in_the_next_window(client, container, clock: F
+ 
+     clock.advance(seconds=container.settings.login_rate_window_seconds)
+ 
+-    assert (await login(client, "yuki@example.com", ip="192.0.2.9")).status_code == 200
++    again = await login(client, "yuki@example.com", "a wrong password", ip="192.0.2.9")
++    assert again.status_code == 401
+ 
+ 
+ async def test_refresh_is_limited_per_ip(client, container):

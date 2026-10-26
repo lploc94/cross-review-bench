@@ -1,0 +1,463 @@
+diff --git a/README.md b/README.md
+index c9415f9..32e83a1 100644
+--- a/README.md
++++ b/README.md
+@@ -54,7 +54,10 @@ internal/testredis/ per-test Redis key spaces for tests
+ 6. Retries follow the route's `retry` policy, only for GET, HEAD, OPTIONS, PUT and DELETE unless
+    `non_idempotent` is set, and only when the body was buffered: bodies up to `BODY_BUFFER_LIMIT`
+    are held in memory, longer ones are streamed and sent once. Each retry waits an exponential
+-   backoff with jitter and prefers an upstream not tried yet.
++   backoff with jitter and prefers an upstream not tried yet. A route's `retry.budget` caps its
++   retries too: a retry is refused while the retries of the last `window` reach `ratio` times the
++   requests of that window plus `min_per_second` for each second of it (defaults 0.2, 3 and 10s).
++   A refused retry relays the last response and counts in `gateway_retry_budget_exhausted_total`.
+ 7. The response streams back with its trailers, which follow the same rules as its header
+    (hop-by-hop fields and the route's response transform); event streams and bodies of unknown
+    length are flushed after every write. No response headers within the route's `timeout` is
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..353fccc 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -34,6 +34,9 @@ const (
+ 	DefaultRetryAttempts       = 3
+ 	DefaultRetryBackoff        = 50 * time.Millisecond
+ 	DefaultRetryMaxBackoff     = time.Second
++	DefaultBudgetRatio         = 0.2
++	DefaultBudgetMinPerSecond  = 3
++	DefaultBudgetWindow        = 10 * time.Second
+ 	DefaultBreakerFailureRatio = 0.5
+ 	DefaultBreakerMinRequests  = 10
+ 	DefaultBreakerWindow       = 20
+@@ -92,12 +95,22 @@ type RateLimit struct {
+ 
+ // Retry says when a failed attempt is tried again on the next upstream.
+ type Retry struct {
+-	Attempts      int      `json:"attempts"` // total attempts, the first one included
+-	OnStatus      []int    `json:"on_status,omitempty"`
+-	OnErrors      []string `json:"on_errors,omitempty"`
+-	Backoff       Duration `json:"backoff,omitempty"`
+-	MaxBackoff    Duration `json:"max_backoff,omitempty"`
+-	NonIdempotent bool     `json:"non_idempotent,omitempty"` // also retry POST and PATCH
++	Attempts      int          `json:"attempts"` // total attempts, the first one included
++	OnStatus      []int        `json:"on_status,omitempty"`
++	OnErrors      []string     `json:"on_errors,omitempty"`
++	Backoff       Duration     `json:"backoff,omitempty"`
++	MaxBackoff    Duration     `json:"max_backoff,omitempty"`
++	NonIdempotent bool         `json:"non_idempotent,omitempty"` // also retry POST and PATCH
++	Budget        *RetryBudget `json:"budget,omitempty"`
++}
++
++// RetryBudget caps the retries of a route at a share of its requests: a retry is allowed while
++// the retries of the last Window stay below Ratio times the requests of that window plus
++// MinPerSecond for each second of it. A zero field takes its default.
++type RetryBudget struct {
++	Ratio        float64  `json:"ratio,omitempty"`
++	MinPerSecond int      `json:"min_per_second,omitempty"`
++	Window       Duration `json:"window,omitempty"`
+ }
+ 
+ // CircuitBreaker opens when FailureRatio of the last Window outcomes failed, once at least
+@@ -288,6 +301,17 @@ func (r *Route) normalize() {
+ 		if rt.MaxBackoff == 0 {
+ 			rt.MaxBackoff = Duration(max(DefaultRetryMaxBackoff, rt.Backoff.D()))
+ 		}
++		if b := rt.Budget; b != nil {
++			if b.Ratio == 0 {
++				b.Ratio = DefaultBudgetRatio
++			}
++			if b.MinPerSecond == 0 {
++				b.MinPerSecond = DefaultBudgetMinPerSecond
++			}
++			if b.Window == 0 {
++				b.Window = Duration(DefaultBudgetWindow)
++			}
++		}
+ 	}
+ 	if cb := r.CircuitBreaker; cb != nil {
+ 		if cb.FailureRatio == 0 {
+diff --git a/internal/config/routes_test.go b/internal/config/routes_test.go
+index d62f5f0..3c281b8 100644
+--- a/internal/config/routes_test.go
++++ b/internal/config/routes_test.go
+@@ -73,6 +73,17 @@ func TestParseRoutesDefaultsWithoutOptionalBlocks(t *testing.T) {
+ 	}
+ }
+ 
++func TestRetryBudgetDefaults(t *testing.T) {
++	rs, err := ParseRoutes([]byte(`{"routes":[{"id":"a","path":"/a","retry":{"attempts":2,"budget":{}},"upstreams":[{"url":"http://a"}]}]}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	b := rs.Routes[0].Retry.Budget
++	if b == nil || b.Ratio != DefaultBudgetRatio || b.MinPerSecond != DefaultBudgetMinPerSecond || b.Window.D() != DefaultBudgetWindow {
++		t.Errorf("budget defaults = %+v", b)
++	}
++}
++
+ func TestEmptyRetryListsMeanNone(t *testing.T) {
+ 	rs, err := ParseRoutes([]byte(`{"routes":[{"id":"a","path":"/x","upstreams":[{"url":"http://a"}],
+ 		"retry":{"attempts":2,"on_status":[],"on_errors":["connect"]}}]}`))
+@@ -115,6 +126,8 @@ func TestValidationNamesRouteAndField(t *testing.T) {
+ 		{"weight", `{"id":"a","path":"/a","upstreams":[{"url":"http://a","weight":101}]}`, `route "a": upstreams[0].weight: must be between 1 and 100`},
+ 		{"auth", `{"id":"a","path":"/a","auth":"basic","upstreams":[{"url":"http://a"}]}`, `route "a": auth: must be "none", "api_key" or "hmac"`},
+ 		{"rate window", `{"id":"a","path":"/a","rate_limit":{"requests":1,"window":"500ms"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.window: must be a whole number of milliseconds`},
++		{"budget ratio", `{"id":"a","path":"/a","retry":{"attempts":2,"budget":{"ratio":1.5}},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.budget.ratio: must be above 0 and at most 1, got 1.5`},
++		{"budget window", `{"id":"a","path":"/a","retry":{"attempts":2,"budget":{"window":"1500ms"}},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.budget.window: must be a whole number of seconds between 1s and 1m0s`},
+ 		{"rate requests", `{"id":"a","path":"/a","rate_limit":{"requests":0,"window":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.requests: must be at least 1`},
+ 		{"retry attempts", `{"id":"a","path":"/a","retry":{"attempts":11},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.attempts: must be between 1 and 10`},
+ 		{"retry status", `{"id":"a","path":"/a","retry":{"attempts":2,"on_status":[404]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_status[0]: must be a 5xx status`},
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..e89b667 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -16,15 +16,16 @@ import (
+ 
+ // Limits on route settings.
+ const (
+-	MaxUpstreams       = 64
+-	MaxUpstreamWeight  = 100
+-	MaxRetryAttempts   = 10
+-	MaxBreakerWindow   = 1000
+-	MaxBreakerProbes   = 100
+-	MinRateLimitWindow = time.Second
+-	MaxRateLimitWindow = 24 * time.Hour
+-	MinHealthInterval  = time.Second
+-	MaxTimeout         = 10 * time.Minute
++	MaxUpstreams          = 64
++	MaxUpstreamWeight     = 100
++	MaxRetryAttempts      = 10
++	MaxBudgetMinPerSecond = 1000
++	MaxBreakerWindow      = 1000
++	MaxBreakerProbes      = 100
++	MinRateLimitWindow    = time.Second
++	MaxRateLimitWindow    = 24 * time.Hour
++	MinHealthInterval     = time.Second
++	MaxTimeout            = 10 * time.Minute
+ )
+ 
+ var (
+@@ -222,6 +223,17 @@ func (rt *Retry) validate(p routeProblems) {
+ 	if rt.MaxBackoff.D() < rt.Backoff.D() {
+ 		p.add("retry.max_backoff", "must not be shorter than retry.backoff")
+ 	}
++	if b := rt.Budget; b != nil {
++		if b.Ratio <= 0 || b.Ratio > 1 {
++			p.add("retry.budget.ratio", "must be above 0 and at most 1, got %g", b.Ratio)
++		}
++		if b.MinPerSecond < 1 || b.MinPerSecond > MaxBudgetMinPerSecond {
++			p.add("retry.budget.min_per_second", "must be between 1 and %d, got %d", MaxBudgetMinPerSecond, b.MinPerSecond)
++		}
++		if w := b.Window.D(); w < time.Second || w > time.Minute || w%time.Second != 0 {
++			p.add("retry.budget.window", "must be a whole number of seconds between 1s and 1m0s")
++		}
++	}
+ 	if rt.MaxBackoff.D() > time.Minute {
+ 		p.add("retry.max_backoff", "must be at most 1m")
+ 	}
+diff --git a/internal/core/budget.go b/internal/core/budget.go
+new file mode 100644
+index 0000000..abfef95
+--- /dev/null
++++ b/internal/core/budget.go
+@@ -0,0 +1,78 @@
++package core
++
++import (
++	"sync"
++	"time"
++
++	"github.com/relaywork/gateway/internal/config"
++)
++
++// RetryBudget caps the retries of one route. Requests and retries are counted in buckets of one
++// second, over the window; a retry is allowed while the retries of the window stay below
++// ratio × requests + minPerSecond × window seconds. Refused retries cost nothing: they are not
++// counted, so a route that keeps failing is held to the same share.
++type RetryBudget struct {
++	mu        sync.Mutex
++	ratio     float64
++	minPerSec float64
++	buckets   []budgetBucket // one per second of the window, indexed by second modulo its length
++}
++
++// budgetBucket holds the counts of one Unix second.
++type budgetBucket struct {
++	second   int64
++	requests int
++	retries  int
++}
++
++// NewRetryBudget returns a budget with the policy's ratio, minimum rate and window. The settings
++// are validated by the config package.
++func NewRetryBudget(ratio float64, minPerSecond int, window time.Duration) *RetryBudget {
++	seconds := max(int(window/time.Second), 1)
++	return &RetryBudget{
++		ratio:     ratio,
++		minPerSec: float64(minPerSecond),
++		buckets:   make([]budgetBucket, seconds),
++	}
++}
++
++// bucket returns the bucket of the second of now, emptied first when it still holds an earlier
++// second. The caller holds mu.
++func (b *RetryBudget) bucket(now time.Time) *budgetBucket {
++	sec := now.Unix()
++	bk := &b.buckets[sec%int64(len(b.buckets))]
++	if bk.second != sec {
++		*bk = budgetBucket{second: sec}
++	}
++	return bk
++}
++
++// Request counts a first attempt at time now.
++func (b *RetryBudget) Request(now time.Time) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	b.bucket(now).requests++
++}
++
++// AllowRetry reports whether a retry at time now is within the budget, and counts it when it is.
++func (b *RetryBudget) AllowRetry(now time.Time) bool {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	requests, retries := 0, 0
++	for _, bk := range b.buckets {
++		requests += bk.requests
++		retries += bk.retries
++	}
++	allowance := b.ratio*float64(requests) + b.minPerSec*float64(len(b.buckets))
++	if float64(retries) >= allowance {
++		return false
++	}
++	b.bucket(now).retries++
++	return true
++}
++
++// budgetState is a route's budget and the settings it was built from.
++type budgetState struct {
++	spec   config.RetryBudget
++	budget *RetryBudget
++}
+diff --git a/internal/core/budget_test.go b/internal/core/budget_test.go
+new file mode 100644
+index 0000000..e418441
+--- /dev/null
++++ b/internal/core/budget_test.go
+@@ -0,0 +1,39 @@
++package core
++
++import (
++	"testing"
++	"time"
++)
++
++var budgetStart = time.Date(2025, time.June, 2, 12, 0, 0, 0, time.UTC)
++
++func TestRetryBudgetAllowsTheRatioPlusTheMinimum(t *testing.T) {
++	b := NewRetryBudget(0.5, 2, 4*time.Second)
++	for range 10 {
++		b.Request(budgetStart)
++	}
++	// 0.5 × 10 requests + 2 × 4 seconds allow 13 retries.
++	allowed := 0
++	for b.AllowRetry(budgetStart) {
++		allowed++
++	}
++	if allowed != 13 {
++		t.Errorf("allowed %d retries, want 13", allowed)
++	}
++}
++
++func TestRetryBudgetCountsTheRequestsOfTheWindow(t *testing.T) {
++	b := NewRetryBudget(1, 0, 4*time.Second)
++	b.Request(budgetStart)
++	b.Request(budgetStart)
++	// Three seconds later the requests are still in the four-second window: two retries fit.
++	later := budgetStart.Add(3 * time.Second)
++	for i := range 2 {
++		if !b.AllowRetry(later) {
++			t.Fatalf("retry %d refused inside the window", i+1)
++		}
++	}
++	if b.AllowRetry(later) {
++		t.Error("a third retry was allowed for two requests")
++	}
++}
+diff --git a/internal/core/policy.go b/internal/core/policy.go
+index d654118..4ef845d 100644
+--- a/internal/core/policy.go
++++ b/internal/core/policy.go
+@@ -26,6 +26,7 @@ type RetryPolicy struct {
+ 	Backoff       time.Duration
+ 	MaxBackoff    time.Duration
+ 	NonIdempotent bool
++	Budget        *RetryBudget // nil: retries are not budgeted
+ }
+ 
+ func retryPolicy(c *config.Retry) RetryPolicy {
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..cd1fb3a 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -31,9 +31,10 @@ type Runtime struct {
+ 
+ 	table atomic.Pointer[Table]
+ 
+-	mu     sync.Mutex // serialises Apply and Close
+-	states map[stateKey]*upstreamState
+-	closed bool
++	mu      sync.Mutex // serialises Apply and Close
++	states  map[stateKey]*upstreamState
++	budgets map[string]budgetState // by route id
++	closed  bool
+ }
+ 
+ // stateKey identifies an upstream of a route across reloads.
+@@ -101,7 +102,8 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
+ 			reloads:  reg.NewCounter("gateway_route_reloads_total", "Route table loads by result.", "result"),
+ 			lastLoad: reg.NewGauge("gateway_route_table_loaded_timestamp_seconds", "When the live route table was loaded, as a Unix time."),
+ 		},
+-		states: make(map[stateKey]*upstreamState),
++		states:  make(map[stateKey]*upstreamState),
++		budgets: make(map[string]budgetState),
+ 	}
+ 	rt.table.Store(newTable(nil))
+ 	return rt, nil
+@@ -132,10 +134,11 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 	}
+ 
+ 	next := make(map[stateKey]*upstreamState)
++	budgets := make(map[string]budgetState)
+ 	var started []stateKey
+ 	built := make([]*Route, 0, len(routes.Routes))
+ 	for _, spec := range routes.Routes {
+-		r, err := rt.buildRoute(spec, next, &started)
++		r, err := rt.buildRoute(spec, next, budgets, &started)
+ 		if err != nil {
+ 			for _, key := range started {
+ 				next[key].stop()
+@@ -174,6 +177,7 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 		}
+ 	}
+ 	rt.states = next
++	rt.budgets = budgets
+ 	rt.gauges.routes.Set(float64(len(built)))
+ 	rt.gauges.reloads.Inc("ok")
+ 	rt.gauges.lastLoad.Set(float64(rt.clock.Now().Unix()))
+@@ -181,9 +185,10 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 	return nil
+ }
+ 
+-// buildRoute compiles one route into next, reusing the state of upstreams it already had. New
+-// health checkers are started and their keys appended to started.
+-func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamState, started *[]stateKey) (*Route, error) {
++// buildRoute compiles one route into next, reusing the state of upstreams it already had, and
++// its retry budget into budgets. New health checkers are started and their keys appended to
++// started.
++func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamState, budgets map[string]budgetState, started *[]stateKey) (*Route, error) {
+ 	path, prefix := spec.MatchPath()
+ 	r := &Route{
+ 		ID:          spec.ID,
+@@ -203,6 +208,9 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 	if spec.RateLimit != nil {
+ 		r.RateLimit = &RateLimitPolicy{Requests: spec.RateLimit.Requests, Window: spec.RateLimit.Window.D()}
+ 	}
++	if spec.Retry != nil && spec.Retry.Budget != nil {
++		r.Retry.Budget = rt.retryBudget(spec.ID, *spec.Retry.Budget, budgets)
++	}
+ 	if t := spec.Transforms; t != nil {
+ 		r.Request = compileTransform(t.Request)
+ 		r.Response = compileTransform(t.Response)
+@@ -235,6 +243,22 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 	return r, nil
+ }
+ 
++// retryBudget returns the budget of route id under spec: the current one where its settings are
++// unchanged, a new one otherwise. It records the budget in budgets; the current table is not
++// modified, so that a failed Apply leaves it as it was.
++func (rt *Runtime) retryBudget(id string, spec config.RetryBudget, budgets map[string]budgetState) *RetryBudget {
++	if old, ok := rt.budgets[id]; ok && old.spec == spec {
++		budgets[id] = old
++		return old.budget
++	}
++	st := budgetState{
++		spec:   spec,
++		budget: NewRetryBudget(spec.Ratio, spec.MinPerSecond, spec.Window.D()),
++	}
++	budgets[id] = st
++	return st.budget
++}
++
+ // upstreamState returns the state for key under spec: the current parts where their settings
+ // are unchanged, fresh parts otherwise. It never modifies the current state, so that a failed
+ // Apply leaves the live table untouched.
+diff --git a/internal/proxy/forward.go b/internal/proxy/forward.go
+index 9a51c3f..ccd47a3 100644
+--- a/internal/proxy/forward.go
++++ b/internal/proxy/forward.go
+@@ -80,9 +80,16 @@ func (h *Handler) forward(w *statusRecorder, ex *exchange, body *requestBody) {
+ 		attempts = route.Retry.Attempts
+ 	}
+ 	tried := make(map[*core.Upstream]bool, attempts)
++	if b := route.Retry.Budget; b != nil {
++		b.Request(h.clock.Now())
++	}
+ 	var last *attemptResult
+ 	for n := 1; n <= attempts; n++ {
+ 		if n > 1 {
++			if b := route.Retry.Budget; b != nil && !b.AllowRetry(h.clock.Now()) {
++				h.metrics.budgetExhausted.Inc(route.ID)
++				break // the route's retry budget is spent; relay what the last attempt got
++			}
+ 			if !h.sleep(ex.req.Context(), route.Retry.Delay(n-1, h.rand)) {
+ 				break // the client went away during the backoff
+ 			}
+diff --git a/internal/proxy/forward_test.go b/internal/proxy/forward_test.go
+index 96927f7..ce340cb 100644
+--- a/internal/proxy/forward_test.go
++++ b/internal/proxy/forward_test.go
+@@ -76,6 +76,23 @@ func TestRetryGivesUpAfterAttemptsAndRelaysLastResponse(t *testing.T) {
+ 	}
+ }
+ 
++func TestRetryBudgetStopsRetries(t *testing.T) {
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		return reply(r, 503, "down"), nil
++	}}
++	routes := `{"routes":[{"id":"api","path_prefix":"/api","upstreams":[{"url":"http://up.internal"}],
++	  "retry":{"attempts":5,"backoff":"1ms","budget":{"min_per_second":1,"window":"1s"}}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: tr})
++	w := f.get("/api/x")
++	// One request in the window allows 0.2 + 1 retries: two retries, then the budget is spent.
++	if w.Code != 503 || len(tr.sent()) != 3 {
++		t.Errorf("status %d after %d attempts, want 503 after 3", w.Code, len(tr.sent()))
++	}
++	if !f.has(`gateway_retry_budget_exhausted_total{route="api"} 1`) {
++		t.Error("the refused retry was not counted")
++	}
++}
++
+ func TestRetryOnlyOnListedStatuses(t *testing.T) {
+ 	tr := statusTransport(500, 200)
+ 	f := newFixture(t, retryRoute(`,"on_status":[502]`), fixtureOptions{transport: tr})
+diff --git a/internal/proxy/metrics.go b/internal/proxy/metrics.go
+index da058ba..1ef3050 100644
+--- a/internal/proxy/metrics.go
++++ b/internal/proxy/metrics.go
+@@ -9,6 +9,7 @@ type proxyMetrics struct {
+ 	requests        *metrics.Counter
+ 	upstreamLatency *metrics.Histogram
+ 	retries         *metrics.Counter
++	budgetExhausted *metrics.Counter
+ 	rateLimited     *metrics.Counter
+ 	rateLimitErrors *metrics.Counter
+ 	authFailures    *metrics.Counter
+@@ -22,6 +23,8 @@ func newProxyMetrics(reg *metrics.Registry) proxyMetrics {
+ 			"Time from sending a request to an upstream until its response headers arrived, per attempt.", upstreamBuckets, "route"),
+ 		retries: reg.NewCounter("gateway_retries_total",
+ 			"Attempts after the first, by route.", "route"),
++		budgetExhausted: reg.NewCounter("gateway_retry_budget_exhausted_total",
++			"Retries refused because the route's retry budget is spent, by route.", "route"),
+ 		rateLimited: reg.NewCounter("gateway_rate_limit_rejections_total",
+ 			"Requests rejected with 429 by the rate limiter, by route.", "route"),
+ 		rateLimitErrors: reg.NewCounter("gateway_rate_limit_errors_total",

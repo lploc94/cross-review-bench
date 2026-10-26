@@ -1,0 +1,956 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..ce1ceb2 100644
+--- a/README.md
++++ b/README.md
+@@ -26,6 +26,17 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   takes is waited for at most that long. So a release can answer 503 `busy` (see Errors) while an
+   admin write holds an inventory row. The expiry sweep skips a hold it cannot lock and pages past
+   it, so the other due holds still expire; the skipped hold is found again by the next run.
++- **Hold groups.** A group holds several room types for one stay and one guest (`items`, each room
++  type once, at most `max-rooms-per-booking` rooms in all). It is one hold per room type, priced on
++  its own, sharing a group id and a time limit. The group takes its rooms in one transaction, in
++  room type id order and then night order, whatever order the request lists them in: a short night
++  on any room type rolls the whole transaction back, so no room is held. Single holds take their
++  nights in the same order, so two groups, or a group and a single hold, never take inventory rows
++  in opposite orders. Confirming charges the group's total once (`charge-group-<groupId>`) and makes
++  one reservation per room type, each with a ledger entry for its own total (none for a room type
++  quoted at zero). Release, confirmation and expiry (the sweep and the admin override) act on every
++  hold of the group, locked in room type id order; releasing or confirming one hold of a group on
++  its own is a 409 `conflict`.
+ - **Pricing.** The rules run in a fixed order, and the price lines are stored with the reservation so
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+   Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+@@ -125,6 +136,8 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `POST /api/v1/properties/{code}/quotes` | public | per-night price breakdown |
+ | `POST /api/v1/properties/{code}/holds` | public | create a hold (201, `Location`) |
+ | `GET /api/v1/holds/{id}`, `POST /api/v1/holds/{id}/release`, `POST /api/v1/holds/{id}/confirm` | public | hold lifecycle |
++| `POST /api/v1/properties/{code}/hold-groups` | public | hold several room types for one stay (201, `Location`) |
++| `GET /api/v1/hold-groups/{id}`, `POST .../release`, `POST .../confirm` | public | group lifecycle; confirm returns one reservation per room type (201) |
+ | `GET /api/v1/reservations/{reference}` | public | one reservation with its price lines |
+ | `GET /api/v1/reservations/{reference}/cancellation-quote` | public | refund a cancellation would get |
+ | `POST /api/v1/reservations/{reference}/cancel` | public | cancel and refund |
+diff --git a/src/main/java/com/innkeep/booking/api/HoldController.java b/src/main/java/com/innkeep/booking/api/HoldController.java
+index 7399d8c..82db561 100644
+--- a/src/main/java/com/innkeep/booking/api/HoldController.java
++++ b/src/main/java/com/innkeep/booking/api/HoldController.java
+@@ -1,5 +1,7 @@
+ package com.innkeep.booking.api;
+ 
++import com.innkeep.booking.api.dto.HoldGroupRequest;
++import com.innkeep.booking.api.dto.HoldGroupResponse;
+ import com.innkeep.booking.api.dto.HoldRequest;
+ import com.innkeep.booking.api.dto.HoldResponse;
+ import com.innkeep.booking.api.dto.ReservationResponse;
+@@ -8,9 +10,12 @@ import com.innkeep.booking.domain.GuestDetails;
+ import com.innkeep.booking.domain.Hold;
+ import com.innkeep.booking.domain.Reservation;
+ import com.innkeep.booking.service.HoldService;
++import com.innkeep.booking.service.HoldService.GroupItem;
+ import jakarta.validation.Valid;
+ import java.net.URI;
++import java.util.List;
+ import java.util.UUID;
++import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+@@ -61,4 +66,36 @@ public class HoldController {
+     return ResponseEntity.created(URI.create("/api/v1/reservations/" + reservation.getReference()))
+         .body(ReservationResponse.from(reservation));
+   }
++
++  @PostMapping("/api/v1/properties/{code}/hold-groups")
++  public ResponseEntity<HoldGroupResponse> createGroup(
++      @PathVariable String code, @Valid @RequestBody HoldGroupRequest request) {
++    var stay = new DateRange(request.checkIn(), request.checkOut());
++    var guest =
++        new GuestDetails(request.guest().name(), request.guest().email(), request.guest().phone());
++    List<GroupItem> items =
++        request.items().stream()
++            .map(item -> new GroupItem(item.roomType(), item.rooms(), item.guests()))
++            .toList();
++    List<Hold> group = holds.createGroup(code, stay, items, guest);
++    return ResponseEntity.created(URI.create("/api/v1/hold-groups/" + group.get(0).getGroupId()))
++        .body(HoldGroupResponse.from(group));
++  }
++
++  @GetMapping("/api/v1/hold-groups/{id}")
++  public HoldGroupResponse getGroup(@PathVariable UUID id) {
++    return HoldGroupResponse.from(holds.getGroup(id));
++  }
++
++  @PostMapping("/api/v1/hold-groups/{id}/release")
++  public HoldGroupResponse releaseGroup(@PathVariable UUID id) {
++    return HoldGroupResponse.from(holds.releaseGroup(id));
++  }
++
++  /** Confirms the group; one reservation per room type, in the group's order. */
++  @PostMapping("/api/v1/hold-groups/{id}/confirm")
++  public ResponseEntity<List<ReservationResponse>> confirmGroup(@PathVariable UUID id) {
++    return ResponseEntity.status(HttpStatus.CREATED)
++        .body(holds.confirmGroup(id).stream().map(ReservationResponse::from).toList());
++  }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/HoldGroupRequest.java b/src/main/java/com/innkeep/booking/api/dto/HoldGroupRequest.java
+new file mode 100644
+index 0000000..35493c8
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/HoldGroupRequest.java
+@@ -0,0 +1,20 @@
++package com.innkeep.booking.api.dto;
++
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotEmpty;
++import jakarta.validation.constraints.NotNull;
++import java.time.LocalDate;
++import java.util.List;
++
++/** Several room types for one stay, held together for one guest. */
++public record HoldGroupRequest(
++    @NotNull LocalDate checkIn,
++    @NotNull LocalDate checkOut,
++    @NotEmpty List<@NotNull @Valid Item> items,
++    @NotNull @Valid GuestRequest guest) {
++
++  /** One room type of the group: the number of rooms and of guests staying in them. */
++  public record Item(@NotBlank String roomType, @Min(1) int rooms, @Min(1) int guests) {}
++}
+diff --git a/src/main/java/com/innkeep/booking/api/dto/HoldGroupResponse.java b/src/main/java/com/innkeep/booking/api/dto/HoldGroupResponse.java
+new file mode 100644
+index 0000000..d4065c8
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/HoldGroupResponse.java
+@@ -0,0 +1,33 @@
++package com.innkeep.booking.api.dto;
++
++import com.innkeep.booking.domain.Hold;
++import com.innkeep.booking.domain.Money;
++import java.math.BigDecimal;
++import java.time.Instant;
++import java.util.List;
++import java.util.UUID;
++
++/** A group and its holds in room type id order; the total is the sum of the holds' totals. */
++public record HoldGroupResponse(
++    UUID id,
++    String status,
++    String currency,
++    BigDecimal total,
++    Instant expiresAt,
++    List<HoldResponse> holds) {
++
++  public static HoldGroupResponse from(List<Hold> group) {
++    Hold first = group.get(0);
++    Money total = Money.zero(first.getTotal().currency());
++    for (Hold hold : group) {
++      total = total.plus(hold.getTotal());
++    }
++    return new HoldGroupResponse(
++        first.getGroupId(),
++        first.getStatus().name(),
++        total.currency().getCurrencyCode(),
++        total.amount(),
++        first.getExpiresAt(),
++        group.stream().map(HoldResponse::from).toList());
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java b/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java
+index 5ff7f34..2be5a4a 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java
+@@ -9,6 +9,7 @@ import java.util.UUID;
+ 
+ public record HoldResponse(
+     UUID id,
++    UUID groupId,
+     String status,
+     String propertyCode,
+     String roomType,
+@@ -24,6 +25,7 @@ public record HoldResponse(
+   public static HoldResponse from(Hold hold) {
+     return new HoldResponse(
+         hold.getId(),
++        hold.getGroupId(),
+         hold.getStatus().name(),
+         hold.getProperty().getCode(),
+         hold.getRoomType().getCode(),
+diff --git a/src/main/java/com/innkeep/booking/api/dto/HoldSummary.java b/src/main/java/com/innkeep/booking/api/dto/HoldSummary.java
+index d73796a..13d1176 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/HoldSummary.java
++++ b/src/main/java/com/innkeep/booking/api/dto/HoldSummary.java
+@@ -9,6 +9,7 @@ import java.util.UUID;
+ /** A hold as the admin list shows it. */
+ public record HoldSummary(
+     UUID id,
++    UUID groupId,
+     String status,
+     String propertyCode,
+     String roomTypeCode,
+@@ -23,6 +24,7 @@ public record HoldSummary(
+   public static HoldSummary from(Hold hold) {
+     return new HoldSummary(
+         hold.getId(),
++        hold.getGroupId(),
+         hold.getStatus().name(),
+         hold.getProperty().getCode(),
+         hold.getRoomType().getCode(),
+diff --git a/src/main/java/com/innkeep/booking/domain/Hold.java b/src/main/java/com/innkeep/booking/domain/Hold.java
+index 47d5216..92b4ee6 100644
+--- a/src/main/java/com/innkeep/booking/domain/Hold.java
++++ b/src/main/java/com/innkeep/booking/domain/Hold.java
+@@ -26,7 +26,8 @@ import java.util.UUID;
+ /**
+  * Rooms held for a guest while they pay. The rooms are counted as held in inventory until the hold
+  * is confirmed (they become booked), released, or expires. The hold keeps the quote it was made
+- * with, so the reservation can copy it.
++ * with, so the reservation can copy it. A hold made as part of a group (several room types for one
++ * stay) carries the group id; the group changes state as a whole.
+  */
+ @Entity
+ @Table(name = "hold")
+@@ -72,6 +73,9 @@ public class Hold extends AbstractEntity<UUID> {
+   @Column(name = "created_at", nullable = false)
+   private Instant createdAt;
+ 
++  @Column(name = "group_id")
++  private UUID groupId;
++
+   @Version private Long version;
+ 
+   @ElementCollection(fetch = FetchType.LAZY)
+@@ -116,6 +120,19 @@ public class Hold extends AbstractEntity<UUID> {
+     return property;
+   }
+ 
++  /** The group this hold belongs to, or null for a single hold. */
++  public UUID getGroupId() {
++    return groupId;
++  }
++
++  /** Makes a new hold part of the group {@code groupId}; a hold never changes group. */
++  public void joinGroup(UUID groupId) {
++    if (this.groupId != null) {
++      throw new IllegalStateException("hold " + id + " is already in a group");
++    }
++    this.groupId = groupId;
++  }
++
+   public RoomType getRoomType() {
+     return roomType;
+   }
+diff --git a/src/main/java/com/innkeep/booking/persistence/HoldRepository.java b/src/main/java/com/innkeep/booking/persistence/HoldRepository.java
+index bf02eef..29c4d4b 100644
+--- a/src/main/java/com/innkeep/booking/persistence/HoldRepository.java
++++ b/src/main/java/com/innkeep/booking/persistence/HoldRepository.java
+@@ -61,6 +61,24 @@ public interface HoldRepository extends JpaRepository<Hold, UUID> {
+       @Param("afterId") UUID afterId,
+       Pageable page);
+ 
++  /** The holds of a group in room type id order. */
++  @EntityGraph(attributePaths = {"property", "roomType", "priceLines"})
++  @Query("select h from Hold h where h.groupId = :groupId order by h.roomType.id")
++  List<Hold> findGroup(@Param("groupId") UUID groupId);
++
++  /**
++   * The holds of a group with row locks, taken in room type id order: every change of a group locks
++   * its holds in that order, so two changes of one group never wait on each other in a cycle. Like
++   * {@link #findLockedById}, it locks the hold rows only; the caller loads the associations.
++   */
++  @Lock(LockModeType.PESSIMISTIC_WRITE)
++  @Query("select h from Hold h where h.groupId = :groupId order by h.roomType.id")
++  List<Hold> findLockedGroup(@Param("groupId") UUID groupId);
++
++  /** The group of a hold, read without loading or locking the hold; empty for a single hold. */
++  @Query("select h.groupId from Hold h where h.id = :id and h.groupId is not null")
++  Optional<UUID> findGroupIdOf(@Param("id") UUID id);
++
+   @Query("select h.status as status, count(h) as total from Hold h group by h.status")
+   List<HoldStatusCount> countByStatus();
+ }
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 5a246a1..da966d7 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -10,6 +10,7 @@ import com.innkeep.booking.domain.HoldStatus;
+ import com.innkeep.booking.domain.InsufficientAvailabilityException;
+ import com.innkeep.booking.domain.LedgerEntry;
+ import com.innkeep.booking.domain.LedgerKind;
++import com.innkeep.booking.domain.Money;
+ import com.innkeep.booking.domain.NotFoundException;
+ import com.innkeep.booking.domain.PricingEngine;
+ import com.innkeep.booking.domain.Quote;
+@@ -31,9 +32,13 @@ import java.security.SecureRandom;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.time.LocalDate;
++import java.util.ArrayList;
++import java.util.Comparator;
+ import java.util.EnumMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.UUID;
+ import org.springframework.dao.PessimisticLockingFailureException;
+ import org.springframework.data.domain.Page;
+@@ -48,6 +53,10 @@ import org.springframework.transaction.support.TransactionTemplate;
+  * cannot both succeed and two holds never lock nights in opposite orders. The hold row is written
+  * before inventory is touched: if a concurrent request already changed it, the version check fails
+  * there and nothing has been moved yet.
++ *
++ * <p>A group holds several room types for one stay. It takes, confirms and gives back inventory in
++ * one global order, room type id and then night, the order a single hold's nights also follow, so
++ * groups and single holds never lock inventory rows in opposite orders.
+  */
+ @Service
+ public class HoldService {
+@@ -134,6 +143,77 @@ public class HoldService {
+         });
+   }
+ 
++  /** One room type of a group: how many rooms, and how many guests stay in them. */
++  public record GroupItem(String roomType, int rooms, int guests) {}
++
++  /**
++   * Prices and holds every item of a group for the same stay, in one transaction: if any night of
++   * any item is short, the transaction rolls back and nothing is held. The holds share a group id
++   * and a time limit; they are returned in room type id order.
++   */
++  public List<Hold> createGroup(
++      String propertyCode, DateRange stay, List<GroupItem> items, GuestDetails guest) {
++    if (items.isEmpty()) {
++      throw new ValidationException("a group needs at least one room type");
++    }
++    int totalRooms = 0;
++    for (GroupItem item : items) {
++      config.requireWithinLimits(stay, item.rooms());
++      totalRooms += item.rooms();
++    }
++    config.requireWithinLimits(stay, totalRooms);
++    return tx.execute(
++        status -> {
++          record Resolved(RoomType type, GroupItem item) {}
++          var resolved = new ArrayList<Resolved>();
++          var seen = new HashSet<Long>();
++          for (GroupItem item : items) {
++            RoomType type = catalog.roomType(propertyCode, item.roomType());
++            if (!seen.add(type.getId())) {
++              throw new ValidationException("room type " + type.getCode() + " is listed twice");
++            }
++            resolved.add(new Resolved(type, item));
++          }
++          resolved.sort(Comparator.comparing(r -> r.type().getId()));
++          var property = resolved.get(0).type().getProperty();
++          Instant now = clock.instant();
++          if (stay.checkIn().isBefore(LocalDate.ofInstant(now, property.zone()))) {
++            throw new ValidationException(
++                "check-in " + stay.checkIn() + " is before today at the property");
++          }
++          UUID groupId = UUID.randomUUID();
++          var created = new ArrayList<Hold>();
++          for (Resolved r : resolved) {
++            RoomType type = r.type();
++            int rooms = r.item().rooms();
++            List<SeasonalRate> rates =
++                seasonalRates.findOverlapping(
++                    List.of(type.getId()), stay.checkIn(), stay.lastNight());
++            Quote quote =
++                PricingEngine.quote(property, type, rates, stay, rooms, r.item().guests());
++            for (LocalDate night : stay.nightDates()) {
++              if (inventory.holdRooms(type.getId(), night, rooms) == 0) {
++                throw new InsufficientAvailabilityException(type.getCode(), night);
++              }
++            }
++            var hold =
++                new Hold(
++                    property,
++                    type,
++                    stay,
++                    rooms,
++                    r.item().guests(),
++                    guest,
++                    quote,
++                    now,
++                    config.holdTtl());
++            hold.joinGroup(groupId);
++            created.add(holds.save(hold));
++          }
++          return created;
++        });
++  }
++
+   public Hold get(UUID id) {
+     return holds.findById(id).orElseThrow(() -> new NotFoundException("hold", id));
+   }
+@@ -156,11 +236,57 @@ public class HoldService {
+    * the row. The timeout is set for this transaction only.
+    */
+   private Hold lockedGetWithinTimeout(UUID id) {
++    limitLockWaits();
++    return lockedGet(id);
++  }
++
++  private void limitLockWaits() {
+     entities
+         .createNativeQuery("select set_config('lock_timeout', :limit, true)")
+         .setParameter("limit", config.lockTimeout().toMillis() + "ms")
+         .getSingleResult();
+-    return lockedGet(id);
++  }
++
++  /** The holds of a group in room type id order. */
++  public List<Hold> getGroup(UUID groupId) {
++    List<Hold> group = holds.findGroup(groupId);
++    if (group.isEmpty()) {
++      throw new NotFoundException("hold group", groupId);
++    }
++    return group;
++  }
++
++  private List<Hold> lockedGroup(UUID groupId) {
++    List<Hold> group = holds.findLockedGroup(groupId);
++    if (group.isEmpty()) {
++      throw new NotFoundException("hold group", groupId);
++    }
++    for (Hold hold : group) {
++      hold.getProperty().getCode();
++      hold.getRoomType().getCode();
++      hold.getPriceLines().size();
++    }
++    return group;
++  }
++
++  /**
++   * The hold under a row lock bounded by {@code booking.lock-timeout}; for a hold of a group, every
++   * hold of its group, locked in room type id order.
++   */
++  private List<Hold> lockedWithinTimeout(UUID id) {
++    Optional<UUID> group = holds.findGroupIdOf(id);
++    if (group.isEmpty()) {
++      return List.of(lockedGetWithinTimeout(id));
++    }
++    limitLockWaits();
++    return lockedGroup(group.get());
++  }
++
++  /** A hold of a group changes only with its group; this refuses to change it alone. */
++  private void requireSingle(UUID id) {
++    if (holds.findGroupIdOf(id).isPresent()) {
++      throw new ConflictException("hold " + id + " belongs to a group; change the group instead");
++    }
+   }
+ 
+   /** Releases the hold's rooms. Only an active hold can be released. */
+@@ -169,6 +295,7 @@ public class HoldService {
+         () ->
+             tx.execute(
+                 status -> {
++                  requireSingle(id);
+                   Hold hold = lockedGetWithinTimeout(id);
+                   hold.markReleased();
+                   holds.saveAndFlush(hold);
+@@ -177,6 +304,23 @@ public class HoldService {
+                 }));
+   }
+ 
++  /** Releases every hold of the group, or none when one of them cannot be released. */
++  public List<Hold> releaseGroup(UUID groupId) {
++    return retry.run(
++        () ->
++            tx.execute(
++                status -> {
++                  limitLockWaits();
++                  List<Hold> group = lockedGroup(groupId);
++                  for (Hold hold : group) {
++                    hold.markReleased();
++                    holds.saveAndFlush(hold);
++                    releaseNights(hold);
++                  }
++                  return group;
++                }));
++  }
++
+   /**
+    * Turns a usable hold into a confirmed reservation and charges the quoted total. The charge key
+    * is derived from the hold, so a retried confirmation charges once. A stay quoted at zero moves
+@@ -187,43 +331,77 @@ public class HoldService {
+         () ->
+             tx.execute(
+                 status -> {
++                  requireSingle(id);
+                   Hold hold = lockedGet(id);
+                   Instant now = clock.instant();
+-                  hold.requireUsable(now);
+-                  if (hold.getStay()
+-                      .checkIn()
+-                      .isBefore(LocalDate.ofInstant(now, hold.getProperty().zone()))) {
+-                    // The stay has begun at the property: the hold is refused and left to expire.
+-                    throw new HoldExpiredException(id.toString());
+-                  }
+-                  boolean charged = hold.getTotal().isPositive();
++                  requireConfirmable(hold, now);
+                   String gatewayReference =
+-                      charged ? payments.charge("charge-" + id, hold.getTotal()) : null;
+-                  hold.markConfirmed();
+-                  holds.saveAndFlush(hold);
+-                  for (LocalDate night : hold.getStay().nightDates()) {
+-                    if (inventory.confirmHeld(hold.getRoomType().getId(), night, hold.getRooms())
+-                        == 0) {
+-                      throw outOfStep(hold, night);
+-                    }
++                      hold.getTotal().isPositive()
++                          ? payments.charge("charge-" + id, hold.getTotal())
++                          : null;
++                  return book(hold, gatewayReference, now);
++                }));
++  }
++
++  /**
++   * Confirms every hold of the group into its own reservation, with one charge for the group's
++   * total, or confirms none. Each reservation's ledger records its own share under the group's
++   * charge reference. As with a single hold, a share quoted at zero gets no ledger entry, and a
++   * group quoted at zero is confirmed without a charge.
++   */
++  public List<Reservation> confirmGroup(UUID groupId) {
++    return retry.run(
++        () ->
++            tx.execute(
++                status -> {
++                  List<Hold> group = lockedGroup(groupId);
++                  Instant now = clock.instant();
++                  Money total = null;
++                  for (Hold hold : group) {
++                    requireConfirmable(hold, now);
++                    total = total == null ? hold.getTotal() : total.plus(hold.getTotal());
+                   }
+-                  Reservation reservation =
+-                      reservations.saveAndFlush(
+-                          new Reservation(ReferenceCode.generate(random), hold, now));
+-                  if (charged) {
+-                    ledger.save(
+-                        new LedgerEntry(
+-                            reservation.getId(),
+-                            LedgerKind.CHARGE,
+-                            hold.getTotal(),
+-                            "payment for hold " + id,
+-                            gatewayReference,
+-                            now));
++                  String gatewayReference =
++                      total.isPositive() ? payments.charge("charge-group-" + groupId, total) : null;
++                  var booked = new ArrayList<Reservation>();
++                  for (Hold hold : group) {
++                    booked.add(book(hold, gatewayReference, now));
+                   }
+-                  return reservation;
++                  return booked;
+                 }));
+   }
+ 
++  private void requireConfirmable(Hold hold, Instant now) {
++    hold.requireUsable(now);
++    if (hold.getStay().checkIn().isBefore(LocalDate.ofInstant(now, hold.getProperty().zone()))) {
++      // The stay has begun at the property: the hold is refused and left to expire.
++      throw new HoldExpiredException(hold.getId().toString());
++    }
++  }
++
++  private Reservation book(Hold hold, String gatewayReference, Instant now) {
++    hold.markConfirmed();
++    holds.saveAndFlush(hold);
++    for (LocalDate night : hold.getStay().nightDates()) {
++      if (inventory.confirmHeld(hold.getRoomType().getId(), night, hold.getRooms()) == 0) {
++        throw outOfStep(hold, night);
++      }
++    }
++    Reservation reservation =
++        reservations.saveAndFlush(new Reservation(ReferenceCode.generate(random), hold, now));
++    if (hold.getTotal().isPositive()) {
++      ledger.save(
++          new LedgerEntry(
++              reservation.getId(),
++              LedgerKind.CHARGE,
++              hold.getTotal(),
++              "payment for hold " + hold.getId(),
++              gatewayReference,
++              now));
++    }
++    return reservation;
++  }
++
+   /** Holds in one state, earliest expiry first; the admin view. */
+   public Page<Hold> list(HoldStatus status, String propertyCode, Pageable page) {
+     return holds.findForAdmin(status, propertyCode, page);
+@@ -242,29 +420,33 @@ public class HoldService {
+   }
+ 
+   /**
+-   * Ops override: expires an active hold now, whatever its time limit says, and frees its rooms.
++   * Ops override: expires an active hold now, whatever its time limit says, and frees its rooms. A
++   * hold of a group expires with its whole group.
+    */
+   public Hold expireNow(UUID id) {
+     return retry.run(
+         () ->
+             tx.execute(
+                 status -> {
+-                  Hold hold = lockedGetWithinTimeout(id);
+-                  if (hold.getStatus() != HoldStatus.ACTIVE) {
+-                    throw new ConflictException(
+-                        "hold " + id + " is " + hold.getStatus() + ", not active");
++                  List<Hold> changed = lockedWithinTimeout(id);
++                  for (Hold hold : changed) {
++                    if (hold.getStatus() != HoldStatus.ACTIVE) {
++                      throw new ConflictException(
++                          "hold " + hold.getId() + " is " + hold.getStatus() + ", not active");
++                    }
+                   }
+-                  hold.markExpired();
+-                  holds.saveAndFlush(hold);
+-                  releaseNights(hold);
+-                  return hold;
++                  expire(changed);
++                  return changed.stream()
++                      .filter(hold -> hold.getId().equals(id))
++                      .findFirst()
++                      .orElseThrow();
+                 }));
+   }
+ 
+   /**
+    * Expires every active hold whose time has passed, reading them {@code batchSize} at a time, and
+    * returns how many this call expired. Each hold is its own unit of work, so one conflict does not
+-   * undo the others.
++   * undo the others; a hold of a group expires with its whole group.
+    */
+   public int releaseExpired(int batchSize) {
+     Instant now = clock.instant();
+@@ -294,14 +476,22 @@ public class HoldService {
+   }
+ 
+   private int expireOne(UUID id, Instant now) {
+-    Hold hold = lockedGetWithinTimeout(id);
+-    if (hold.getStatus() != HoldStatus.ACTIVE || !hold.isExpiredAt(now)) {
+-      return 0;
++    List<Hold> changed = lockedWithinTimeout(id);
++    for (Hold hold : changed) {
++      if (hold.getStatus() != HoldStatus.ACTIVE || !hold.isExpiredAt(now)) {
++        return 0;
++      }
++    }
++    expire(changed);
++    return changed.size();
++  }
++
++  private void expire(List<Hold> changed) {
++    for (Hold hold : changed) {
++      hold.markExpired();
++      holds.saveAndFlush(hold);
++      releaseNights(hold);
+     }
+-    hold.markExpired();
+-    holds.saveAndFlush(hold);
+-    releaseNights(hold);
+-    return 1;
+   }
+ 
+   private void releaseNights(Hold hold) {
+diff --git a/src/main/resources/db/migration/V2__hold_groups.sql b/src/main/resources/db/migration/V2__hold_groups.sql
+new file mode 100644
+index 0000000..8579a74
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__hold_groups.sql
+@@ -0,0 +1,4 @@
++-- Holds taken together for several room types of one stay share a group id. A group has at most
++-- one hold per room type.
++ALTER TABLE hold ADD COLUMN group_id UUID;
++CREATE UNIQUE INDEX hold_group_room_type ON hold (group_id, room_type_id) WHERE group_id IS NOT NULL;
+diff --git a/src/test/java/com/innkeep/booking/api/HoldGroupApiTest.java b/src/test/java/com/innkeep/booking/api/HoldGroupApiTest.java
+new file mode 100644
+index 0000000..cf469ad
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/HoldGroupApiTest.java
+@@ -0,0 +1,73 @@
++package com.innkeep.booking.api;
++
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.MediaType;
++
++class HoldGroupApiTest extends IntegrationTestBase {
++
++  private static final String GROUP_BODY =
++      "{\"checkIn\":\"2027-06-01\",\"checkOut\":\"2027-06-03\",\"items\":["
++          + "{\"roomType\":\"suite\",\"rooms\":1,\"guests\":2},"
++          + "{\"roomType\":\"double\",\"rooms\":1,\"guests\":2}],"
++          + "\"guest\":{\"name\":\"Mara Quill\",\"email\":\"guest@example.com\"}}";
++
++  @BeforeEach
++  void setUp() {
++    Property property = data.harbourHouse();
++    RoomType doubleRoom = data.roomType(property, "double", 2, "100.00");
++    RoomType suite = data.roomType(property, "suite", 2, "200.00");
++    LocalDate from = LocalDate.parse("2027-06-01");
++    LocalDate to = LocalDate.parse("2027-06-03");
++    data.rooms(property, doubleRoom, from, to, 1);
++    data.rooms(property, suite, from, to, 1);
++  }
++
++  private String create() throws Exception {
++    return mvc.perform(
++            post("/api/v1/properties/harbour-house/hold-groups")
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(GROUP_BODY))
++        .andExpect(status().isCreated())
++        .andReturn()
++        .getResponse()
++        .getHeader("Location");
++  }
++
++  @Test
++  void aGroupIsCreatedWithItsLocationTotalAndHolds() throws Exception {
++    String location = create();
++
++    mvc.perform(get(location))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.status").value("ACTIVE"))
++        .andExpect(jsonPath("$.total").value(600.00))
++        .andExpect(jsonPath("$.holds.length()").value(2))
++        .andExpect(jsonPath("$.holds[0].roomType").value("double"))
++        .andExpect(jsonPath("$.holds[1].lines.length()").value(2));
++  }
++
++  @Test
++  void confirmingAGroupReturnsOneReservationPerRoomType() throws Exception {
++    String location = create();
++
++    mvc.perform(post(location + "/confirm"))
++        .andExpect(status().isCreated())
++        .andExpect(jsonPath("$.length()").value(2))
++        .andExpect(jsonPath("$[0].roomType").value("double"))
++        .andExpect(jsonPath("$[1].status").value("CONFIRMED"));
++    mvc.perform(post(location + "/release"))
++        .andExpect(status().isConflict())
++        .andExpect(header().doesNotExist("Location"));
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/service/HoldGroupTest.java b/src/test/java/com/innkeep/booking/service/HoldGroupTest.java
+new file mode 100644
+index 0000000..47a5562
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/service/HoldGroupTest.java
+@@ -0,0 +1,203 @@
++package com.innkeep.booking.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.innkeep.booking.domain.ConflictException;
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.GuestDetails;
++import com.innkeep.booking.domain.Hold;
++import com.innkeep.booking.domain.HoldStatus;
++import com.innkeep.booking.domain.InsufficientAvailabilityException;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.Reservation;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.domain.ValidationException;
++import com.innkeep.booking.service.HoldService.GroupItem;
++import com.innkeep.booking.support.IntegrationTestBase;
++import com.innkeep.booking.support.TestConfig;
++import java.math.BigDecimal;
++import java.time.Duration;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class HoldGroupTest extends IntegrationTestBase {
++
++  private static final LocalDate JUNE_1 = LocalDate.parse("2027-06-01");
++  private static final LocalDate JUNE_2 = LocalDate.parse("2027-06-02");
++  private static final LocalDate JUNE_3 = LocalDate.parse("2027-06-03");
++  private static final DateRange STAY = new DateRange(JUNE_1, JUNE_3);
++  private static final GuestDetails GUEST =
++      new GuestDetails("Mara Quill", "guest@example.com", null);
++
++  @Autowired private HoldService holds;
++
++  private Property property;
++  private RoomType doubleRoom;
++  private RoomType suite;
++
++  @BeforeEach
++  void setUp() {
++    property = data.harbourHouse();
++    doubleRoom = data.roomType(property, "double", 2, "100.00");
++    suite = data.roomType(property, "suite", 2, "200.00");
++    data.rooms(property, doubleRoom, JUNE_1, JUNE_3, 2);
++    data.rooms(property, suite, JUNE_1, JUNE_3, 1);
++  }
++
++  private List<Hold> group(GroupItem... items) {
++    return holds.createGroup(property.getCode(), STAY, List.of(items), GUEST);
++  }
++
++  @Test
++  void aGroupHoldsEveryRoomTypeInRoomTypeOrderWithItsOwnQuote() {
++    List<Hold> group = group(new GroupItem("suite", 1, 2), new GroupItem("double", 2, 4));
++
++    assertThat(group).extracting(h -> h.getRoomType().getCode()).containsExactly("double", "suite");
++    assertThat(group).extracting(Hold::getGroupId).containsOnly(group.get(0).getGroupId());
++    assertThat(group).extracting(Hold::getExpiresAt).containsOnly(group.get(0).getExpiresAt());
++    assertThat(group.get(0).getTotal().amount()).isEqualByComparingTo("400.00");
++    assertThat(group.get(1).getTotal().amount()).isEqualByComparingTo("400.00");
++    assertThat(held(doubleRoom, JUNE_2)).isEqualTo(2);
++    assertThat(held(suite, JUNE_2)).isEqualTo(1);
++  }
++
++  @Test
++  void aShortRoomTypeHoldsNothingForTheOthers() {
++    data.hold(property, doubleRoom, JUNE_2, JUNE_3, 2);
++
++    assertThatThrownBy(() -> group(new GroupItem("double", 1, 2), new GroupItem("suite", 1, 2)))
++        .isInstanceOf(InsufficientAvailabilityException.class);
++    assertThat(held(doubleRoom, JUNE_1)).isZero();
++    assertThat(held(suite, JUNE_1)).isZero();
++    assertThat(held(suite, JUNE_2)).isZero();
++  }
++
++  @Test
++  void aRoomTypeListedTwiceIsRefused() {
++    assertThatThrownBy(() -> group(new GroupItem("double", 1, 2), new GroupItem("double", 1, 2)))
++        .isInstanceOf(ValidationException.class);
++    assertThat(held(doubleRoom, JUNE_1)).isZero();
++  }
++
++  @Test
++  void confirmingChargesTheTotalOnceAndBooksEveryRoomType() {
++    Hold first = group(new GroupItem("double", 1, 2), new GroupItem("suite", 1, 2)).get(0);
++
++    List<Reservation> booked = holds.confirmGroup(first.getGroupId());
++
++    assertThat(booked)
++        .extracting(r -> r.getRoomType().getCode())
++        .containsExactly("double", "suite");
++    assertThat(payments.movements()).hasSize(1);
++    assertThat(payments.movements().get(0).key()).isEqualTo("charge-group-" + first.getGroupId());
++    assertThat(payments.movements().get(0).amount().amount()).isEqualByComparingTo("600.00");
++    assertThat(
++            jdbc.queryForObject(
++                "select sum(amount) from ledger_entry where kind = 'CHARGE'", BigDecimal.class))
++        .isEqualByComparingTo("600.00");
++    assertThat(booked(doubleRoom, JUNE_1)).isEqualTo(1);
++    assertThat(booked(suite, JUNE_2)).isEqualTo(1);
++    assertThat(held(suite, JUNE_2)).isZero();
++  }
++
++  @Test
++  void aRoomTypeQuotedAtZeroIsBookedWithoutALedgerEntry() {
++    RoomType comp = data.roomType(property, "comp", 2, "0.00");
++    data.rooms(property, comp, JUNE_1, JUNE_3, 1);
++    Hold first = group(new GroupItem("double", 1, 2), new GroupItem("comp", 1, 2)).get(0);
++
++    List<Reservation> booked = holds.confirmGroup(first.getGroupId());
++
++    assertThat(booked).hasSize(2);
++    assertThat(payments.movements()).hasSize(1);
++    assertThat(payments.movements().get(0).amount().amount()).isEqualByComparingTo("200.00");
++    assertThat(jdbc.queryForObject("select count(*) from ledger_entry", Integer.class))
++        .isEqualTo(1);
++    assertThat(booked(comp, JUNE_1)).isEqualTo(1);
++  }
++
++  @Test
++  void aGroupQuotedAtZeroIsConfirmedWithoutACharge() {
++    RoomType comp = data.roomType(property, "comp", 2, "0.00");
++    data.rooms(property, comp, JUNE_1, JUNE_3, 1);
++    Hold only = group(new GroupItem("comp", 1, 2)).get(0);
++
++    holds.confirmGroup(only.getGroupId());
++
++    assertThat(payments.movements()).isEmpty();
++    assertThat(jdbc.queryForObject("select count(*) from ledger_entry", Integer.class)).isZero();
++    assertThat(booked(comp, JUNE_2)).isEqualTo(1);
++  }
++
++  @Test
++  void aGroupConfirmationLocksOnlyItsHoldRowsWhileItIsCharged() throws Exception {
++    Hold first = group(new GroupItem("double", 1, 2), new GroupItem("suite", 1, 2)).get(0);
++    var probe = new AtomicReference<Throwable>();
++    try (var pool = Executors.newSingleThreadExecutor()) {
++      payments.beforeNextCharge(
++          () -> {
++            try {
++              pool.submit(
++                      () -> {
++                        // NOWAIT: fails at once if the confirmation holds one of these rows.
++                        for (String table : List.of("property", "room_type")) {
++                          jdbc.queryForList("select id from " + table + " for update nowait");
++                        }
++                        data.hold(property, doubleRoom, JUNE_1, JUNE_3, 1);
++                        return null;
++                      })
++                  .get(10, TimeUnit.SECONDS);
++            } catch (Exception e) {
++              probe.set(e);
++            }
++          });
++
++      holds.confirmGroup(first.getGroupId());
++    }
++
++    assertThat(probe.get()).isNull();
++    assertThat(held(doubleRoom, JUNE_1)).isEqualTo(1);
++    assertThat(booked(doubleRoom, JUNE_1)).isEqualTo(1);
++  }
++
++  @Test
++  void aHoldOfAGroupIsReleasedOnlyWithItsGroup() {
++    List<Hold> group = group(new GroupItem("double", 1, 2), new GroupItem("suite", 1, 2));
++    Hold suiteHold = group.get(1);
++
++    assertThatThrownBy(() -> holds.release(suiteHold.getId()))
++        .isInstanceOf(ConflictException.class);
++    assertThatThrownBy(() -> holds.confirm(suiteHold.getId()))
++        .isInstanceOf(ConflictException.class);
++    assertThat(held(suite, JUNE_1)).isEqualTo(1);
++
++    holds.releaseGroup(suiteHold.getGroupId());
++
++    assertThat(holds.getGroup(suiteHold.getGroupId()))
++        .extracting(Hold::getStatus)
++        .containsOnly(HoldStatus.RELEASED);
++    assertThat(held(doubleRoom, JUNE_1)).isZero();
++    assertThat(held(suite, JUNE_2)).isZero();
++  }
++
++  @Test
++  void theSweepExpiresTheWholeGroup() {
++    List<Hold> group = group(new GroupItem("double", 1, 2), new GroupItem("suite", 1, 2));
++    clock.set(TestConfig.START.plus(Duration.ofMinutes(15)));
++
++    assertThat(holds.releaseExpired(1)).isEqualTo(2);
++
++    assertThat(holds.getGroup(group.get(0).getGroupId()))
++        .extracting(Hold::getStatus)
++        .containsOnly(HoldStatus.EXPIRED);
++    assertThat(held(doubleRoom, JUNE_1)).isZero();
++    assertThat(held(suite, JUNE_1)).isZero();
++  }
++}

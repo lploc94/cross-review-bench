@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/MadsLorentzen/ai-job-search",
+  "intro_pr": 498,
+  "intro_merged_at": "2026-09-28T17:06:41Z",
+  "fix_pr": 533,
+  "fix_merged_at": "2026-10-17T17:48:26Z",
+  "license": "MIT",
+  "base_commit": "8cbab6823ecfb66cb128431e24146e9bbfb592b5",
+  "intro_commit": "a45bbd1a2a60ddb72a5e744d268ff28b640452b0",
+  "fix_commit": "7fe4ea3781c4336d13d89bc6b33c634f6da24adf",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

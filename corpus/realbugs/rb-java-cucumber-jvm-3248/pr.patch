@@ -1,0 +1,776 @@
+diff --git a/.revapi/api-changes.json b/.revapi/api-changes.json
+index 282ca1ca9..1d7666212 100644
+--- a/.revapi/api-changes.json
++++ b/.revapi/api-changes.json
+@@ -287,7 +287,6 @@
+             "code": "java.method.addedToInterface",
+             "new": "method int io.cucumber.core.backend.Options::getGlueHintThreshold()",
+             "justification": "New feature"
+-
+           },
+           {
+             "ignore": true,
+@@ -301,7 +300,6 @@
+             "new": "method java.time.Duration io.cucumber.core.backend.Options::getGlueHintThreshold()",
+             "justification": "New feature"
+           },
+-
+           {
+             "ignore": true,
+             "code": "java.class.externalClassExposedInAPI",
+@@ -313,6 +311,33 @@
+             "code": "java.class.externalClassExposedInAPI",
+             "new": "interface io.cucumber.core.backend.Options",
+             "justification": "New feature"
++          },
++          {
++            "ignore": true,
++            "code": "java.method.addedToInterface",
++            "new": "method java.util.List<io.cucumber.core.gherkin.Argument> io.cucumber.core.gherkin.Step::getArguments()",
++            "justification": "New feature"
++          },
++          {
++            "ignore": true,
++            "code": "java.method.visibilityReduced",
++            "old": "method java.util.List<io.cucumber.core.stepexpression.Argument> io.cucumber.core.stepexpression.StepExpression::match(java.lang.String, java.lang.reflect.Type[])",
++            "new": "method java.util.List<io.cucumber.core.stepexpression.Argument> io.cucumber.core.stepexpression.StepExpression::match(io.cucumber.core.gherkin.Step, java.lang.reflect.Type[])",
++            "oldVisibility": "public",
++            "newVisibility": "package",
++            "justification": "Internal refactoring"
++          },
++          {
++            "ignore": true,
++            "code": "java.method.removed",
++            "old": "method java.util.List<io.cucumber.core.stepexpression.Argument> io.cucumber.core.stepexpression.StepExpression::match(java.lang.String, java.lang.String, java.lang.String, java.lang.reflect.Type[])",
++            "justification": "Internal refactoring"
++          },
++          {
++            "ignore": true,
++            "code": "java.method.removed",
++            "old": "method java.util.List<io.cucumber.core.stepexpression.Argument> io.cucumber.core.stepexpression.StepExpression::match(java.lang.String, java.util.List<java.util.List<java.lang.String>>, java.lang.reflect.Type[])",
++            "justification": "Internal refactoring"
+           }
+         ]
+       }
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9fbc312c0..24f4d2331 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [Java] Declare step definitions with minimal ceremony ([#3200](https://github.com/cucumber/cucumber-jvm/issues/3200))
+ - [Java] Display hints when the glue is not efficiently configured ([#3151](https://github.com/cucumber/cucumber-jvm/pull/3151), Julien Kronegg)
+ - [JUnit Platform] Use `ParallelHierarchicalTestExecutorServiceFactory` ([#3105](https://github.com/cucumber/cucumber-jvm/pull/3105))
+-
++- [Core] Support both DocString and DataTable arguments on steps ([#3213](https://github.com/cucumber/cucumber-jvm/pull/3213))
+ 
+ ### Fixed
+ - [JUnit Platform Engine] Accept partial matches with `cucumber.filter.name` and align the behavior with JUnit 4 and CLI ([#3174](https://github.com/cucumber/cucumber-jvm/pull/3174))
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/ArgumentMatcher.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/ArgumentMatcher.java
+index ddd9610da..b5c3e290b 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/ArgumentMatcher.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/ArgumentMatcher.java
+@@ -1,13 +1,10 @@
+ package io.cucumber.core.stepexpression;
+ 
+-import io.cucumber.core.gherkin.DataTableArgument;
+-import io.cucumber.core.gherkin.DocStringArgument;
+ import io.cucumber.core.gherkin.Step;
+ import org.jspecify.annotations.Nullable;
+ 
+ import java.lang.reflect.Type;
+ import java.util.List;
+-import java.util.stream.Collectors;
+ 
+ public final class ArgumentMatcher {
+ 
+@@ -18,31 +15,7 @@ public final class ArgumentMatcher {
+     }
+ 
+     public @Nullable List<Argument> argumentsFrom(Step step, Type... types) {
+-        io.cucumber.core.gherkin.Argument arg = step.getArgument();
+-        if (arg == null) {
+-            return expression.match(step.getText(), types);
+-        }
+-
+-        if (arg instanceof DocStringArgument docString) {
+-            String content = docString.getContent();
+-            String contentType = docString.getMediaType();
+-            return expression.match(step.getText(), content, contentType, types);
+-        }
+-
+-        if (arg instanceof DataTableArgument table) {
+-            List<List<@Nullable String>> cells = emptyCellsToNull(table.cells());
+-            return expression.match(step.getText(), cells, types);
+-        }
+-
+-        throw new IllegalStateException("Argument was neither PickleString nor PickleTable");
+-    }
+-
+-    private static List<List<@Nullable String>> emptyCellsToNull(List<List<String>> cells) {
+-        return cells.stream()
+-                .map(row -> row.stream()
+-                        .map(s -> s.isEmpty() ? null : s)
+-                        .collect(Collectors.toList()))
+-                .collect(Collectors.toList());
++        return expression.match(step, types);
+     }
+ 
+ }
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DataTableArgument.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DataTableArgument.java
+index 8f6593d0f..1a127f26b 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DataTableArgument.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DataTableArgument.java
+@@ -6,19 +6,23 @@ import org.jspecify.annotations.Nullable;
+ 
+ import java.util.List;
+ 
++import static java.util.Objects.requireNonNull;
++
+ public final class DataTableArgument implements Argument {
+ 
+-    private final RawTableTransformer<?> tableType;
++    private final int argumentIndex;
++    private final RawTableTransformer<?> transformer;
+     private final List<List<String>> argument;
+ 
+-    DataTableArgument(RawTableTransformer<?> tableType, List<List<String>> argument) {
+-        this.tableType = tableType;
+-        this.argument = argument;
++    DataTableArgument(int argumentIndex, RawTableTransformer<?> transformer, List<List<@Nullable String>> argument) {
++        this.argumentIndex = argumentIndex;
++        this.transformer = requireNonNull(transformer);
++        this.argument = requireNonNull(argument);
+     }
+ 
+     @Override
+     public @Nullable Object getValue() {
+-        return tableType.transform(argument);
++        return transformer.transform(argumentIndex, argument);
+     }
+ 
+     @Override
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringArgument.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringArgument.java
+index bab5cdffc..6271e9dd3 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringArgument.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringArgument.java
+@@ -7,19 +7,23 @@ import static java.util.Objects.requireNonNull;
+ 
+ public final class DocStringArgument implements Argument {
+ 
+-    private final DocStringTransformer<?> docStringType;
++    private final int argumentIndex;
++    private final DocStringTransformer<?> transformer;
+     private final String content;
+     private final @Nullable String contentType;
+ 
+-    DocStringArgument(DocStringTransformer<?> docStringType, String content, @Nullable String contentType) {
+-        this.docStringType = requireNonNull(docStringType);
++    DocStringArgument(
++            int argumentIndex, DocStringTransformer<?> transformer, String content, @Nullable String contentType
++    ) {
++        this.argumentIndex = argumentIndex;
++        this.transformer = requireNonNull(transformer);
+         this.content = requireNonNull(content);
+         this.contentType = contentType;
+     }
+ 
+     @Override
+     public @Nullable Object getValue() {
+-        return docStringType.transform(content, contentType);
++        return transformer.transform(argumentIndex, content, contentType);
+     }
+ 
+     @Override
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringTransformer.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringTransformer.java
+index a5a3598ab..d9913fcd6 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringTransformer.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/DocStringTransformer.java
+@@ -6,6 +6,6 @@ import org.jspecify.annotations.Nullable;
+ interface DocStringTransformer<T> {
+ 
+     @Nullable
+-    T transform(String docString, @Nullable String contentType);
++    T transform(int argumentIndex, String docString, @Nullable String contentType);
+ 
+ }
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/RawTableTransformer.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/RawTableTransformer.java
+index 3b3ae1253..ef1bc1008 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/RawTableTransformer.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/RawTableTransformer.java
+@@ -8,6 +8,6 @@ import java.util.List;
+ interface RawTableTransformer<T> {
+ 
+     @Nullable
+-    T transform(List<List<String>> raw);
++    T transform(int argumentIndex, List<List<@Nullable String>> raw);
+ 
+ }
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java
+index 2a1934aa0..97f6ff37a 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java
+@@ -1,24 +1,29 @@
+ package io.cucumber.core.stepexpression;
+ 
++import io.cucumber.core.gherkin.Step;
+ import io.cucumber.cucumberexpressions.Expression;
+ import org.jspecify.annotations.Nullable;
+ 
+ import java.lang.reflect.Type;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.stream.Collectors;
+ 
+ import static java.util.Objects.requireNonNull;
+ 
+ public final class StepExpression {
+ 
+     private final Expression expression;
+-    private final DocStringTransformer<?> docStringType;
+-    private final RawTableTransformer<?> tableType;
++    private final DocStringTransformer<?> docStringTransformer;
++    private final RawTableTransformer<?> dataTableTransformer;
+ 
+-    StepExpression(Expression expression, DocStringTransformer<?> docStringType, RawTableTransformer<?> tableType) {
++    StepExpression(
++            Expression expression, DocStringTransformer<?> docStringTransformer,
++            RawTableTransformer<?> dataTableTransformer
++    ) {
+         this.expression = requireNonNull(expression);
+-        this.docStringType = requireNonNull(docStringType);
+-        this.tableType = requireNonNull(tableType);
++        this.docStringTransformer = requireNonNull(docStringTransformer);
++        this.dataTableTransformer = requireNonNull(dataTableTransformer);
+     }
+ 
+     public Class<? extends Expression> getExpressionType() {
+@@ -29,40 +34,45 @@ public final class StepExpression {
+         return expression.getSource();
+     }
+ 
+-    public @Nullable List<Argument> match(String text, List<List<String>> cells, Type... types) {
+-        List<Argument> list = match(text, types);
+-
+-        if (list == null) {
+-            return null;
+-        }
+-
+-        list.add(new DataTableArgument(tableType, cells));
+-
+-        return list;
+-
+-    }
+-
+-    public @Nullable List<Argument> match(String text, Type... types) {
+-        return expression.match(text, types).map(StepExpression::wrapPlusOne).orElse(null);
++    @Nullable
++    List<Argument> match(Step step, Type... types) {
++        return expression.match(step.getText(), types)
++                .map(expressionArguments -> {
++                    var stepArguments = step.getArguments();
++                    int stepArgumentSize = stepArguments.size();
++                    var arguments = new ArrayList<Argument>(expressionArguments.size() + stepArgumentSize);
++                    expressionArguments.stream()
++                            .map(ExpressionArgument::new)
++                            .forEach(arguments::add);
++
++                    for (int i = 0; i < stepArgumentSize; i++) {
++                        io.cucumber.core.gherkin.Argument stepArgument = stepArguments.get(i);
++                        Argument argument = createArgument(i, stepArgument);
++                        arguments.add(argument);
++                    }
++                    return arguments;
++                })
++                .orElse(null);
+     }
+ 
+-    private static List<Argument> wrapPlusOne(List<io.cucumber.cucumberexpressions.Argument<?>> match) {
+-        List<Argument> copy = new ArrayList<>(match.size() + 1);
+-        for (io.cucumber.cucumberexpressions.Argument<?> argument : match) {
+-            copy.add(new ExpressionArgument(argument));
++    private Argument createArgument(int argumentIndex, io.cucumber.core.gherkin.@Nullable Argument argument) {
++        if (argument instanceof io.cucumber.core.gherkin.DocStringArgument docString) {
++            var content = docString.getContent();
++            var contentType = docString.getMediaType();
++            return new DocStringArgument(argumentIndex, this.docStringTransformer, content, contentType);
+         }
+-        return copy;
+-    }
+-
+-    public @Nullable List<Argument> match(String text, String content, @Nullable String contentType, Type... types) {
+-        List<Argument> list = match(text, types);
+-        if (list == null) {
+-            return null;
++        if (argument instanceof io.cucumber.core.gherkin.DataTableArgument table) {
++            var cells = emptyCellsToNull(table.cells());
++            return new DataTableArgument(argumentIndex, dataTableTransformer, cells);
+         }
+-
+-        list.add(new DocStringArgument(this.docStringType, content, contentType));
+-
+-        return list;
++        throw new IllegalStateException("Argument was neither PickleString nor PickleTable");
+     }
+ 
++    private static List<List<@Nullable String>> emptyCellsToNull(List<List<String>> cells) {
++        return cells.stream()
++                .map(row -> row.stream()
++                        .map(s -> s.isEmpty() ? null : s)
++                        .collect(Collectors.toList()))
++                .collect(Collectors.toList());
++    }
+ }
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpressionFactory.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpressionFactory.java
+index 284f977af..6740432f4 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpressionFactory.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpressionFactory.java
+@@ -14,11 +14,8 @@ import io.cucumber.docstring.DocStringTypeRegistryDocStringConverter;
+ import io.cucumber.messages.types.Envelope;
+ import io.cucumber.messages.types.UndefinedParameterType;
+ 
+-import java.lang.reflect.Type;
+ import java.util.List;
+-import java.util.function.Supplier;
+-
+-import static java.util.Objects.requireNonNull;
++import java.util.function.Function;
+ 
+ public final class StepExpressionFactory {
+ 
+@@ -36,50 +33,34 @@ public final class StepExpressionFactory {
+ 
+     public StepExpression createExpression(StepDefinition stepDefinition) {
+         List<ParameterInfo> parameterInfos = stepDefinition.parameterInfos();
++        String expressionString = stepDefinition.getPattern();
++        var expression = crateExpression(expressionString);
++
++        Function<Integer, ParameterInfo> safeGetParameterInfos = argumentIndex -> {
++            if (argumentIndex < parameterInfos.size()) {
++                return parameterInfos.get(argumentIndex);
++            }
++            throw new CucumberException("step definition at %s does not take enough parameters. Expected %s parameters."
++                    .formatted(stepDefinition.getLocation(), argumentIndex + 1));
++        };
+ 
+-        if (parameterInfos.isEmpty()) {
+-            return createExpression(
+-                stepDefinition.getPattern(),
+-                stepDefinitionDoesNotTakeAnyParameter(stepDefinition),
+-                false);
+-        }
+-
+-        ParameterInfo parameterInfo = parameterInfos.get(parameterInfos.size() - 1);
+-        return createExpression(
+-            stepDefinition.getPattern(),
+-            parameterInfo.getTypeResolver()::resolve,
+-            parameterInfo.isTransposed());
+-    }
+-
+-    private StepExpression createExpression(
+-            String expressionString, Supplier<Type> tableOrDocStringType, boolean transpose
+-    ) {
+-        requireNonNull(expressionString, "expressionString can not be null");
+-        requireNonNull(tableOrDocStringType, "tableOrDocStringType can not be null");
+-
+-        final Expression expression = crateExpression(expressionString);
+-
+-        RawTableTransformer<?> tableTransform = (List<List<String>> raw) -> {
+-            DataTable dataTable = DataTable.create(raw, StepExpressionFactory.this.tableConverter);
+-            Type targetType = tableOrDocStringType.get();
++        RawTableTransformer<?> tableTransform = (argumentIndex, raw) -> {
++            var parameterInfo = safeGetParameterInfos.apply(argumentIndex);
++            var targetType = parameterInfo.getType();
++            var transpose = parameterInfo.isTransposed();
++            var dataTable = DataTable.create(raw, this.tableConverter);
+             return dataTable.convert(Object.class.equals(targetType) ? DataTable.class : targetType, transpose);
+         };
+ 
+-        DocStringTransformer<?> docStringTransform = (text, contentType) -> {
+-            DocString docString = DocString.create(text, contentType, docStringConverter);
+-            Type targetType = tableOrDocStringType.get();
++        DocStringTransformer<?> docStringTransform = (argumentIndex, text, contentType) -> {
++            var parameterInfo = safeGetParameterInfos.apply(argumentIndex);
++            var targetType = parameterInfo.getType();
++            var docString = DocString.create(text, contentType, docStringConverter);
+             return docString.convert(Object.class.equals(targetType) ? DocString.class : targetType);
+         };
+         return new StepExpression(expression, docStringTransform, tableTransform);
+     }
+ 
+-    private static Supplier<Type> stepDefinitionDoesNotTakeAnyParameter(StepDefinition stepDefinition) {
+-        return () -> {
+-            throw new CucumberException("step definition at %s does not take any parameters"
+-                    .formatted(stepDefinition.getLocation()));
+-        };
+-    }
+-
+     private Expression crateExpression(String expressionString) {
+         final Expression expression;
+         try {
+diff --git a/cucumber-core/src/test/java/io/cucumber/core/stepexpression/StepExpressionFactoryTest.java b/cucumber-core/src/test/java/io/cucumber/core/stepexpression/StepExpressionFactoryTest.java
+index 114bef898..d5df9e90a 100644
+--- a/cucumber-core/src/test/java/io/cucumber/core/stepexpression/StepExpressionFactoryTest.java
++++ b/cucumber-core/src/test/java/io/cucumber/core/stepexpression/StepExpressionFactoryTest.java
+@@ -4,6 +4,7 @@ import io.cucumber.core.backend.StepDefinition;
+ import io.cucumber.core.backend.StubStepDefinition;
+ import io.cucumber.core.eventbus.EventBus;
+ import io.cucumber.core.exception.CucumberException;
++import io.cucumber.core.gherkin.Step;
+ import io.cucumber.core.runtime.TimeServiceEventBus;
+ import io.cucumber.cucumberexpressions.CucumberExpression;
+ import io.cucumber.datatable.DataTable;
+@@ -13,8 +14,9 @@ import io.cucumber.datatable.TableTransformer;
+ import io.cucumber.docstring.DocString;
+ import io.cucumber.docstring.DocStringType;
+ import io.cucumber.messages.types.Envelope;
+-import org.junit.jupiter.api.Disabled;
+ import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.shadow.de.siegmar.fastcsv.util.Nullable;
++import org.mockito.Mockito;
+ import tools.jackson.core.StreamWriteFeature;
+ import tools.jackson.databind.JsonNode;
+ import tools.jackson.databind.cfg.ConstructorDetector;
+@@ -38,9 +40,9 @@ import static org.hamcrest.core.Is.is;
+ import static org.hamcrest.core.IsEqual.equalTo;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.when;
+ 
+ @SuppressWarnings("NullAway") // TODO: Use AssertJ
+-@Disabled // TODO: Put tests into separate module
+ public class StepExpressionFactoryTest {
+ 
+     private static final Type UNKNOWN_TYPE = Object.class;
+@@ -55,24 +57,75 @@ public class StepExpressionFactoryTest {
+         UUID::randomUUID);
+     private final StepTypeRegistry registry = new StepTypeRegistry(Locale.ENGLISH);
+     private final StepExpressionFactory stepExpressionFactory = new StepExpressionFactory(registry, bus);
++
++    private final String content = "A rather long and boring string of documentation";
+     private final List<List<String>> table = asList(asList("name", "amount",
+         "unit"), asList("chocolate", "2", "tbsp"));
+     private final List<List<String>> tableTransposed = asList(asList("name",
+         "chocolate"), asList("amount", "2"),
+         asList("unit", "tbsp"));
+ 
++    private static Step step(String text) {
++        var step = Mockito.mock(Step.class);
++        when(step.getText()).thenReturn(text);
++        return step;
++    }
++
++    private Step stepWithTable(String text, List<List<String>> cells) {
++        var step = step(text);
++        var table = table(cells);
++        when(step.getArguments()).thenReturn(List.of(table));
++        return step;
++    }
++
++    private static io.cucumber.core.gherkin.DataTableArgument table(List<List<String>> cells) {
++        var table = Mockito.mock(io.cucumber.core.gherkin.DataTableArgument.class);
++        when(table.cells()).thenReturn(cells);
++        return table;
++    }
++
++    private Step stepWithDocString(String text, String content, @Nullable String mediaType) {
++        var step = step(text);
++        var docString = docString(content, mediaType);
++        when(step.getArguments()).thenReturn(List.of(docString));
++        return step;
++    }
++
++    private static io.cucumber.core.gherkin.DocStringArgument docString(String content, @Nullable String mediaType) {
++        var docString = Mockito.mock(io.cucumber.core.gherkin.DocStringArgument.class);
++        when(docString.getContent()).thenReturn(content);
++        when(docString.getMediaType()).thenReturn(mediaType);
++        return docString;
++    }
++
++    private Step stepWithTableDocString(String text, List<List<String>> cells, String content) {
++        var step = step(text);
++        var table = table(cells);
++        var docString = docString(content, null);
++        when(step.getArguments()).thenReturn(List.of(table, docString));
++        return step;
++    }
++
++    private Step stepWithDocStringTable(String text, String content, List<List<String>> cells) {
++        var step = step(text);
++        var table = table(cells);
++        var docString = docString(content, null);
++        when(step.getArguments()).thenReturn(List.of(docString, table));
++        return step;
++    }
++
+     @Test
+     void creates_a_step_expression() {
+-        StepDefinition stepDefinition = new StubStepDefinition("Given a step");
++        StepDefinition stepDefinition = new StubStepDefinition("Given a stepWithTable");
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        assertThat(expression.getSource(), is("Given a step"));
++        assertThat(expression.getSource(), is("Given a stepWithTable"));
+         assertThat(expression.getExpressionType(), is(CucumberExpression.class));
+-        assertThat(expression.match("Given a step"), is(emptyList()));
++        assertThat(expression.match(step("Given a stepWithTable")), is(emptyList()));
+     }
+ 
+     @Test
+     void throws_for_unknown_parameter_types() {
+-        StepDefinition stepDefinition = new StubStepDefinition("Given a {unknownParameterType} ");
++        StepDefinition stepDefinition = new StubStepDefinition("Given a {unknownParameterType}");
+ 
+         List<Envelope> events = new ArrayList<>();
+         bus.registerHandlerFor(Envelope.class, events::add);
+@@ -96,7 +149,7 @@ public class StepExpressionFactoryTest {
+             DataTable.class);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+ 
+-        List<Argument> match = expression.match("Given some stuff:", table);
++        List<Argument> match = expression.match(stepWithTable("Given some stuff:", table));
+ 
+         DataTable dataTable = (DataTable) match.get(0).getValue();
+         assertThat(dataTable.cells(), is(equalTo(table)));
+@@ -110,8 +163,8 @@ public class StepExpressionFactoryTest {
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             Ingredient.class);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:",
+-            tableTransposed);
++        List<Argument> match = expression.match(stepWithTable("Given some stuff:",
++            tableTransposed));
+ 
+         Ingredient ingredient = (Ingredient) match.get(0).getValue();
+         assertThat(ingredient.name, is(equalTo("chocolate")));
+@@ -138,14 +191,13 @@ public class StepExpressionFactoryTest {
+     @SuppressWarnings("unchecked")
+     @Test
+     void table_expression_with_list_type_creates_list_of_ingredients_from_table() {
+-
+         registry.defineDataTableType(new DataTableType(Ingredient.class,
+             listBeanMapper()));
+ 
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             getTypeFromStepDefinition());
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:", table);
++        List<Argument> match = expression.match(stepWithTable("Given some stuff:", table));
+ 
+         List<Ingredient> ingredients = (List<Ingredient>) match.get(0).getValue();
+         Ingredient ingredient = ingredients.get(0);
+@@ -166,44 +218,41 @@ public class StepExpressionFactoryTest {
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             UNKNOWN_TYPE);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:", table);
++        List<Argument> match = expression.match(stepWithTable("Given some stuff:", table));
+         assertThat(match.get(0).getValue(), is(equalTo(DataTable.create(table))));
+     }
+ 
+     @Test
+     void unknown_target_type_transform_doc_string_to_doc_string() {
+-        String docString = "A rather long and boring string of documentation";
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             UNKNOWN_TYPE);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:", docString,
+-            null);
++        List<Argument> match = expression.match(stepWithDocString("Given some stuff:", content,
++            null));
+         assertThat(match.get(0).getValue(),
+-            is(equalTo(DocString.create(docString))));
++            is(equalTo(DocString.create(content))));
+     }
+ 
+     @Test
+     void docstring_expression_transform_doc_string_to_string() {
+-        String docString = "A rather long and boring string of documentation";
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             String.class);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:", docString,
+-            null);
+-        assertThat(match.get(0).getValue(), is(equalTo(docString)));
++        List<Argument> match = expression.match(stepWithDocString("Given some stuff:", content,
++            null));
++        assertThat(match.get(0).getValue(), is(equalTo(content)));
+     }
+ 
+     @Test
+     void docstring_and_datatable_match_same_step_definition() {
+-        String docString = "A rather long and boring string of documentation";
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             UNKNOWN_TYPE);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:", docString,
+-            null);
++        List<Argument> match = expression.match(stepWithDocString("Given some stuff:", content,
++            null));
+         assertThat(match.get(0).getValue(),
+-            is(equalTo(DocString.create(docString))));
+-        match = expression.match("Given some stuff:", table);
++            is(equalTo(DocString.create(content))));
++        match = expression.match(stepWithTable("Given some stuff:", table));
+         assertThat(match.get(0).getValue(), is(equalTo(DataTable.create(table))));
+     }
+ 
+@@ -219,8 +268,8 @@ public class StepExpressionFactoryTest {
+         StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:",
+             JsonNode.class);
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+-        List<Argument> match = expression.match("Given some stuff:", docString,
+-            contentType);
++        List<Argument> match = expression.match(stepWithDocString("Given some stuff:", docString,
++            contentType));
+         JsonNode node = (JsonNode) match.get(0).getValue();
+         assertThat(node.asString(), equalTo(docString));
+     }
+@@ -236,8 +285,8 @@ public class StepExpressionFactoryTest {
+             getTypeFromStepDefinition());
+         StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
+         List<List<String>> table = asList(asList("name", "amount", "unit"),
+-            asList("chocolate", null, "tbsp"));
+-        List<Argument> match = expression.match("Given some stuff:", table);
++            asList("chocolate", "", "tbsp"));
++        List<Argument> match = expression.match(stepWithTable("Given some stuff:", table));
+ 
+         List<Ingredient> ingredients = (List<Ingredient>) match.get(0).getValue();
+         Ingredient ingredient = ingredients.get(0);
+@@ -245,6 +294,30 @@ public class StepExpressionFactoryTest {
+ 
+     }
+ 
++    @Test
++    void table_doc_string_expression() {
++        StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:", DataTable.class, DocString.class);
++        StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
++        List<Argument> match = expression.match(stepWithTableDocString("Given some stuff:", table, content));
++
++        DataTable dataTable = (DataTable) match.get(0).getValue();
++        assertThat(dataTable.cells(), is(equalTo(table)));
++        DocString docString = (DocString) match.get(1).getValue();
++        assertThat(docString.getContent(), is(equalTo(content)));
++    }
++
++    @Test
++    void doc_string_table_expression() {
++        StepDefinition stepDefinition = new StubStepDefinition("Given some stuff:", DocString.class, DataTable.class);
++        StepExpression expression = stepExpressionFactory.createExpression(stepDefinition);
++        List<Argument> match = expression.match(stepWithDocStringTable("Given some stuff:", content, table));
++
++        DocString docString = (DocString) match.get(0).getValue();
++        assertThat(docString.getContent(), is(equalTo(content)));
++        DataTable dataTable = (DataTable) match.get(1).getValue();
++        assertThat(dataTable.cells(), is(equalTo(table)));
++    }
++
+     @SuppressWarnings("unused")
+     public void fake_step_definition(List<Ingredient> ingredients) {
+ 
+diff --git a/cucumber-gherkin-messages/src/main/java/io/cucumber/core/gherkin/messages/GherkinMessagesStep.java b/cucumber-gherkin-messages/src/main/java/io/cucumber/core/gherkin/messages/GherkinMessagesStep.java
+index b373253fc..78ce1b87e 100644
+--- a/cucumber-gherkin-messages/src/main/java/io/cucumber/core/gherkin/messages/GherkinMessagesStep.java
++++ b/cucumber-gherkin-messages/src/main/java/io/cucumber/core/gherkin/messages/GherkinMessagesStep.java
+@@ -10,10 +10,16 @@ import io.cucumber.messages.types.PickleTable;
+ import io.cucumber.plugin.event.Location;
+ import org.jspecify.annotations.Nullable;
+ 
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Optional;
++import java.util.stream.Stream;
++
+ final class GherkinMessagesStep implements Step {
+ 
+     private final PickleStep pickleStep;
+-    private final @Nullable Argument argument;
++    private final List<Argument> arguments;
+     private final String keyword;
+     private final StepType stepType;
+     private final String previousGwtKeyword;
+@@ -27,27 +33,38 @@ final class GherkinMessagesStep implements Step {
+             String keyword
+     ) {
+         this.pickleStep = pickleStep;
+-        this.argument = extractArgument(pickleStep, location);
++        this.arguments = extractArgument(pickleStep, location);
+         this.keyword = keyword;
+         this.stepType = extractKeyWordType(this.keyword, dialect);
+         this.previousGwtKeyword = previousGwtKeyword;
+         this.location = location;
+     }
+ 
+-    private static @Nullable Argument extractArgument(PickleStep pickleStep, Location location) {
+-        return pickleStep.getArgument()
+-                .map(argument -> {
+-                    if (argument.getDocString().isPresent()) {
+-                        PickleDocString docString = argument.getDocString().get();
+-                        // TODO: Fix this work around
+-                        return new GherkinMessagesDocStringArgument(docString, location.getLine() + 1);
+-                    }
+-                    if (argument.getDataTable().isPresent()) {
+-                        PickleTable table = argument.getDataTable().get();
+-                        return new GherkinMessagesDataTableArgument(table, location.getLine() + 1);
++    private static List<Argument> extractArgument(PickleStep pickleStep, Location location) {
++        return Stream.of(pickleStep.getArgument())
++                .filter(Optional::isPresent)
++                .map(Optional::get)
++                .flatMap(argument -> {
++                    var dt = argument.getDataTable();
++                    var ds = argument.getDocString();
++                    var arguments = new ArrayList<Argument>(2);
++
++                    // Workaround, we don't know the location of the table.
++                    dt.map(pickleTable -> new GherkinMessagesDataTableArgument(pickleTable, location.getLine() + 1))
++                            .ifPresent(arguments::add);
++                    ds.map(pickleDocString -> new GherkinMessagesDocStringArgument(pickleDocString,
++                        location.getLine() + 1))
++                            .ifPresent(arguments::add);
++
++                    var dataTableIndex = dt.flatMap(PickleTable::getArgumentIndex).orElse(Integer.MAX_VALUE);
++                    var docStringIndex = ds.flatMap(PickleDocString::getArgumentIndex).orElse(Integer.MAX_VALUE);
++
++                    if (docStringIndex < dataTableIndex) {
++                        Collections.reverse(arguments);
+                     }
+-                    return null;
+-                }).orElse(null);
++                    return arguments.stream();
++                })
++                .toList();
+     }
+ 
+     private static StepType extractKeyWordType(String keyword, GherkinDialect dialect) {
+@@ -104,7 +121,12 @@ final class GherkinMessagesStep implements Step {
+ 
+     @Override
+     public @Nullable Argument getArgument() {
+-        return argument;
++        return arguments.isEmpty() ? null : arguments.get(0);
++    }
++
++    @Override
++    public List<Argument> getArguments() {
++        return arguments;
+     }
+ 
+     @Override
+diff --git a/cucumber-gherkin/src/main/java/io/cucumber/core/gherkin/Step.java b/cucumber-gherkin/src/main/java/io/cucumber/core/gherkin/Step.java
+index 30959bc48..f50f3ee0e 100644
+--- a/cucumber-gherkin/src/main/java/io/cucumber/core/gherkin/Step.java
++++ b/cucumber-gherkin/src/main/java/io/cucumber/core/gherkin/Step.java
+@@ -2,6 +2,8 @@ package io.cucumber.core.gherkin;
+ 
+ import org.jspecify.annotations.Nullable;
+ 
++import java.util.List;
++
+ public interface Step extends io.cucumber.plugin.event.Step {
+ 
+     StepType getType();
+@@ -14,4 +16,5 @@ public interface Step extends io.cucumber.plugin.event.Step {
+     @Nullable
+     Argument getArgument();
+ 
++    List<Argument> getArguments();
+ }

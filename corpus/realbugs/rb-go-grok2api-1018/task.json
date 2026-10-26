@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-go-grok2api-1018",
+  "repo": "rb-go-grok2api-1018",
+  "kind": "realbug",
+  "title": "feat(audit): 请求审计中新增不同账号调度详情、完整HTTP请求/响应报文、默认7天全量日志记录等完整诊断生命周期重要功能",
+  "description": "### 📌 概述 (Overview)\r\n完善网关请求审计体系，提供客户端完整请求报文、服务端响应报文（含 SSE 流式自动重组）的持久化与可视化诊断能力，修复上游流式中断时的尝试诊断记录，并新增跨数据库兼容的日志保留策略与独立设置面板。\r\n\r\n---\r\n<img width=\"882\" height=\"515\" alt=\"image\" src=\"https://github.com/user-attachments/assets/fd097886-e4a7-4676-ad56-636a4e8a36c2\" />\r\n\r\n\r\n<img width=\"859\" height=\"627\" alt=\"image\" src=\"https://github.com/user-attachments/assets/249380b7-a0aa-49db-8999-e208761b5e3d\" />\r\n\r\n\r\n<img width=\"881\" height=\"624\" alt=\"image\" src=\"https://github.com/user-attachments/assets/13c2e00d-e11a-49a4-ae88-40f99ed47e2c\" />\r\n\r\n\r\n\r\n\r\n### ✨ 主要功能与变更 (Features & Improvements)\r\n\r\n#### 1. 客户端完整 HTTP 请求报文捕获与查看\r\n- **报文完整捕获**：完整抓取客户端发起的 HTTP 请求行、所有自定义 Header / User-Agent 及完整 Body（支持文本与多模态数据）。\r\n- **Markdown / JSON 可视化**：审计详情中新增「请求报文」面板，支持原生 HTTP 报文高亮显示，并提供一键「复制 JSON」与「复制完整 HTTP 报文」功能。\r\n- **放开成功请求限制**：移除了此前 200 成功状态码禁止点击查看详情的限制，方便排查正常调用的账号与报文行为。\r\n\r\n#### 2. 服务端响应报文捕获与 SSE 流式自动组包\r\n- **SSE 流式聚合重构**：针对 Chat Completions、Anthropic Messages 及 Responses API 的流式输出，在流结束时自动聚合 Delta Chunks 并重构成标准的合法 JSON 响应报文；非流式直接捕获响应 JSON。\r\n- **响应报文面板**：新增「响应报文 (Response Body)」选项卡，展示模型完整输出、Token 统计与大小，支持复制原始响应与 Markdown 代码块。\r\n\r\n#### 3. 修复上游流式中断诊断回溯\r\n- 修复了当上游先返回 `200 OK` 响应头但随后中途断开（如 `upstream_stream_interrupted` / `upstream_stream_incomplete`）时，网关未记录尝试诊断导致后台显示“在发送到上游前失败”的问题。\r\n- 异常结束时自动补录 `response_stream` 诊断快照，准确记录所调用的账号、节点、状态码及底层网络 Transport 错误。\r\n\r\n#### 4. 独立「日志设置」面板与定时自动清理\r\n- 将请求审计配置从“运行策略”中拆分，设立独立的 **「日志设置 (Audit & Logs)」** 面板。\r\n- **日志保留天数 (`retentionDays`)**：支持自由配置日志保留时长（默认 7 天，设为 0 永久保留）。\r\n- **报文采集开关**：提供 `recordRequestBody`（记录请求体）与 `recordResponseBody`（记录响应体）独立开关。\r\n- **自动清理机制**：后端引入定时任务，跨 SQLite、MySQL、PostgreSQL 数据库均使用标准时间戳安全清理过期审计与诊断数据。\r\n\r\n---\r\n\r\n### 🔍 影响与兼容性 (Compatibility)\r\n- **数据库兼容**：通过 GORM AutoMigrate 自动迁移 `response_body` 字段，跨 SQLite / MySQL / PostgreSQL 存储源无缝兼容。\r\n- **性能友好**：保持了原有的 16384 队列缓冲与 256 批量写入机制，SSE 累加器限制最大 512KB 防御内存溢出，不影响并发吞吐。\r\n- **全量测试通过**：后端全部单元测试（`go test ./...`）与前端静态类型编译（`npm run build`）均 100% 通过。\r\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "backend/internal/application/gateway/service.go",
+      "lines": [
+        1121,
+        1140
+      ],
+      "category": "logic",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "When a streamed upstream response fails after its 2xx headers arrive, the request audit only records the stream-failure attempt if no earlier attempt was recorded. After a prior failed attempt on another account (e.g. a 429 that triggered rotation), the failing 2xx stream attempt is silently dropped, so the audit shows only the earlier failure and misattributes the request outcome.",
+      "trigger": "A streaming request whose first account answers 429 (recorded as an attempt), then retries on a second account that returns 200 headers and the stream later fails; the audit record lists only the 429 attempt, not the second account response_stream failure.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "backend/internal/application/gateway/service_test.go"
+      ],
+      "hidden_test_cmd": "cd backend && go test -count=1 ./internal/application/gateway/ -run '^TestGatewayRetryStreamFailureRecordsPrior429AndRetryStream$'"
+    }
+  ]
+}

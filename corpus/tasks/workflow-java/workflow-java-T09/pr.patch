@@ -1,0 +1,487 @@
+diff --git a/README.md b/README.md
+index fe11f01..45a289e 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,12 @@ Flyway and PostgreSQL.
+   counts apply the same rule, so titles of documents a user cannot see never appear. A document
+   the caller may not see is a 404 on every route, including the task and decision routes; a 403 is
+   only for a document the caller can see but may not change.
++- **Search.** `GET /documents/search?q=` finds documents by the words of their title, case
++  insensitive and without stemming (`merger` does not find `mergers`). `q` takes web search
++  syntax: words that must all appear, `"quoted phrases"`, `or` and `-word`. Results are ranked,
++  best match first, and paged with the opaque `nextCursor` of the previous page; `total` counts
++  every match. Search applies the permission rule like the lists: neither the results nor the
++  total include a document the caller cannot see.
+ - **Notifications.** Each event is written to an outbox with an idempotency key and the recipient's
+   account id; the address it was sent to is kept for delivery. A user's notifications follow the
+   account, so changing an address keeps them. Dispatch is at-least-once; a redelivered event
+@@ -133,6 +139,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `POST /documents` | create a draft (201, `Location`) |
+ | `GET /documents?status=&owner=&definition=&shared=&cursor=&size=` | visible documents, newest first; `shared=true` keeps only those granted to the caller |
+ | `GET /documents/count?status=&owner=&definition=` | visible documents, counted |
++| `GET /documents/search?q=&cursor=&size=` | visible documents whose title matches `q`, best match first, with `total` |
+ | `GET /documents/summary` | the caller's visible documents per status |
+ | `GET /documents/{id}` | one document with its tasks |
+ | `PUT /documents/{id}` | edit a draft (owner) |
+diff --git a/src/main/java/com/papertrail/workflow/api/DocumentController.java b/src/main/java/com/papertrail/workflow/api/DocumentController.java
+index f7665f9..ba6c800 100644
+--- a/src/main/java/com/papertrail/workflow/api/DocumentController.java
++++ b/src/main/java/com/papertrail/workflow/api/DocumentController.java
+@@ -15,6 +15,7 @@ import com.papertrail.workflow.service.Views.DocumentDetail;
+ import com.papertrail.workflow.service.Views.DocumentSummary;
+ import com.papertrail.workflow.service.Views.PageView;
+ import com.papertrail.workflow.service.Views.RoundView;
++import com.papertrail.workflow.service.Views.SearchPageView;
+ import jakarta.validation.Valid;
+ import java.net.URI;
+ import java.util.List;
+@@ -65,6 +66,15 @@ public class DocumentController {
+     return documents.list(principal(), filter, cursor, size);
+   }
+ 
++  /** Visible documents whose title matches {@code q}, best match first. */
++  @GetMapping("/search")
++  public SearchPageView search(
++      @RequestParam String q,
++      @RequestParam(required = false) String cursor,
++      @RequestParam(required = false) Integer size) {
++    return documents.search(principal(), q, cursor, size);
++  }
++
+   /** Every round of the document with its tasks, so earlier decisions stay on record. */
+   @GetMapping("/{id}/rounds")
+   public List<RoundView> rounds(@PathVariable long id) {
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentQueries.java b/src/main/java/com/papertrail/workflow/persistence/DocumentQueries.java
+index 7824859..564650b 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/DocumentQueries.java
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentQueries.java
+@@ -18,9 +18,24 @@ public interface DocumentQueries {
+           + " or exists (select p.id from DocumentPermission p where p.document = d and p.user.id"
+           + " = :userId))";
+ 
++  /** The same predicate in SQL, on table alias {@code d}, for the native search queries. */
++  String VISIBLE_TO_USER_SQL =
++      "(d.owner_id = :userId"
++          + " or exists (select 1 from approval_task t where t.document_id = d.id"
++          + " and t.assignee_id = :userId)"
++          + " or exists (select 1 from document_permission p where p.document_id = d.id"
++          + " and p.user_id = :userId))";
++
+   /** Visible documents, newest first, after the cursor id. Fetches owner and definition. */
+   List<Document> findVisiblePage(
+       long userId, boolean admin, DocumentFilter filter, Long afterId, int limit);
+ 
+   long countVisible(long userId, boolean admin, DocumentFilter filter);
++
++  /**
++   * Visible documents whose title matches the web-search style {@code query}, best rank first and
++   * then newest first, strictly after {@code after} in that order, with the number of matches.
++   */
++  TitleMatch.Page searchVisible(
++      long userId, boolean admin, String query, TitleMatch after, int limit);
+ }
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java b/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
+index 71ba247..8e32b5a 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
+@@ -3,7 +3,9 @@ package com.papertrail.workflow.persistence;
+ import com.papertrail.workflow.domain.Document;
+ import jakarta.persistence.EntityManager;
+ import jakarta.persistence.PersistenceContext;
++import jakarta.persistence.Query;
+ import jakarta.persistence.TypedQuery;
++import java.util.ArrayList;
+ import java.util.List;
+ import org.springframework.stereotype.Repository;
+ 
+@@ -11,6 +13,9 @@ import org.springframework.stereotype.Repository;
+ @Repository
+ public class DocumentQueriesImpl implements DocumentQueries {
+ 
++  private static final String TITLE_MATCHES =
++      "d.title_search @@ websearch_to_tsquery('simple', :query)";
++
+   @PersistenceContext private EntityManager em;
+ 
+   @Override
+@@ -38,6 +43,48 @@ public class DocumentQueriesImpl implements DocumentQueries {
+     return query.getSingleResult();
+   }
+ 
++  @Override
++  public TitleMatch.Page searchVisible(
++      long userId, boolean admin, String query, TitleMatch after, int limit) {
++    StringBuilder sql =
++        new StringBuilder(
++            "select m.id, m.rank from (select d.id,"
++                + " ts_rank(d.title_search, websearch_to_tsquery('simple', :query)) as rank"
++                + " from document d where "
++                + TITLE_MATCHES);
++    if (!admin) {
++      sql.append(" and ").append(DocumentQueries.VISIBLE_TO_USER_SQL);
++    }
++    sql.append(") m");
++    if (after != null) {
++      sql.append(
++          " where m.rank < cast(:afterRank as real)"
++              + " or (m.rank = cast(:afterRank as real) and m.id < :afterId)");
++    }
++    sql.append(" order by m.rank desc, m.id desc");
++    Query q = em.createNativeQuery(sql.toString());
++    q.setParameter("query", query);
++    if (!admin) {
++      q.setParameter("userId", userId);
++    }
++    if (after != null) {
++      q.setParameter("afterRank", after.rank());
++      q.setParameter("afterId", after.id());
++    }
++    List<TitleMatch> matches = new ArrayList<>();
++    for (Object row : q.setMaxResults(limit).getResultList()) {
++      Object[] columns = (Object[]) row;
++      matches.add(
++          new TitleMatch(((Number) columns[0]).longValue(), ((Number) columns[1]).floatValue()));
++    }
++    Number total =
++        (Number)
++            em.createNativeQuery("select count(*) from document d where " + TITLE_MATCHES)
++                .setParameter("query", query)
++                .getSingleResult();
++    return new TitleMatch.Page(matches, total.longValue());
++  }
++
+   private static void appendFilters(
+       StringBuilder jpql, boolean admin, DocumentFilter filter, boolean keyset) {
+     if (!admin) {
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java b/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java
+index 27c3ad9..b57b05a 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java
+@@ -3,6 +3,8 @@ package com.papertrail.workflow.persistence;
+ import com.papertrail.workflow.domain.Document;
+ import com.papertrail.workflow.domain.DocumentStatus;
+ import jakarta.persistence.LockModeType;
++import java.util.Collection;
++import java.util.List;
+ import java.util.Optional;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.data.jpa.repository.Lock;
+@@ -25,4 +27,7 @@ public interface DocumentRepository extends JpaRepository<Document, Long>, Docum
+       "select d from Document d join fetch d.owner join fetch d.definition where d.id = :id and "
+           + VISIBLE_TO_USER)
+   Optional<Document> findVisibleById(@Param("id") long id, @Param("userId") long userId);
++
++  @Query("select d from Document d join fetch d.owner join fetch d.definition where d.id in :ids")
++  List<Document> findDetailsByIdIn(@Param("ids") Collection<Long> ids);
+ }
+diff --git a/src/main/java/com/papertrail/workflow/persistence/TitleMatch.java b/src/main/java/com/papertrail/workflow/persistence/TitleMatch.java
+new file mode 100644
+index 0000000..aa5cbe9
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/persistence/TitleMatch.java
+@@ -0,0 +1,10 @@
++package com.papertrail.workflow.persistence;
++
++import java.util.List;
++
++/** A document whose title matches a search, with the rank Postgres gave the match. */
++public record TitleMatch(long id, float rank) {
++
++  /** One page of matches and how many documents match in all. */
++  public record Page(List<TitleMatch> matches, long total) {}
++}
+diff --git a/src/main/java/com/papertrail/workflow/service/DocumentService.java b/src/main/java/com/papertrail/workflow/service/DocumentService.java
+index f8315e3..119afb2 100644
+--- a/src/main/java/com/papertrail/workflow/service/DocumentService.java
++++ b/src/main/java/com/papertrail/workflow/service/DocumentService.java
+@@ -8,6 +8,7 @@ import com.papertrail.workflow.domain.DocumentStatus;
+ import com.papertrail.workflow.domain.ForbiddenException;
+ import com.papertrail.workflow.domain.NotFoundException;
+ import com.papertrail.workflow.domain.Principal;
++import com.papertrail.workflow.domain.ValidationException;
+ import com.papertrail.workflow.domain.WorkflowDefinition;
+ import com.papertrail.workflow.persistence.AppUserRepository;
+ import com.papertrail.workflow.persistence.ApprovalTaskRepository;
+@@ -15,6 +16,7 @@ import com.papertrail.workflow.persistence.AuditEventRepository;
+ import com.papertrail.workflow.persistence.DocumentFilter;
+ import com.papertrail.workflow.persistence.DocumentPermissionRepository;
+ import com.papertrail.workflow.persistence.DocumentRepository;
++import com.papertrail.workflow.persistence.TitleMatch;
+ import com.papertrail.workflow.persistence.WorkflowDefinitionRepository;
+ import com.papertrail.workflow.service.Views.AccessView;
+ import com.papertrail.workflow.service.Views.AuditView;
+@@ -22,12 +24,15 @@ import com.papertrail.workflow.service.Views.DocumentDetail;
+ import com.papertrail.workflow.service.Views.DocumentSummary;
+ import com.papertrail.workflow.service.Views.PageView;
+ import com.papertrail.workflow.service.Views.PermissionView;
++import com.papertrail.workflow.service.Views.SearchPageView;
+ import com.papertrail.workflow.service.Views.TaskView;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.util.EnumMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.function.Function;
++import java.util.stream.Collectors;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+@@ -37,6 +42,7 @@ public class DocumentService {
+ 
+   static final int MAX_PAGE = 100;
+   static final int DEFAULT_PAGE = 20;
++  static final int MAX_QUERY = 200;
+ 
+   private final DocumentRepository documents;
+   private final WorkflowDefinitionRepository definitions;
+@@ -117,6 +123,61 @@ public class DocumentService {
+     return new PageView<>(items, next);
+   }
+ 
++  /**
++   * Searches the titles of the documents the caller can see, best match first. The query takes web
++   * search syntax: words, "quoted phrases", {@code or} and {@code -word}.
++   */
++  @Transactional(readOnly = true)
++  public SearchPageView search(Principal actor, String text, String cursor, Integer size) {
++    if (text == null || text.isBlank()) {
++      throw new ValidationException("q is required");
++    }
++    String query = text.trim();
++    if (query.length() > MAX_QUERY) {
++      throw new ValidationException("q may not exceed " + MAX_QUERY + " characters");
++    }
++    int limit = Pages.limit(size);
++    TitleMatch.Page page =
++        documents.searchVisible(
++            actor.userId(), actor.admin(), query, decodeCursor(cursor), limit + 1);
++    List<TitleMatch> rows = page.matches();
++    boolean more = rows.size() > limit;
++    List<TitleMatch> kept = more ? rows.subList(0, limit) : rows;
++    Map<Long, Document> byId =
++        kept.isEmpty()
++            ? Map.of()
++            : documents.findDetailsByIdIn(kept.stream().map(TitleMatch::id).toList()).stream()
++                .collect(Collectors.toMap(Document::getId, Function.identity()));
++    List<DocumentSummary> items =
++        kept.stream().map(match -> DocumentSummary.of(byId.get(match.id()))).toList();
++    String next = more ? encodeCursor(kept.get(kept.size() - 1)) : null;
++    return new SearchPageView(items, page.total(), next);
++  }
++
++  /** A search cursor is the rank and id of the last match on the previous page. */
++  static String encodeCursor(TitleMatch last) {
++    return last.rank() + ":" + last.id();
++  }
++
++  static TitleMatch decodeCursor(String cursor) {
++    if (cursor == null) {
++      return null;
++    }
++    int colon = cursor.indexOf(':');
++    try {
++      if (colon > 0) {
++        float rank = Float.parseFloat(cursor.substring(0, colon));
++        long id = Long.parseLong(cursor.substring(colon + 1));
++        if (Float.isFinite(rank)) {
++          return new TitleMatch(id, rank);
++        }
++      }
++    } catch (NumberFormatException e) {
++      // reported below
++    }
++    throw new ValidationException("cursor is not a search cursor");
++  }
++
+   @Transactional(readOnly = true)
+   public long count(Principal actor, DocumentFilter filter) {
+     return documents.countVisible(actor.userId(), actor.admin(), filter);
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..3a379e9 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -61,6 +61,12 @@ public final class Views {
+     }
+   }
+ 
++  /**
++   * One page of title search results, best match first. {@code total} counts every match the caller
++   * can see; {@code nextCursor} is an opaque token, null on the last page.
++   */
++  public record SearchPageView(List<DocumentSummary> items, long total, String nextCursor) {}
++
+   public record DocumentDetail(DocumentSummary summary, String body, List<TaskView> tasks) {}
+ 
+   public record TaskView(
+diff --git a/src/main/resources/db/migration/V3__document_title_search.sql b/src/main/resources/db/migration/V3__document_title_search.sql
+new file mode 100644
+index 0000000..be228c3
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__document_title_search.sql
+@@ -0,0 +1,5 @@
++-- Title search: the words of each title, kept by Postgres whenever the title changes. The 'simple'
++-- configuration lower-cases words and does not stem them, so names and codes match as written.
++ALTER TABLE document
++    ADD COLUMN title_search tsvector GENERATED ALWAYS AS (to_tsvector('simple', title)) STORED;
++CREATE INDEX document_title_search ON document USING gin (title_search);
+diff --git a/src/test/java/com/papertrail/workflow/api/DocumentSearchApiTest.java b/src/test/java/com/papertrail/workflow/api/DocumentSearchApiTest.java
+new file mode 100644
+index 0000000..a22c8a0
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/DocumentSearchApiTest.java
+@@ -0,0 +1,155 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.service.DocumentService;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class DocumentSearchApiTest extends IntegrationTestBase {
++
++  private static final String AUTH = "Authorization";
++
++  @Autowired private DocumentService documents;
++  @Autowired private ObjectMapper json;
++
++  private long owner;
++  private long approver;
++  private long stranger;
++
++  @BeforeEach
++  void setUp() {
++    owner = data.user("Ines Berg");
++    approver = data.user("Tomas Vale");
++    stranger = data.user("Omar Lind");
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++  }
++
++  private long draft(String title) {
++    return data.draft(data.principal(owner), "Contract", title);
++  }
++
++  private JsonNode search(long caller, String query) throws Exception {
++    String body =
++        mvc.perform(
++                get("/api/v1/documents/search").param("q", query).header(AUTH, data.bearer(caller)))
++            .andExpect(status().isOk())
++            .andReturn()
++            .getResponse()
++            .getContentAsString();
++    return json.readTree(body);
++  }
++
++  private static List<String> titles(JsonNode page) {
++    List<String> titles = new ArrayList<>();
++    page.get("items").forEach(item -> titles.add(item.get("title").asText()));
++    return titles;
++  }
++
++  @Test
++  void matchesWholeWordsWithoutCaseAndRanksTheBestMatchFirst() throws Exception {
++    draft("Merger memo");
++    draft("Merger review: merger terms");
++    draft("Mergers and acquisitions");
++    draft("Lease renewal");
++
++    JsonNode page = search(owner, "MERGER");
++
++    assertThat(titles(page)).containsExactly("Merger review: merger terms", "Merger memo");
++    assertThat(page.get("total").asLong()).isEqualTo(2);
++    assertThat(page.get("nextCursor").isNull()).isTrue();
++  }
++
++  @Test
++  void phrasesAndExclusionsFollowWebSearchSyntax() throws Exception {
++    draft("Supplier contract renewal");
++    draft("Contract with supplier");
++    draft("Supplier contract draft");
++
++    assertThat(titles(search(owner, "\"supplier contract\" -draft")))
++        .containsExactly("Supplier contract renewal");
++    assertThat(titles(search(owner, "renewal or draft"))).hasSize(2);
++  }
++
++  @Test
++  void pagesCoverEveryMatchOnce() throws Exception {
++    for (int i = 0; i < 5; i++) {
++      draft("Budget line " + i);
++    }
++    var seen = new HashSet<String>();
++    String cursor = null;
++    int pages = 0;
++    do {
++      var request =
++          get("/api/v1/documents/search")
++              .param("q", "budget")
++              .param("size", "2")
++              .header(AUTH, data.bearer(owner));
++      if (cursor != null) {
++        request.param("cursor", cursor);
++      }
++      JsonNode page =
++          json.readTree(mvc.perform(request).andReturn().getResponse().getContentAsString());
++      titles(page).forEach(title -> assertThat(seen.add(title)).isTrue());
++      assertThat(page.get("total").asLong()).isEqualTo(5);
++      cursor = page.get("nextCursor").isNull() ? null : page.get("nextCursor").asText();
++      pages++;
++    } while (cursor != null);
++
++    assertThat(seen).hasSize(5);
++    assertThat(pages).isEqualTo(3);
++  }
++
++  @Test
++  void resultsFollowThePermissionRule() throws Exception {
++    long submitted = draft("Merger memo");
++    documents.submit(data.principal(owner), submitted);
++    draft("Merger draft notes");
++
++    assertThat(titles(search(approver, "merger"))).containsExactly("Merger memo");
++    assertThat(titles(search(stranger, "merger"))).isEmpty();
++    assertThat(titles(search(data.admin("Ops Admin"), "merger"))).hasSize(2);
++  }
++
++  @Test
++  void aQueryIsRequiredAndCursorsAreChecked() throws Exception {
++    mvc.perform(get("/api/v1/documents/search").header(AUTH, data.bearer(owner)))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:invalid-request"));
++    mvc.perform(get("/api/v1/documents/search").param("q", "  ").header(AUTH, data.bearer(owner)))
++        .andExpect(status().isBadRequest());
++    mvc.perform(
++            get("/api/v1/documents/search")
++                .param("q", "x".repeat(201))
++                .header(AUTH, data.bearer(owner)))
++        .andExpect(status().isBadRequest());
++    mvc.perform(
++            get("/api/v1/documents/search")
++                .param("q", "merger")
++                .param("cursor", "next-page")
++                .header(AUTH, data.bearer(owner)))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:invalid-request"));
++  }
++
++  @Test
++  void aTitleChangeIsSearchableAtOnce() throws Exception {
++    long id = draft("Quarterly figures");
++    documents.updateDraft(data.principal(owner), id, "Annual figures", "Invented body text");
++
++    assertThat(titles(search(owner, "annual"))).containsExactly("Annual figures");
++    assertThat(titles(search(owner, "quarterly"))).isEmpty();
++  }
++}

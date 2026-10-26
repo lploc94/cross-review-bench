@@ -1,0 +1,19 @@
+diff --git a/src/etl/pipeline/metrics.py b/src/etl/pipeline/metrics.py
+index dfdac00..21aa1c7 100644
+--- a/src/etl/pipeline/metrics.py
++++ b/src/etl/pipeline/metrics.py
+@@ -10,7 +10,6 @@ from __future__ import annotations
+ import os
+ import tempfile
+ from collections.abc import Mapping
+-from datetime import timedelta
+ from pathlib import Path
+ from typing import TextIO
+ 
+@@ -124,5 +123,5 @@ def render_metrics(connection: Connection, out: TextIO) -> None:
+         "How long the latest finished run of the source took.",
+     )
+     for run in latest:
+-        duration = (run["finished_at"] - run["started_at"]) / timedelta(milliseconds=1)
++        duration = (run["finished_at"] - run["started_at"]).seconds
+         _sample(out, "etl_run_duration_seconds", {"source": run["source"]}, duration)

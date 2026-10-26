@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/alvinunreal/oh-my-opencode-slim",
+  "intro_pr": 1338,
+  "intro_merged_at": "2026-09-27T09:14:22Z",
+  "fix_pr": 1366,
+  "fix_merged_at": "2026-10-01T07:30:09Z",
+  "license": "MIT",
+  "base_commit": "4c8bfdfbd9eae348457bc77d4ba38cb4b2a5e52b",
+  "intro_commit": "2b8278d3b261e6db124096582db720d702626185",
+  "fix_commit": "fa39ad67d1a0e6502415fda75919c6ce3c7315b8",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

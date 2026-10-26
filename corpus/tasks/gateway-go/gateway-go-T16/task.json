@@ -1,0 +1,30 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T16",
+  "repo": "gateway-go",
+  "kind": "decoy",
+  "title": "Passive health checks with ejection and panic routing",
+  "description": "Active health checks only notice an upstream that is down when its /healthz probe fails, which can take several intervals. Requests meanwhile keep going to an upstream that has just failed ten times in a row. This adds passive health checks: the proxy's own request outcomes eject a failing upstream for a while.\n\n- Routes gain `passive_health: {consecutive_failures, ejection, max_ejected_percent}`. An upstream whose requests fail `consecutive_failures` times in a row (connect, timeout or reset errors, and 5xx answers) is ejected for `ejection`; a success clears the count.\n- At most `max_ejected_percent` of a route's upstreams are ejected at once, and at least one stays in rotation.\n- A retry first prefers an upstream that is healthy and not ejected, including one already tried. Only when none is left does the attempt pick among all of the route's upstreams, ejected ones too, instead of answering `503 no_healthy_upstream` (panic routing, as Envoy does): a failing upstream is a better bet than an error the client sees for certain.\n- The admin route view shows which upstreams are ejected.\n- Ejection state is kept per upstream across reloads, like the circuit breaker, when the route's passive settings are unchanged; a removed upstream takes its ejection with it, and the share limit follows the upstream count: when it drops, the ejections that end first are released until the limit holds, so one upstream always stays in rotation. Outcomes a request reports for an upstream the table no longer has are ignored.\n- `config` validation names each bad field of the block.\n- README: the request path and the routes file.\n\nTests: ejection after the configured failures in a row and not before, the return after the ejection period, the share limit, panic routing with and without the block, and forwarding through the handler.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "internal/core/route.go",
+      "lines": [
+        99,
+        103
+      ],
+      "looks_like": "NextAny ignores both the active health flag and the passive ejection, so a route whose upstreams are all unhealthy or ejected still sends traffic to them: a known-bad upstream receives requests it is supposed to be spared, which looks like the health checks are switched off whenever the route runs short of upstreams.",
+      "why_correct": "NextAny is reached only from the pick loop in forward.go, after the healthy passes: first an untried healthy upstream, then any healthy upstream not ejected (tried ones included), and only when neither finds one. The panic pick returns nil on routes without passive_health, so routes without the block behave exactly as before and answer 503 when no upstream is healthy. Every pick, panic included, still goes through the upstream's circuit breaker, so an open circuit is never bypassed.",
+      "valid_rebuttal": "The fallback is the documented panic routing. The README's request path (step 5) and the routes file section state that a retry first prefers a healthy, unejected upstream, tried ones included, and that only when none is left the attempt picks among all upstreams rather than answering 503; the PR description says the same. The guard is r.spec.PassiveHealth == nil, so routes without passive_health keep the 503 behaviour, and forward.go's pick still runs the circuit breaker's Allow on every candidate. internal/core/passive_health_test.go (TestPassivePanicRoutingUsesEjectedUpstreams) and internal/proxy/passive_health_test.go check the ejection and the fallback order.",
+      "hidden_tests": [
+        "internal/core/passive_check_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 -run '^TestPassiveEjectionCheck$' ./internal/core/"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

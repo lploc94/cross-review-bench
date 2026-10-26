@@ -1,0 +1,70 @@
+diff --git a/packages/server/src/repositories/events.ts b/packages/server/src/repositories/events.ts
+index 15120db..6125ed1 100644
+--- a/packages/server/src/repositories/events.ts
++++ b/packages/server/src/repositories/events.ts
+@@ -80,20 +80,25 @@ interface EventRow {
+   server_received_at: Date;
+ }
+ 
+-/** At most `limit` events of the user with `seq > after`, in seq order. */
++/**
++ * At most `limit` events of the user with `seq > after`, in seq order; with `filter`, only those
++ * of its collections with `seq <= upTo`.
++ */
+ export async function listEventsAfter(
+   db: Queryable,
+   userId: string,
+   after: number,
+   limit: number,
++  filter?: { readonly collections: readonly string[]; readonly upTo: number },
+ ): Promise<StoredEvent[]> {
+   const result = await db.query<EventRow>(
+     `SELECT seq, device_id, mutation_id, collection, doc_id, field, value, hlc, server_received_at
+        FROM events
+       WHERE user_id = $1 AND seq > $2
++        AND ($4::text[] IS NULL OR (collection = ANY($4::text[]) AND seq <= $5))
+       ORDER BY seq
+       LIMIT $3`,
+-    [userId, after, limit],
++    [userId, after, limit, filter?.collections ?? null, filter?.upTo ?? null],
+   );
+   return result.rows.map((row) => ({
+     seq: toSafeInteger(row.seq, "events.seq"),
+diff --git a/packages/server/src/services/pullService.ts b/packages/server/src/services/pullService.ts
+index fdf2649..b587266 100644
+--- a/packages/server/src/services/pullService.ts
++++ b/packages/server/src/services/pullService.ts
+@@ -57,9 +57,10 @@ export class PullService {
+   }
+ 
+   /**
+-   * Reads the feed in pages until `limit + 1` events of the collections are found or the feed
+-   * ends. When it ends, `nextAfter` is the last event examined, so the next pull does not read
+-   * the other collections' events again.
++   * Reads the events of the collections up to the user's latest event; when they do not fill the
++   * page, `nextAfter` is that latest event, so the next pull does not read the other
++   * collections' events again. The latest seq is read first: every event of the user below it
++   * has committed (pushes of a user commit in seq order).
+    */
+   private async filteredPage(
+     userId: string,
+@@ -67,14 +68,11 @@ export class PullService {
+     limit: number,
+     collections: ReadonlySet<string>,
+   ): Promise<PullPage> {
+-    const matching: StoredEvent[] = [];
+-    let examined = after;
+-    for (;;) {
+-      const rows = await listEventsAfter(this.pool, userId, examined, limit + 1);
+-      matching.push(...rows.filter((event) => collections.has(event.collection)));
+-      examined = rows.at(-1)?.seq ?? examined;
+-      if (rows.length <= limit || matching.length > limit) break;
+-    }
++    const examined = Math.max(after, await latestSeq(this.pool, userId));
++    const matching = await listEventsAfter(this.pool, userId, after, limit + 1, {
++      collections: [...collections],
++      upTo: examined,
++    });
+ 
+     const hasMore = matching.length > limit;
+     const events = hasMore ? matching.slice(0, limit) : matching;

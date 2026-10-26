@@ -1,0 +1,12 @@
+diff --git a/src/etl/errors.py b/src/etl/errors.py
+index d36b39e..8af3f8b 100644
+--- a/src/etl/errors.py
++++ b/src/etl/errors.py
+@@ -162,6 +162,7 @@ EXIT_CODES: dict[type[EtlError], int] = {
+     WatermarkConflict: 14,
+     RunLocked: 15,
+     SchemaNotCurrent: 16,
++    SchemaDrift: 17,
+     EtlError: 20,
+ }
+ 

@@ -1,0 +1,48 @@
+diff --git a/src/services/outboxDispatcher.ts b/src/services/outboxDispatcher.ts
+index a0a8e4f..512a31a 100644
+--- a/src/services/outboxDispatcher.ts
++++ b/src/services/outboxDispatcher.ts
+@@ -35,6 +35,21 @@ interface DeliveryFailure {
+   readonly error: unknown;
+ }
+ 
++/** The batch's events per aggregate, each group in id order. */
++function groupByAggregate(events: readonly OutboxEvent[]): OutboxEvent[][] {
++  const groups = new Map<string, OutboxEvent[]>();
++  for (const event of events) {
++    const key = `${event.tenantId}:${event.aggregateId}`;
++    const group = groups.get(key);
++    if (group) {
++      group.push(event);
++    } else {
++      groups.set(key, [event]);
++    }
++  }
++  return [...groups.values()];
++}
++
+ /**
+  * Delivers outbox events to the tenant's active webhook endpoints.
+  *
+@@ -78,12 +93,15 @@ export class OutboxDispatcher {
+       };
+       let delivered = 0;
+       let failed = 0;
+-      await this.forEachConcurrently(events, async (event) => {
+-        const failure = await this.send(event, endpointsByTenant.get(event.tenantId) ?? []);
+-        if (await record(event, failure)) {
+-          delivered++;
+-        } else {
+-          failed++;
++      // Aggregates run in parallel; one aggregate's events go out one after another.
++      await this.forEachConcurrently(groupByAggregate(events), async (group) => {
++        for (const event of group) {
++          const failure = await this.send(event, endpointsByTenant.get(event.tenantId) ?? []);
++          if (await record(event, failure)) {
++            delivered++;
++          } else {
++            failed++;
++          }
+         }
+       });
+       return { claimed: events.length, delivered, failed };

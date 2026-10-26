@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T12",
+  "repo": "authz-py",
+  "kind": "clean",
+  "title": "Organisation ownership transfer",
+  "description": "Handing an organisation over today takes two PATCHes on members (promote the new owner, then step down), and in between the org has an extra owner nobody meant to keep. This adds one call that does both.\n\n- `POST /v1/orgs/{org_id}/transfer-ownership {user_id, stay_owner?}`: the member named becomes an owner and the caller is demoted to the built-in `admin` role, or keeps `owner` with `\"stay_owner\": true`. The answer is `{new_owner, previous_owner}`, both in the usual member shape.\n- Only a member whose membership role is `owner` may transfer. The route requires `org:manage`, and the service checks the caller's membership role again inside the transaction, so holding `org:manage` through a role assignment is not enough (403).\n- The target must already be a member (404 otherwise), must not be the caller (422), must not be an owner already (409) and must not be a disabled account (409), so ownership never lands on someone who cannot sign in.\n- `MemberService.transfer_ownership` runs in one transaction under the organisation lock (`_lock_org`), like role changes and removals, so it is serialised with them and with other transfers; the caller's role is read after the lock is taken. The new owner is promoted before the caller is demoted, and `_ensure_owner_remains` still guards the demotion. Role assignments of both members are left alone.\n- Audit: a `member.role_changed` event for each membership whose role changes (same data as a PATCH) and a new `org.ownership_transferred` event (`from_user_id`, `previous_role_id`, `stayed_owner`), all in the same transaction.\n\nTests: `tests/api/test_ownership_transfer.py` (hand-over and demotion, `stay_owner`, the old owner losing owner rights, admins refused, non-members and unknown ids, self/existing owner/disabled account, unknown body fields, audit events). README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "tests/hidden/test_ownership_transfer_rules.py"
+  ],
+  "clean_hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_ownership_transfer_rules.py"
+}

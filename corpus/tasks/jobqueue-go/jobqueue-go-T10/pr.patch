@@ -1,0 +1,571 @@
+diff --git a/README.md b/README.md
+index 7c29825..fb42240 100644
+--- a/README.md
++++ b/README.md
+@@ -6,8 +6,8 @@ type and record the outcome. Failed attempts are retried after a fixed delay unt
+ out of attempts and lands in the dead-letter queue, from where an operator can requeue it. Cron
+ schedules enqueue jobs periodically.
+ 
+-One binary runs everything: the API, the worker pool, the scheduler and the reaper that recovers
+-jobs from workers that died. Every instance can run all of them against the same database.
++One binary runs everything: the API, the worker pool, the scheduler, the reaper that recovers
++jobs from workers that died, and the purger that deletes old finished jobs. Every instance can run all of them against the same database.
+ 
+ ## Layout
+ 
+@@ -19,6 +19,7 @@ jobs from workers that died. Every instance can run all of them against the same
+ | `internal/domain` | the job and schedule model, the state machine, validation, the retry policy, error values |
+ | `internal/store` | PostgreSQL persistence: enqueue, lease, settle, reap, dead letters, schedules |
+ | `internal/worker` | the worker pool, the handler registry and the lease reaper |
++| `internal/retention` | the loop that deletes finished jobs after `RETENTION_PERIOD` |
+ | `internal/scheduler`, `internal/cron` | cron expression parsing and the loop that fires due schedules |
+ | `internal/builtin` | the built-in handlers `noop`, `sleep` and `http.post` |
+ | `internal/metrics` | counters, gauges and histograms in the Prometheus text format |
+@@ -46,6 +47,9 @@ available ──cancel──▶ cancelled
+   `worker.WithTimeout`). A handler that may outlive its lease calls `worker.ExtendLease(ctx)`;
+   the `sleep` handler shows how.
+ - A panicking handler fails its attempt with the panic message; the worker carries on.
++- Finished jobs, dead ones included, are kept for `RETENTION_PERIOD` after `finished_at` and
++  then deleted by the purger (`jobqueue_jobs_purged_total`). Requeue a dead job before then if
++  you still want it to run.
+ - `Stop` (on SIGTERM or SIGINT) stops leasing and waits for running handlers to return. It does
+   not cancel them.
+ 
+@@ -97,6 +101,8 @@ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ | `RETRY_DELAY` | `30s` | wait before a failed attempt runs again |
+ | `REAP_INTERVAL` | `30s` | how often expired leases are recovered |
+ | `SCHEDULER_INTERVAL` | `10s` | how often due schedules are fired |
++| `RETENTION_PERIOD` | `336h` (14 days) | finished jobs (succeeded, failed, cancelled, dead) are deleted this long after they finished |
++| `PURGE_INTERVAL` | `10m` | how often old finished jobs are deleted, 1000 per statement |
+ 
+ The service logs JSON lines to stdout and exits with status 2 on invalid configuration, listing
+ every problem.
+diff --git a/cmd/jobqueue/main.go b/cmd/jobqueue/main.go
+index 7ff6a35..0c0eeb8 100644
+--- a/cmd/jobqueue/main.go
++++ b/cmd/jobqueue/main.go
+@@ -1,5 +1,5 @@
+ // Command jobqueue runs the job queue service: the HTTP API, the worker pool, the cron
+-// scheduler and the lease reaper, all in one process. Configuration comes from the environment;
++// scheduler, the lease reaper and the retention purger, all in one process. Configuration comes from the environment;
+ // see internal/config.
+ package main
+ 
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/relaywork/jobqueue/internal/logging"
+ 	"github.com/relaywork/jobqueue/internal/metrics"
+ 	"github.com/relaywork/jobqueue/internal/migrate"
++	"github.com/relaywork/jobqueue/internal/retention"
+ 	"github.com/relaywork/jobqueue/internal/scheduler"
+ 	"github.com/relaywork/jobqueue/internal/store"
+ 	"github.com/relaywork/jobqueue/internal/worker"
+@@ -169,6 +170,10 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	purger, err := retention.New(st, cfg.RetentionPeriod, cfg.PurgeInterval, store.PurgeBatchSize, clk, logger, reg)
++	if err != nil {
++		return err
++	}
+ 
+ 	httpServer := &http.Server{
+ 		Handler:           server,
+@@ -191,7 +196,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 		return err
+ 	}
+ 	var background sync.WaitGroup
+-	background.Add(2)
++	background.Add(3)
+ 	go func() {
+ 		defer background.Done()
+ 		_ = reaper.Run(ctx)
+@@ -200,6 +205,10 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 		defer background.Done()
+ 		_ = sched.Run(ctx)
+ 	}()
++	go func() {
++		defer background.Done()
++		_ = purger.Run(ctx)
++	}()
+ 
+ 	serveErr := make(chan error, 1)
+ 	go func() {
+diff --git a/internal/config/config.go b/internal/config/config.go
+index a11eebd..a74ff58 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -43,6 +43,9 @@ type Config struct {
+ 
+ 	ReapInterval      time.Duration
+ 	SchedulerInterval time.Duration
++
++	RetentionPeriod time.Duration // finished jobs older than this are deleted
++	PurgeInterval   time.Duration
+ }
+ 
+ // Load reads the configuration from the process environment.
+@@ -71,6 +74,9 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
+ 
+ 		ReapInterval:      r.duration("REAP_INTERVAL", 30*time.Second),
+ 		SchedulerInterval: r.duration("SCHEDULER_INTERVAL", 10*time.Second),
++
++		RetentionPeriod: r.duration("RETENTION_PERIOD", 14*24*time.Hour),
++		PurgeInterval:   r.duration("PURGE_INTERVAL", 10*time.Minute),
+ 	}
+ 	cfg.validate(&r)
+ 	if len(r.errs) > 0 {
+@@ -115,6 +121,8 @@ func (c Config) validate(r *reader) {
+ 		{"JOB_TIMEOUT", c.JobTimeout},
+ 		{"REAP_INTERVAL", c.ReapInterval},
+ 		{"SCHEDULER_INTERVAL", c.SchedulerInterval},
++		{"RETENTION_PERIOD", c.RetentionPeriod},
++		{"PURGE_INTERVAL", c.PurgeInterval},
+ 	}
+ 	for _, p := range positive {
+ 		if p.d <= 0 {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index ad4dc14..6eee152 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -41,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
+ 	if cfg.WorkerID == "" {
+ 		t.Error("no default worker id")
+ 	}
++	if cfg.RetentionPeriod != 14*24*time.Hour || cfg.PurgeInterval != 10*time.Minute {
++		t.Errorf("retention = %s every %s", cfg.RetentionPeriod, cfg.PurgeInterval)
++	}
+ }
+ 
+ func TestLoadOverrides(t *testing.T) {
+@@ -79,13 +82,15 @@ func TestLoadReportsEveryProblem(t *testing.T) {
+ 		"RETRY_DELAY":        "-1s",
+ 		"REAP_INTERVAL":      "0s",
+ 		"DB_MAX_CONNS":       "0",
++		"RETENTION_PERIOD":   "0s",
++		"PURGE_INTERVAL":     "soon",
+ 	}
+ 	_, err := LoadFrom(env(vars))
+ 	if err == nil {
+ 		t.Fatal("invalid configuration accepted")
+ 	}
+ 	for _, name := range []string{"DATABASE_URL", "ADMIN_TOKEN", "WORKER_CONCURRENCY", "LEASE_DURATION",
+-		"LOG_LEVEL", "WORKER_QUEUES", "RETRY_DELAY", "REAP_INTERVAL", "DB_MAX_CONNS"} {
++		"LOG_LEVEL", "WORKER_QUEUES", "RETRY_DELAY", "REAP_INTERVAL", "DB_MAX_CONNS", "RETENTION_PERIOD", "PURGE_INTERVAL"} {
+ 		if !strings.Contains(err.Error(), name) {
+ 			t.Errorf("error does not mention %s:\n%v", name, err)
+ 		}
+diff --git a/internal/retention/purger.go b/internal/retention/purger.go
+new file mode 100644
+index 0000000..afc456a
+--- /dev/null
++++ b/internal/retention/purger.go
+@@ -0,0 +1,97 @@
++// Package retention deletes finished jobs once they are older than the retention period, so
++// that the jobs table does not grow without bound.
++package retention
++
++import (
++	"context"
++	"errors"
++	"log/slog"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/clock"
++	"github.com/relaywork/jobqueue/internal/metrics"
++	"github.com/relaywork/jobqueue/internal/store"
++)
++
++// Store is the part of the job store the purger needs.
++type Store interface {
++	// PurgeFinished deletes one batch of jobs that finished before cutoff.
++	PurgeFinished(ctx context.Context, cutoff time.Time) ([]store.PurgedJob, error)
++}
++
++// Purger periodically deletes jobs that finished more than the retention period ago.
++type Purger struct {
++	store     Store
++	retention time.Duration
++	interval  time.Duration
++	batchSize int
++	clock     clock.Clock
++	log       *slog.Logger
++	purged    *metrics.Counter
++}
++
++// New returns a purger that runs every interval and deletes jobs that finished more than
++// retention ago. batchSize must match the most jobs one PurgeFinished call deletes, so that the
++// purger knows when to call again.
++func New(st Store, retention, interval time.Duration, batchSize int, clk clock.Clock, logger *slog.Logger, reg *metrics.Registry) (*Purger, error) {
++	if retention <= 0 {
++		return nil, errors.New("retention: retention period must be positive")
++	}
++	if interval <= 0 {
++		return nil, errors.New("retention: interval must be positive")
++	}
++	if batchSize < 1 {
++		return nil, errors.New("retention: batch size must be positive")
++	}
++	if reg == nil {
++		reg = metrics.NewRegistry()
++	}
++	return &Purger{
++		store:     st,
++		retention: retention,
++		interval:  interval,
++		batchSize: batchSize,
++		clock:     clk,
++		log:       logger.With("component", "purger"),
++		purged: reg.NewCounter("jobqueue_jobs_purged_total",
++			"Finished jobs deleted after the retention period, by the state they ended in.", "queue", "state"),
++	}, nil
++}
++
++// Run purges once immediately and then every interval until ctx is done. It returns nil when ctx
++// is cancelled; errors of individual passes are logged and retried at the next interval.
++func (p *Purger) Run(ctx context.Context) error {
++	for {
++		if _, err := p.PurgeOnce(ctx); err != nil && ctx.Err() == nil {
++			p.log.Error("purge finished jobs", "error", err)
++		}
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-p.clock.After(p.interval):
++		}
++	}
++}
++
++// PurgeOnce deletes every job that finished before now minus the retention period, in batches,
++// and returns how many it deleted.
++func (p *Purger) PurgeOnce(ctx context.Context) (int, error) {
++	cutoff := p.clock.Now().Add(-p.retention)
++	total := 0
++	for {
++		jobs, err := p.store.PurgeFinished(ctx, cutoff)
++		if err != nil {
++			return total, err
++		}
++		for _, j := range jobs {
++			p.purged.Inc(j.Queue, string(j.State))
++		}
++		total += len(jobs)
++		if len(jobs) < p.batchSize {
++			if total > 0 {
++				p.log.Info("purged finished jobs", "count", total, "finished_before", cutoff)
++			}
++			return total, nil
++		}
++	}
++}
+diff --git a/internal/retention/purger_test.go b/internal/retention/purger_test.go
+new file mode 100644
+index 0000000..e2b295b
+--- /dev/null
++++ b/internal/retention/purger_test.go
+@@ -0,0 +1,125 @@
++package retention_test
++
++import (
++	"context"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/clock"
++	"github.com/relaywork/jobqueue/internal/domain"
++	"github.com/relaywork/jobqueue/internal/logging"
++	"github.com/relaywork/jobqueue/internal/metrics"
++	"github.com/relaywork/jobqueue/internal/retention"
++	"github.com/relaywork/jobqueue/internal/store"
++)
++
++var t0 = time.Date(2025, time.March, 10, 9, 0, 0, 0, time.UTC)
++
++const retentionPeriod = 14 * 24 * time.Hour
++
++// fakeStore hands out the given batches, one per call, then empty ones.
++type fakeStore struct {
++	mu      sync.Mutex
++	batches [][]store.PurgedJob
++	cutoffs []time.Time
++}
++
++func (f *fakeStore) PurgeFinished(_ context.Context, cutoff time.Time) ([]store.PurgedJob, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.cutoffs = append(f.cutoffs, cutoff)
++	if len(f.batches) == 0 {
++		return nil, nil
++	}
++	b := f.batches[0]
++	f.batches = f.batches[1:]
++	return b, nil
++}
++
++func (f *fakeStore) calls() []time.Time {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return append([]time.Time(nil), f.cutoffs...)
++}
++
++func batch(n int, queue string, st domain.State) []store.PurgedJob {
++	out := make([]store.PurgedJob, n)
++	for i := range out {
++		out[i] = store.PurgedJob{ID: int64(i + 1), Queue: queue, State: st}
++	}
++	return out
++}
++
++func newPurger(t *testing.T, st retention.Store, clk clock.Clock, reg *metrics.Registry) *retention.Purger {
++	t.Helper()
++	p, err := retention.New(st, retentionPeriod, 10*time.Minute, 3, clk, logging.Discard(), reg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
++
++func TestPurgeOnceDrainsFullBatches(t *testing.T) {
++	st := &fakeStore{batches: [][]store.PurgedJob{
++		batch(3, "emails", domain.StateSucceeded),
++		batch(3, "emails", domain.StateDead),
++		batch(2, "reports", domain.StateCancelled),
++	}}
++	reg := metrics.NewRegistry()
++	n, err := newPurger(t, st, clock.NewManual(t0), reg).PurgeOnce(context.Background())
++	if err != nil || n != 8 {
++		t.Fatalf("PurgeOnce = %d, %v; want 8", n, err)
++	}
++	calls := st.calls()
++	if len(calls) != 3 || !calls[0].Equal(t0.Add(-retentionPeriod)) {
++		t.Errorf("cutoffs = %v, want 3 calls at %s (stop after the partial batch)", calls, t0.Add(-retentionPeriod))
++	}
++
++	var buf strings.Builder
++	if err := reg.WriteText(&buf); err != nil {
++		t.Fatal(err)
++	}
++	for _, want := range []string{
++		`jobqueue_jobs_purged_total{queue="emails",state="succeeded"} 3`,
++		`jobqueue_jobs_purged_total{queue="emails",state="dead"} 3`,
++		`jobqueue_jobs_purged_total{queue="reports",state="cancelled"} 2`,
++	} {
++		if !strings.Contains(buf.String(), want) {
++			t.Errorf("metrics lack %s:\n%s", want, buf.String())
++		}
++	}
++}
++
++func TestPurgerRunsEveryInterval(t *testing.T) {
++	st := &fakeStore{}
++	clk := clock.NewManual(t0)
++	p := newPurger(t, st, clk, nil)
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- p.Run(ctx) }()
++
++	clk.BlockUntil(1)
++	clk.Advance(10 * time.Minute)
++	clk.BlockUntil(1)
++	calls := st.calls()
++	if len(calls) != 2 || !calls[1].Equal(t0.Add(10*time.Minute-retentionPeriod)) {
++		t.Fatalf("cutoffs = %v, want a second pass at %s", calls, t0.Add(10*time.Minute-retentionPeriod))
++	}
++	cancel()
++	if err := <-done; err != nil {
++		t.Errorf("Run returned %v after cancel, want nil", err)
++	}
++}
++
++func TestNewValidates(t *testing.T) {
++	for _, tc := range []struct {
++		retention, interval time.Duration
++		batch               int
++	}{{0, time.Minute, 10}, {time.Hour, 0, 10}, {time.Hour, time.Minute, 0}} {
++		if _, err := retention.New(&fakeStore{}, tc.retention, tc.interval, tc.batch, clock.Real{}, logging.Discard(), nil); err == nil {
++			t.Errorf("%+v accepted", tc)
++		}
++	}
++}
+diff --git a/internal/store/purge.go b/internal/store/purge.go
+new file mode 100644
+index 0000000..34558eb
+--- /dev/null
++++ b/internal/store/purge.go
+@@ -0,0 +1,61 @@
++package store
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/jackc/pgx/v5"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++// PurgeBatchSize is the most jobs one PurgeFinished call deletes. Callers that get a full batch
++// call again.
++const PurgeBatchSize = 1000
++
++// PurgedJob describes a job that PurgeFinished deleted.
++type PurgedJob struct {
++	ID    int64
++	Queue string
++	State domain.State
++}
++
++// PurgeFinished deletes up to PurgeBatchSize jobs that reached a terminal state (succeeded,
++// failed, cancelled or dead) before cutoff, oldest first, and returns what it deleted.
++func (s *Store) PurgeFinished(ctx context.Context, cutoff time.Time) ([]PurgedJob, error) {
++	rows, err := s.pool.Query(ctx, `
++		SELECT id FROM jobs
++		WHERE state IN ('succeeded', 'failed', 'cancelled', 'dead') AND finished_at < $1
++		ORDER BY finished_at, id
++		LIMIT $2`,
++		dbTime(cutoff), PurgeBatchSize)
++	if err != nil {
++		return nil, fmt.Errorf("find finished jobs: %w", err)
++	}
++	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
++	if err != nil {
++		return nil, fmt.Errorf("find finished jobs: %w", err)
++	}
++	if len(ids) == 0 {
++		return nil, nil
++	}
++
++	rows, err = s.pool.Query(ctx, `DELETE FROM jobs WHERE id = ANY($1) RETURNING id, queue, state`, ids)
++	if err != nil {
++		return nil, fmt.Errorf("delete finished jobs: %w", err)
++	}
++	purged, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (PurgedJob, error) {
++		var (
++			p     PurgedJob
++			state string
++		)
++		err := row.Scan(&p.ID, &p.Queue, &state)
++		p.State = domain.State(state)
++		return p, err
++	})
++	if err != nil {
++		return nil, fmt.Errorf("delete finished jobs: %w", err)
++	}
++	return purged, nil
++}
+diff --git a/internal/store/purge_test.go b/internal/store/purge_test.go
+new file mode 100644
+index 0000000..1e789de
+--- /dev/null
++++ b/internal/store/purge_test.go
+@@ -0,0 +1,100 @@
++package store_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++	"github.com/relaywork/jobqueue/internal/store"
++)
++
++// finishJobs creates one job in each terminal state of queue, finished at the clock's time.
++func finishJobs(t *testing.T, s *store.Store, queue string) map[int64]domain.State {
++	t.Helper()
++	ctx := context.Background()
++	cancelled := mustEnqueue(t, s, domain.NewJob{Queue: queue})
++	if _, err := s.Cancel(ctx, cancelled.ID); err != nil {
++		t.Fatal(err)
++	}
++	out := map[int64]domain.State{cancelled.ID: domain.StateCancelled}
++	for _, st := range []domain.State{domain.StateSucceeded, domain.StateFailed, domain.StateDead} {
++		job := mustEnqueue(t, s, domain.NewJob{Queue: queue, MaxAttempts: 1})
++		mustLease(t, s, queue, "w1", 1)
++		var err error
++		switch st {
++		case domain.StateSucceeded:
++			err = s.Complete(ctx, job.ID, "w1")
++		case domain.StateFailed:
++			_, err = s.Discard(ctx, job.ID, "w1", "malformed payload")
++		case domain.StateDead:
++			_, err = s.Fail(ctx, job.ID, "w1", "upstream unavailable", t0)
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		out[job.ID] = st
++	}
++	return out
++}
++
++func TestPurgeFinishedDeletesOldTerminalJobs(t *testing.T) {
++	s, clk := newStore(t)
++	ctx := context.Background()
++	old := finishJobs(t, s, "default")
++	clk.Advance(time.Hour)
++	recent := finishJobs(t, s, "reports")
++	waiting := mustEnqueue(t, s, domain.NewJob{Queue: "default"})
++	mustEnqueue(t, s, domain.NewJob{Queue: "other"})
++	running := mustLease(t, s, "other", "w2", 1)[0]
++
++	purged, err := s.PurgeFinished(ctx, t0.Add(time.Minute))
++	if err != nil || len(purged) != len(old) {
++		t.Fatalf("purged %v, %v; want the %d old jobs", purged, err, len(old))
++	}
++	for _, p := range purged {
++		if old[p.ID] != p.State || p.Queue != "default" {
++			t.Errorf("purged %+v, want one of %v", p, old)
++		}
++		if _, err := s.Get(ctx, p.ID); err == nil {
++			t.Errorf("job %d still exists", p.ID)
++		}
++	}
++	for id := range recent {
++		mustGet(t, s, id)
++	}
++	mustGet(t, s, waiting.ID)
++	mustGet(t, s, running.ID)
++
++	// finished_at must be before the cutoff, not at it.
++	if purged, err := s.PurgeFinished(ctx, clk.Now()); err != nil || len(purged) != 0 {
++		t.Errorf("cutoff equal to finished_at purged %v, %v", purged, err)
++	}
++}
++
++func TestPurgeFinishedWorksInBatches(t *testing.T) {
++	if testing.Short() {
++		t.Skip("creates more than one purge batch")
++	}
++	s, clk := newStore(t)
++	ctx := context.Background()
++	// Finished one second apart, so that the oldest ones go first.
++	if _, err := testPool.Exec(ctx, `
++		INSERT INTO jobs (queue, type, state, run_at, created_at, updated_at, finished_at)
++		SELECT 'default', 'noop', 'succeeded', $1, $1, $1, $1::timestamptz + n * interval '1 second'
++		FROM generate_series(1, $2) AS n`,
++		clk.Now(), store.PurgeBatchSize+5); err != nil {
++		t.Fatal(err)
++	}
++	cutoff := clk.Now().Add(24 * time.Hour)
++
++	first, err := s.PurgeFinished(ctx, cutoff)
++	if err != nil || len(first) != store.PurgeBatchSize {
++		t.Fatalf("first batch: %d jobs, %v; want %d", len(first), err, store.PurgeBatchSize)
++	}
++	mustGet(t, s, int64(store.PurgeBatchSize+1)) // younger than the whole first batch
++	second, err := s.PurgeFinished(ctx, cutoff)
++	if err != nil || len(second) != 5 {
++		t.Fatalf("second batch: %d jobs, %v; want 5", len(second), err)
++	}
++}
+diff --git a/migrations/0003_index_jobs_finished_at.sql b/migrations/0003_index_jobs_finished_at.sql
+new file mode 100644
+index 0000000..9f1a504
+--- /dev/null
++++ b/migrations/0003_index_jobs_finished_at.sql
+@@ -0,0 +1,2 @@
++-- Retention: finished jobs, oldest first. Only terminal jobs have finished_at set.
++CREATE INDEX jobs_finished_at_idx ON jobs (finished_at, id) WHERE finished_at IS NOT NULL;

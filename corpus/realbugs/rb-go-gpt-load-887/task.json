@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-go-gpt-load-887",
+  "repo": "rb-go-gpt-load-887",
+  "kind": "realbug",
+  "title": "feat(gateway): 接入原生 Responses WebSocket 与逐轮治理",
+  "description": "### 关联 Issue / Related Issue\n\n无（独立功能需求）\n\n### 变更内容 / Change Content\n\n- [x] Bug 修复 / Bug fix\n- [x] 新功能 / New feature\n- [ ] 其他改动 / Other changes\n\n新增同端口 `GET /v1/responses` 原生 WebSocket 入口，按渠道能力接入上游；每条连接固定一个上游 Session，每轮复用当前权限、模型路由、RPM、额度、健康、日志和成本统计。\n\n- 支持同流 FIFO、标准 `stream_id` 多流与分叉、真实预热及响应归属隔离。完整多流用于 OpenAI 和满足端到端条件的 GPT-Load 级联；Codex 使用已有 Session，只支持原连接内续接。\n- 新增 `responses_websocket_enabled`，全局默认开启，分组可继承或显式覆盖。关闭 WS 立即终止受影响连接及未完成轮次；分组停用或删除也会关闭已绑定连接。普通 HTTP/SSE 不受 WS 开关影响。全局关闭不覆盖分组的显式开启。\n- 原生错误保留流标识并脱敏凭据，已知模型限流进入既有冷却；非法业务轮次也计入 RPM。握手与首事件共用首字节预算，无效首轮不能解除等待期限。第 33 个不同命名流只收到流级错误，已有流继续可用。\n- 级联握手剥离客户端 Origin，保留管理员显式上游 HeaderRules。可靠未发送的订阅首轮 401 可在原凭据上刷新并重试一次，计入现有预算；可能已发送和已绑定续接不重放。\n\n兼容性：不提供 WS→HTTP 桥接、历史重放或会话池；不新增数据库表或迁移。复用现有 `gorilla/websocket v1.5.3` 并声明为直接依赖，无依赖升级。关闭 WS 会中断正在生成的轮次，重新开启不恢复旧连接的临时状态。后台使用现有全局设置和分组覆盖控件；README 与 bridge 说明已更新，本地设计记录不随代码提交。\n\n验证：`make check`、CPA bridge 的 `go test -count=1 ./embedded` 均通过。回归覆盖配置继承/持久化、握手拒绝、活动/空闲/未绑定连接关闭、分组停用/删除及同时关闭全局 WS、绑定期间配置变更、HTTP 保持可用、错误与限流、超时及安全刷新。真实账号和 CPA/sub2api 实际部署尚未联调；既有 Codex SDK 代理拨号与读取限制继续适用。\n\n### 自查清单 / Checklist\n\n- [x] 我已运行 `make check`，或在说明中写明无法运行的原因和未验证范围。 / I ran `make check`, or documented why it could not run and what remains unverified.\n- [x] 本 PR 范围聚焦，未包含无关改动。 / This PR is focused and contains no unrelated changes.\n- [x] 我已更新必要的公开文档或发布说明。 / I updated any required public documentation or release notes.\n- [x] 我已确认提交、日志和测试数据不包含敏感信息。 / I confirmed that commits, logs, and fixtures contain no sensitive data.\n- [x] 如适用，我已说明兼容性或数据迁移影响。 / Where applicable, I documented compatibility or data-migration impact.\n\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/gateway/websocket_turn.go",
+      "lines": [
+        627,
+        627
+      ],
+      "category": "error-handling",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "When an upstream WebSocket turn returns a provider error, the request and attempt logs record the fixed text \"Upstream WebSocket request failed.\" instead of the upstream error message (redacted), unlike the HTTP/SSE path, which builds the summary with summarizeErrorBody; the real failure reason is lost from diagnostics.",
+      "trigger": "An upstream WebSocket session emits an error event with an error.message (e.g. model at capacity); the client sees the message but the request log ErrorSummary and the attempt ErrorSummary contain only the generic text.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "internal/gateway/websocket_error_response_test.go"
+      ],
+      "hidden_test_cmd": "GOFLAGS=-mod=mod GOPROXY=off go test -count=1 ./internal/gateway/ -run ^TestWebsocketProviderErrorsRetainSanitizedSummaries$"
+    }
+  ]
+}

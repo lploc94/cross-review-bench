@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-ts-react-router-15612",
+  "repo": "rb-ts-react-router-15612",
+  "kind": "realbug",
+  "title": "fix: handle cancellation in injectRSCPayload to avoid post-abort server crash",
+  "description": "Fixes #15275\n\n## Problem\n\nIn RSC Framework Mode, an aborted/cancelled document request can crash the production server:\n\n```\nTypeError: Invalid state: Unable to enqueue\n    at flushBufferedChunks (...)\n    at Timeout._onTimeout (...)\n```\n\n`injectRSCPayload` buffers HTML chunks and flushes them in a `setTimeout(..., 0)` callback. When the client aborts, the readable side of the `TransformStream` is cancelled while that flush is still pending — the timer then calls `controller.enqueue()` on a cancelled stream. Because the timer callback is `async`, the throw becomes an unhandled rejection, which exits the Node process. The transformer had no `cancel()` hook, so the pending timer and the RSC payload stream were never cleaned up.\n\n## Fix\n\n- Add a `cancel(reason)` handler to the transformer: it flags cancellation, clears the pending flush timer, drops the buffered chunks, cancels the underlying RSC payload stream (via its reader when streaming has started), and resolves the flight-data promise.\n- Guard the flush timer callback and the `writeRSCStream` write loop so late timers / in-flight reads become no-ops after cancellation instead of enqueueing into a cancelled stream.\n\nThe transformer is typed with a small extension (`Transformer & { cancel? }`) since the repo's current TS lib doesn't yet include the standard `Transformer#cancel` member.\n\n## Tests\n\nAdded `packages/react-router/__tests__/rsc/html-stream-test.ts` with two regression tests, covering an abort **while a flush is pending** (the reported crash) and an abort **mid-RSC-stream**. Both assert no unhandled rejection escapes a timer and that the RSC payload stream gets cancelled.\n\n- Without the fix: both fail (the flush-pending case reproduces the exact `Invalid state: Unable to enqueue` rejection).\n- With the fix: both pass. Typecheck, ESLint and Prettier are clean. (Note: the sibling `rsc/server-test.ts` suite currently fails to load on a clean `main` checkout in the same way, unrelated to this change.)\n\nA change file is included (`patch.rsc-html-stream-cancel.md`), and I've signed the CLA in `contributors.yml` as part of this PR.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/react-router/lib/rsc/html-stream/server.ts",
+      "lines": [
+        45,
+        82
+      ],
+      "category": "concurrency",
+      "severity": "high",
+      "difficulty": "L4",
+      "summary": "The new cancellation handling relies only on the transformer cancel() hook to set `cancelled`, but the Streams spec does not call cancel() when the readable side is cancelled while flush() is running. In that window the pending flush timer still enqueues into the closed stream, the async timer callback rejects with \"Invalid state: Unable to enqueue\" and the Node process dies; the RSC payload stream is never cancelled and flush() can wait forever.",
+      "trigger": "A client aborts a document request after the HTML writable side has closed (flush() waiting for the RSC payload) but before the setTimeout(…, 0) flush timer has fired.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "packages/react-router/__tests__/rsc/html-stream-test.ts"
+      ],
+      "hidden_test_cmd": "node --experimental-vm-modules --no-warnings=ExperimentalWarning ./node_modules/jest/bin/jest.js packages/react-router/__tests__/rsc/html-stream-test.ts -t \"during flush|while flush waits\""
+    }
+  ]
+}

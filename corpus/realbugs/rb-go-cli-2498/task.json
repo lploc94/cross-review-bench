@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-go-cli-2498",
+  "repo": "rb-go-cli-2498",
+  "kind": "realbug",
+  "title": "feat: preflight export permission for downloads",
+  "description": "## Summary\n\nPreflight Drive export permission before direct file and document-media downloads so callers get an actionable preview fallback before attempting a download that cannot succeed.\n\n## Changes\n\n- Add a shared `docs:permission.member:auth` export-permission preflight for `drive +download` and non-whiteboard `docs +media-download`.\n- Return typed permission errors with `drive +preview --type source_file` or `docs +media-preview` recovery hints when export is unavailable.\n- Preserve whiteboard downloads without export preflight and keep the existing media type fallback behavior.\n- Add preview guidance for final HTTP 403 responses and wait/backoff guidance for rate-limit errors.\n- Update skill references, targeted unit coverage, and dry-run E2E coverage.\n\n## Test Plan\n\n- [x] Targeted unit tests pass for `shortcuts/common`, `shortcuts/drive`, and `shortcuts/doc`.\n- [x] Targeted `go vet` passes for the affected shortcut packages.\n- [x] Drive and Docs media-download dry-run E2E tests pass against the newly built binary.\n- [x] Manual bot-identity verification against no-export-permission Drive and Docs media resources returns typed `permission_denied` errors with the expected preview hints and creates no output files.\n\n## Related Issues\n\n- None\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\n## Summary by CodeRabbit\n\n- **New Features**\n  - Added export-permission checks before downloading Drive files and document media.\n  - Added actionable recovery guidance for permission denials, rate limits, and download failures.\n  - Added dry-run visibility for permission checks before download requests.\n  - Whiteboard thumbnail downloads remain unaffected by export authorization checks.\n\n- **Documentation**\n  - Updated troubleshooting guidance with preview alternatives and exponential backoff recommendations.\n  - Expanded end-to-end coverage for document media download workflows, including file verification.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "shortcuts/doc/doc_media_download.go",
+      "lines": [
+        53,
+        77
+      ],
+      "category": "error-handling",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "The new export-permission preflight makes docs +media-download fail whenever the docs:permission.member:auth scope is missing: Validate requires the scope up front and Execute returns any precheck error, so callers that can download the media but lack the optional permission-auth scope (app scope not enabled, token or user scope insufficient) are now blocked instead of downloading.",
+      "trigger": "Run docs +media-download --as bot with a token that has docs:document.media:download but not docs:permission.member:auth (or the members/auth precheck answers code 99991672, 99991676 or 99991679); the command errors with missing required scope instead of downloading the file.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "shortcuts/doc/doc_media_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 ./shortcuts/doc/ -run '^TestDocMediaDownloadPermissionAuthScopeErrorsWarnAndContinue$'"
+    }
+  ]
+}

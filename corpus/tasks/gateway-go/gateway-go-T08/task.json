@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T08",
+  "repo": "gateway-go",
+  "kind": "buggy",
+  "title": "Per-consumer daily quotas",
+  "description": "Consumers can have a `daily_quota` (requests per day; 0 means unlimited), set through the admin API on create and update. Authenticated requests of a consumer with a quota are counted per calendar day after the rate limit passes. A request over the quota gets `429 quota_exceeded` with `Retry-After` until the next day starts; every answer of a consumer with a quota carries `X-Quota-Limit` and `X-Quota-Remaining`.\n\n- The day is the calendar day in `QUOTA_TIME_ZONE` (an IANA name, UTC by default, validated at startup).\n- The counter is one Redis key per consumer and day. A Lua script increments it, sets its expiry on the first request of the day, and takes back a request that goes over the limit, so refused requests do not use up the quota. The expiry is relative to the time left in the day.\n- The quota is stored in the consumer hash; a consumer written before this change has no quota.\n- README: the request path, the configuration table and the admin API example.\n\nTests: counting and refusal within a day, the next day after midnight, the headers and the refusal answer, consumers without a quota skipping the check, the quota stored and read back, and the configuration of the zone.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/store/quota.go",
+      "lines": [
+        41,
+        41
+      ],
+      "category": "boundary",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "ConsumeQuota names the day's counter from now.UTC() while the window end (Retry-After and the counter's expiry) is midnight in the quota zone. With a zone east or west of UTC the quota resets both at the zone's midnight, when the counter expires, and at UTC midnight, when the counter's name changes, so consumers get an extra quota every day: Asia/Tokyo consumers get a fresh quota at 09:00 local, America/New_York consumers at 20:00 local in summer.",
+      "trigger": "QUOTA_TIME_ZONE=Asia/Tokyo, quota 2: two requests at 23:30 UTC (08:30 in Tokyo, 3 June) use it up; a request at 00:30 UTC on 3 June (09:30 in Tokyo, same day) is admitted, although the quota is per Tokyo day. West of UTC it happens in the evening: with America/New_York in June, a quota used up at 00:30 on 3 June is fresh again at 20:00 local (00:00 UTC on 4 June), so a request at 20:30 the same New York day is admitted.",
+      "testable": true,
+      "hidden_tests": [
+        "internal/store/quota_zone_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 -run '^TestQuotaDayFollowsTheQuotaZone$' ./internal/store/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The counter already follows the zone: the day is taken from now.UTC() and the zone only moves the expiry, so a request in the last hours of the local day falls in the same counter; README.md defines the reset as the start of the next UTC day.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

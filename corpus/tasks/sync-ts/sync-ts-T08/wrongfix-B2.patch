@@ -1,0 +1,18 @@
+diff --git a/packages/server/src/services/pullService.ts b/packages/server/src/services/pullService.ts
+index fdf2649..3d5874f 100644
+--- a/packages/server/src/services/pullService.ts
++++ b/packages/server/src/services/pullService.ts
+@@ -67,10 +67,12 @@ export class PullService {
+     limit: number,
+     collections: ReadonlySet<string>,
+   ): Promise<PullPage> {
++    // Read ahead several pages at a time: most of a filtered feed can be other collections.
++    const batch = (limit + 1) * 10;
+     const matching: StoredEvent[] = [];
+     let examined = after;
+     for (;;) {
+-      const rows = await listEventsAfter(this.pool, userId, examined, limit + 1);
++      const rows = await listEventsAfter(this.pool, userId, examined, batch);
+       matching.push(...rows.filter((event) => collections.has(event.collection)));
+       examined = rows.at(-1)?.seq ?? examined;
+       if (rows.length <= limit || matching.length > limit) break;

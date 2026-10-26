@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-ts-e2e-1150",
+  "repo": "rb-ts-e2e-1150",
+  "kind": "realbug",
+  "title": "feat(runner): host e2e sessions in another test runner",
+  "description": "Projects on Playwright Test, Vitest, Jest, or another harness can use e2e engines without moving their suites to `e2e run`.\n\n- `openHost<Fixtures>()` on `e2e/runner` owns the worker lifetime: prepare, app processes, engine init, once per worker. `host.openSession({ name, timeout, signal, agent, onStep })` opens one test-lifetime attempt: fresh fixtures, deadline, steps, artifacts, and a `trace.md` at close.\n- A hosted attempt is published, so `expect.soft` collects for the session and `expect.poll` honors its budget and cancellation. One hosted attempt may be opening, live, or closing per process.\n- The session `timeout` is enforced for every operation: when it passes, running steps fail with `TEST_TIMEOUT`, the session is timed out, and `close()` reports it. An engine that ignores its operation timeout, or a model call, cannot outlive it.\n- A launch that fails or is cancelled leaves the host usable, as `e2e run` keeps its worker for the retry. Only failed engine cleanup retires a host.\n- Artifacts land under `results/host/<safe segment>/`; the session name never becomes a raw path component. Opening errors, notices, titles, and traces are redacted.\n- Both lifetimes have idempotent `close()` and async disposal. Separate hosts and config loads cannot bind secrets or engine ownership to one another.\n- The MCP one-shot path stays internal and shares the worker (`packages/e2e/src/run/standalone.ts`), the attempt (`standalone-attempt.ts`), and target selection (`select-target.ts`). No new dependencies, engine contract, or CI changes.\n\n```ts\nconst test = base.extend<{ e2e: E2ESession<Fixtures> }, { e2eHost: E2EHost<Fixtures> }>({\n  e2eHost: [async ({}, use) => {\n    const host = await openHost<Fixtures>({ target: 'android' });\n    try { await use(host); } finally { await host.close(); }\n  }, { scope: 'worker' }],\n  e2e: async ({ e2eHost }, use, testInfo) => {\n    const session = await e2eHost.openSession({ name: testInfo.titlePath.join(' › '), timeout: testInfo.timeout || undefined });\n    try { await use(session); } finally {\n      const failures = await session.close();\n      await testInfo.attach('e2e trace', { path: session.tracePath, contentType: 'text/markdown' });\n      if (failures.length > 0) throw new AggregateError(failures, 'e2e session close failed');\n    }\n  },\n});\n```\n\n```mermaid\nflowchart LR\n  W[Worker fixture] -->|openHost: prepare, processes, init once| H[Prepared host]\n  H -->|openSession with test name| S[Reserve, publish, launch attempt]\n  S --> A[Fixtures, soft expectations, bounded polling, deadline timer]\n  A -->|session.close| C[End attempt, write trace, release publication]\n  C -->|next test| H\n  H -->|host.close| D[Dispose engine, finish, stop processes]\n```\n\n## Verified\n\nRan it locally: yes\n- A scratch Playwright Test project (`@playwright/test` 1.64.0) hosting the testbed web target in real Chromium through the built `dist`, four tests on one worker: profile form filled; fresh form state on the reused host (same `runId`, one host boot of ~500 ms, sessions open in under 10 ms); `expect.soft` failure returned by `close()` and failing the Playwright test; a `tap()` on a missing element with the session `timeout` at 1500 ms settled at 1463 ms with `TEST_TIMEOUT`, the trace page reading `timed out`.\n\n```text\n[host] opened in 492ms runId=01a13158-795c-7936-8579-70ca501493b7\n[session] \"fills a profile form\" opened in 9ms ... closed, failures=[]\n[session] \"starts with fresh form state on the reused host\" opened in 3ms ... closed, failures=[]\n[session] \"collects a soft failure and fails the test at close\" closed, failures=[\"ASSERTION_FAILED: 1 soft assertion failed ...\"]\n  [step] locator.tap getByLabel(\"No such field\"): failed TEST_TIMEOUT\n  [deadline] tap settled after 1463ms code=TEST_TIMEOUT message=session timed out after 1500 ms\n[host] closed, failures=[]\n  4 passed (3.5s)\n```\n\n- Fake-engine coverage in `packages/e2e/tests/integration/open-host-*.test.ts`: lifecycle and reservation races, deadline (polls, contributed ops, a hung core op), redaction, engine ownership, trace pages.\n- Your runner owns retries and test-body failures; e2e writes per-session traces, not a run report. The session timeout starts after launch and does not bound provisioning or disposal.\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/e2e/src/run/standalone-attempt.ts",
+      "lines": [
+        187,
+        200
+      ],
+      "category": "concurrency",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "A hosted session's timeout is recorded only inside the expiry timer callback, scheduled one tick after the deadline, and close() clears that timer first. A session closed after its deadline but before the timer ran (the poll cut at the deadline, or synchronous work that holds the event loop past it) closes with no failure and a passed trace, although the documented contract says close() returns the timeout.",
+      "trigger": "openSession({ timeout: 20 }), keep the event loop busy for 60 ms (or let expect.poll be cut at the deadline), then call session.close(): it returns [] instead of a TEST_TIMEOUT failure and trace.md says passed.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "packages/e2e/tests/integration/open-host-deadline.test.ts"
+      ],
+      "hidden_test_cmd": "cd packages/e2e && npm run build && node_modules/.bin/vitest run tests/integration/open-host-deadline.test.ts"
+    }
+  ]
+}

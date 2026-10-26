@@ -1,0 +1,717 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..ef5952e 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,18 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+   Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+   is rounded with HALF_EVEN to the currency's minor units.
++- **Stay restrictions.** A room type may restrict a range of nights (start to end, both inclusive)
++  with a minimum stay (1 to `max-nights-per-stay`), closed to arrival, or both. They bind the
++  arrival night only: a stay arriving on a covered night must last at least the minimum and cannot
++  arrive on a night closed to arrival, while a stay that arrives earlier runs through those nights
++  freely. Where restrictions overlap the strictest wins: closed if any of them closes the night,
++  else the longest minimum. A quote or hold that breaks one is a 400 `stay-restricted` naming the
++  `rule` (`min-stay` or `closed-to-arrival`) and the `night`. Restrictions apply to new quotes and
++  holds only: holds and reservations that already exist are not checked again, and availability
++  search and the calendar do not show them. Replacing a room type's list locks the room type row
++  (`FOR NO KEY UPDATE`), so it waits for and holds back other replacements, rate changes and new or
++  changed seasonal rates of that room type; holds and reservations for the room type do not wait
++  for it.
+ - **Reservations.** Status moves `CONFIRMED` to `CHECKED_IN` (on or after the check-in date, before
+   check-out) to `COMPLETED`, or to `CANCELLED`. A cancellation made at or before the full-refund
+   deadline is refunded in full; later ones follow the property policy. Cancelling twice is a
+@@ -138,6 +150,7 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `POST .../room-types`, `PUT .../room-types/{roomType}/rates` | admin | add a room type, change its rates |
+ | `POST/GET/PUT/DELETE .../room-types/{roomType}/seasonal-rates[/{id}]` | admin | seasonal rates (same priority may not overlap) |
+ | `GET/PUT .../room-types/{roomType}/inventory`, `PUT .../inventory/range` | admin | inventory per night and for a range |
++| `GET/PUT .../room-types/{roomType}/restrictions` | admin | minimum stay and closed-to-arrival rules (`PUT` replaces the whole list) |
+ | `GET /api/v1/admin/holds`, `GET /api/v1/admin/holds/summary`, `POST /api/v1/admin/holds/{id}/expire` | admin | hold list, counts, manual expiry |
+ | `POST /api/v1/admin/maintenance/run` | admin | expire holds and complete stays now |
+ 
+diff --git a/src/main/java/com/innkeep/booking/api/AdminRestrictionController.java b/src/main/java/com/innkeep/booking/api/AdminRestrictionController.java
+new file mode 100644
+index 0000000..f995cf6
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/AdminRestrictionController.java
+@@ -0,0 +1,38 @@
++package com.innkeep.booking.api;
++
++import com.innkeep.booking.service.StayRestrictionDraft;
++import com.innkeep.booking.service.StayRestrictionService;
++import java.util.List;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/** The minimum-stay and closed-to-arrival rules of a room type, read and replaced as a whole. */
++@RestController
++@RequestMapping("/api/v1/admin/properties/{code}/room-types/{roomType}/restrictions")
++public class AdminRestrictionController {
++
++  private final StayRestrictionService restrictions;
++
++  public AdminRestrictionController(StayRestrictionService restrictions) {
++    this.restrictions = restrictions;
++  }
++
++  @GetMapping
++  public List<StayRestrictionDraft> list(@PathVariable String code, @PathVariable String roomType) {
++    return restrictions.list(code, roomType).stream().map(StayRestrictionDraft::from).toList();
++  }
++
++  @PutMapping
++  public List<StayRestrictionDraft> replace(
++      @PathVariable String code,
++      @PathVariable String roomType,
++      @RequestBody List<StayRestrictionDraft> request) {
++    return restrictions.replace(code, roomType, request).stream()
++        .map(StayRestrictionDraft::from)
++        .toList();
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java b/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
+index 47c5d34..f3984e2 100644
+--- a/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
++++ b/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
+@@ -5,6 +5,7 @@ import com.innkeep.booking.domain.HoldExpiredException;
+ import com.innkeep.booking.domain.InsufficientAvailabilityException;
+ import com.innkeep.booking.domain.NotFoundException;
+ import com.innkeep.booking.domain.PaymentFailedException;
++import com.innkeep.booking.domain.StayRestrictedException;
+ import com.innkeep.booking.domain.ValidationException;
+ import jakarta.persistence.LockTimeoutException;
+ import jakarta.persistence.PessimisticLockException;
+@@ -55,6 +56,16 @@ public class ApiExceptionHandler {
+     return problem(HttpStatus.BAD_REQUEST, "invalid-request", "Invalid request", e.getMessage());
+   }
+ 
++  /** Names the broken rule ({@code min-stay} or {@code closed-to-arrival}) and its night. */
++  @ExceptionHandler(StayRestrictedException.class)
++  public ProblemDetail stayRestricted(StayRestrictedException e) {
++    ProblemDetail detail =
++        problem(HttpStatus.BAD_REQUEST, "stay-restricted", "Stay restricted", e.getMessage());
++    detail.setProperty("rule", e.rule());
++    detail.setProperty("night", e.night().toString());
++    return detail;
++  }
++
+   @ExceptionHandler(NoResourceFoundException.class)
+   public ProblemDetail noSuchRoute(NoResourceFoundException e) {
+     return problem(HttpStatus.NOT_FOUND, "no-such-route", "Not found", "no route for this path");
+diff --git a/src/main/java/com/innkeep/booking/domain/StayRestrictedException.java b/src/main/java/com/innkeep/booking/domain/StayRestrictedException.java
+new file mode 100644
+index 0000000..3d1a023
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/StayRestrictedException.java
+@@ -0,0 +1,26 @@
++package com.innkeep.booking.domain;
++
++import java.time.LocalDate;
++
++/** A stay breaks an arrival rule of its room type: a minimum stay or a closed arrival night. */
++public class StayRestrictedException extends BookingException {
++
++  private final String rule;
++  private final LocalDate night;
++
++  public StayRestrictedException(String rule, LocalDate night, String message) {
++    super(message);
++    this.rule = rule;
++    this.night = night;
++  }
++
++  /** {@code min-stay} or {@code closed-to-arrival}. */
++  public String rule() {
++    return rule;
++  }
++
++  /** The arrival night whose rule the stay breaks. */
++  public LocalDate night() {
++    return night;
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/StayRestriction.java b/src/main/java/com/innkeep/booking/domain/StayRestriction.java
+new file mode 100644
+index 0000000..c559bef
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/StayRestriction.java
+@@ -0,0 +1,78 @@
++package com.innkeep.booking.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.FetchType;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.JoinColumn;
++import jakarta.persistence.ManyToOne;
++import jakarta.persistence.Table;
++import java.time.LocalDate;
++
++/**
++ * Arrival rules of one room type for the nights from start to end (both inclusive): a minimum stay,
++ * closed to arrival, or both. They bind a stay that arrives on a covered night only.
++ */
++@Entity
++@Table(name = "stay_restriction")
++public class StayRestriction extends AbstractEntity<Long> {
++
++  @Id
++  @GeneratedValue(strategy = GenerationType.IDENTITY)
++  private Long id;
++
++  @ManyToOne(fetch = FetchType.LAZY, optional = false)
++  @JoinColumn(name = "room_type_id", nullable = false)
++  private RoomType roomType;
++
++  @Column(name = "start_date", nullable = false)
++  private LocalDate startDate;
++
++  @Column(name = "end_date", nullable = false)
++  private LocalDate endDate;
++
++  @Column(name = "min_stay")
++  private Integer minStay;
++
++  @Column(name = "closed_to_arrival", nullable = false)
++  private boolean closedToArrival;
++
++  protected StayRestriction() {}
++
++  public StayRestriction(
++      RoomType roomType,
++      LocalDate startDate,
++      LocalDate endDate,
++      Integer minStay,
++      boolean closedToArrival) {
++    this.roomType = roomType;
++    this.startDate = startDate;
++    this.endDate = endDate;
++    this.minStay = minStay;
++    this.closedToArrival = closedToArrival;
++  }
++
++  @Override
++  public Long getId() {
++    return id;
++  }
++
++  public LocalDate getStartDate() {
++    return startDate;
++  }
++
++  public LocalDate getEndDate() {
++    return endDate;
++  }
++
++  /** The fewest nights a stay arriving on a covered night may last, or null for no minimum. */
++  public Integer getMinStay() {
++    return minStay;
++  }
++
++  public boolean isClosedToArrival() {
++    return closedToArrival;
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/persistence/StayRestrictionRepository.java b/src/main/java/com/innkeep/booking/persistence/StayRestrictionRepository.java
+new file mode 100644
+index 0000000..a55ad51
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/persistence/StayRestrictionRepository.java
+@@ -0,0 +1,26 @@
++package com.innkeep.booking.persistence;
++
++import com.innkeep.booking.domain.StayRestriction;
++import java.time.LocalDate;
++import java.util.List;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++public interface StayRestrictionRepository extends JpaRepository<StayRestriction, Long> {
++
++  List<StayRestriction> findByRoomTypeIdOrderByStartDateAscIdAsc(long roomTypeId);
++
++  /** Restrictions of the room type that cover the night, used to check an arrival. */
++  @Query(
++      """
++      select r from StayRestriction r
++      where r.roomType.id = :roomTypeId and r.startDate <= :night and r.endDate >= :night""")
++  List<StayRestriction> findCovering(
++      @Param("roomTypeId") long roomTypeId, @Param("night") LocalDate night);
++
++  @Modifying
++  @Query("delete from StayRestriction r where r.roomType.id = :roomTypeId")
++  int deleteByRoomType(@Param("roomTypeId") long roomTypeId);
++}
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 5a246a1..a2cf584 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -58,6 +58,7 @@ public class HoldService {
+   private final ReservationRepository reservations;
+   private final LedgerEntryRepository ledger;
+   private final SeasonalRateRepository seasonalRates;
++  private final StayRestrictionService restrictions;
+   private final PaymentGateway payments;
+   private final BookingConfig config;
+   private final Clock clock;
+@@ -73,6 +74,7 @@ public class HoldService {
+       ReservationRepository reservations,
+       LedgerEntryRepository ledger,
+       SeasonalRateRepository seasonalRates,
++      StayRestrictionService restrictions,
+       PaymentGateway payments,
+       BookingConfig config,
+       Clock clock,
+@@ -85,6 +87,7 @@ public class HoldService {
+     this.reservations = reservations;
+     this.ledger = ledger;
+     this.seasonalRates = seasonalRates;
++    this.restrictions = restrictions;
+     this.payments = payments;
+     this.config = config;
+     this.clock = clock;
+@@ -93,7 +96,10 @@ public class HoldService {
+     this.entities = entities;
+   }
+ 
+-  /** Prices the stay and holds the rooms for every night, or none of them. */
++  /**
++   * Checks the room type's arrival rules, prices the stay and holds the rooms for every night, or
++   * none of them.
++   */
+   public Hold create(
+       String propertyCode,
+       String roomTypeCode,
+@@ -110,6 +116,7 @@ public class HoldService {
+             throw new ValidationException(
+                 "check-in " + stay.checkIn() + " is before today at the property");
+           }
++          restrictions.requireAllowed(type, stay);
+           List<SeasonalRate> rates =
+               seasonalRates.findOverlapping(
+                   List.of(type.getId()), stay.checkIn(), stay.lastNight());
+diff --git a/src/main/java/com/innkeep/booking/service/PricingService.java b/src/main/java/com/innkeep/booking/service/PricingService.java
+index 91e5bdd..ce52d2a 100644
+--- a/src/main/java/com/innkeep/booking/service/PricingService.java
++++ b/src/main/java/com/innkeep/booking/service/PricingService.java
+@@ -16,19 +16,26 @@ public class PricingService {
+ 
+   private final CatalogService catalog;
+   private final SeasonalRateRepository seasonalRates;
++  private final StayRestrictionService restrictions;
+   private final BookingConfig config;
+ 
+   public PricingService(
+-      CatalogService catalog, SeasonalRateRepository seasonalRates, BookingConfig config) {
++      CatalogService catalog,
++      SeasonalRateRepository seasonalRates,
++      StayRestrictionService restrictions,
++      BookingConfig config) {
+     this.catalog = catalog;
+     this.seasonalRates = seasonalRates;
++    this.restrictions = restrictions;
+     this.config = config;
+   }
+ 
++  /** Prices the stay; a stay its room type's arrival rules refuse is not quoted. */
+   public Quote quote(
+       String propertyCode, String roomTypeCode, DateRange stay, int rooms, int guests) {
+     config.requireWithinLimits(stay, rooms);
+     RoomType type = catalog.roomType(propertyCode, roomTypeCode);
++    restrictions.requireAllowed(type, stay);
+     List<SeasonalRate> rates =
+         seasonalRates.findOverlapping(List.of(type.getId()), stay.checkIn(), stay.lastNight());
+     return PricingEngine.quote(type.getProperty(), type, rates, stay, rooms, guests);
+diff --git a/src/main/java/com/innkeep/booking/service/StayRestrictionDraft.java b/src/main/java/com/innkeep/booking/service/StayRestrictionDraft.java
+new file mode 100644
+index 0000000..50132bc
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/StayRestrictionDraft.java
+@@ -0,0 +1,17 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.domain.StayRestriction;
++import java.time.LocalDate;
++
++/** One restriction of a room type, as an admin sends it and as it is listed. */
++public record StayRestrictionDraft(
++    LocalDate startDate, LocalDate endDate, Integer minStay, boolean closedToArrival) {
++
++  public static StayRestrictionDraft from(StayRestriction restriction) {
++    return new StayRestrictionDraft(
++        restriction.getStartDate(),
++        restriction.getEndDate(),
++        restriction.getMinStay(),
++        restriction.isClosedToArrival());
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/service/StayRestrictionService.java b/src/main/java/com/innkeep/booking/service/StayRestrictionService.java
+new file mode 100644
+index 0000000..8ef5437
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/StayRestrictionService.java
+@@ -0,0 +1,123 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.config.BookingConfig;
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.domain.StayRestrictedException;
++import com.innkeep.booking.domain.StayRestriction;
++import com.innkeep.booking.domain.ValidationException;
++import com.innkeep.booking.persistence.RoomTypeRepository;
++import com.innkeep.booking.persistence.StayRestrictionRepository;
++import java.time.LocalDate;
++import java.time.temporal.ChronoUnit;
++import java.util.List;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.support.TransactionTemplate;
++
++/**
++ * Minimum-stay and closed-to-arrival rules per room type. Only the rules of a stay's arrival night
++ * count; where restrictions overlap the strictest wins: closed if any of them closes the night,
++ * else the longest minimum.
++ */
++@Service
++public class StayRestrictionService {
++
++  private static final int MAX_RESTRICTIONS = 100;
++  private static final int MAX_NIGHTS = 366;
++
++  private final CatalogService catalog;
++  private final StayRestrictionRepository restrictions;
++  private final BookingConfig config;
++  private final TransactionTemplate tx;
++  private final RoomTypeRepository roomTypes;
++
++  public StayRestrictionService(
++      CatalogService catalog,
++      StayRestrictionRepository restrictions,
++      BookingConfig config,
++      TransactionTemplate tx,
++      RoomTypeRepository roomTypes) {
++    this.catalog = catalog;
++    this.restrictions = restrictions;
++    this.config = config;
++    this.tx = tx;
++    this.roomTypes = roomTypes;
++  }
++
++  /** Throws {@link StayRestrictedException} when the stay breaks a rule of its arrival night. */
++  public void requireAllowed(RoomType type, DateRange stay) {
++    LocalDate arrival = stay.checkIn();
++    int minimum = 1;
++    for (StayRestriction restriction : restrictions.findCovering(type.getId(), arrival)) {
++      if (restriction.isClosedToArrival()) {
++        throw new StayRestrictedException(
++            "closed-to-arrival", arrival, "arrival on " + arrival + " is closed");
++      }
++      if (restriction.getMinStay() != null) {
++        minimum = Math.max(minimum, restriction.getMinStay());
++      }
++    }
++    if (stay.nights() < minimum) {
++      throw new StayRestrictedException(
++          "min-stay",
++          arrival,
++          "a stay arriving on " + arrival + " must last at least " + minimum + " nights");
++    }
++  }
++
++  public List<StayRestriction> list(String propertyCode, String roomTypeCode) {
++    return restrictions.findByRoomTypeIdOrderByStartDateAscIdAsc(
++        catalog.roomType(propertyCode, roomTypeCode).getId());
++  }
++
++  /**
++   * Replaces every restriction of the room type with the given ones (none clears them). The room
++   * type row is locked first, so two replacements of the same room type apply one after the other.
++   * The lock is {@code FOR NO KEY UPDATE}: rows that reference the room type (holds, reservations,
++   * inventory) take a key share lock on insert, which it does not block.
++   */
++  public List<StayRestriction> replace(
++      String propertyCode, String roomTypeCode, List<StayRestrictionDraft> drafts) {
++    if (drafts.size() > MAX_RESTRICTIONS) {
++      throw new ValidationException("at most " + MAX_RESTRICTIONS + " restrictions per room type");
++    }
++    drafts.forEach(this::validate);
++    return tx.execute(
++        status -> {
++          RoomType type = catalog.roomType(propertyCode, roomTypeCode);
++          roomTypes.lockForUpdate(type.getId());
++          restrictions.deleteByRoomType(type.getId());
++          for (StayRestrictionDraft draft : drafts) {
++            restrictions.save(
++                new StayRestriction(
++                    type,
++                    draft.startDate(),
++                    draft.endDate(),
++                    draft.minStay(),
++                    draft.closedToArrival()));
++          }
++          return restrictions.findByRoomTypeIdOrderByStartDateAscIdAsc(type.getId());
++        });
++  }
++
++  private void validate(StayRestrictionDraft draft) {
++    if (draft == null
++        || draft.startDate() == null
++        || draft.endDate() == null
++        || draft.endDate().isBefore(draft.startDate())
++        || ChronoUnit.DAYS.between(draft.startDate(), draft.endDate()) >= MAX_NIGHTS) {
++      throw new ValidationException(
++          "a restriction needs a start date and an end date on or after it, at most "
++              + MAX_NIGHTS
++              + " nights apart");
++    }
++    if (draft.minStay() == null && !draft.closedToArrival()) {
++      throw new ValidationException("a restriction needs a minimum stay or closed to arrival");
++    }
++    if (draft.minStay() != null
++        && (draft.minStay() < 1 || draft.minStay() > config.maxNightsPerStay())) {
++      throw new ValidationException(
++          "minimum stay must be between 1 and " + config.maxNightsPerStay() + " nights");
++    }
++  }
++}
+diff --git a/src/main/resources/db/migration/V2__stay_restrictions.sql b/src/main/resources/db/migration/V2__stay_restrictions.sql
+new file mode 100644
+index 0000000..257cee1
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__stay_restrictions.sql
+@@ -0,0 +1,11 @@
++CREATE TABLE stay_restriction (
++    id                BIGSERIAL PRIMARY KEY,
++    room_type_id      BIGINT  NOT NULL REFERENCES room_type (id),
++    start_date        DATE    NOT NULL,
++    end_date          DATE    NOT NULL,
++    min_stay          INTEGER CHECK (min_stay BETWEEN 1 AND 365),
++    closed_to_arrival BOOLEAN NOT NULL DEFAULT FALSE,
++    CHECK (end_date >= start_date),
++    CHECK (min_stay IS NOT NULL OR closed_to_arrival)
++);
++CREATE INDEX stay_restriction_room_type_dates ON stay_restriction (room_type_id, start_date, end_date);
+diff --git a/src/test/java/com/innkeep/booking/api/StayRestrictionApiTest.java b/src/test/java/com/innkeep/booking/api/StayRestrictionApiTest.java
+new file mode 100644
+index 0000000..34c59e0
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/StayRestrictionApiTest.java
+@@ -0,0 +1,105 @@
++package com.innkeep.booking.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++class StayRestrictionApiTest extends IntegrationTestBase {
++
++  private RoomType room;
++
++  @BeforeEach
++  void setUp() {
++    var property = data.harbourHouse();
++    room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, LocalDate.parse("2027-06-01"), LocalDate.parse("2027-06-30"), 2);
++  }
++
++  private ResultActions restrict(String restrictions) throws Exception {
++    return mvc.perform(
++        put("/api/v1/admin/properties/harbour-house/room-types/double/restrictions")
++            .header("Authorization", ADMIN_AUTH)
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(restrictions));
++  }
++
++  private ResultActions quote(String checkIn, String checkOut) throws Exception {
++    return mvc.perform(
++        post("/api/v1/properties/harbour-house/quotes")
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(
++                "{\"roomType\":\"double\",\"checkIn\":\"%s\",\"checkOut\":\"%s\",\"rooms\":1,"
++                        .formatted(checkIn, checkOut)
++                    + "\"guests\":2}"));
++  }
++
++  @Test
++  void restrictionsAreReplacedAsAWhole() throws Exception {
++    restrict("[{\"startDate\":\"2027-06-10\",\"endDate\":\"2027-06-12\",\"minStay\":3}]")
++        .andExpect(status().isOk());
++    restrict(
++            "[{\"startDate\":\"2027-06-20\",\"endDate\":\"2027-06-20\",\"closedToArrival\":true},"
++                + "{\"startDate\":\"2027-06-01\",\"endDate\":\"2027-06-05\",\"minStay\":2}]")
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.length()").value(2));
++
++    mvc.perform(
++            get("/api/v1/admin/properties/harbour-house/room-types/double/restrictions")
++                .header("Authorization", ADMIN_AUTH))
++        .andExpect(jsonPath("$.length()").value(2))
++        .andExpect(jsonPath("$[0].startDate").value("2027-06-01"))
++        .andExpect(jsonPath("$[0].minStay").value(2))
++        .andExpect(jsonPath("$[1].closedToArrival").value(true));
++    quote("2027-06-10", "2027-06-12").andExpect(status().isOk());
++  }
++
++  @Test
++  void aRestrictionNeedsARuleAndSensibleDates() throws Exception {
++    for (String rule : new String[] {"", ",\"minStay\":0", ",\"minStay\":61"}) {
++      restrict("[{\"startDate\":\"2027-06-10\",\"endDate\":\"2027-06-12\"" + rule + "}]")
++          .andExpect(status().isBadRequest());
++    }
++    restrict("[{\"startDate\":\"2027-06-12\",\"endDate\":\"2027-06-10\",\"minStay\":2}]")
++        .andExpect(status().isBadRequest());
++  }
++
++  @Test
++  void aQuoteBreakingARuleNamesTheRuleAndTheNight() throws Exception {
++    restrict("[{\"startDate\":\"2027-06-10\",\"endDate\":\"2027-06-12\",\"minStay\":3}]");
++
++    quote("2027-06-11", "2027-06-13")
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:innkeep:problem:stay-restricted"))
++        .andExpect(jsonPath("$.rule").value("min-stay"))
++        .andExpect(jsonPath("$.night").value("2027-06-11"));
++    quote("2027-06-11", "2027-06-14").andExpect(status().isOk());
++  }
++
++  @Test
++  void aHoldArrivingOnAClosedNightTakesNoRooms() throws Exception {
++    restrict(
++        "[{\"startDate\":\"2027-06-10\",\"endDate\":\"2027-06-10\",\"closedToArrival\":true}]");
++
++    mvc.perform(
++            post("/api/v1/properties/harbour-house/holds")
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(
++                    "{\"stay\":{\"roomType\":\"double\",\"checkIn\":\"2027-06-10\","
++                        + "\"checkOut\":\"2027-06-12\",\"rooms\":1,\"guests\":2},"
++                        + "\"guest\":{\"name\":\"Ines Lark\",\"email\":\"guest@example.com\"}}"))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.rule").value("closed-to-arrival"));
++    assertThat(held(room, LocalDate.parse("2027-06-10"))).isZero();
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/service/StayRestrictionLockScopeTest.java b/src/test/java/com/innkeep/booking/service/StayRestrictionLockScopeTest.java
+new file mode 100644
+index 0000000..9df3841
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/service/StayRestrictionLockScopeTest.java
+@@ -0,0 +1,99 @@
++package com.innkeep.booking.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.domain.StayRestriction;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.support.TransactionTemplate;
++
++/**
++ * A replacement that has not committed yet keeps other replacements of the room type waiting, but
++ * not guests' holds. The replacement is kept open by an enclosing transaction; waits are bounded.
++ */
++class StayRestrictionLockScopeTest extends IntegrationTestBase {
++
++  private static final LocalDate NIGHT = LocalDate.parse("2027-06-01");
++  private static final LocalDate NEXT = LocalDate.parse("2027-06-02");
++
++  @Autowired private StayRestrictionService restrictions;
++  @Autowired private PlatformTransactionManager transactions;
++
++  private ExecutorService pool;
++  private Property property;
++  private RoomType room;
++
++  @BeforeEach
++  void setUp() {
++    pool = Executors.newFixedThreadPool(4);
++    property = data.harbourHouse();
++    room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, NIGHT, NEXT, 3);
++  }
++
++  @AfterEach
++  void tearDown() {
++    pool.shutdownNow();
++  }
++
++  @Test
++  void anOpenReplacementHoldsBackOtherReplacementsButNotHolds() throws Exception {
++    var replaced = new CountDownLatch(1);
++    var commit = new CountDownLatch(1);
++    Future<?> first =
++        pool.submit(
++            () ->
++                new TransactionTemplate(transactions)
++                    .executeWithoutResult(
++                        status -> {
++                          replace(new StayRestrictionDraft(NIGHT, NEXT, 2, false));
++                          replaced.countDown();
++                          await(commit);
++                        }));
++    assertThat(replaced.await(10, TimeUnit.SECONDS)).isTrue();
++
++    pool.submit(() -> data.hold(property, room, NIGHT, NEXT, 1)).get(10, TimeUnit.SECONDS);
++    Future<?> second =
++        pool.submit(() -> replace(new StayRestrictionDraft(NIGHT, NIGHT, null, true)));
++    assertThatThrownBy(() -> second.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
++
++    commit.countDown();
++    first.get(10, TimeUnit.SECONDS);
++    second.get(10, TimeUnit.SECONDS);
++    assertThat(held(room, NIGHT)).isEqualTo(1);
++    assertThat(restrictions.list(property.getCode(), room.getCode()))
++        .singleElement()
++        .extracting(StayRestriction::isClosedToArrival)
++        .isEqualTo(true);
++  }
++
++  private List<StayRestriction> replace(StayRestrictionDraft draft) {
++    return restrictions.replace(property.getCode(), room.getCode(), List.of(draft));
++  }
++
++  private static void await(CountDownLatch latch) {
++    try {
++      if (!latch.await(10, TimeUnit.SECONDS)) {
++        throw new IllegalStateException("latch not released");
++      }
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++      throw new IllegalStateException(e);
++    }
++  }
++}

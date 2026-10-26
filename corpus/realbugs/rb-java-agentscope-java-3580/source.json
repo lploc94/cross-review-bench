@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/agentscope-ai/agentscope-java",
+  "intro_pr": 3078,
+  "intro_merged_at": "2026-09-24T06:54:42Z",
+  "fix_pr": 3580,
+  "fix_merged_at": "2026-10-15T11:39:14Z",
+  "license": "Apache-2.0",
+  "base_commit": "a0e89a3aad3f740a8f7c295967cde7c7241fa121",
+  "intro_commit": "9084fabe5d6bfa66dfb713f9501dbdce4f2160b0",
+  "fix_commit": "c71db2c597a48e70a572079d386659f9f3996895",
+  "fix_ported": true,
+  "snapshot_changes": []
+}

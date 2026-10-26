@@ -1,0 +1,29 @@
+diff --git a/src/services/scanWorker.ts b/src/services/scanWorker.ts
+index 07272f2..57e84cb 100644
+--- a/src/services/scanWorker.ts
++++ b/src/services/scanWorker.ts
+@@ -5,7 +5,7 @@ import type { Logger } from "../infra/logger.js";
+ import * as files from "../repositories/fileRepo.js";
+ import type { StorageDriver } from "../storage/driver.js";
+ import type { Scanner, ScanVerdict } from "./scanner.js";
+-import type { FileEventNotifier } from "./webhooks.js";
++import { WebhookDeliveryError, type FileEventNotifier } from "./webhooks.js";
+ 
+ export interface ScanSettings {
+   readonly maxAttempts: number;
+@@ -103,7 +103,14 @@ export class ScanWorker {
+       case "clean": {
+         if (!(await files.recordScanVerdict(pool, file.id, "available", now))) return null;
+         // Deliveries wait for slow receivers and pause between retries; the batch goes on.
+-        void notifier.fileAvailable(file, now);
++        void notifier.fileAvailable(file, now).catch((err: unknown) => {
++          // The receiver answered and refused every attempt: that is the tenant's endpoint, log it.
++          if (err instanceof WebhookDeliveryError && err.lastStatus !== null) {
++            logger.warn({ err, fileId: file.id, tenantId: file.tenantId }, "file.available webhook refused");
++            return;
++          }
++          throw err;
++        });
+         return "available";
+       }
+       case "infected": {

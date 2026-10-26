@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T13",
+  "repo": "workflow-java",
+  "kind": "clean",
+  "title": "Export and import workflow definitions as JSON",
+  "description": "Operators build approval routes on the test installation and then re-enter them by hand in production, step by step, with ids that differ between the two. This adds an export of a definition as a JSON document that carries no database ids, and an import that turns such a document into a draft.\n\n- `GET /api/v1/admin/definitions/{id}/export` returns `{name, version, steps: [{order, kind, assignee, group, quorum, sla}]}`. A `SINGLE` step names its approver by email address (addresses are unique per account), a group step names its group, and the SLA is an ISO-8601 duration (`PT8H`, `PT1H30M`). Steps come in definition order, parallel steps included. Drafts can be exported too.\n- `POST /api/v1/admin/definitions/import` takes the same document and creates a draft (201 with `Location`, like `POST /admin/definitions`). Groups are looked up by name and approvers by address on the installation the import runs on; an unknown group is a 400 that names the group, an address no account has is a 400 that names the step but not the address (problem details never echo addresses). The step rules are the ones `addStep` already enforces, and the whole import is one transaction, so a failing step leaves nothing behind.\n- `sla` must be whole minutes between `PT1M` and `PT720H`, the same range as `slaMinutes` on the create route. It is parsed with `Duration.parse` and range-checked as a `long` before it becomes an `int`; it is bound as a string, so a bare number such as `480` is refused rather than read as seconds.\n- Versions: without `version` the draft takes the next version of its name, as `createDraft` does. With `version` (1 to 100000) the number is kept only when it is above every version of that name on this installation, otherwise 409; so an import never reuses an existing version number or goes below the latest one. Importing an unchanged export on the installation it came from is therefore a 409; leave out `version` to make a new draft from it. Two imports racing for the same number end in the existing unique `(name, version)` constraint, answered as 409.\n- An imported draft is published through the usual route; nothing is published by the import.\n\nTests: `DefinitionTransferApiTest` (export shape, round trip as the next version with identical steps, existing version refused and nothing created, higher version kept, unknown group named, unknown approver without the address, a null step refused with 400 `validation-failed` (the step list is declared `List<@NotNull @Valid ImportStepRequest>`), SLA format and range, user tokens refused). README: new admin routes and a section on moving definitions between installations.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "src/test/java/com/papertrail/workflow/api/DefinitionPortabilityCheckTest.java"
+  ],
+  "clean_hidden_test_cmd": "mvn -q -B test -Dtest=DefinitionPortabilityCheckTest"
+}

@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/modem-dev/hunk",
+  "intro_pr": 759,
+  "intro_merged_at": "2026-08-16T18:41:33Z",
+  "fix_pr": 784,
+  "fix_merged_at": "2026-08-25T01:53:38Z",
+  "license": "MIT",
+  "base_commit": "bdec620a7e977d0aaa8d6670b4f2d349590838f6",
+  "intro_commit": "5ebe97549edeeef855da92f1086f7bdc41354377",
+  "fix_commit": "4aea1e16f6df1672c4c1de04ecce113931141617",
+  "fix_ported": true,
+  "snapshot_changes": []
+}

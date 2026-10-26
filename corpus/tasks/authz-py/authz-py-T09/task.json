@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T09",
+  "repo": "authz-py",
+  "kind": "buggy",
+  "title": "Bulk role assignment",
+  "description": "Onboarding a team means one `POST /role-assignments` per person and role today, and a provisioning script that fails halfway leaves no record of which calls went through. This adds a bulk endpoint.\n\n- `POST /v1/orgs/{org_id}/role-assignments:bulk {items: [{user_id, role_id, project_id?}, …]}` (1–100 items, `members:manage`). Each item is applied on its own: an item that fails (unknown member, role or project, a role the caller cannot hand out, an assignment that already exists) is rolled back to its own savepoint and reported, and the other items still apply.\n- The answer is 200 with one result per item, in the order of the request: `{\"status\": \"created\", \"user_id\", \"assignment_id\"}` or `{\"status\": \"failed\", \"user_id\", \"error\": {code, message, details?}}` (the same error bodies the single endpoint returns).\n- `MemberService.assign_many` runs all items in one transaction with the caller's policy snapshot read once. Items are written in key order (user, role, project), so two bulk requests over the same members insert their rows in the same order and cannot deadlock on the unique index. The checks and the insert of `assign` move into `_add_assignment`, which both methods use; `assign` behaves as before.\n- Each created assignment writes its own `role_assignment.created` audit event; failed items write none.\n\nTests: `tests/api/test_bulk_role_assignments.py` (everything created with audit events, failed items do not stop the others, existing assignment and ungrantable role reported per item, permission required, empty and oversized requests refused). README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/authz/services/members.py",
+      "lines": [192, 205],
+      "category": "api-contract",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "MemberService.assign_many processes the items sorted by (user_id, role_id, project_id) to fix the lock order, appends each outcome in that processing order and returns the list as is; the router (routers/roles.py) maps it one-to-one onto the response, which the README and BulkAssignmentResult promise is in the order of the request. Whenever the request is not already sorted by user id, results land at the wrong indexes: a client maps errors and assignment ids to the wrong items (retrying the wrong ones, recording ids against the wrong people), and for two items of the same user even the user_id in each result cannot tell them apart.",
+      "trigger": "Bulk request with items for users in non-sorted order (e.g. mid, high, low by UUID) where the second item names a missing project: the response's second result is 'created' and the 'failed' one is last.",
+      "testable": true,
+      "hidden_tests": ["tests/hidden/test_bulk_assignment_results.py"],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_bulk_assignment_results.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The order of the results does not matter: every BulkAssignmentResult carries the item's user_id (BulkAssignmentResult.of in src/authz/api/schemas/organizations.py fills it from outcome.request), so a client matches each result to its item by user, and processing in key order is what keeps two concurrent bulk requests from deadlocking.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

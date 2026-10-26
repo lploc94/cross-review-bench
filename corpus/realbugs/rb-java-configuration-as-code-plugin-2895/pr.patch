@@ -1,0 +1,1813 @@
+diff --git a/README.md b/README.md
+index 30711dd0..b48ee26d 100644
+--- a/README.md
++++ b/README.md
+@@ -110,25 +110,11 @@ First, start a Jenkins instance with the [Configuration as Code](https://plugins
+ 
+ Second, the plugin looks for the `CASC_JENKINS_CONFIG` environment variable. The variable points to a comma-separated list of any of the following:
+ 
+-- Path to a folder containing a set of config files. For example, `/var/jenkins_home/casc_configs`.
+-- A full path to a single file. For example, `/var/jenkins_home/casc_configs/jenkins.yaml`.
+-- A URL pointing to a file served on the web. For example, `https://acme.org/jenkins.yaml`.
+-
+-If an element of `CASC_JENKINS_CONFIG` points to a folder, the plugin will recursively traverse the folder to find file(s) with .yml,.yaml,.YAML,.YML suffix. It will exclude hidden files or files that contain a hidden folder in **any part** of the full path. It follows symbolic links for both files and directories.
+-<details><summary>Exclusion examples</summary>
+-
+-`CASC_JENKINS_CONFIG=/jenkins/casc_configs`  
+-:heavy_check_mark: `/jenkins/casc_configs/jenkins.yaml`  
+-:heavy_check_mark: `/jenkins/casc_configs/dir1/config.yaml`  
+-:x: `/jenkins/casc_configs/.dir1/config.yaml`  
+-:x: `/jenkins/casc_configs/..dir2/config.yaml`  
+-  
+-`CASC_JENKINS_CONFIG=/jenkins/.configs/casc_configs` contains hidden folder `.config`  
+-:x: `/jenkins/.configs/casc_configs/jenkins.yaml`  
+-:x: `/jenkins/.configs/casc_configs/dir1/config.yaml`  
+-:x: `/jenkins/.configs/casc_configs/.dir1/config.yaml`  
+-:x: `/jenkins/.configs/casc_configs/..dir2/config.yaml`  
+-</details>
++- Path to a local folder containing a set of config files. For example, `/var/jenkins_home/casc_configs`.
++- A full path or URI to a local file. For example, `/var/jenkins_home/casc_configs/jenkins.yaml` or `file:///var/jenkins_home/casc_configs/jenkins.yaml`.
++- An HTTP or HTTPS URL pointing to a remote file. For example, `https://acme.org/jenkins.yaml`.
++
++If an element of `CASC_JENKINS_CONFIG` points to a folder, the plugin will recursively traverse the folder to find file(s) with `.yml`, `.yaml`, `.YAML`, `.YML` suffix.
+ 
+ All configuration files that are discovered MUST be supplementary. They cannot overwrite each other's configuration values. This creates a conflict and raises a `ConfiguratorException`. Thus, the order of traversal does not matter to the final outcome.
+ 
+diff --git a/docs/developer/implementation.md b/docs/developer/implementation.md
+index 026bd568..504f8a48 100644
+--- a/docs/developer/implementation.md
++++ b/docs/developer/implementation.md
+@@ -103,3 +103,45 @@ As short term workaround, a custom `Configurator` glue-code implementation can b
+ 
+ Initial secrets are handled by the concrete implementations of the [SecretSource](https://github.com/jenkinsci/configuration-as-code-plugin/blob/master/plugin/src/main/java/io/jenkins/plugins/casc/SecretSource.java). In order to implement a new
+ secret source, subclass `SecretSource` by extending it, and mark the new class with the `@Extension` annotation.
++
++## Configuration Fetchers
++
++Configuration sources are resolved through the `CasCConfigFetcher`
++extension point.
++
++Each fetcher determines whether it supports a location by implementing
++`supports(String location)` and retrieves configuration by implementing
++`fetch(String location, FetchCredentials credentials)`.
++
++### Built-in Fetchers
++
++- **`LocalFileSystemFetcher`**: Handles local file paths and `file://` URIs. If given a directory path, it recursively traverses the tree to load all files ending in `.yaml` or `.yml`.
++- **`DefaultHttpFetcher`**: Handles remote HTTP and HTTPS URLs (`http://`, `https://`).
++
++### Custom Fetchers
++
++Plugin developers can create custom fetchers (for example, to load configurations directly from S3, Git, or Vault) by implementing `CasCConfigFetcher`:
++
++```java
++@Extension
++public class CustomConfigFetcher implements CasCConfigFetcher {
++
++    @Override
++    public boolean supports(String location) {
++        return location != null && location.startsWith("custom://");
++    }
++
++    @Override
++    public FetchResult fetch(String location, FetchCredentials credentials) throws IOException {
++        // Retrieve resources and return a FetchResult containing ResolvedYaml items
++    }
++}
++```
++
++### Credentials
++
++Fetchers receive a `FetchCredentials` instance which resolves authentication
++data through registered `FetchCredentialsProvider` extensions.
++
++Plugins can contribute credentials for custom configuration sources by
++implementing `FetchCredentialsProvider`.
+\ No newline at end of file
+diff --git a/plugin/pom.xml b/plugin/pom.xml
+index 286e36b3..85698f60 100644
+--- a/plugin/pom.xml
++++ b/plugin/pom.xml
+@@ -10,7 +10,6 @@
+ 
+   <groupId>io.jenkins</groupId>
+   <artifactId>configuration-as-code</artifactId>
+-  <version>${changelist}</version>
+   <packaging>hpi</packaging>
+ 
+   <name>Configuration as Code Plugin</name>
+@@ -93,6 +92,12 @@
+       <version>1.19.0</version>
+       <scope>test</scope>
+     </dependency>
++    <dependency>
++      <groupId>com.github.tomakehurst</groupId>
++      <artifactId>wiremock-jre8-standalone</artifactId>
++      <version>2.35.1</version>
++      <scope>test</scope>
++    </dependency>
+     <dependency>
+       <groupId>com.google.code.findbugs</groupId>
+       <artifactId>jsr305</artifactId>
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/ConfigurationAsCode.java b/plugin/src/main/java/io/jenkins/plugins/casc/ConfigurationAsCode.java
+index c9c44566..cf139139 100644
+--- a/plugin/src/main/java/io/jenkins/plugins/casc/ConfigurationAsCode.java
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/ConfigurationAsCode.java
+@@ -1,7 +1,8 @@
+ package io.jenkins.plugins.casc;
+ 
+ import static io.jenkins.plugins.casc.SchemaGeneration.writeJSONSchema;
+-import static java.lang.String.format;
++import static io.jenkins.plugins.casc.fetcher.FetchCredentials.resolveAll;
++import static java.util.Collections.unmodifiableList;
+ import static java.util.stream.Collectors.toList;
+ import static org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK;
+ import static org.yaml.snakeyaml.DumperOptions.ScalarStyle.DOUBLE_QUOTED;
+@@ -22,6 +23,9 @@ import hudson.security.ACL;
+ import hudson.security.ACLContext;
+ import hudson.security.Permission;
+ import hudson.util.FormValidation;
++import io.jenkins.plugins.casc.fetcher.CasCConfigFetcher;
++import io.jenkins.plugins.casc.fetcher.FetchContext;
++import io.jenkins.plugins.casc.fetcher.FetchCredentials;
+ import io.jenkins.plugins.casc.impl.DefaultConfiguratorRegistry;
+ import io.jenkins.plugins.casc.model.CNode;
+ import io.jenkins.plugins.casc.model.Mapping;
+@@ -43,8 +47,6 @@ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.io.OutputStreamWriter;
+ import java.io.Writer;
+-import java.net.URI;
+-import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.FileSystems;
+@@ -232,20 +234,23 @@ public class ConfigurationAsCode extends ManagementLink {
+                 }
+             }
+             if (!candidateSources.isEmpty()) {
+-                List<YamlSource> candidates = getConfigFromSources(candidateSources);
+-                if (canApplyFrom(candidates)) {
+-                    sources = candidateSources;
+-                    configureWith(getConfigFromSources(getSources()));
+-                    CasCGlobalConfig config = GlobalConfiguration.all().get(CasCGlobalConfig.class);
+-                    if (config != null) {
+-                        config.setConfigurationPath(normalizedSource);
+-                        config.save();
++                try (FetchContext context = getConfigFromSources(candidateSources)) {
++                    if (canApplyFrom(context.getSources())) {
++                        sources = unmodifiableList(candidateSources);
++                        try (FetchContext applyContext = getConfigFromSources(getSources())) {
++                            configureWith(applyContext.getSources());
++                        }
++                        CasCGlobalConfig config = GlobalConfiguration.all().get(CasCGlobalConfig.class);
++                        if (config != null) {
++                            config.setConfigurationPath(normalizedSource);
++                            config.save();
++                        }
++                        LOGGER.log(Level.FINE, "Replace configuration with: " + normalizedSource);
++                    } else {
++                        LOGGER.log(Level.WARNING, "Provided sources could not be applied");
++                        throw new ConfiguratorException(
++                                "Provided sources could not be applied. Please check the syntax and validity of the provided configuration.");
+                     }
+-                    LOGGER.log(Level.FINE, "Replace configuration with: " + normalizedSource);
+-                } else {
+-                    LOGGER.log(Level.WARNING, "Provided sources could not be applied");
+-                    throw new ConfiguratorException(
+-                            "Provided sources could not be applied. Please check the syntax and validity of the provided configuration.");
+                 }
+             } else {
+                 LOGGER.log(Level.FINE, "No such source exists, applying default");
+@@ -294,9 +299,8 @@ public class ConfigurationAsCode extends ManagementLink {
+             }
+             candidateSources.add(candidateSource);
+         }
+-        try {
+-            List<YamlSource> candidates = getConfigFromSources(candidateSources);
+-            final Map<Source, String> issues = checkWith(candidates);
++        try (FetchContext context = getConfigFromSources(candidateSources)) {
++            final Map<Source, String> issues = checkWith(context.getSources());
+             final JSONArray errors = collectProblems(issues, "error");
+             if (!errors.isEmpty()) {
+                 return FormValidation.error(errors.toString());
+@@ -305,10 +309,16 @@ public class ConfigurationAsCode extends ManagementLink {
+             if (!warnings.isEmpty()) {
+                 return FormValidation.warning(warnings.toString());
+             }
+-            return FormValidation.okWithMarkup("The configuration can be applied");
+-        } catch (ConfiguratorException | IllegalArgumentException e) {
+-            return FormValidation.error(
+-                    e, e.getCause() == null ? e.getMessage() : e.getCause().getMessage());
++            return FormValidation.ok("The configuration can be applied");
++        } catch (Exception e) {
++            String errorMessage = e.getMessage();
++            if (errorMessage == null && e.getCause() != null) {
++                errorMessage = e.getCause().getMessage();
++            }
++            if (errorMessage == null) {
++                errorMessage = "An unexpected " + e.getClass().getSimpleName() + " occurred.";
++            }
++            return FormValidation.error("Invalid configuration: " + errorMessage);
+         }
+     }
+ 
+@@ -326,21 +336,42 @@ public class ConfigurationAsCode extends ManagementLink {
+         return problems;
+     }
+ 
+-    private void appendSources(List<YamlSource> sources, String source) throws ConfiguratorException {
+-        if (isSupportedURI(source)) {
+-            sources.add(YamlSource.of(source));
+-        } else {
+-            sources.addAll(configs(source).stream().map(YamlSource::of).collect(toList()));
+-        }
+-    }
++    private FetchContext getConfigFromSources(List<String> newSources) throws ConfiguratorException {
++        FetchContext context = new FetchContext();
++        boolean success = false;
+ 
+-    private List<YamlSource> getConfigFromSources(List<String> newSources) throws ConfiguratorException {
+-        List<YamlSource> sources = new ArrayList<>();
++        try {
++            FetchCredentials credentials = resolveAll();
++
++            for (String p : newSources) {
++                boolean fetched = false;
++
++                for (CasCConfigFetcher fetcher : Jenkins.get().getExtensionList(CasCConfigFetcher.class)) {
++                    if (fetcher.supports(p)) {
++                        try {
++                            context.add(fetcher.fetch(p, credentials));
++                            fetched = true;
++                            break;
++                        } catch (IOException e) {
++                            throw new ConfiguratorException("Failed to fetch configuration from " + p, e);
++                        }
++                    }
++                }
++
++                if (!fetched) {
++                    throw new ConfiguratorException("Source '" + p
++                            + "' is not supported by any registered configuration fetcher or does not exist.");
++                }
++            }
+ 
+-        for (String p : newSources) {
+-            appendSources(sources, p);
++            success = true;
++            return context;
++
++        } finally {
++            if (!success) {
++                context.close();
++            }
+         }
+-        return sources;
+     }
+ 
+     /**
+@@ -367,18 +398,16 @@ public class ConfigurationAsCode extends ManagementLink {
+      * @throws ConfiguratorException Configuration error
+      */
+     public void configure() throws ConfiguratorException {
+-        configureWith(getStandardConfigSources());
++        try (FetchContext context = getStandardConfigSources()) {
++            configureWith(context.getSources());
++        }
+     }
+ 
+-    private List<YamlSource> getStandardConfigSources() throws ConfiguratorException {
+-        List<YamlSource> configs = new ArrayList<>();
+-
++    private FetchContext getStandardConfigSources() throws ConfiguratorException {
+         List<String> standardConfig = getStandardConfig();
+-        for (String p : standardConfig) {
+-            appendSources(configs, p);
+-        }
+-        sources = Collections.unmodifiableList(standardConfig);
+-        return configs;
++        FetchContext context = getConfigFromSources(standardConfig);
++        sources = unmodifiableList(standardConfig);
++        return context;
+     }
+ 
+     private List<String> getStandardConfig() {
+@@ -710,38 +739,35 @@ public class ConfigurationAsCode extends ManagementLink {
+ 
+     public void configure(Collection<String> configParameters) throws ConfiguratorException {
+ 
+-        List<YamlSource> configs = new ArrayList<>();
++        List<String> newSources = new ArrayList<>(configParameters);
+ 
+-        for (String p : configParameters) {
+-            appendSources(configs, p);
++        try (FetchContext context = getConfigFromSources(newSources)) {
++            sources = unmodifiableList(newSources);
++            configureWith(context.getSources());
++            lastTimeLoaded = System.currentTimeMillis();
+         }
+-        sources = Collections.unmodifiableList(new ArrayList<>(configParameters));
+-        configureWith(configs);
+-        lastTimeLoaded = System.currentTimeMillis();
+     }
+ 
+     public static boolean isSupportedURI(String configurationParameter) {
+         if (configurationParameter == null) {
+             return false;
+         }
+-        final List<String> supportedProtocols = Arrays.asList("https", "http", "file");
+-        URI uri;
+-        try {
+-            uri = new URI(configurationParameter);
+-        } catch (URISyntaxException ex) {
+-            return false;
+-        }
+-        if (uri.getScheme() == null) {
+-            return false;
++        for (CasCConfigFetcher fetcher : Jenkins.get().getExtensionList(CasCConfigFetcher.class)) {
++            if (fetcher.supports(configurationParameter)) {
++                return true;
++            }
+         }
+-        return supportedProtocols.contains(uri.getScheme());
++        return false;
+     }
+ 
+     @Restricted(NoExternalUse.class)
++    @SuppressWarnings("rawtypes")
+     public void configureWith(YamlSource source) throws ConfiguratorException {
+-        final List<YamlSource> sources = getStandardConfigSources();
+-        sources.add(source);
+-        configureWith(sources);
++        try (FetchContext context = getStandardConfigSources()) {
++            List<YamlSource> allSources = new ArrayList<>(context.getSources());
++            allSources.add(source);
++            configureWith(allSources);
++        }
+     }
+ 
+     private void configureWith(List<YamlSource> sources) throws ConfiguratorException {
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/BootstrapEnvVarCredentialResolver.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/BootstrapEnvVarCredentialResolver.java
+new file mode 100644
+index 00000000..874c5025
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/BootstrapEnvVarCredentialResolver.java
+@@ -0,0 +1,46 @@
++package io.jenkins.plugins.casc.fetcher;
++
++public final class BootstrapEnvVarCredentialResolver {
++
++    public static final BootstrapEnvVarCredentialResolver INSTANCE = new BootstrapEnvVarCredentialResolver();
++
++    private BootstrapEnvVarCredentialResolver() {}
++
++    @SuppressWarnings("unchecked")
++    public <T extends FetchAuthData> T resolve(String credentialId, Class<T> type) {
++        if (credentialId == null || credentialId.isEmpty() || type == null) {
++            return null;
++        }
++        if (type == FetchAuthData.Token.class) {
++            String token = System.getenv(credentialId);
++            if (token != null && !token.isEmpty()) {
++                return (T) (FetchAuthData.Token) () -> token;
++            }
++        }
++
++        if (type == FetchAuthData.SshKey.class) {
++            String privateKey = System.getenv(credentialId + "_PRIVATE_KEY");
++            if (privateKey != null && !privateKey.isEmpty()) {
++                String username = System.getenv(credentialId + "_USERNAME");
++                String passphrase = System.getenv(credentialId + "_PASSPHRASE");
++                return (T) new FetchAuthData.SshKey() {
++                    @Override
++                    public String getUsername() {
++                        return username != null ? username : "git";
++                    }
++
++                    @Override
++                    public String getPrivateKey() {
++                        return privateKey;
++                    }
++
++                    @Override
++                    public String getPassphrase() {
++                        return passphrase;
++                    }
++                };
++            }
++        }
++        return null;
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/CasCConfigFetcher.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/CasCConfigFetcher.java
+new file mode 100644
+index 00000000..730cefaa
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/CasCConfigFetcher.java
+@@ -0,0 +1,11 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import hudson.ExtensionPoint;
++import java.io.IOException;
++
++public interface CasCConfigFetcher extends ExtensionPoint {
++
++    boolean supports(String location);
++
++    FetchResult fetch(String location, FetchCredentials credentials) throws IOException;
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/DefaultHttpFetcher.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/DefaultHttpFetcher.java
+new file mode 100644
+index 00000000..9baf1227
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/DefaultHttpFetcher.java
+@@ -0,0 +1,68 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static java.lang.Thread.currentThread;
++
++import hudson.Extension;
++import hudson.ProxyConfiguration;
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.Collections;
++
++@Extension(ordinal = -100)
++public class DefaultHttpFetcher implements CasCConfigFetcher {
++
++    @Override
++    public boolean supports(String location) {
++        return location != null && (location.startsWith("http://") || location.startsWith("https://"));
++    }
++
++    @Override
++    public FetchResult fetch(String location, FetchCredentials credentials) throws IOException {
++        URI uri;
++        try {
++            uri = new URI(location);
++        } catch (URISyntaxException e) {
++            throw new IOException("Invalid URL: " + location, e);
++        }
++
++        String path = uri.getPath();
++        String fileName =
++                (path != null && path.contains("/")) ? path.substring(path.lastIndexOf('/') + 1) : "casc.yaml";
++
++        if (fileName.isEmpty()) {
++            fileName = "casc.yaml";
++        }
++
++        HttpClient client = ProxyConfiguration.newHttpClient();
++
++        HttpRequest request = ProxyConfiguration.newHttpRequestBuilder(uri)
++                .GET()
++                .timeout(Duration.ofSeconds(30))
++                .build();
++
++        byte[] yamlBytes;
++        try {
++            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
++
++            if (response.statusCode() < 200 || response.statusCode() >= 300) {
++                throw new IOException("Failed to fetch configuration from " + location + ". HTTP status code: "
++                        + response.statusCode());
++            }
++
++            yamlBytes = response.body();
++        } catch (InterruptedException e) {
++            currentThread().interrupt();
++            throw new IOException("Interrupted while fetching configuration from: " + location, e);
++        }
++
++        ResolvedYaml resolved = new ResolvedYaml(fileName, () -> new ByteArrayInputStream(yamlBytes));
++
++        return new FetchResult(Collections.singletonList(resolved), (AutoCloseable) null);
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/EnvVarFetchCredentialsProvider.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/EnvVarFetchCredentialsProvider.java
+new file mode 100644
+index 00000000..8411f664
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/EnvVarFetchCredentialsProvider.java
+@@ -0,0 +1,12 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import hudson.Extension;
++
++@Extension(ordinal = -100)
++public class EnvVarFetchCredentialsProvider implements FetchCredentialsProvider {
++
++    @Override
++    public <T extends FetchAuthData> T getCredentials(String credentialId, Class<T> type) {
++        return BootstrapEnvVarCredentialResolver.INSTANCE.resolve(credentialId, type);
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchAuthData.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchAuthData.java
+new file mode 100644
+index 00000000..d94afc5b
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchAuthData.java
+@@ -0,0 +1,25 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++
++public interface FetchAuthData {
++
++    interface Token extends FetchAuthData {
++        String getToken();
++    }
++
++    interface UsernamePassword extends FetchAuthData {
++        String getUsername();
++
++        String getPassword();
++    }
++
++    interface SshKey extends FetchAuthData {
++        String getUsername();
++
++        String getPrivateKey();
++
++        @CheckForNull
++        String getPassphrase();
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchContext.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchContext.java
+new file mode 100644
+index 00000000..1adad9e5
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchContext.java
+@@ -0,0 +1,53 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static java.util.Collections.unmodifiableList;
++
++import io.jenkins.plugins.casc.yaml.YamlSource;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++
++public final class FetchContext implements AutoCloseable {
++
++    private static final Logger LOGGER = Logger.getLogger(FetchContext.class.getName());
++
++    private final List<FetchResult> results = new ArrayList<>();
++
++    @SuppressWarnings("rawtypes")
++    private final List<YamlSource> yamlSources = new ArrayList<>();
++
++    public void add(FetchResult result) {
++        if (result == null) {
++            return;
++        }
++
++        this.results.add(result);
++        List<ResolvedYaml> items = new ArrayList<>(result.items());
++
++        items.sort(java.util.Comparator.comparing(ResolvedYaml::relativePath));
++
++        for (ResolvedYaml item : items) {
++            yamlSources.add(YamlSource.of(item));
++        }
++    }
++
++    @SuppressWarnings("rawtypes")
++    public List<YamlSource> getSources() {
++        return unmodifiableList(yamlSources);
++    }
++
++    @Override
++    public void close() {
++        for (FetchResult result : results) {
++            try {
++                if (result != null) {
++                    result.close();
++                }
++            } catch (IOException e) {
++                LOGGER.log(Level.WARNING, "Failed to clean up JCasC fetch result", e);
++            }
++        }
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchCredentials.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchCredentials.java
+new file mode 100644
+index 00000000..5b012419
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchCredentials.java
+@@ -0,0 +1,42 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import jenkins.model.Jenkins;
++
++public interface FetchCredentials {
++
++    Logger LOGGER = Logger.getLogger(FetchCredentials.class.getName());
++
++    @CheckForNull
++    <T extends FetchAuthData> T get(String credentialId, Class<T> type);
++
++    static FetchCredentials resolveAll() {
++        return new FetchCredentials() {
++            @Override
++            public <T extends FetchAuthData> T get(String credentialId, Class<T> type) {
++                Jenkins jenkins = Jenkins.getInstanceOrNull();
++                if (jenkins != null) {
++                    for (FetchCredentialsProvider provider : jenkins.getExtensionList(FetchCredentialsProvider.class)) {
++                        try {
++                            T authData = provider.getCredentials(credentialId, type);
++                            if (authData != null) {
++                                return authData;
++                            }
++                        } catch (Exception e) {
++                            LOGGER.log(
++                                    Level.FINE,
++                                    e,
++                                    () -> "Credential provider "
++                                            + provider.getClass().getName()
++                                            + " threw an exception while resolving ID: " + credentialId);
++                        }
++                    }
++                }
++
++                return BootstrapEnvVarCredentialResolver.INSTANCE.resolve(credentialId, type);
++            }
++        };
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsProvider.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsProvider.java
+new file mode 100644
+index 00000000..235b0984
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsProvider.java
+@@ -0,0 +1,10 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++import hudson.ExtensionPoint;
++
++public interface FetchCredentialsProvider extends ExtensionPoint {
++
++    @CheckForNull
++    <T extends FetchAuthData> T getCredentials(String credentialId, Class<T> type);
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchResult.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchResult.java
+new file mode 100644
+index 00000000..4b123397
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/FetchResult.java
+@@ -0,0 +1,62 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static java.util.Collections.emptyList;
++import static java.util.Collections.reverseOrder;
++import static java.util.Collections.unmodifiableList;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++
++public final class FetchResult implements AutoCloseable {
++
++    private final List<ResolvedYaml> items;
++    private final List<AutoCloseable> resourcesToClose = new ArrayList<>();
++    private final List<Path> pathsToDelete = new ArrayList<>();
++
++    public FetchResult(List<ResolvedYaml> items, AutoCloseable resource) {
++        this.items = items != null ? unmodifiableList(items) : emptyList();
++        if (resource != null) {
++            this.resourcesToClose.add(resource);
++        }
++    }
++
++    public FetchResult(List<ResolvedYaml> items, Path tempDirectory) {
++        this.items = items != null ? unmodifiableList(items) : emptyList();
++        if (tempDirectory != null) {
++            this.pathsToDelete.add(tempDirectory);
++        }
++    }
++
++    public List<ResolvedYaml> items() {
++        return items;
++    }
++
++    @Override
++    public void close() throws IOException {
++        for (AutoCloseable resource : resourcesToClose) {
++            try {
++                resource.close();
++            } catch (Exception e) {
++                throw new IOException("Failed to close fetched resource", e);
++            }
++        }
++
++        for (Path tempDirectory : pathsToDelete) {
++            if (!Files.exists(tempDirectory)) {
++                continue;
++            }
++
++            try (var stream = Files.walk(tempDirectory)) {
++                List<Path> paths = stream.sorted(reverseOrder()).toList();
++                for (Path p : paths) {
++                    Files.delete(p);
++                }
++            } catch (Exception e) {
++                throw new IOException("Failed to clean up fetched directory: " + tempDirectory, e);
++            }
++        }
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcher.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcher.java
+new file mode 100644
+index 00000000..717bd1cd
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcher.java
+@@ -0,0 +1,77 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import hudson.Extension;
++import java.io.IOException;
++import java.net.URI;
++import java.nio.file.FileSystems;
++import java.nio.file.FileVisitOption;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.PathMatcher;
++import java.nio.file.Paths;
++import java.util.Collections;
++import java.util.List;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++
++@Extension(ordinal = -100)
++public class LocalFileSystemFetcher implements CasCConfigFetcher {
++
++    private static final String YAML_FILES_PATTERN = "glob:**.{yml,yaml,YAML,YML}";
++
++    @Override
++    public boolean supports(String location) {
++        if (location == null) {
++            return false;
++        }
++        if (location.startsWith("file:")) {
++            return true;
++        }
++        try {
++            return Files.exists(Paths.get(location));
++        } catch (Exception e) {
++            return false;
++        }
++    }
++
++    @Override
++    public FetchResult fetch(String location, FetchCredentials credentials) throws IOException {
++        final Path root;
++        if (location.startsWith("file:")) {
++            try {
++                root = Paths.get(URI.create(location));
++            } catch (IllegalArgumentException e) {
++                throw new IOException("Invalid file URI format: " + location, e);
++            }
++        } else {
++            root = Paths.get(location);
++        }
++
++        if (!Files.exists(root)) {
++            throw new IOException("Invalid configuration: '" + root + "' isn't a valid path.");
++        }
++
++        if (Files.isRegularFile(root) && Files.isReadable(root)) {
++            Path fileNamePath = root.getFileName();
++            String fileName = fileNamePath != null ? fileNamePath.toString() : root.toString();
++            ResolvedYaml resolved = new ResolvedYaml(fileName, () -> Files.newInputStream(root));
++            return new FetchResult(Collections.singletonList(resolved), (AutoCloseable) null);
++        }
++
++        final PathMatcher matcher = FileSystems.getDefault().getPathMatcher(YAML_FILES_PATTERN);
++        try (Stream<Path> stream = Files.find(
++                root,
++                Integer.MAX_VALUE,
++                (next, attrs) -> !attrs.isDirectory() && matcher.matches(next),
++                FileVisitOption.FOLLOW_LINKS)) {
++
++            List<ResolvedYaml> items = stream.map(path -> {
++                        String relativePath = root.relativize(path).toString().replace('\\', '/');
++                        return new ResolvedYaml(relativePath, () -> Files.newInputStream(path));
++                    })
++                    .collect(Collectors.toList());
++
++            return new FetchResult(items, (AutoCloseable) null);
++        }
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/ResolvedYaml.java b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/ResolvedYaml.java
+new file mode 100644
+index 00000000..2b9e7940
+--- /dev/null
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/fetcher/ResolvedYaml.java
+@@ -0,0 +1,34 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.Objects;
++
++public final class ResolvedYaml {
++
++    private final String relativePath;
++    private final StreamSupplier streamSupplier;
++
++    @FunctionalInterface
++    public interface StreamSupplier {
++        InputStream open() throws IOException;
++    }
++
++    public ResolvedYaml(String relativePath, StreamSupplier streamSupplier) {
++        this.relativePath = Objects.requireNonNull(relativePath, "relativePath cannot be null");
++        this.streamSupplier = Objects.requireNonNull(streamSupplier, "streamSupplier cannot be null");
++    }
++
++    public String relativePath() {
++        return relativePath;
++    }
++
++    public InputStream open() throws IOException {
++        return streamSupplier.open();
++    }
++
++    @Override
++    public String toString() {
++        return "ResolvedYaml{relativePath='" + relativePath + "'}";
++    }
++}
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlSource.java b/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlSource.java
+index a0888c37..83c2baf7 100644
+--- a/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlSource.java
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlSource.java
+@@ -1,5 +1,6 @@
+ package io.jenkins.plugins.casc.yaml;
+ 
++import io.jenkins.plugins.casc.fetcher.ResolvedYaml;
+ import jakarta.servlet.http.HttpServletRequest;
+ import java.io.InputStream;
+ import java.nio.file.Path;
+@@ -10,15 +11,25 @@ import java.nio.file.Path;
+ public class YamlSource<T> {
+ 
+     public final T source;
++    private String name;
+ 
+     public YamlSource(T source) {
+         this.source = source;
+     }
+ 
++    public YamlSource(T source, String name) {
++        this.source = source;
++        this.name = name;
++    }
++
+     public static YamlSource<InputStream> of(InputStream in) {
+         return new YamlSource<>(in);
+     }
+ 
++    public static YamlSource<InputStream> of(InputStream in, String name) {
++        return new YamlSource<>(in, name);
++    }
++
+     public static YamlSource<String> of(String url) {
+         return new YamlSource<>(url);
+     }
+@@ -31,7 +42,18 @@ public class YamlSource<T> {
+         return new YamlSource<>(path);
+     }
+ 
++    public static YamlSource<Path> of(Path path, String name) {
++        return new YamlSource<>(path, name);
++    }
++
++    public static YamlSource<ResolvedYaml> of(ResolvedYaml resolvedYaml) {
++        return new YamlSource<>(resolvedYaml, resolvedYaml.relativePath());
++    }
++
+     public String source() {
++        if (name != null) {
++            return name;
++        }
+         if (source instanceof HttpServletRequest) {
+             return ((HttpServletRequest) source).getPathInfo();
+         }
+diff --git a/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlUtils.java b/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlUtils.java
+index cd64c5da..e3424a00 100644
+--- a/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlUtils.java
++++ b/plugin/src/main/java/io/jenkins/plugins/casc/yaml/YamlUtils.java
+@@ -5,6 +5,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
+ import io.jenkins.plugins.casc.ConfigurationAsCode;
+ import io.jenkins.plugins.casc.ConfigurationContext;
+ import io.jenkins.plugins.casc.ConfiguratorException;
++import io.jenkins.plugins.casc.fetcher.ResolvedYaml;
+ import io.jenkins.plugins.casc.model.Mapping;
+ import jakarta.servlet.http.HttpServletRequest;
+ import java.io.IOException;
+@@ -78,7 +79,9 @@ public final class YamlUtils {
+ 
+     public static Reader reader(YamlSource<?> source) throws IOException {
+         Object src = source.source;
+-        if (src instanceof String) {
++        if (src instanceof ResolvedYaml) {
++            return new InputStreamReader(((ResolvedYaml) src).open(), UTF_8);
++        } else if (src instanceof String) {
+             final URL url = URI.create((String) src).toURL();
+             return new InputStreamReader(url.openStream(), UTF_8);
+         } else if (src instanceof InputStream) {
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/BootstrapEnvVarCredentialResolverTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/BootstrapEnvVarCredentialResolverTest.java
+new file mode 100644
+index 00000000..062bd7ce
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/BootstrapEnvVarCredentialResolverTest.java
+@@ -0,0 +1,80 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assume.assumeTrue;
++
++import io.jenkins.plugins.casc.fetcher.FetchAuthData.SshKey;
++import io.jenkins.plugins.casc.fetcher.FetchAuthData.Token;
++import io.jenkins.plugins.casc.fetcher.FetchAuthData.UsernamePassword;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.contrib.java.lang.system.EnvironmentVariables;
++
++public class BootstrapEnvVarCredentialResolverTest {
++
++    @Rule
++    public final EnvironmentVariables environment = new EnvironmentVariables();
++
++    private final BootstrapEnvVarCredentialResolver resolver = BootstrapEnvVarCredentialResolver.INSTANCE;
++
++    @Test
++    public void testResolveWithInvalidInputsReturnsNull() {
++        assertNull(resolver.resolve(null, Token.class));
++        assertNull(resolver.resolve("", Token.class));
++        assertNull(resolver.resolve("VALID_ID", null));
++    }
++
++    @Test
++    public void testMissingVariablesReturnNull() {
++        assertNull(resolver.resolve("NON_EXISTENT_TOKEN", Token.class));
++        assertNull(resolver.resolve("NON_EXISTENT_SSH", SshKey.class));
++    }
++
++    @Test
++    public void testUnsupportedTypeReturnsNull() {
++        UsernamePassword unsupported = resolver.resolve("SOME_ID", UsernamePassword.class);
++        assertNull(unsupported);
++    }
++
++    @Test
++    public void testTokenResolutionWithExistingEnvVar() {
++        String expectedToken = System.getenv("PATH");
++
++        assumeTrue(expectedToken != null && !expectedToken.isEmpty());
++
++        Token tokenAuth = resolver.resolve("PATH", FetchAuthData.Token.class);
++
++        assertNotNull(tokenAuth);
++        assertEquals(expectedToken, tokenAuth.getToken());
++    }
++
++    @Test
++    public void testSshKeyResolutionWithAllVars() {
++        environment.set("MY_SSH_PRIVATE_KEY", "dummy-key-data");
++        environment.set("MY_SSH_USERNAME", "custom-user");
++        environment.set("MY_SSH_PASSPHRASE", "super-secret");
++
++        SshKey sshKey = resolver.resolve("MY_SSH", SshKey.class);
++
++        assertNotNull(sshKey);
++        assertEquals("dummy-key-data", sshKey.getPrivateKey());
++        assertEquals("custom-user", sshKey.getUsername());
++        assertEquals("super-secret", sshKey.getPassphrase());
++    }
++
++    @Test
++    public void testSshKeyResolutionWithDefaultUsername() {
++        environment.set("DEFAULT_SSH_PRIVATE_KEY", "dummy-key-data-2");
++
++        SshKey sshKey = resolver.resolve("DEFAULT_SSH", SshKey.class);
++
++        assertNotNull(sshKey);
++        assertEquals("dummy-key-data-2", sshKey.getPrivateKey());
++
++        assertEquals("git", sshKey.getUsername());
++
++        assertNull(sshKey.getPassphrase());
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/ConfigFetcherIntegrationTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/ConfigFetcherIntegrationTest.java
+new file mode 100644
+index 00000000..49b60ae6
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/ConfigFetcherIntegrationTest.java
+@@ -0,0 +1,65 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import io.jenkins.plugins.casc.ConfigurationAsCode;
++import java.io.ByteArrayInputStream;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.Collections;
++import java.util.List;
++import org.junit.Rule;
++import org.junit.Test;
++import org.jvnet.hudson.test.JenkinsRule;
++import org.jvnet.hudson.test.TestExtension;
++
++public class ConfigFetcherIntegrationTest {
++
++    @Rule
++    public JenkinsRule j = new JenkinsRule();
++
++    @Test
++    public void testCustomFetcherEndToEndLifecycle() {
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        casc.configure("mock-fetcher://production/jenkins.yaml");
++
++        List<String> activeSources = casc.getSources();
++        assertEquals(1, activeSources.size());
++        assertEquals("mock-fetcher://production/jenkins.yaml", activeSources.get(0));
++        assertTrue("The AutoCloseable lifecycle must invoke close() on our FetchResult", MockConfigFetcher.wasClosed);
++    }
++
++    @TestExtension
++    public static class MockConfigFetcher implements CasCConfigFetcher {
++
++        public static boolean wasClosed = false;
++
++        @Override
++        public boolean supports(String location) {
++            return location != null && location.startsWith("mock-fetcher://");
++        }
++
++        @Override
++        public FetchResult fetch(String location, FetchCredentials credentials) {
++            wasClosed = false;
++
++            String dummyYaml = """
++                jenkins:
++                  systemMessage: "Configured seamlessly via physical Integration Tests!"
++                """;
++
++            InputStream contentStream = new ByteArrayInputStream(dummyYaml.getBytes(StandardCharsets.UTF_8));
++
++            ResolvedYaml resolvedItem = new ResolvedYaml("jenkins.yaml", () -> contentStream);
++
++            AutoCloseable resourceTracker = () -> {
++                contentStream.close();
++                wasClosed = true;
++            };
++
++            return new FetchResult(Collections.singletonList(resolvedItem), resourceTracker);
++        }
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/DefaultHttpFetcherTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/DefaultHttpFetcherTest.java
+new file mode 100644
+index 00000000..f886120f
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/DefaultHttpFetcherTest.java
+@@ -0,0 +1,116 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
++import static com.github.tomakehurst.wiremock.client.WireMock.get;
++import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
++import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
++import static java.lang.Thread.currentThread;
++import static java.lang.Thread.interrupted;
++import static java.nio.charset.StandardCharsets.UTF_8;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertThrows;
++import static org.junit.Assert.assertTrue;
++
++import com.github.tomakehurst.wiremock.junit.WireMockRule;
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.util.stream.Collectors;
++import org.junit.Rule;
++import org.junit.Test;
++
++public class DefaultHttpFetcherTest {
++
++    @Rule
++    public WireMockRule wireMockRule = new WireMockRule(0);
++
++    private final DefaultHttpFetcher fetcher = new DefaultHttpFetcher();
++
++    @Test
++    public void testSupportsLogic() {
++        assertTrue(fetcher.supports("http://example.com/casc.yaml"));
++        assertTrue(fetcher.supports("https://github.com/org/repo/jenkins.yml"));
++        assertFalse(fetcher.supports("file:///local/path"));
++        assertFalse(fetcher.supports(null));
++    }
++
++    @Test(expected = IOException.class)
++    public void testFetchThrowsOnInvalidUrl() throws Exception {
++        fetcher.fetch("http://example.com/invalid path with spaces", null);
++    }
++
++    @Test
++    public void testActualHttpFetchIntegration() throws Exception {
++        stubFor(get(urlEqualTo("/casc.yaml"))
++                .willReturn(aResponse().withStatus(200).withBody("jenkins:\n  systemMessage: 'Hello HTTP'")));
++
++        String targetUrl = wireMockRule.baseUrl() + "/casc.yaml";
++        FetchResult result = fetcher.fetch(targetUrl, null);
++
++        assertEquals(1, result.items().size());
++        ResolvedYaml yaml = result.items().get(0);
++
++        assertEquals("casc.yaml", yaml.relativePath());
++
++        String content = new BufferedReader(new InputStreamReader(yaml.open(), UTF_8))
++                .lines()
++                .collect(Collectors.joining("\n"));
++
++        assertEquals("jenkins:\n  systemMessage: 'Hello HTTP'", content);
++    }
++
++    @Test
++    public void testFetchWithEmptyFileNameUsesDefault() throws Exception {
++        stubFor(get(urlEqualTo("/"))
++                .willReturn(aResponse().withStatus(200).withBody("jenkins:\n  systemMessage: 'Fallback'")));
++
++        String targetUrl = wireMockRule.baseUrl() + "/";
++        FetchResult result = fetcher.fetch(targetUrl, null);
++
++        assertEquals(1, result.items().size());
++        ResolvedYaml yaml = result.items().get(0);
++
++        assertEquals("casc.yaml", yaml.relativePath());
++    }
++
++    @Test
++    public void testFetchThrowsOnHttpError() {
++        stubFor(get(urlEqualTo("/404")).willReturn(aResponse().withStatus(404)));
++
++        String targetUrl = wireMockRule.baseUrl() + "/404";
++
++        IOException e = assertThrows(
++                "Expected fetcher to throw IOException due to HTTP 404 status",
++                IOException.class,
++                () -> fetcher.fetch(targetUrl, null));
++
++        assertTrue("Message should contain the HTTP status code", e.getMessage().contains("HTTP status code: 404"));
++    }
++
++    @Test
++    public void testFetchThrowsOnInterruption() {
++        stubFor(get(urlEqualTo("/slow")).willReturn(aResponse().withStatus(200).withFixedDelay(1000)));
++
++        String targetUrl = wireMockRule.baseUrl() + "/slow";
++
++        currentThread().interrupt();
++
++        try {
++            IOException e = assertThrows(
++                    "Expected fetcher to throw IOException due to thread interruption",
++                    IOException.class,
++                    () -> fetcher.fetch(targetUrl, null));
++
++            assertTrue(
++                    "Message should indicate the thread was interrupted",
++                    e.getMessage().contains("Interrupted while fetching"));
++
++            assertTrue(
++                    "Thread interrupt flag should be restored", currentThread().isInterrupted());
++        } finally {
++            @SuppressWarnings("unused")
++            boolean cleared = interrupted();
++        }
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/EnvVarFetchCredentialsProviderTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/EnvVarFetchCredentialsProviderTest.java
+new file mode 100644
+index 00000000..a56cc8b2
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/EnvVarFetchCredentialsProviderTest.java
+@@ -0,0 +1,27 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assume.assumeTrue;
++
++import io.jenkins.plugins.casc.fetcher.FetchAuthData.Token;
++import org.junit.Test;
++
++public class EnvVarFetchCredentialsProviderTest {
++
++    @Test
++    public void testGetCredentialsDelegatesToBootstrapResolver() {
++        EnvVarFetchCredentialsProvider provider = new EnvVarFetchCredentialsProvider();
++
++        assertNull(provider.getCredentials("NON_EXISTENT_ID", Token.class));
++
++        String expectedToken = System.getenv("PATH");
++        assumeTrue(expectedToken != null && !expectedToken.isEmpty());
++
++        Token tokenAuth = provider.getCredentials("PATH", Token.class);
++
++        assertNotNull(tokenAuth);
++        assertEquals(expectedToken, tokenAuth.getToken());
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchContextTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchContextTest.java
+new file mode 100644
+index 00000000..a0bbba1f
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchContextTest.java
+@@ -0,0 +1,74 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertTrue;
++
++import java.io.ByteArrayInputStream;
++import java.util.Arrays;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.junit.Test;
++
++public class FetchContextTest {
++
++    @Test
++    public void testDeterministicSorting() {
++        ResolvedYaml yamlB = new ResolvedYaml("z-last.yaml", () -> new ByteArrayInputStream(new byte[0]));
++        ResolvedYaml yamlA = new ResolvedYaml("a-first.yaml", () -> new ByteArrayInputStream(new byte[0]));
++
++        FetchResult result = new FetchResult(Arrays.asList(yamlB, yamlA), (AutoCloseable) null);
++
++        try (FetchContext context = new FetchContext()) {
++            context.add(result);
++
++            String firstSource = context.getSources().get(0).toString();
++            String secondSource = context.getSources().get(1).toString();
++
++            assertTrue("a-first.yaml should be sorted first", firstSource.contains("a-first.yaml"));
++            assertTrue("z-last.yaml should be sorted last", secondSource.contains("z-last.yaml"));
++        }
++    }
++
++    @Test
++    public void testContextClosesAllResults() {
++        AtomicBoolean result1Closed = new AtomicBoolean(false);
++        AtomicBoolean result2Closed = new AtomicBoolean(false);
++
++        FetchResult result1 = new FetchResult(null, () -> result1Closed.set(true));
++        FetchResult result2 = new FetchResult(null, () -> result2Closed.set(true));
++
++        FetchContext context = new FetchContext();
++        context.add(result1);
++        context.add(result2);
++        context.close();
++
++        assertTrue("FetchContext must close the first FetchResult", result1Closed.get());
++        assertTrue("FetchContext must close the second FetchResult", result2Closed.get());
++    }
++
++    @Test
++    public void testAddNullResultIsIgnored() {
++        try (FetchContext context = new FetchContext()) {
++            context.add(null);
++            assertTrue(
++                    "Sources should remain empty when a null result is added",
++                    context.getSources().isEmpty());
++        }
++    }
++
++    @Test
++    public void testCloseHandlesIOExceptionAndContinues() {
++        AtomicBoolean secondResultClosed = new AtomicBoolean(false);
++
++        FetchResult failingResult = new FetchResult(null, () -> {
++            throw new java.io.IOException("Simulated cleanup failure");
++        });
++
++        FetchResult succeedingResult = new FetchResult(null, () -> secondResultClosed.set(true));
++
++        FetchContext context = new FetchContext();
++        context.add(failingResult);
++        context.add(succeedingResult);
++        context.close();
++
++        assertTrue("FetchContext must continue closing remaining results after an exception", secondResultClosed.get());
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsChainTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsChainTest.java
+new file mode 100644
+index 00000000..f75c2c29
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsChainTest.java
+@@ -0,0 +1,64 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++
++import io.jenkins.plugins.casc.fetcher.FetchAuthData.Token;
++import java.util.logging.Level;
++import org.junit.Rule;
++import org.junit.Test;
++import org.jvnet.hudson.test.JenkinsRule;
++import org.jvnet.hudson.test.LoggerRule;
++import org.jvnet.hudson.test.TestExtension;
++
++public class FetchCredentialsChainTest {
++
++    @Rule
++    public JenkinsRule j = new JenkinsRule();
++
++    @Rule
++    public LoggerRule logging = new LoggerRule().record(FetchCredentials.class, Level.FINE);
++
++    @Test
++    public void testProviderSuccessfullyResolvesCredential() {
++        FetchCredentials credentials = FetchCredentials.resolveAll();
++        Token tokenAuth = credentials.get("dummy-id", Token.class);
++
++        assertNotNull(tokenAuth);
++        assertEquals("dummy-token-value", tokenAuth.getToken());
++    }
++
++    @Test
++    public void testProviderExceptionIsIgnoredAndFallsBack() {
++        FetchCredentials credentials = FetchCredentials.resolveAll();
++        Token tokenAuth = credentials.get("error-id", Token.class);
++
++        assertNull(tokenAuth);
++    }
++
++    @TestExtension
++    @SuppressWarnings("unused")
++    public static class DummyProvider implements FetchCredentialsProvider {
++        @SuppressWarnings("unchecked")
++        @Override
++        public <T extends FetchAuthData> T getCredentials(String credentialId, Class<T> type) {
++            if ("dummy-id".equals(credentialId) && type == Token.class) {
++                return (T) (Token) () -> "dummy-token-value";
++            }
++            return null;
++        }
++    }
++
++    @TestExtension
++    @SuppressWarnings("unused")
++    public static class ExceptionThrowingProvider implements FetchCredentialsProvider {
++        @Override
++        public <T extends FetchAuthData> T getCredentials(String credentialId, Class<T> type) {
++            if ("error-id".equals(credentialId)) {
++                throw new RuntimeException("Simulated provider failure");
++            }
++            return null;
++        }
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsEarlyBootTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsEarlyBootTest.java
+new file mode 100644
+index 00000000..6a24b48c
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchCredentialsEarlyBootTest.java
+@@ -0,0 +1,17 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertNull;
++
++import io.jenkins.plugins.casc.fetcher.FetchAuthData.Token;
++import org.junit.Test;
++
++public class FetchCredentialsEarlyBootTest {
++
++    @Test
++    public void testJenkinsNullFallsBackToEnvResolver() {
++        FetchCredentials credentials = FetchCredentials.resolveAll();
++        Token tokenAuth = credentials.get("some-id", Token.class);
++
++        assertNull(tokenAuth);
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchResultTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchResultTest.java
+new file mode 100644
+index 00000000..204ea310
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/FetchResultTest.java
+@@ -0,0 +1,69 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static java.util.Collections.emptyList;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.junit.Test;
++
++public class FetchResultTest {
++
++    @Test
++    public void testAutoCloseableLifecycle() throws Exception {
++        AtomicBoolean wasClosed = new AtomicBoolean(false);
++        AutoCloseable mockResource = () -> wasClosed.set(true);
++
++        FetchResult result = new FetchResult(emptyList(), mockResource);
++
++        result.close();
++
++        assertTrue("FetchResult must trigger close() on wrapped AutoCloseables", wasClosed.get());
++    }
++
++    @Test
++    public void testTempDirectoryCleanup() throws Exception {
++        Path tempDir = Files.createTempDirectory("casc-test-cleanup-");
++        Path nestedFile = tempDir.resolve("jenkins.yaml");
++        Files.write(nestedFile, "jenkins:".getBytes());
++
++        assertTrue(Files.exists(nestedFile));
++
++        FetchResult result = new FetchResult(emptyList(), tempDir);
++
++        result.close();
++
++        assertFalse("Nested files must be deleted", Files.exists(nestedFile));
++        assertFalse("The temporary directory itself must be deleted", Files.exists(tempDir));
++    }
++
++    @Test(expected = IOException.class)
++    public void testCloseWrapsAndPropagatesExceptions() throws Exception {
++        AutoCloseable faultyResource = () -> {
++            throw new Exception("Simulated cleanup failure");
++        };
++
++        FetchResult result = new FetchResult(emptyList(), faultyResource);
++
++        result.close();
++    }
++
++    @Test
++    public void testCloseIgnoresNullConstructorArguments() throws Exception {
++        FetchResult nullResourceResult = new FetchResult(emptyList(), (AutoCloseable) null);
++        nullResourceResult.close();
++        FetchResult nullPathResult = new FetchResult(emptyList(), (Path) null);
++        nullPathResult.close();
++    }
++
++    @Test
++    public void testCloseSkipsNonExistentDirectory() throws Exception {
++        Path tempDir = Files.createTempDirectory("casc-missing-");
++        FetchResult result = new FetchResult(emptyList(), tempDir);
++        Files.delete(tempDir);
++        result.close();
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcherTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcherTest.java
+new file mode 100644
+index 00000000..3cc06a69
+--- /dev/null
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcherTest.java
+@@ -0,0 +1,111 @@
++package io.jenkins.plugins.casc.fetcher;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.util.List;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++public class LocalFileSystemFetcherTest {
++
++    @Rule
++    public TemporaryFolder tempFolder = new TemporaryFolder();
++
++    private final LocalFileSystemFetcher fetcher = new LocalFileSystemFetcher();
++
++    @Test
++    public void testSupportsLogic() throws IOException {
++        File tempFile = tempFolder.newFile("test.yaml");
++
++        assertTrue("Should support valid file:// URI", fetcher.supports("file:///some/path"));
++        assertTrue("Should support valid local paths", fetcher.supports(tempFile.getAbsolutePath()));
++        assertFalse("Should reject null locations", fetcher.supports(null));
++        assertFalse("Should reject non-existent paths", fetcher.supports("/does/not/exist/ever.yaml"));
++    }
++
++    @Test
++    public void testFetchSingleFile() throws Exception {
++        File file = tempFolder.newFile("single.yaml");
++        Files.write(file.toPath(), "jenkins:".getBytes());
++
++        FetchResult result = fetcher.fetch(file.getAbsolutePath(), null);
++        List<ResolvedYaml> items = result.items();
++
++        assertEquals(1, items.size());
++        assertEquals("single.yaml", items.get(0).relativePath());
++    }
++
++    @Test
++    public void testFetchDirectoryIgnoresNonYaml() throws Exception {
++
++        File dir = tempFolder.newFolder("casc-configs");
++        File valid1 = new File(dir, "a.yaml");
++        File valid2 = new File(dir, "b.yml");
++        File previouslyHidden = new File(dir, ".secrets.yaml");
++        File txtFile = new File(dir, "readme.txt");
++
++        Files.write(valid1.toPath(), "jenkins:".getBytes());
++        Files.write(valid2.toPath(), "unclassified:".getBytes());
++        Files.write(previouslyHidden.toPath(), "secret: 123".getBytes());
++        Files.write(txtFile.toPath(), "hello".getBytes());
++
++        FetchResult result = fetcher.fetch(dir.getAbsolutePath(), null);
++        List<ResolvedYaml> items = result.items();
++
++        assertEquals("Should find a.yaml, b.yml, and .secrets.yaml", 3, items.size());
++
++        boolean hasA = items.stream().anyMatch(i -> i.relativePath().equals("a.yaml"));
++        boolean hasB = items.stream().anyMatch(i -> i.relativePath().equals("b.yml"));
++        boolean hasSecrets = items.stream().anyMatch(i -> i.relativePath().equals(".secrets.yaml"));
++
++        assertTrue(hasA);
++        assertTrue(hasB);
++        assertTrue(hasSecrets);
++    }
++
++    @Test
++    public void testNestedDirectoryTraversal() throws Exception {
++        File rootDir = tempFolder.newFolder("configs");
++        File prodDir = new File(rootDir, "prod");
++        assertTrue("Failed to create nested directory", prodDir.mkdir());
++
++        File jenkinsYaml = new File(prodDir, "jenkins.yaml");
++        Files.write(jenkinsYaml.toPath(), "jenkins:\n  mode: EXCLUSIVE".getBytes());
++
++        FetchResult result = fetcher.fetch(rootDir.getAbsolutePath(), null);
++        List<ResolvedYaml> items = result.items();
++
++        assertEquals(1, items.size());
++        assertEquals("prod/jenkins.yaml", items.get(0).relativePath());
++    }
++
++    @Test
++    public void testResolvedYamlToString() {
++        ResolvedYaml yaml = new ResolvedYaml("my/test/config.yaml", () -> null);
++
++        assertEquals("ResolvedYaml{relativePath='my/test/config.yaml'}", yaml.toString());
++    }
++
++    @Test
++    public void testSupportsThrowsExceptionOnInvalidCharacters() {
++        assertFalse(
++                "Should safely catch exception and return false for strictly invalid path strings",
++                fetcher.supports("invalid\u0000path"));
++    }
++
++    @Test(expected = IOException.class)
++    public void testFetchThrowsOnInvalidFileUri() throws Exception {
++        fetcher.fetch("file:///invalid path with spaces.yaml", null);
++    }
++
++    @Test(expected = IOException.class)
++    public void testFetchThrowsOnNonExistentPath() throws Exception {
++        fetcher.fetch("/this/path/absolutely/does/not/exist/casc.yaml", null);
++    }
++}
+diff --git a/plugin/src/test/java/io/jenkins/plugins/casc/yaml/YamlSourceTest.java b/plugin/src/test/java/io/jenkins/plugins/casc/yaml/YamlSourceTest.java
+index b03c7420..22e7a140 100644
+--- a/plugin/src/test/java/io/jenkins/plugins/casc/yaml/YamlSourceTest.java
++++ b/plugin/src/test/java/io/jenkins/plugins/casc/yaml/YamlSourceTest.java
+@@ -48,4 +48,18 @@ class YamlSourceTest {
+         YamlSource<HttpServletRequest> yamlSource = YamlSource.of(request);
+         assertEquals("YamlSource: /configuration-as-code/check", yamlSource.toString());
+     }
++
++    @Test
++    void shouldHandleInputStreamWithName() {
++        InputStream testInputStream = new ByteArrayInputStream("IS content".getBytes(StandardCharsets.UTF_8));
++        YamlSource<InputStream> yamlSource = YamlSource.of(testInputStream, "my-custom-stream");
++        assertEquals("YamlSource: my-custom-stream", yamlSource.toString());
++    }
++
++    @Test
++    void shouldHandlePathWithName() {
++        Path path = new File("./test").toPath();
++        YamlSource<Path> yamlSource = YamlSource.of(path, "my-custom-path");
++        assertEquals("YamlSource: my-custom-path", yamlSource.toString());
++    }
+ }
+diff --git a/test-harness/src/test/java/io/jenkins/plugins/casc/ConfigurationAsCodeTest.java b/test-harness/src/test/java/io/jenkins/plugins/casc/ConfigurationAsCodeTest.java
+index 90364a27..8f89a9c6 100644
+--- a/test-harness/src/test/java/io/jenkins/plugins/casc/ConfigurationAsCodeTest.java
++++ b/test-harness/src/test/java/io/jenkins/plugins/casc/ConfigurationAsCodeTest.java
+@@ -11,6 +11,8 @@ import static org.hamcrest.Matchers.hasSize;
+ import static org.hamcrest.Matchers.is;
+ import static org.htmlunit.HttpMethod.POST;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+@@ -18,6 +20,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
+ 
+ import hudson.Functions;
+ import hudson.util.FormValidation;
++import io.jenkins.plugins.casc.fetcher.CasCConfigFetcher;
++import io.jenkins.plugins.casc.fetcher.FetchCredentials;
++import io.jenkins.plugins.casc.fetcher.FetchResult;
+ import io.jenkins.plugins.casc.misc.ConfiguredWithCode;
+ import io.jenkins.plugins.casc.misc.JenkinsConfiguredWithCodeRule;
+ import io.jenkins.plugins.casc.misc.junit.jupiter.WithJenkinsConfiguredWithCode;
+@@ -27,6 +32,8 @@ import io.jenkins.plugins.casc.yaml.YamlSource;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+@@ -45,6 +52,7 @@ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.io.TempDir;
+ import org.jvnet.hudson.test.Issue;
+ import org.jvnet.hudson.test.JenkinsRule.WebClient;
++import org.jvnet.hudson.test.TestExtension;
+ 
+ @WithJenkinsConfiguredWithCode
+ class ConfigurationAsCodeTest {
+@@ -146,7 +154,7 @@ class ConfigurationAsCodeTest {
+     }
+ 
+     @Test
+-    void shouldReportMissingFileOnNotFoundConfig() {
++    void shouldReportMissingFileOnNotFoundConfig(JenkinsConfiguredWithCodeRule j) {
+         ConfigurationAsCode casc = new ConfigurationAsCode();
+         assertThrows(ConfiguratorException.class, () -> casc.configure("some"));
+     }
+@@ -291,7 +299,7 @@ class ConfigurationAsCodeTest {
+ 
+     @Test
+     @Issue("Issue #914")
+-    void isSupportedURI_should_not_throw_on_invalid_uri() {
++    void isSupportedURI_should_not_throw_on_invalid_uri(JenkinsConfiguredWithCodeRule j) {
+         // for example, a Windows path is not a valid URI
+         assertThat(ConfigurationAsCode.isSupportedURI("C:\\jenkins\\casc"), is(false));
+     }
+@@ -340,6 +348,119 @@ class ConfigurationAsCodeTest {
+         assertEquals(expectedDocString, actualDocString);
+     }
+ 
++    @Test
++    void doCheckNewSource_should_catch_exceptions_on_invalid_yaml(JenkinsConfiguredWithCodeRule j) throws Exception {
++        File brokenYaml = newFile(tempFolder, "broken.yaml");
++        Files.write(brokenYaml.toPath(), "jenkins: \n\t- tabs: are: forbidden: in: yaml".getBytes());
++
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        FormValidation validation = casc.doCheckNewSource(brokenYaml.getAbsolutePath());
++
++        assertEquals(FormValidation.Kind.ERROR, validation.kind);
++    }
++
++    @Test
++    void doCheckNewSource_should_return_error_for_invalid_config(JenkinsConfiguredWithCodeRule j) throws Exception {
++        File invalidConfig = newFile(tempFolder, "invalid.yaml");
++        Files.write(invalidConfig.toPath(), "jenkins:\n  definitelyNotARealProperty: true".getBytes());
++
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        FormValidation validation = casc.doCheckNewSource(invalidConfig.getAbsolutePath());
++
++        assertEquals(FormValidation.Kind.ERROR, validation.kind);
++        assertTrue(
++                validation.getMessage().contains("definitelyNotARealProperty"),
++                "Error message should mention the invalid property");
++    }
++
++    @Test
++    void configure_should_wrap_ioexception_from_fetcher(JenkinsConfiguredWithCodeRule j) {
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        ConfiguratorException ex = assertThrows(
++                ConfiguratorException.class,
++                () -> casc.configure("file:/this/path/definitely/does/not/exist_casc.yaml"));
++
++        assertTrue(
++                ex.getMessage().contains("Failed to fetch configuration from"),
++                "Exception message should come from the IOException catch block");
++    }
++
++    @Test
++    void configure_should_throw_when_source_is_not_supported(JenkinsConfiguredWithCodeRule j) {
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        ConfiguratorException ex =
++                assertThrows(ConfiguratorException.class, () -> casc.configure("unsupported://protocol-scheme-test"));
++
++        assertTrue(
++                ex.getMessage().contains("is not supported by any registered configuration fetcher"),
++                "Exception message should indicate unsupported source protocol");
++    }
++
++    @Test
++    void isSupportedURI_should_cover_all_branches(JenkinsConfiguredWithCodeRule j) {
++        assertFalse(ConfigurationAsCode.isSupportedURI(null), "Should return false for null input");
++
++        assertTrue(
++                ConfigurationAsCode.isSupportedURI("throw-io://test"),
++                "Should return true when our test fetcher claims support");
++
++        assertFalse(
++                ConfigurationAsCode.isSupportedURI("unsupported-scheme://test"),
++                "Should return false when no fetchers support the scheme");
++    }
++
++    @Test
++    void getConfigFromSources_should_throw_on_ioexception(JenkinsConfiguredWithCodeRule j) throws Exception {
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        Method method = ConfigurationAsCode.class.getDeclaredMethod("getConfigFromSources", List.class);
++        method.setAccessible(true);
++
++        InvocationTargetException ex =
++                assertThrows(InvocationTargetException.class, () -> method.invoke(casc, List.of("throw-io://test")));
++
++        assertInstanceOf(ConfiguratorException.class, ex.getCause(), "Cause should be ConfiguratorException");
++        assertTrue(
++                ex.getCause().getMessage().contains("Failed to fetch configuration from"),
++                "Should cover the catch (IOException e) block");
++    }
++
++    @Test
++    void getConfigFromSources_should_throw_on_unsupported_source(JenkinsConfiguredWithCodeRule j) throws Exception {
++        ConfigurationAsCode casc = ConfigurationAsCode.get();
++
++        Method method = ConfigurationAsCode.class.getDeclaredMethod("getConfigFromSources", List.class);
++        method.setAccessible(true);
++
++        InvocationTargetException ex = assertThrows(
++                InvocationTargetException.class,
++                () -> method.invoke(casc, List.of("definitely-unsupported-scheme://test")));
++
++        assertInstanceOf(ConfiguratorException.class, ex.getCause(), "Cause should be ConfiguratorException");
++        assertTrue(
++                ex.getCause().getMessage().contains("is not supported by any registered configuration fetcher"),
++                "Should cover the if (!fetched) block");
++    }
++
++    @TestExtension
++    @SuppressWarnings("unused")
++    public static class ThrowOnFetchFetcher implements CasCConfigFetcher {
++
++        @Override
++        public boolean supports(String location) {
++            return "throw-io://test".equals(location);
++        }
++
++        @Override
++        public FetchResult fetch(String location, FetchCredentials credentials) throws IOException {
++            throw new IOException("Simulated fetch failure");
++        }
++    }
++
+     private static File newFolder(File root, String... subDirs) throws IOException {
+         String subFolder = String.join("/", subDirs);
+         File result = new File(root, subFolder);

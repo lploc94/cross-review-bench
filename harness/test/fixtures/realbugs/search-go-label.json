@@ -1,0 +1,24 @@
+{
+  "total_count": 2,
+  "incomplete_results": false,
+  "items": [
+    {
+      "number": 412,
+      "title": "fix: retry counter resets after a lease expires",
+      "html_url": "https://github.com/acme/tinyq/pull/412",
+      "repository_url": "https://api.github.com/repos/acme/tinyq",
+      "user": { "login": "dev-a", "type": "User" },
+      "labels": [{ "name": "bug" }],
+      "pull_request": { "merged_at": "2026-08-14T09:12:00Z" }
+    },
+    {
+      "number": 430,
+      "title": "Handle empty batches in the scheduler",
+      "html_url": "https://github.com/acme/tinyq/pull/430",
+      "repository_url": "https://api.github.com/repos/acme/tinyq",
+      "user": { "login": "dev-e", "type": "User" },
+      "labels": [{ "name": "kind/bug" }],
+      "pull_request": { "merged_at": "2026-06-30T23:59:59Z" }
+    }
+  ]
+}

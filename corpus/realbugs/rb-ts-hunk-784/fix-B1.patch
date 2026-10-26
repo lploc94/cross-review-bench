@@ -1,0 +1,53 @@
+diff --git a/src/main.tsx b/src/main.tsx
+index 069d08d..f643574 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -6,7 +6,6 @@ import { prepareStartupPlan } from "./app/startup";
+ import { sanitizeTerminalText } from "./lib/terminalText";
+ import { serveSessionBrokerDaemon } from "./session/broker/brokerServer";
+ import { runSessionCommand } from "./session/agent/commands";
+-import { disposeHighlightWorker } from "./ui/diff/worker";
+ 
+ async function main() {
+   const startupPlan = await prepareStartupPlan();
+@@ -102,13 +101,10 @@ async function main() {
+ 
+   // OpenTUI stays behind the interactive plan so headless commands never materialize its embedded
+   // native library. The highlighting client starts the compiled worker only when an opted-in,
+-  // eligible large diff needs it, so normal sessions do not pay its startup cost.
+-  try {
+-    const { runInteractiveApp } = await import("./ui/runInteractiveApp");
+-    await runInteractiveApp(startupPlan);
+-  } finally {
+-    disposeHighlightWorker();
+-  }
++  // eligible large diff needs it, so normal sessions do not pay its startup cost. The interactive
++  // app owns that worker's disposal: this call returns once the app is mounted, not once it exits.
++  const { runInteractiveApp } = await import("./ui/runInteractiveApp");
++  await runInteractiveApp(startupPlan);
+ }
+ 
+ await main().catch((error) => {
+diff --git a/src/ui/runInteractiveApp.tsx b/src/ui/runInteractiveApp.tsx
+index 7ac64d9..b6d3c19 100644
+--- a/src/ui/runInteractiveApp.tsx
++++ b/src/ui/runInteractiveApp.tsx
+@@ -23,6 +23,7 @@ import type {
+ } from "../session/types";
+ import { SessionBrokerClient } from "../session/broker/brokerClient";
+ import { AppHost } from "./AppHost";
++import { disposeHighlightWorker } from "./diff/worker";
+ 
+ export interface InteractiveAppInput {
+   bootstrap: AppBootstrap;
+@@ -92,6 +93,10 @@ export async function runInteractiveApp({
+     jobControlInterruptSupport.dispose();
+     jobControlSuspendSupport.dispose();
+     hostClient.stop();
++    // Release the syntax worker here rather than from the executable entrypoint: this function
++    // returns once the app is mounted, so an entrypoint-side dispose would fire before the first
++    // eligible diff ever asked for the worker.
++    disposeHighlightWorker();
+     shutdownSession({ root, renderer: appRenderer });
+   }
+ 

@@ -1,0 +1,743 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..5de3dda 100644
+--- a/README.md
++++ b/README.md
+@@ -9,7 +9,7 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+ 
+ - **Properties and room types.** A property has an IANA time zone, check-in and check-out times, an
+   ISO 4217 currency (at most two minor units, since money is stored to cents) and a policy (full
+-  refund days, partial refund percent, weekend surcharge, length-of-stay rule). A room type has a
++  refund days, partial refund percent, weekend surcharge, length-of-stay rule, deposit percent). A room type has a
+   capacity, a base nightly rate and an extra-guest fee.
+ - **Inventory.** One row per room type and night (local date of the property) with `total`, `held`
+   and `booked`. Availability is `total - held - booked`. Inventory writes take
+@@ -30,6 +30,13 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+   Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+   is rounded with HALF_EVEN to the currency's minor units.
++- **Deposits.** A property's `depositPercent` (1–100, default 100) is the share of the price
++  charged when a hold is confirmed, rounded HALF_EVEN to the currency's minor units; at 100 the
++  whole price is charged as before. Checking the guest in charges the balance (the price less what
++  has been paid). A declined balance answers 402 `balance-declined` and the reservation stays
++  `CONFIRMED`. The ledger records `CHARGE` (whole price), `DEPOSIT`, `BALANCE` and `REFUND`
++  entries; revenue counts the first three as charged. A cancellation refunds what the policy
++  allows, never more than what was paid.
+ - **Reservations.** Status moves `CONFIRMED` to `CHECKED_IN` (on or after the check-in date, before
+   check-out) to `COMPLETED`, or to `CANCELLED`. A cancellation made at or before the full-refund
+   deadline is refunded in full; later ones follow the property policy. Cancelling twice is a
+@@ -129,8 +136,8 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `GET /api/v1/reservations/{reference}/cancellation-quote` | public | refund a cancellation would get |
+ | `POST /api/v1/reservations/{reference}/cancel` | public | cancel and refund |
+ | `GET /api/v1/admin/reservations` | admin | paged list with filters (property, status, dates, guest email, guest name) |
+-| `POST /api/v1/admin/reservations/{reference}/check-in` | admin | check a guest in |
+-| `GET /api/v1/admin/reservations/{reference}/ledger` | admin | charges and refunds |
++| `POST /api/v1/admin/reservations/{reference}/check-in` | admin | check a guest in and charge the balance (402 when declined) |
++| `GET /api/v1/admin/reservations/{reference}/ledger` | admin | charges, deposits, balances and refunds |
+ | `GET /api/v1/admin/reservations/summary` | admin | reservations per status |
+ | `GET /api/v1/admin/properties/{code}/arrivals`, `.../departures`, `.../in-house` | admin | a day's guests (`date`) |
+ | `GET /api/v1/admin/properties/{code}/revenue` | admin | charged, refunded and net money for a period |
+diff --git a/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java b/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
+index 47c5d34..45ebbf2 100644
+--- a/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
++++ b/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
+@@ -1,5 +1,6 @@
+ package com.innkeep.booking.api;
+ 
++import com.innkeep.booking.domain.BalanceDeclinedException;
+ import com.innkeep.booking.domain.ConflictException;
+ import com.innkeep.booking.domain.HoldExpiredException;
+ import com.innkeep.booking.domain.InsufficientAvailabilityException;
+@@ -138,6 +139,16 @@ public class ApiExceptionHandler {
+         "the payment was not processed");
+   }
+ 
++  @ExceptionHandler(BalanceDeclinedException.class)
++  public ProblemDetail balanceDeclined(BalanceDeclinedException e) {
++    log.warn("balance charge failed: {}", e.getClass().getName());
++    return problem(
++        HttpStatus.PAYMENT_REQUIRED,
++        "balance-declined",
++        "Balance declined",
++        "the balance was not charged; the guest is not checked in");
++  }
++
+   @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+   public ProblemDetail concurrentUpdate(ObjectOptimisticLockingFailureException e) {
+     return problem(
+diff --git a/src/main/java/com/innkeep/booking/api/dto/CreatePropertyRequest.java b/src/main/java/com/innkeep/booking/api/dto/CreatePropertyRequest.java
+index d2062b2..d6dd188 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/CreatePropertyRequest.java
++++ b/src/main/java/com/innkeep/booking/api/dto/CreatePropertyRequest.java
+@@ -26,6 +26,7 @@ public record CreatePropertyRequest(
+         policy.partialRefundPercent(),
+         policy.weekendSurchargePercent(),
+         policy.losMinNights(),
+-        policy.losDiscountPercent());
++        policy.losDiscountPercent(),
++        policy.depositPercentOrDefault());
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/PolicyRequest.java b/src/main/java/com/innkeep/booking/api/dto/PolicyRequest.java
+index 879aa54..69c4291 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/PolicyRequest.java
++++ b/src/main/java/com/innkeep/booking/api/dto/PolicyRequest.java
+@@ -2,13 +2,21 @@ package com.innkeep.booking.api.dto;
+ 
+ import com.innkeep.booking.service.PolicyDraft;
+ 
+-/** Refund and pricing rules of a property; the catalog service checks the ranges. */
++/**
++ * Refund, pricing and payment rules of a property; the catalog service checks the ranges. Without a
++ * deposit percentage the whole price is charged at confirmation.
++ */
+ public record PolicyRequest(
+     int fullRefundDays,
+     int partialRefundPercent,
+     int weekendSurchargePercent,
+     int losMinNights,
+-    int losDiscountPercent) {
++    int losDiscountPercent,
++    Integer depositPercent) {
++
++  public int depositPercentOrDefault() {
++    return depositPercent == null ? 100 : depositPercent;
++  }
+ 
+   public PolicyDraft toDraft() {
+     return new PolicyDraft(
+@@ -16,6 +24,7 @@ public record PolicyRequest(
+         partialRefundPercent,
+         weekendSurchargePercent,
+         losMinNights,
+-        losDiscountPercent);
++        losDiscountPercent,
++        depositPercentOrDefault());
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/PropertyResponse.java b/src/main/java/com/innkeep/booking/api/dto/PropertyResponse.java
+index ff80b87..8332ca4 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/PropertyResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/PropertyResponse.java
+@@ -14,7 +14,8 @@ public record PropertyResponse(
+     int partialRefundPercent,
+     int weekendSurchargePercent,
+     int losMinNights,
+-    int losDiscountPercent) {
++    int losDiscountPercent,
++    int depositPercent) {
+ 
+   public static PropertyResponse from(Property property) {
+     return new PropertyResponse(
+@@ -28,6 +29,7 @@ public record PropertyResponse(
+         property.getPartialRefundPercent(),
+         property.getWeekendSurchargePercent(),
+         property.getLosMinNights(),
+-        property.getLosDiscountPercent());
++        property.getLosDiscountPercent(),
++        property.getDepositPercent());
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/domain/BalanceDeclinedException.java b/src/main/java/com/innkeep/booking/domain/BalanceDeclinedException.java
+new file mode 100644
+index 0000000..a49e50d
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/BalanceDeclinedException.java
+@@ -0,0 +1,10 @@
++package com.innkeep.booking.domain;
++
++/** The balance due at check-in could not be charged; the guest is not checked in. */
++public class BalanceDeclinedException extends BookingException {
++
++  public BalanceDeclinedException(String reference, Throwable cause) {
++    super("the balance of reservation " + reference + " could not be charged");
++    initCause(cause);
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/LedgerEntry.java b/src/main/java/com/innkeep/booking/domain/LedgerEntry.java
+index 38dead2..ab581ec 100644
+--- a/src/main/java/com/innkeep/booking/domain/LedgerEntry.java
++++ b/src/main/java/com/innkeep/booking/domain/LedgerEntry.java
+@@ -11,7 +11,10 @@ import jakarta.persistence.Table;
+ import java.math.BigDecimal;
+ import java.time.Instant;
+ 
+-/** One money movement against a reservation: the charge at confirmation, refunds on cancel. */
++/**
++ * One money movement against a reservation: the charge or deposit at confirmation, the balance at
++ * check-in, refunds on cancel.
++ */
+ @Entity
+ @Table(name = "ledger_entry")
+ public class LedgerEntry extends AbstractEntity<Long> {
+diff --git a/src/main/java/com/innkeep/booking/domain/LedgerKind.java b/src/main/java/com/innkeep/booking/domain/LedgerKind.java
+index 6605993..40dbbb0 100644
+--- a/src/main/java/com/innkeep/booking/domain/LedgerKind.java
++++ b/src/main/java/com/innkeep/booking/domain/LedgerKind.java
+@@ -2,5 +2,7 @@ package com.innkeep.booking.domain;
+ 
+ public enum LedgerKind {
+   CHARGE,
++  DEPOSIT,
++  BALANCE,
+   REFUND
+ }
+diff --git a/src/main/java/com/innkeep/booking/domain/Property.java b/src/main/java/com/innkeep/booking/domain/Property.java
+index 37f1035..75135cb 100644
+--- a/src/main/java/com/innkeep/booking/domain/Property.java
++++ b/src/main/java/com/innkeep/booking/domain/Property.java
+@@ -52,6 +52,9 @@ public class Property extends AbstractEntity<Long> {
+   @Column(name = "los_discount_percent", nullable = false)
+   private int losDiscountPercent;
+ 
++  @Column(name = "deposit_percent", nullable = false)
++  private int depositPercent;
++
+   protected Property() {}
+ 
+   public Property(
+@@ -65,7 +68,8 @@ public class Property extends AbstractEntity<Long> {
+       int partialRefundPercent,
+       int weekendSurchargePercent,
+       int losMinNights,
+-      int losDiscountPercent) {
++      int losDiscountPercent,
++      int depositPercent) {
+     this.code = code;
+     this.name = name;
+     this.timeZone = zone.getId();
+@@ -77,6 +81,7 @@ public class Property extends AbstractEntity<Long> {
+     this.weekendSurchargePercent = weekendSurchargePercent;
+     this.losMinNights = losMinNights;
+     this.losDiscountPercent = losDiscountPercent;
++    this.depositPercent = depositPercent;
+   }
+ 
+   @Override
+@@ -128,6 +133,11 @@ public class Property extends AbstractEntity<Long> {
+     return losDiscountPercent;
+   }
+ 
++  /** The share of the price charged at confirmation; the balance is charged at check-in. */
++  public int getDepositPercent() {
++    return depositPercent;
++  }
++
+   /**
+    * Replaces the refund and pricing rules. Cancellations and quotes made after the change use the
+    * new rules; a booked reservation keeps the price lines it was quoted with.
+@@ -137,12 +147,14 @@ public class Property extends AbstractEntity<Long> {
+       int partialRefundPercent,
+       int weekendSurchargePercent,
+       int losMinNights,
+-      int losDiscountPercent) {
++      int losDiscountPercent,
++      int depositPercent) {
+     this.fullRefundDays = fullRefundDays;
+     this.partialRefundPercent = partialRefundPercent;
+     this.weekendSurchargePercent = weekendSurchargePercent;
+     this.losMinNights = losMinNights;
+     this.losDiscountPercent = losDiscountPercent;
++    this.depositPercent = depositPercent;
+   }
+ 
+   /** Replaces the name, time zone and check-in and check-out times of the property. */
+diff --git a/src/main/java/com/innkeep/booking/persistence/LedgerEntryRepository.java b/src/main/java/com/innkeep/booking/persistence/LedgerEntryRepository.java
+index 8736f87..466f9c3 100644
+--- a/src/main/java/com/innkeep/booking/persistence/LedgerEntryRepository.java
++++ b/src/main/java/com/innkeep/booking/persistence/LedgerEntryRepository.java
+@@ -11,6 +11,15 @@ public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, Long>
+ 
+   List<LedgerEntry> findByReservationIdOrderByIdAsc(long reservationId);
+ 
++  /** Sums of the reservation's ledger amounts per kind. */
++  @Query(
++      """
++      select e.kind as kind, sum(e.amount) as total
++        from LedgerEntry e
++       where e.reservationId = :reservationId
++       group by e.kind""")
++  List<KindTotal> totalsForReservation(@Param("reservationId") long reservationId);
++
+   /** Sums of ledger amounts per kind for the property's reservations, created in [from, to). */
+   @Query(
+       """
+diff --git a/src/main/java/com/innkeep/booking/service/CatalogService.java b/src/main/java/com/innkeep/booking/service/CatalogService.java
+index 2ced722..9e8e54c 100644
+--- a/src/main/java/com/innkeep/booking/service/CatalogService.java
++++ b/src/main/java/com/innkeep/booking/service/CatalogService.java
+@@ -87,7 +87,8 @@ public class CatalogService {
+             draft.partialRefundPercent(),
+             draft.weekendSurchargePercent(),
+             draft.losMinNights(),
+-            draft.losDiscountPercent()));
++            draft.losDiscountPercent(),
++            draft.depositPercent()));
+     if (draft.checkInTime() == null || draft.checkOutTime() == null) {
+       throw new ValidationException("check-in and check-out times are required");
+     }
+@@ -106,7 +107,8 @@ public class CatalogService {
+             draft.partialRefundPercent(),
+             draft.weekendSurchargePercent(),
+             draft.losMinNights(),
+-            draft.losDiscountPercent()));
++            draft.losDiscountPercent(),
++            draft.depositPercent()));
+   }
+ 
+   /** Replaces the refund and pricing rules; cancellations and quotes made later use them. */
+@@ -120,7 +122,8 @@ public class CatalogService {
+               draft.partialRefundPercent(),
+               draft.weekendSurchargePercent(),
+               draft.losMinNights(),
+-              draft.losDiscountPercent());
++              draft.losDiscountPercent(),
++              draft.depositPercent());
+           return property;
+         });
+   }
+@@ -300,6 +303,7 @@ public class CatalogService {
+     requireBetween("weekend surcharge percent", draft.weekendSurchargePercent(), 0, 100);
+     requireBetween("length-of-stay minimum nights", draft.losMinNights(), 1, 365);
+     requireBetween("length-of-stay discount percent", draft.losDiscountPercent(), 0, 100);
++    requireBetween("deposit percent", draft.depositPercent(), 1, 100);
+   }
+ 
+   private static void requireCode(String code) {
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 5a246a1..50d6e2b 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -10,6 +10,7 @@ import com.innkeep.booking.domain.HoldStatus;
+ import com.innkeep.booking.domain.InsufficientAvailabilityException;
+ import com.innkeep.booking.domain.LedgerEntry;
+ import com.innkeep.booking.domain.LedgerKind;
++import com.innkeep.booking.domain.Money;
+ import com.innkeep.booking.domain.NotFoundException;
+ import com.innkeep.booking.domain.PricingEngine;
+ import com.innkeep.booking.domain.Quote;
+@@ -178,9 +179,10 @@ public class HoldService {
+   }
+ 
+   /**
+-   * Turns a usable hold into a confirmed reservation and charges the quoted total. The charge key
+-   * is derived from the hold, so a retried confirmation charges once. A stay quoted at zero moves
+-   * no money: it is confirmed without a charge or a ledger entry.
++   * Turns a usable hold into a confirmed reservation and charges the property's deposit share of
++   * the quoted total (all of it by default). The charge key is derived from the hold, so a retried
++   * confirmation charges once. A stay quoted at zero moves no money: it is confirmed without a
++   * charge or a ledger entry.
+    */
+   public Reservation confirm(UUID id) {
+     return retry.run(
+@@ -196,9 +198,10 @@ public class HoldService {
+                     // The stay has begun at the property: the hold is refused and left to expire.
+                     throw new HoldExpiredException(id.toString());
+                   }
+-                  boolean charged = hold.getTotal().isPositive();
++                  int depositPercent = hold.getProperty().getDepositPercent();
++                  Money deposit = hold.getTotal().percent(depositPercent);
+                   String gatewayReference =
+-                      charged ? payments.charge("charge-" + id, hold.getTotal()) : null;
++                      deposit.isPositive() ? payments.charge("charge-" + id, deposit) : null;
+                   hold.markConfirmed();
+                   holds.saveAndFlush(hold);
+                   for (LocalDate night : hold.getStay().nightDates()) {
+@@ -210,12 +213,12 @@ public class HoldService {
+                   Reservation reservation =
+                       reservations.saveAndFlush(
+                           new Reservation(ReferenceCode.generate(random), hold, now));
+-                  if (charged) {
++                  if (gatewayReference != null) {
+                     ledger.save(
+                         new LedgerEntry(
+                             reservation.getId(),
+-                            LedgerKind.CHARGE,
+-                            hold.getTotal(),
++                            depositPercent == 100 ? LedgerKind.CHARGE : LedgerKind.DEPOSIT,
++                            deposit,
+                             "payment for hold " + id,
+                             gatewayReference,
+                             now));
+diff --git a/src/main/java/com/innkeep/booking/service/OperationsService.java b/src/main/java/com/innkeep/booking/service/OperationsService.java
+index 8c30897..57f3ee0 100644
+--- a/src/main/java/com/innkeep/booking/service/OperationsService.java
++++ b/src/main/java/com/innkeep/booking/service/OperationsService.java
+@@ -106,8 +106,9 @@ public class OperationsService {
+   }
+ 
+   /**
+-   * Net money for the period: charges minus refunds of ledger entries created between midnight at
+-   * the start and midnight at the end of the period, in the property's own time zone.
++   * Net money for the period: charges, deposits and balances minus refunds of ledger entries
++   * created between midnight at the start and midnight at the end of the period, in the property's
++   * own time zone.
+    */
+   public NetRevenue netRevenue(String propertyCode, DateRange period) {
+     Property property = catalog.property(propertyCode);
+@@ -117,10 +118,11 @@ public class OperationsService {
+     BigDecimal charged = BigDecimal.ZERO.setScale(digits);
+     BigDecimal refunded = BigDecimal.ZERO.setScale(digits);
+     for (KindTotal row : ledger.totalsByKind(propertyCode, from, to)) {
+-      if (row.getKind() == LedgerKind.CHARGE) {
+-        charged = row.getTotal().setScale(digits, RoundingMode.HALF_EVEN);
++      BigDecimal amount = row.getTotal().setScale(digits, RoundingMode.HALF_EVEN);
++      if (row.getKind() == LedgerKind.REFUND) {
++        refunded = refunded.add(amount);
+       } else {
+-        refunded = row.getTotal().setScale(digits, RoundingMode.HALF_EVEN);
++        charged = charged.add(amount);
+       }
+     }
+     return new NetRevenue(
+diff --git a/src/main/java/com/innkeep/booking/service/PolicyDraft.java b/src/main/java/com/innkeep/booking/service/PolicyDraft.java
+index 2eac27b..0d4b8bf 100644
+--- a/src/main/java/com/innkeep/booking/service/PolicyDraft.java
++++ b/src/main/java/com/innkeep/booking/service/PolicyDraft.java
+@@ -6,4 +6,5 @@ public record PolicyDraft(
+     int partialRefundPercent,
+     int weekendSurchargePercent,
+     int losMinNights,
+-    int losDiscountPercent) {}
++    int losDiscountPercent,
++    int depositPercent) {}
+diff --git a/src/main/java/com/innkeep/booking/service/PropertyDraft.java b/src/main/java/com/innkeep/booking/service/PropertyDraft.java
+index 7a0e914..8bf189b 100644
+--- a/src/main/java/com/innkeep/booking/service/PropertyDraft.java
++++ b/src/main/java/com/innkeep/booking/service/PropertyDraft.java
+@@ -14,4 +14,5 @@ public record PropertyDraft(
+     int partialRefundPercent,
+     int weekendSurchargePercent,
+     int losMinNights,
+-    int losDiscountPercent) {}
++    int losDiscountPercent,
++    int depositPercent) {}
+diff --git a/src/main/java/com/innkeep/booking/service/ReservationService.java b/src/main/java/com/innkeep/booking/service/ReservationService.java
+index 0401253..5d27073 100644
+--- a/src/main/java/com/innkeep/booking/service/ReservationService.java
++++ b/src/main/java/com/innkeep/booking/service/ReservationService.java
+@@ -2,17 +2,20 @@ package com.innkeep.booking.service;
+ 
+ import static net.logstash.logback.argument.StructuredArguments.kv;
+ 
++import com.innkeep.booking.domain.BalanceDeclinedException;
+ import com.innkeep.booking.domain.CancellationPolicy;
+ import com.innkeep.booking.domain.ConflictException;
+ import com.innkeep.booking.domain.LedgerEntry;
+ import com.innkeep.booking.domain.LedgerKind;
+ import com.innkeep.booking.domain.Money;
+ import com.innkeep.booking.domain.NotFoundException;
++import com.innkeep.booking.domain.PaymentFailedException;
+ import com.innkeep.booking.domain.Reservation;
+ import com.innkeep.booking.domain.ReservationStatus;
+ import com.innkeep.booking.domain.RoomType;
+ import com.innkeep.booking.domain.ValidationException;
+ import com.innkeep.booking.persistence.InventoryRepository;
++import com.innkeep.booking.persistence.KindTotal;
+ import com.innkeep.booking.persistence.LedgerEntryRepository;
+ import com.innkeep.booking.persistence.ReservationRepository;
+ import com.innkeep.booking.persistence.StatusCount;
+@@ -111,9 +114,7 @@ public class ReservationService {
+                 status -> {
+                   Reservation reservation = get(reference);
+                   Instant now = clock.instant();
+-                  Money refund =
+-                      CancellationPolicy.of(reservation.getProperty())
+-                          .refund(reservation.getTotal(), reservation.getCheckIn(), now);
++                  Money refund = refundDue(reservation, now);
+                   reservation.cancel(now);
+                   reservations.saveAndFlush(reservation);
+                   releaseBooked(reservation);
+@@ -137,6 +138,10 @@ public class ReservationService {
+                 }));
+   }
+ 
++  /**
++   * Checks the guest in and charges the balance: the price less what has been paid. When the charge
++   * fails nothing changes and the guest is not checked in.
++   */
+   public Reservation checkIn(String reference) {
+     return retry.run(
+         () ->
+@@ -146,11 +151,45 @@ public class ReservationService {
+                   Instant now = clock.instant();
+                   LocalDate today = LocalDate.ofInstant(now, reservation.getProperty().zone());
+                   reservation.checkIn(now, today);
+-                  LOG.info("guest checked in", kv("reservationId", reservation.getId()));
++                  Money balance = reservation.getTotal().minus(paid(reservation));
++                  if (balance.isPositive()) {
++                    chargeBalance(reservation, balance, now);
++                  }
++                  LOG.info(
++                      "guest checked in",
++                      kv("reservationId", reservation.getId()),
++                      kv("balanceAmount", balance.amount()));
+                   return reservations.saveAndFlush(reservation);
+                 }));
+   }
+ 
++  private void chargeBalance(Reservation reservation, Money balance, Instant now) {
++    String gatewayReference;
++    try {
++      gatewayReference = payments.charge("balance-" + reservation.getId(), balance);
++    } catch (PaymentFailedException e) {
++      throw new BalanceDeclinedException(reservation.getReference(), e);
++    }
++    ledger.save(
++        new LedgerEntry(
++            reservation.getId(),
++            LedgerKind.BALANCE,
++            balance,
++            "balance at check-in",
++            gatewayReference,
++            now));
++  }
++
++  /** Money received for the reservation so far: charges, deposits and balances less refunds. */
++  private Money paid(Reservation reservation) {
++    Money paid = Money.zero(reservation.getTotal().currency());
++    for (KindTotal row : ledger.totalsForReservation(reservation.getId())) {
++      Money amount = Money.of(row.getTotal(), paid.currency());
++      paid = row.getKind() == LedgerKind.REFUND ? paid.minus(amount) : paid.plus(amount);
++    }
++    return paid;
++  }
++
+   /**
+    * Marks checked-in stays as completed once their check-out date has been reached in the
+    * property's own time zone, and returns how many were completed. Stays are read in id order in
+@@ -211,12 +250,20 @@ public class ReservationService {
+           "reservation " + reference + " is " + reservation.getStatus() + ", not cancellable");
+     }
+     Instant when = at == null ? clock.instant() : at;
+-    CancellationPolicy policy = CancellationPolicy.of(reservation.getProperty());
+-    LocalDate checkIn = reservation.getCheckIn();
+     return new CancellationQuote(
+         when,
+-        policy.refundPercent(checkIn, when),
+-        policy.refund(reservation.getTotal(), checkIn, when));
++        CancellationPolicy.of(reservation.getProperty())
++            .refundPercent(reservation.getCheckIn(), when),
++        refundDue(reservation, when));
++  }
++
++  /**
++   * What cancelling at {@code at} refunds: the property's refund percentage for that moment applied
++   * to the reservation's price. The cancellation and its quote both use it, so they always agree.
++   */
++  private Money refundDue(Reservation reservation, Instant at) {
++    return CancellationPolicy.of(reservation.getProperty())
++        .refund(reservation.getTotal(), reservation.getCheckIn(), at);
+   }
+ 
+   /** The number of reservations in each status, zero for the statuses with none. */
+diff --git a/src/main/resources/db/migration/V2__deposits.sql b/src/main/resources/db/migration/V2__deposits.sql
+new file mode 100644
+index 0000000..a5f97bb
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__deposits.sql
+@@ -0,0 +1,7 @@
++ALTER TABLE property
++    ADD COLUMN deposit_percent INTEGER NOT NULL DEFAULT 100
++        CHECK (deposit_percent BETWEEN 1 AND 100);
++
++ALTER TABLE ledger_entry DROP CONSTRAINT ledger_entry_kind_check;
++ALTER TABLE ledger_entry
++    ADD CONSTRAINT ledger_entry_kind_check CHECK (kind IN ('CHARGE', 'DEPOSIT', 'BALANCE', 'REFUND'));
+diff --git a/src/test/java/com/innkeep/booking/api/AdminCatalogApiTest.java b/src/test/java/com/innkeep/booking/api/AdminCatalogApiTest.java
+index 3333ede..cbbf1cf 100644
+--- a/src/test/java/com/innkeep/booking/api/AdminCatalogApiTest.java
++++ b/src/test/java/com/innkeep/booking/api/AdminCatalogApiTest.java
+@@ -124,6 +124,33 @@ class AdminCatalogApiTest extends IntegrationTestBase {
+         .andExpect(jsonPath("$.losDiscountPercent").value(8));
+   }
+ 
++  @Test
++  void theDepositDefaultsToTheWholePriceAndCanBeLowered() throws Exception {
++    mvc.perform(
++            post(PROPERTIES)
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(NEW_PROPERTY))
++        .andExpect(jsonPath("$.depositPercent").value(100));
++
++    String policy =
++        "{\"fullRefundDays\":7,\"partialRefundPercent\":50,\"weekendSurchargePercent\":10,"
++            + "\"losMinNights\":3,\"losDiscountPercent\":5,\"depositPercent\":%d}";
++    mvc.perform(
++            put(PROPERTIES + "/seaside-house/policy")
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(policy.formatted(30)))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.depositPercent").value(30));
++    mvc.perform(
++            put(PROPERTIES + "/seaside-house/policy")
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(policy.formatted(0)))
++        .andExpect(status().isBadRequest());
++  }
++
+   @Test
+   void aRoomTypeCanBeAddedAndRepriced() throws Exception {
+     String suite =
+diff --git a/src/test/java/com/innkeep/booking/service/DepositServiceTest.java b/src/test/java/com/innkeep/booking/service/DepositServiceTest.java
+new file mode 100644
+index 0000000..69c68c7
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/service/DepositServiceTest.java
+@@ -0,0 +1,126 @@
++package com.innkeep.booking.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.innkeep.booking.domain.BalanceDeclinedException;
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.LedgerEntry;
++import com.innkeep.booking.domain.LedgerKind;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.Reservation;
++import com.innkeep.booking.domain.ReservationStatus;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import com.innkeep.booking.support.RecordingPaymentGateway.Movement;
++import java.math.BigDecimal;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class DepositServiceTest extends IntegrationTestBase {
++
++  private static final LocalDate IN = LocalDate.parse("2027-06-07");
++  private static final LocalDate OUT = LocalDate.parse("2027-06-10");
++  private static final Instant ARRIVAL = Instant.parse("2027-06-07T15:00:00Z");
++
++  @Autowired private CatalogService catalog;
++  @Autowired private ReservationService reservations;
++  @Autowired private OperationsService operations;
++
++  private Property property;
++  private RoomType room;
++
++  @BeforeEach
++  void setUp() {
++    property = data.harbourHouse();
++    room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, IN, OUT, 2);
++  }
++
++  @Test
++  void withoutADepositTheWholePriceIsChargedAtConfirmationAndNothingAtCheckIn() {
++    Reservation reservation = data.book(property, room, IN, OUT, 1);
++    clock.set(ARRIVAL);
++    reservations.checkIn(reservation.getReference());
++
++    assertThat(payments.movements())
++        .extracting(m -> m.amount().amount().toPlainString())
++        .containsExactly("300.00");
++    assertThat(ledgerKinds(reservation)).containsExactly(LedgerKind.CHARGE);
++  }
++
++  @Test
++  void aDepositIsChargedAtConfirmationAndTheBalanceAtCheckIn() {
++    depositOf(30);
++    Reservation reservation = data.book(property, room, IN, OUT, 1);
++
++    Movement deposit = payments.movements().get(0);
++    assertThat(deposit.key()).isEqualTo("charge-" + reservation.getHoldId());
++    assertThat(deposit.amount().amount().toPlainString()).isEqualTo("90.00");
++    assertThat(ledgerKinds(reservation)).containsExactly(LedgerKind.DEPOSIT);
++
++    clock.set(ARRIVAL);
++    Reservation checkedIn = reservations.checkIn(reservation.getReference());
++
++    assertThat(checkedIn.getStatus()).isEqualTo(ReservationStatus.CHECKED_IN);
++    Movement balance = payments.movements().get(1);
++    assertThat(balance.key()).isEqualTo("balance-" + reservation.getId());
++    assertThat(balance.amount().amount().toPlainString()).isEqualTo("210.00");
++    assertThat(ledgerKinds(reservation)).containsExactly(LedgerKind.DEPOSIT, LedgerKind.BALANCE);
++  }
++
++  @Test
++  void theDepositIsRoundedHalfEvenToCents() {
++    catalog.reprice(
++        property.getCode(), room.getCode(), new BigDecimal("33.25"), new BigDecimal("15.00"));
++    depositOf(50);
++    data.book(property, room, IN, LocalDate.parse("2027-06-08"), 1);
++
++    // 50 % of 33.25 is 16.625, which rounds to the even cent
++    assertThat(payments.movements().get(0).amount().amount().toPlainString()).isEqualTo("16.62");
++  }
++
++  @Test
++  void aDeclinedBalanceLeavesTheGuestNotCheckedIn() {
++    depositOf(30);
++    Reservation reservation = data.book(property, room, IN, OUT, 1);
++    clock.set(ARRIVAL);
++    payments.failNextCharge();
++
++    assertThatThrownBy(() -> reservations.checkIn(reservation.getReference()))
++        .isInstanceOf(BalanceDeclinedException.class);
++    assertThat(reservations.get(reservation.getReference()).getStatus())
++        .isEqualTo(ReservationStatus.CONFIRMED);
++    assertThat(ledgerKinds(reservation)).containsExactly(LedgerKind.DEPOSIT);
++  }
++
++  @Test
++  void revenueCountsDepositsAndBalances() {
++    depositOf(30);
++    Reservation reservation = data.book(property, room, IN, OUT, 1);
++    clock.set(ARRIVAL);
++    reservations.checkIn(reservation.getReference());
++
++    NetRevenue revenue =
++        operations.netRevenue(
++            property.getCode(),
++            new DateRange(LocalDate.parse("2027-05-01"), LocalDate.parse("2027-06-30")));
++
++    assertThat(revenue.charged().toPlainString()).isEqualTo("300.00");
++    assertThat(revenue.net().toPlainString()).isEqualTo("300.00");
++  }
++
++  private void depositOf(int percent) {
++    catalog.changePolicy(property.getCode(), new PolicyDraft(7, 50, 10, 7, 0, percent));
++  }
++
++  private List<LedgerKind> ledgerKinds(Reservation reservation) {
++    return reservations.ledger(reservation.getReference()).entries().stream()
++        .map(LedgerEntry::getKind)
++        .toList();
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/support/Fixtures.java b/src/test/java/com/innkeep/booking/support/Fixtures.java
+index 765bd6a..f0d830d 100644
+--- a/src/test/java/com/innkeep/booking/support/Fixtures.java
++++ b/src/test/java/com/innkeep/booking/support/Fixtures.java
+@@ -32,7 +32,8 @@ public final class Fixtures {
+         50,
+         weekendPercent,
+         7,
+-        losPercent);
++        losPercent,
++        100);
+   }
+ 
+   public static RoomType roomType(Property property, int capacity, String rate) {
+diff --git a/src/test/java/com/innkeep/booking/support/TestData.java b/src/test/java/com/innkeep/booking/support/TestData.java
+index 5021c54..13b98e1 100644
+--- a/src/test/java/com/innkeep/booking/support/TestData.java
++++ b/src/test/java/com/innkeep/booking/support/TestData.java
+@@ -69,7 +69,8 @@ public class TestData {
+             50,
+             weekendPercent,
+             7,
+-            losPercent));
++            losPercent,
++            100));
+   }
+ 
+   public RoomType roomType(Property property, String code, int capacity, String rate) {

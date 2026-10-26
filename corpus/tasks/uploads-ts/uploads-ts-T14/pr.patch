@@ -1,0 +1,640 @@
+diff --git a/README.md b/README.md
+index fe7e007..5b32ef4 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ stored. Each key carries scopes, and each route requires exactly one of them:
+ | Scope | Grants |
+ |---|---|
+ | `files:read` | list files, read metadata, download, create signed links |
+-| `files:write` | upload with `PUT /v1/files/…` or `POST /v1/files` |
++| `files:write` | upload with `PUT /v1/files/…` or `POST /v1/files`, tag files |
+ | `files:delete` | delete files |
+ | `uploads:write` | resumable upload sessions |
+ | `tenant:read` | read the tenant's usage and quota |
+@@ -78,6 +78,11 @@ takes at most 10,000 chunks. Once the offset equals the size, `complete` assembl
+ a file; before that it is 409 `upload_incomplete`. Sessions expire `UPLOAD_SESSION_TTL_S` after
+ they are created; an expired or aborted session releases its bytes and its staged chunks.
+ 
++**Tags.** Files can carry up to 20 tags to find them by, such as `invoices` or `q1-2030`: 1 to
++64 characters of lower-case letters, digits and `-`. Tags belong to a file, not to its path:
++deleting a file removes its tags, and a file that replaces another (`overwrite=true`) starts
++without any.
++
+ **Deletion and cleanup.** Deleting a file marks its row deleted, releases its bytes and removes
+ its storage object right away. A background cleanup job (every `CLEANUP_INTERVAL_S`) expires
+ sessions past their expiry, removes the objects of deleted files whose removal failed once
+@@ -90,7 +95,7 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | Method | Path | Scope | Success |
+ |---|---|---|---|
+ | GET | `/health/live`, `/health/ready` | none | 200 (`/health/ready` 503 without the database) |
+-| GET | `/v1/files?limit=&after=` | `files:read` | 200 |
++| GET | `/v1/files?limit=&after=&tag=` | `files:read` | 200 |
+ | PUT | `/v1/files/<path>[?overwrite=true]` | `files:write` | 201, or 200 when it replaced a file |
+ | POST | `/v1/files[?overwrite=true]` (multipart) | `files:write` | 201, or 200 when it replaced a file |
+ | GET | `/v1/files/<path>` | `files:read` | 200 (304 on a matching `If-None-Match`) |
+@@ -98,6 +103,8 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | GET | `/v1/files/by-id/:id` | `files:read` | 200 (304) |
+ | GET | `/v1/files/by-id/:id/meta` | `files:read` | 200 |
+ | POST | `/v1/files/by-id/:id/signed-url` | `files:read` | 200 |
++| GET | `/v1/files/by-id/:id/tags` | `files:read` | 200 |
++| PUT, DELETE | `/v1/files/by-id/:id/tags/:tag` | `files:write` | 200 |
+ | GET | `/v1/public/:id?exp=&sig=` | none (signed) | 200 (304) |
+ | POST | `/v1/uploads[?overwrite=true]` | `uploads:write` | 201 with `Location` |
+ | PATCH | `/v1/uploads/:id` | `uploads:write` | 204 |
+@@ -119,7 +126,11 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+   status, image: { width, height } | null, createdAt, updatedAt }`.
+ - **`GET /v1/files`** lists live files in byte order of their paths: `limit` 1 to
+   `LIST_MAX_LIMIT` (default 100, or `LIST_MAX_LIMIT` when lower), and `after` the `nextCursor` of
+-  the previous page. It answers `{ "data": [...], "nextCursor": "<opaque>" | null }`.
++  the previous page. It answers `{ "data": [...], "nextCursor": "<opaque>" | null }`. With
++  `tag`, only files with that tag are listed, in the same order and pages.
++- **`PUT /v1/files/by-id/:id/tags/:tag`** tags a file and **`DELETE`** removes the tag; both are
++  idempotent and answer the file's tags as `{ "tags": [...] }` in byte order, like `GET
++  /v1/files/by-id/:id/tags`. A 21st tag is 409 `too_many_tags`; an invalid tag is 400.
+ - **`POST /v1/uploads`** takes `{ "path", "size", "contentType"? }` and returns the session
+   `{ id, path, size, offset, state, declaredType, overwrite, fileId, createdAt, expiresAt }`.
+   `overwrite` is checked when the session is created and again when it completes.
+@@ -137,7 +148,7 @@ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ | 401 | `unauthorized` |
+ | 403 | `forbidden`, `invalid_signature`, `signed_url_expired` |
+ | 404 | `not_found` |
+-| 409 | `conflict`, `path_exists`, `file_not_available`, `upload_session_state`, `chunk_in_progress`, `upload_incomplete`, `offset_mismatch` |
++| 409 | `conflict`, `path_exists`, `file_not_available`, `upload_session_state`, `chunk_in_progress`, `upload_incomplete`, `offset_mismatch`, `too_many_tags` |
+ | 413 | `payload_too_large` |
+ | 415 | `unsupported_media_type` |
+ | 422 | `quota_exceeded` |
+diff --git a/migrations/0004_file_tags.sql b/migrations/0004_file_tags.sql
+new file mode 100644
+index 0000000..fc43598
+--- /dev/null
++++ b/migrations/0004_file_tags.sql
+@@ -0,0 +1,13 @@
++-- Tags on files: 1 to 64 characters of a-z, 0-9 and '-', at most 20 per file (counted by the insert
++-- in fileTagRepo.ts while the caller holds the file's row lock). A file's tags are removed in the
++-- transaction that deletes or replaces it, so only live files have tags.
++CREATE TABLE file_tags (
++  file_id    uuid NOT NULL REFERENCES files (id) ON DELETE CASCADE,
++  tenant_id  uuid NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
++  tag        text COLLATE "C" NOT NULL CHECK (tag ~ '^[a-z0-9-]{1,64}$'),
++  created_at timestamptz NOT NULL,
++  CONSTRAINT file_tags_unique UNIQUE (file_id, tag)
++);
++
++-- Finds a tenant's files with a tag.
++CREATE INDEX file_tags_tenant_tag ON file_tags (tenant_id, tag);
+diff --git a/src/api/routes/files.ts b/src/api/routes/files.ts
+index a921a3a..3c7d9f3 100644
+--- a/src/api/routes/files.ts
++++ b/src/api/routes/files.ts
+@@ -1,13 +1,13 @@
+ import type { FastifyPluginAsync } from "fastify";
+ import { authOf, requireScope } from "../plugins/auth.js";
+ import { idParamsSchema, wildcardParamsSchema } from "../schemas/common.js";
+-import { listFilesQuerySchema, signedUrlBodySchema } from "../schemas/files.js";
++import { fileTagParamsSchema, listFilesQuerySchema, signedUrlBodySchema } from "../schemas/files.js";
+ import { serializeFile } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import { sendFile } from "./sendFile.js";
+ import type { RouteOptions } from "./types.js";
+ 
+-/** Listing, metadata, downloads, deletion and signed links of stored files. */
++/** Listing, metadata, tags, downloads, deletion and signed links of stored files. */
+ export const fileRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services, limits }) => {
+   const listQuery = listFilesQuerySchema(limits.listMaxLimit);
+   const signedUrlBody = signedUrlBodySchema(limits.signedUrlMaxTtlSeconds);
+@@ -15,10 +15,11 @@ export const fileRoutes: FastifyPluginAsync<RouteOptions> = async (app, { servic
+   app.get("/files", { preHandler: requireScope("files:read") }, async (request) => {
+     const { tenantId } = authOf(request);
+     const query = parse(listQuery, request.query, "query");
+-    const page = await services.files.list(
+-      tenantId,
+-      query.after === undefined ? { limit: query.limit } : { after: query.after, limit: query.limit },
+-    );
++    const page = await services.files.list(tenantId, {
++      limit: query.limit,
++      ...(query.after === undefined ? {} : { after: query.after }),
++      ...(query.tag === undefined ? {} : { tag: query.tag }),
++    });
+     return { data: page.items.map(serializeFile), nextCursor: page.nextCursor };
+   });
+ 
+@@ -28,6 +29,24 @@ export const fileRoutes: FastifyPluginAsync<RouteOptions> = async (app, { servic
+     return serializeFile(await services.files.getById(tenantId, id));
+   });
+ 
++  app.get("/files/by-id/:id/tags", { preHandler: requireScope("files:read") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const { id } = parse(idParamsSchema, request.params, "params");
++    return { tags: await services.files.listTags(tenantId, id) };
++  });
++
++  app.put("/files/by-id/:id/tags/:tag", { preHandler: requireScope("files:write") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const { id, tag } = parse(fileTagParamsSchema, request.params, "params");
++    return { tags: await services.files.addTag(tenantId, id, tag) };
++  });
++
++  app.delete("/files/by-id/:id/tags/:tag", { preHandler: requireScope("files:write") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const { id, tag } = parse(fileTagParamsSchema, request.params, "params");
++    return { tags: await services.files.removeTag(tenantId, id, tag) };
++  });
++
+   app.get("/files/by-id/:id", { preHandler: requireScope("files:read") }, async (request, reply) => {
+     const { tenantId } = authOf(request);
+     const { id } = parse(idParamsSchema, request.params, "params");
+diff --git a/src/api/schemas/files.ts b/src/api/schemas/files.ts
+index 4f4361d..1086b6e 100644
+--- a/src/api/schemas/files.ts
++++ b/src/api/schemas/files.ts
+@@ -1,17 +1,23 @@
+ import { z } from "zod";
+ import { MAX_CURSOR_LENGTH } from "../../domain/cursor.js";
+-import { integerParam } from "./common.js";
++import { isValidTag, TAG_RULE } from "../../domain/tags.js";
++import { idSchema, integerParam } from "./common.js";
+ 
+ /** Default page size of the listing, capped by LIST_MAX_LIMIT. */
+ export const DEFAULT_LIST_LIMIT = 100;
+ 
++export const tagSchema = z.string().refine(isValidTag, { error: TAG_RULE });
++
+ export function listFilesQuerySchema(maxLimit: number) {
+   return z.object({
+     after: z.string().min(1).max(MAX_CURSOR_LENGTH).optional(),
+     limit: integerParam({ min: 1, max: maxLimit, fallback: Math.min(DEFAULT_LIST_LIMIT, maxLimit) }),
++    tag: tagSchema.optional(),
+   });
+ }
+ 
++export const fileTagParamsSchema = z.object({ id: idSchema, tag: tagSchema });
++
+ export function signedUrlBodySchema(maxTtlSeconds: number) {
+   return z.object({
+     expiresIn: z.number().int().min(1).max(maxTtlSeconds),
+diff --git a/src/domain/errors.ts b/src/domain/errors.ts
+index a96c1c5..aaa8acb 100644
+--- a/src/domain/errors.ts
++++ b/src/domain/errors.ts
+@@ -77,6 +77,15 @@ export class UploadIncompleteError extends ConflictError {
+   }
+ }
+ 
++/** The file already has as many tags as a file may have. */
++export class TooManyTagsError extends ConflictError {
++  override readonly code = "too_many_tags";
++
++  constructor(fileId: string, maxTags: number) {
++    super(`file ${fileId} already has ${maxTags} tags; remove one first`, { fileId, maxTags });
++  }
++}
++
+ export class ForbiddenError extends DomainError {
+   readonly code: string = "forbidden";
+   readonly httpStatus = 403;
+diff --git a/src/domain/tags.ts b/src/domain/tags.ts
+new file mode 100644
+index 0000000..e838a35
+--- /dev/null
++++ b/src/domain/tags.ts
+@@ -0,0 +1,11 @@
++/** Tags label files: lower-case letters, digits and `-`, 1 to 64 characters, at most 20 per file. */
++export const MAX_TAGS_PER_FILE = 20;
++export const MAX_TAG_LENGTH = 64;
++
++const TAG_PATTERN = new RegExp(`^[a-z0-9-]{1,${MAX_TAG_LENGTH}}$`);
++
++export function isValidTag(value: string): boolean {
++  return TAG_PATTERN.test(value);
++}
++
++export const TAG_RULE = `a tag is 1 to ${MAX_TAG_LENGTH} characters of a-z, 0-9 and -`;
+diff --git a/src/repositories/fileRepo.ts b/src/repositories/fileRepo.ts
+index cf9a0cc..a4915c4 100644
+--- a/src/repositories/fileRepo.ts
++++ b/src/repositories/fileRepo.ts
+@@ -121,14 +121,19 @@ export async function findLiveFileByPath(
+   return row ? mapFile(row) : null;
+ }
+ 
+-/** The tenant's live file with this id; another tenant's file is not found. */
++/**
++ * The tenant's live file with this id; another tenant's file is not found. `forUpdate` locks it
++ * for the transaction.
++ */
+ export async function findLiveFileById(
+   db: Queryable,
+   tenantId: string,
+   id: string,
++  options: { forUpdate?: boolean } = {},
+ ): Promise<FileRecord | null> {
+   const result = await db.query<FileRow>(
+-    `SELECT ${COLUMNS} FROM files WHERE tenant_id = $1 AND id = $2 AND status <> 'deleted'`,
++    `SELECT ${COLUMNS} FROM files WHERE tenant_id = $1 AND id = $2 AND status <> 'deleted'
++     ${options.forUpdate ? "FOR UPDATE" : ""}`,
+     [tenantId, id],
+   );
+   const row = firstRow(result.rows);
+@@ -151,28 +156,35 @@ export async function findLiveFileBySignedId(
+   return row ? mapFile(row) : null;
+ }
+ 
+-/** Up to `limit` live files after `after` in (path, id) order. */
++/** Up to `limit` live files after `after` in (path, id) order, only those tagged `tag` if given. */
+ export async function listLiveFiles(
+   db: Queryable,
+   tenantId: string,
+   after: FileCursor | null,
+   limit: number,
++  tag: string | null = null,
+ ): Promise<FileRecord[]> {
+-  const result = after
+-    ? await db.query<FileRow>(
+-        `SELECT ${COLUMNS} FROM files
+-         WHERE tenant_id = $1 AND status <> 'deleted' AND (path, id) > ($2, $3)
+-         ORDER BY path, id
+-         LIMIT $4`,
+-        [tenantId, after.path, after.id, limit],
+-      )
+-    : await db.query<FileRow>(
+-        `SELECT ${COLUMNS} FROM files
+-         WHERE tenant_id = $1 AND status <> 'deleted'
+-         ORDER BY path, id
+-         LIMIT $2`,
+-        [tenantId, limit],
+-      );
++  const params: unknown[] = [tenantId];
++  const conditions = ["tenant_id = $1", "status <> 'deleted'"];
++  if (after) {
++    params.push(after.path, after.id);
++    conditions.push(`(path, id) > ($${params.length - 1}, $${params.length})`);
++  }
++  if (tag !== null) {
++    params.push(tag);
++    conditions.push(
++      `EXISTS (SELECT 1 FROM file_tags
++         WHERE file_tags.tenant_id = $1 AND file_tags.tag = $${params.length} AND file_tags.file_id = files.id)`,
++    );
++  }
++  params.push(limit);
++  const result = await db.query<FileRow>(
++    `SELECT ${COLUMNS} FROM files
++     WHERE ${conditions.join(" AND ")}
++     ORDER BY path, id
++     LIMIT $${params.length}`,
++    params,
++  );
+   return result.rows.map(mapFile);
+ }
+ 
+diff --git a/src/repositories/fileTagRepo.ts b/src/repositories/fileTagRepo.ts
+new file mode 100644
+index 0000000..2233b43
+--- /dev/null
++++ b/src/repositories/fileTagRepo.ts
+@@ -0,0 +1,43 @@
++import type { Queryable } from "../db/pool.js";
++
++/** A file's tags in byte order. */
++export async function listTags(db: Queryable, fileId: string): Promise<string[]> {
++  const result = await db.query<{ tag: string }>(
++    "SELECT tag FROM file_tags WHERE file_id = $1 ORDER BY tag",
++    [fileId],
++  );
++  return result.rows.map((row) => row.tag);
++}
++
++/**
++ * Add a tag unless the file already has `maxTags` of them; a tag the file already has is left as
++ * it is. Returns whether a row was inserted. The count is only reliable while the caller holds the
++ * file's row lock, which every writer of a file's tags takes first.
++ */
++export async function insertTagIfRoom(
++  db: Queryable,
++  tag: { fileId: string; tenantId: string; tag: string; maxTags: number; now: Date },
++): Promise<boolean> {
++  const result = await db.query(
++    `INSERT INTO file_tags (file_id, tenant_id, tag, created_at)
++     SELECT $1::uuid, $2::uuid, $3::text, $4::timestamptz
++     WHERE (SELECT count(*) FROM file_tags WHERE file_id = $1) < $5
++     ON CONFLICT ON CONSTRAINT file_tags_unique DO NOTHING`,
++    [tag.fileId, tag.tenantId, tag.tag, tag.now, tag.maxTags],
++  );
++  return result.rowCount === 1;
++}
++
++export async function hasTag(db: Queryable, fileId: string, tag: string): Promise<boolean> {
++  const result = await db.query("SELECT 1 FROM file_tags WHERE file_id = $1 AND tag = $2", [fileId, tag]);
++  return result.rowCount === 1;
++}
++
++export async function deleteTag(db: Queryable, fileId: string, tag: string): Promise<void> {
++  await db.query("DELETE FROM file_tags WHERE file_id = $1 AND tag = $2", [fileId, tag]);
++}
++
++/** Remove every tag of a file (it is being deleted or replaced). */
++export async function deleteTagsOf(db: Queryable, fileId: string): Promise<void> {
++  await db.query("DELETE FROM file_tags WHERE file_id = $1", [fileId]);
++}
+diff --git a/src/services/fileCatalog.ts b/src/services/fileCatalog.ts
+index 933fe53..0fdc0ca 100644
+--- a/src/services/fileCatalog.ts
++++ b/src/services/fileCatalog.ts
+@@ -7,6 +7,7 @@ import type { Clock } from "../infra/clock.js";
+ import type { Logger } from "../infra/logger.js";
+ import { readPrefix } from "../infra/streams.js";
+ import * as files from "../repositories/fileRepo.js";
++import * as fileTags from "../repositories/fileTagRepo.js";
+ import { isUniqueViolation } from "../repositories/mapping.js";
+ import * as tenants from "../repositories/tenantRepo.js";
+ import type { StorageDriver } from "../storage/driver.js";
+@@ -91,6 +92,8 @@ export class FileCatalog {
+       replaced = await files.markDeleted(client, stored.tenantId, existing.id, now);
+       if (replaced) {
+         await tenants.releaseBytes(client, stored.tenantId, replaced.size, this.deps.logger);
++        // Tags belong to the file, not to its path: the new file starts without any.
++        await fileTags.deleteTagsOf(client, replaced.id);
+       }
+     }
+     try {
+diff --git a/src/services/fileService.ts b/src/services/fileService.ts
+index 02088ef..16c9f27 100644
+--- a/src/services/fileService.ts
++++ b/src/services/fileService.ts
+@@ -7,13 +7,16 @@ import {
+   InvalidSignatureError,
+   NotFoundError,
+   SignedUrlExpiredError,
++  TooManyTagsError,
+   ValidationError,
+ } from "../domain/errors.js";
+ import { isDownloadable, type FileRecord } from "../domain/file.js";
+ import { normalizePath } from "../domain/paths.js";
++import { isValidTag, MAX_TAGS_PER_FILE, TAG_RULE } from "../domain/tags.js";
+ import type { Clock } from "../infra/clock.js";
+ import type { Logger } from "../infra/logger.js";
+ import * as files from "../repositories/fileRepo.js";
++import * as fileTags from "../repositories/fileTagRepo.js";
+ import * as tenants from "../repositories/tenantRepo.js";
+ import type { StorageDriver } from "../storage/driver.js";
+ import type { FileCatalog } from "./fileCatalog.js";
+@@ -57,22 +60,70 @@ export class FileService {
+     return file;
+   }
+ 
+-  /** One page of the tenant's live files in path order. */
++  /** One page of the tenant's live files in path order, only those with `tag` if given. */
+   async list(
+     tenantId: string,
+-    options: { after?: string; limit: number },
++    options: { after?: string; limit: number; tag?: string },
+   ): Promise<CursorPage<FileRecord>> {
+     if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > this.deps.listMaxLimit) {
+       throw new ValidationError(`limit must be from 1 to ${this.deps.listMaxLimit}`);
+     }
++    if (options.tag !== undefined) assertTag(options.tag);
+     const after = options.after === undefined ? null : decodeCursor(options.after);
+-    const rows = await files.listLiveFiles(this.deps.pool, tenantId, after, options.limit + 1);
++    const rows = await files.listLiveFiles(
++      this.deps.pool,
++      tenantId,
++      after,
++      options.limit + 1,
++      options.tag ?? null,
++    );
+     return toCursorPage(rows, options.limit);
+   }
+ 
++  /** The tags of one of the tenant's files, in byte order. */
++  async listTags(tenantId: string, fileId: string): Promise<string[]> {
++    const file = await this.getById(tenantId, fileId);
++    return fileTags.listTags(this.deps.pool, file.id);
++  }
++
++  /**
++   * Tag a file; tagging it again with the same tag changes nothing. The file's row is locked
++   * while its tags are counted and the tag inserted, so concurrent requests cannot pass
++   * MAX_TAGS_PER_FILE, and a file being deleted gets no new tag. Returns the file's tags.
++   */
++  async addTag(tenantId: string, fileId: string, tag: string): Promise<string[]> {
++    assertTag(tag);
++    return withTransaction(this.deps.pool, async (client) => {
++      const file = await files.findLiveFileById(client, tenantId, fileId, { forUpdate: true });
++      if (!file) throw NotFoundError.resource("file", fileId);
++      const inserted = await fileTags.insertTagIfRoom(client, {
++        fileId: file.id,
++        tenantId: file.tenantId,
++        tag,
++        maxTags: MAX_TAGS_PER_FILE,
++        now: this.deps.clock.now(),
++      });
++      if (!inserted && !(await fileTags.hasTag(client, file.id, tag))) {
++        throw new TooManyTagsError(file.id, MAX_TAGS_PER_FILE);
++      }
++      return fileTags.listTags(client, file.id);
++    });
++  }
++
++  /** Remove a tag from a file; removing one it does not have changes nothing. Returns its tags. */
++  async removeTag(tenantId: string, fileId: string, tag: string): Promise<string[]> {
++    assertTag(tag);
++    return withTransaction(this.deps.pool, async (client) => {
++      const file = await files.findLiveFileById(client, tenantId, fileId, { forUpdate: true });
++      if (!file) throw NotFoundError.resource("file", fileId);
++      await fileTags.deleteTag(client, file.id, tag);
++      return fileTags.listTags(client, file.id);
++    });
++  }
++
+   /**
+-   * Soft-delete the file at a path and release its bytes, then remove its storage object once
+-   * the deletion is committed. If the object cannot be removed now, the cleanup job will.
++   * Soft-delete the file at a path, release its bytes and drop its tags, then remove its storage
++   * object once the deletion is committed. If the object cannot be removed now, the cleanup job will.
+    */
+   async deleteByPath(tenantId: string, rawPath: string): Promise<FileRecord> {
+     const path = normalizePath(rawPath);
+@@ -82,6 +133,7 @@ export class FileService {
+       const row = await files.markDeleted(client, tenantId, file.id, this.deps.clock.now());
+       if (!row) throw new NotFoundError(`no file at ${path}`, { path });
+       await tenants.releaseBytes(client, tenantId, row.size, this.deps.logger);
++      await fileTags.deleteTagsOf(client, row.id);
+       return row;
+     });
+     await this.deps.catalog.removeObjectOf(deleted);
+@@ -128,3 +180,7 @@ export class FileService {
+     return file;
+   }
+ }
++
++function assertTag(tag: string): void {
++  if (!isValidTag(tag)) throw new ValidationError(TAG_RULE, { tag: tag.slice(0, 80) });
++}
+diff --git a/test/api/tags.test.ts b/test/api/tags.test.ts
+new file mode 100644
+index 0000000..3ec77cf
+--- /dev/null
++++ b/test/api/tags.test.ts
+@@ -0,0 +1,162 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  expectStatus,
++  issueKey,
++  putFile,
++  storeFile,
++  type ErrorResponse,
++  type FileBody,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++interface Page {
++  data: FileBody[];
++  nextCursor: string | null;
++}
++
++describe("file tags", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeEach(async () => {
++    t = await buildTestApp();
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  function tagRequest(method: "PUT" | "DELETE", fileId: string, tag: string, key: TestTenant = tenant) {
++    return t.app.inject({ method, url: `/v1/files/by-id/${fileId}/tags/${encodeURIComponent(tag)}`, headers: key.headers });
++  }
++
++  async function tag(fileId: string, name: string): Promise<string[]> {
++    const response = await tagRequest("PUT", fileId, name);
++    expectStatus(response, 200);
++    return response.json<{ tags: string[] }>().tags;
++  }
++
++  async function tagsOf(fileId: string): Promise<string[]> {
++    const response = await t.app.inject({ url: `/v1/files/by-id/${fileId}/tags`, headers: tenant.headers });
++    expectStatus(response, 200);
++    return response.json<{ tags: string[] }>().tags;
++  }
++
++  async function page(query: string, key: TestTenant = tenant): Promise<Page> {
++    const response = await t.app.inject({ url: `/v1/files${query}`, headers: key.headers });
++    expectStatus(response, 200);
++    return response.json<Page>();
++  }
++
++  it("adds, lists and removes tags, idempotently", async () => {
++    const file = await storeFile(t.app, tenant, "invoices/march.pdf", "pdf");
++    expect(await tagsOf(file.id)).toEqual([]);
++    expect(await tag(file.id, "q1-2030")).toEqual(["q1-2030"]);
++    expect(await tag(file.id, "invoices")).toEqual(["invoices", "q1-2030"]);
++    expect(await tag(file.id, "invoices")).toEqual(["invoices", "q1-2030"]);
++
++    const removed = await tagRequest("DELETE", file.id, "q1-2030");
++    expectStatus(removed, 200);
++    expect(removed.json<{ tags: string[] }>().tags).toEqual(["invoices"]);
++    expectStatus(await tagRequest("DELETE", file.id, "q1-2030"), 200);
++    expect(await tagsOf(file.id)).toEqual(["invoices"]);
++    expect(await tag(file.id, "a".repeat(64))).toEqual(["a".repeat(64), "invoices"]);
++  });
++
++  it.each([["Invoices"], ["with space"], ["under_score"], ["x".repeat(65)], ["é"]])("refuses the tag %j", async (bad) => {
++    const file = await storeFile(t.app, tenant, "a.txt", "a");
++    expectStatus(await tagRequest("PUT", file.id, bad), 400);
++    const listing = await t.app.inject({ url: `/v1/files?tag=${encodeURIComponent(bad)}`, headers: tenant.headers });
++    expectStatus(listing, 400);
++  });
++
++  it("allows 20 tags per file", async () => {
++    const file = await storeFile(t.app, tenant, "a.txt", "a");
++    for (let i = 0; i < 20; i++) await tag(file.id, `t${i}`);
++    const extra = await tagRequest("PUT", file.id, "one-more");
++    expectStatus(extra, 409);
++    expect(extra.json<ErrorResponse>().error.code).toBe("too_many_tags");
++    // A tag the file already has is still accepted.
++    expect(await tag(file.id, "t7")).toHaveLength(20);
++    expectStatus(await tagRequest("DELETE", file.id, "t7"), 200);
++    expect(await tag(file.id, "one-more")).toHaveLength(20);
++  });
++
++  it("keeps the limit when tags arrive concurrently", async () => {
++    const file = await storeFile(t.app, tenant, "a.txt", "a");
++    const responses = await Promise.all(
++      Array.from({ length: 30 }, (_, i) => tagRequest("PUT", file.id, `c${i}`)),
++    );
++    expect(responses.filter((r) => r.statusCode === 200)).toHaveLength(20);
++    expect(responses.filter((r) => r.statusCode === 409)).toHaveLength(10);
++    expect(await tagsOf(file.id)).toHaveLength(20);
++  });
++
++  it("lists the files with a tag, page by page", async () => {
++    const tagged: string[] = [];
++    for (const path of ["e.txt", "a.txt", "c/d.txt", "b.txt", "f.txt"]) {
++      const file = await storeFile(t.app, tenant, path, path);
++      if (path !== "b.txt") {
++        await tag(file.id, "keep");
++        tagged.push(path);
++      }
++      await tag(file.id, "all");
++    }
++    const seen: string[] = [];
++    let cursor: string | null = null;
++    let pages = 0;
++    do {
++      const current: Page = await page(`?tag=keep&limit=3${cursor ? `&after=${encodeURIComponent(cursor)}` : ""}`);
++      seen.push(...current.data.map((file) => file.path));
++      cursor = current.nextCursor;
++      pages++;
++    } while (cursor !== null && pages < 10);
++    expect(seen).toEqual(["a.txt", "c/d.txt", "e.txt", "f.txt"]);
++    expect(pages).toBe(2);
++    expect((await page("?tag=all")).data).toHaveLength(5);
++    expect((await page("?tag=none")).data).toEqual([]);
++  });
++
++  it("keeps tags within the tenant", async () => {
++    const other = await createTenant(t.pool, t.clock, { name: "Harbor Logistics" });
++    const theirs = await storeFile(t.app, other, "theirs.txt", "x");
++    const response = await t.app.inject({
++      method: "PUT",
++      url: `/v1/files/by-id/${theirs.id}/tags/mine`,
++      headers: tenant.headers,
++    });
++    expectStatus(response, 404);
++    expectStatus(await t.app.inject({ url: `/v1/files/by-id/${theirs.id}/tags`, headers: tenant.headers }), 404);
++    const ours = await storeFile(t.app, tenant, "ours.txt", "x");
++    await tag(ours.id, "shared-name");
++    expect((await page("?tag=shared-name", other)).data).toEqual([]);
++  });
++
++  it("drops the tags of a deleted or replaced file", async () => {
++    const first = await storeFile(t.app, tenant, "report.pdf", "v1");
++    await tag(first.id, "draft");
++    const replaced = await putFile(t.app, tenant, "report.pdf", "v2", { overwrite: true });
++    expectStatus(replaced, 200);
++    const second = replaced.json<FileBody>();
++    expect(await tagsOf(second.id)).toEqual([]);
++    expect((await page("?tag=draft")).data).toEqual([]);
++
++    await tag(second.id, "final");
++    expectStatus(await t.app.inject({ method: "DELETE", url: "/v1/files/report.pdf", headers: tenant.headers }), 204);
++    expectStatus(await tagRequest("PUT", second.id, "final"), 404);
++    const rows = await t.pool.query("SELECT 1 FROM file_tags");
++    expect(rows.rowCount).toBe(0);
++  });
++
++  it("needs files:write to change tags and files:read to read them", async () => {
++    const file = await storeFile(t.app, tenant, "a.txt", "a");
++    const reader = await issueKey(t.pool, t.clock, tenant.tenantId, ["files:read"]);
++    expectStatus(await tagRequest("PUT", file.id, "x", reader), 403);
++    expectStatus(await tagRequest("DELETE", file.id, "x", reader), 403);
++    const writer = await issueKey(t.pool, t.clock, tenant.tenantId, ["files:write"]);
++    expectStatus(await t.app.inject({ url: `/v1/files/by-id/${file.id}/tags`, headers: writer.headers }), 403);
++  });
++});

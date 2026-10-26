@@ -1,0 +1,36 @@
+diff --git a/src/authz/api/deps.py b/src/authz/api/deps.py
+index 103be27..b88e836 100644
+--- a/src/authz/api/deps.py
++++ b/src/authz/api/deps.py
+@@ -88,6 +88,8 @@ async def org_context(
+     An API key acts for the member who created it, so it stops working once they leave the
+     organisation; what it may do there is limited by the key's role.
+     """
++    if principal.org_id is not None and principal.org_id != org_id:
++        raise NotFoundError("organization")
+     membership = await container.members.membership(org_id, principal.user_id)
+     if membership is None:
+         raise NotFoundError("organization")
+diff --git a/src/authz/domain/principal.py b/src/authz/domain/principal.py
+index 62681dd..0f33597 100644
+--- a/src/authz/domain/principal.py
++++ b/src/authz/domain/principal.py
+@@ -23,6 +23,7 @@ class Principal:
+     ip: str | None = None
+     user_agent: str | None = None
+     api_key_id: UUID | None = None
++    org_id: UUID | None = None
+     scopes: frozenset[str] | None = None
+ 
+     @classmethod
+diff --git a/src/authz/services/api_keys.py b/src/authz/services/api_keys.py
+index c0499c5..0b00300 100644
+--- a/src/authz/services/api_keys.py
++++ b/src/authz/services/api_keys.py
+@@ -147,5 +147,6 @@ class ApiKeyService:
+             ip=client.ip,
+             user_agent=client.user_agent,
+             api_key_id=key.id,
++            org_id=key.org_id,
+             scopes=effective_permissions(graph, [key.role_id]) & API_KEY_PERMISSIONS,
+         )

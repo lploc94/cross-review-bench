@@ -1,0 +1,10 @@
+{
+  "language": "py",
+  "test_cmd": "uv run --frozen pytest -q",
+  "typecheck_cmd": "uv run --frozen mypy",
+  "lint_cmd": "uv run --frozen ruff check .",
+  "deps_cmd": "uv sync --frozen",
+  "warm_cmd": "uv run --frozen pytest -q",
+  "services": ["postgres"],
+  "allow_words": []
+}

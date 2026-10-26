@@ -1,0 +1,685 @@
+{
+  "set": "final",
+  "bugs": [
+    {
+      "id": "P2",
+      "task": "gateway-go-T02",
+      "severity": "low"
+    },
+    {
+      "id": "P4",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P5",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P9",
+      "task": "sync-ts-T04",
+      "severity": "medium"
+    },
+    {
+      "id": "P10",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P12",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P16",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P19",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P23",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P24",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P26",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P27",
+      "task": "rb-go-gpt-load-887",
+      "severity": "low"
+    },
+    {
+      "id": "P28",
+      "task": "gateway-go-T06",
+      "severity": "low"
+    },
+    {
+      "id": "P29",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P30",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P31",
+      "task": "rb-py-agents-7783",
+      "severity": "high"
+    },
+    {
+      "id": "P34",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P35",
+      "task": "rb-py-agents-7783",
+      "severity": "low"
+    },
+    {
+      "id": "P36",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P38",
+      "task": "rb-py-agents-7783",
+      "severity": "low"
+    },
+    {
+      "id": "P39",
+      "task": "rb-go-gpt-load-887",
+      "severity": "low"
+    },
+    {
+      "id": "P40",
+      "task": "sync-ts-T13",
+      "severity": "medium"
+    },
+    {
+      "id": "P41",
+      "task": "gateway-go-T08",
+      "severity": "medium"
+    },
+    {
+      "id": "P42",
+      "task": "rb-py-agents-7783",
+      "severity": "high"
+    },
+    {
+      "id": "P43",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P44",
+      "task": "sync-ts-T13",
+      "severity": "low"
+    },
+    {
+      "id": "P45",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P46",
+      "task": "gateway-go-T09",
+      "severity": "low"
+    },
+    {
+      "id": "P47",
+      "task": "rb-go-gpt-load-887",
+      "severity": "low"
+    },
+    {
+      "id": "P48",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P49",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P50",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P51",
+      "task": "rb-py-agents-7783",
+      "severity": "low"
+    },
+    {
+      "id": "P52",
+      "task": "rb-go-gpt-load-887",
+      "severity": "medium"
+    },
+    {
+      "id": "P53",
+      "task": "gateway-go-T10",
+      "severity": "high"
+    },
+    {
+      "id": "P54",
+      "task": "sync-ts-T14",
+      "severity": "medium"
+    },
+    {
+      "id": "P55",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P56",
+      "task": "rb-py-agents-7783",
+      "severity": "medium"
+    },
+    {
+      "id": "P58",
+      "task": "etl-py-T04",
+      "severity": "low"
+    },
+    {
+      "id": "P59",
+      "task": "rb-py-agents-7783",
+      "severity": "low"
+    },
+    {
+      "id": "P60",
+      "task": "etl-py-T04",
+      "severity": "low"
+    },
+    {
+      "id": "P62",
+      "task": "rb-py-agents-7783",
+      "severity": "low"
+    },
+    {
+      "id": "P63",
+      "task": "rb-py-agents-7783",
+      "severity": "low"
+    },
+    {
+      "id": "P64",
+      "task": "rb-go-grok2api-1018",
+      "severity": "low"
+    },
+    {
+      "id": "P66",
+      "task": "rb-go-grok2api-1018",
+      "severity": "low"
+    },
+    {
+      "id": "P67",
+      "task": "rb-py-browser-harness-757",
+      "severity": "medium"
+    },
+    {
+      "id": "P68",
+      "task": "rb-go-grok2api-1018",
+      "severity": "low"
+    },
+    {
+      "id": "P69",
+      "task": "gateway-go-T12",
+      "severity": "low"
+    },
+    {
+      "id": "P70",
+      "task": "rb-py-browser-harness-757",
+      "severity": "low"
+    },
+    {
+      "id": "P71",
+      "task": "rb-py-browser-harness-757",
+      "severity": "low"
+    },
+    {
+      "id": "P72",
+      "task": "rb-py-browser-harness-757",
+      "severity": "low"
+    },
+    {
+      "id": "P73",
+      "task": "etl-py-T07",
+      "severity": "medium"
+    },
+    {
+      "id": "P74",
+      "task": "rb-go-grok2api-1018",
+      "severity": "medium"
+    },
+    {
+      "id": "P75",
+      "task": "rb-py-browser-harness-757",
+      "severity": "medium"
+    },
+    {
+      "id": "P76",
+      "task": "rb-py-browser-harness-757",
+      "severity": "high"
+    },
+    {
+      "id": "P77",
+      "task": "etl-py-T10",
+      "severity": "low"
+    },
+    {
+      "id": "P78",
+      "task": "gateway-go-T13",
+      "severity": "medium"
+    },
+    {
+      "id": "P79",
+      "task": "rb-py-browser-harness-757",
+      "severity": "medium"
+    },
+    {
+      "id": "P80",
+      "task": "rb-py-browser-harness-757",
+      "severity": "medium"
+    },
+    {
+      "id": "P81",
+      "task": "rb-py-browser-harness-757",
+      "severity": "medium"
+    },
+    {
+      "id": "P82",
+      "task": "rb-go-grok2api-1018",
+      "severity": "high"
+    },
+    {
+      "id": "P85",
+      "task": "rb-go-grype-3809",
+      "severity": "medium"
+    },
+    {
+      "id": "P86",
+      "task": "rb-py-browser-harness-757",
+      "severity": "low"
+    },
+    {
+      "id": "P87",
+      "task": "rb-py-browser-harness-757",
+      "severity": "low"
+    },
+    {
+      "id": "P88",
+      "task": "rb-go-grype-3809",
+      "severity": "medium"
+    },
+    {
+      "id": "P89",
+      "task": "rb-go-grype-3809",
+      "severity": "medium"
+    },
+    {
+      "id": "P92",
+      "task": "rb-java-configuration-as-code-plugin-2895",
+      "severity": "medium"
+    },
+    {
+      "id": "P93",
+      "task": "booking-java-T06",
+      "severity": "high"
+    },
+    {
+      "id": "P94",
+      "task": "rb-go-grype-3809",
+      "severity": "low"
+    },
+    {
+      "id": "P95",
+      "task": "rb-java-configuration-as-code-plugin-2895",
+      "severity": "medium"
+    },
+    {
+      "id": "P96",
+      "task": "rb-go-ragflow-21119",
+      "severity": "medium"
+    },
+    {
+      "id": "P98",
+      "task": "rb-java-configuration-as-code-plugin-2895",
+      "severity": "low"
+    },
+    {
+      "id": "P99",
+      "task": "rb-go-ragflow-21119",
+      "severity": "medium"
+    },
+    {
+      "id": "P100",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "high"
+    },
+    {
+      "id": "P101",
+      "task": "booking-java-T08",
+      "severity": "medium"
+    },
+    {
+      "id": "P102",
+      "task": "rb-java-cucumber-jvm-3248",
+      "severity": "medium"
+    },
+    {
+      "id": "P103",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "medium"
+    },
+    {
+      "id": "P104",
+      "task": "booking-java-T08",
+      "severity": "medium"
+    },
+    {
+      "id": "P105",
+      "task": "rb-java-cucumber-jvm-3248",
+      "severity": "low"
+    },
+    {
+      "id": "P106",
+      "task": "rb-py-dspy-10447",
+      "severity": "medium"
+    },
+    {
+      "id": "P107",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "low"
+    },
+    {
+      "id": "P108",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "medium"
+    },
+    {
+      "id": "P110",
+      "task": "rb-py-dspy-10447",
+      "severity": "high"
+    },
+    {
+      "id": "P111",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "low"
+    },
+    {
+      "id": "P112",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P114",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "medium"
+    },
+    {
+      "id": "P115",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "medium"
+    },
+    {
+      "id": "P116",
+      "task": "rb-py-dspy-10447",
+      "severity": "medium"
+    },
+    {
+      "id": "P117",
+      "task": "rb-py-dspy-10447",
+      "severity": "medium"
+    },
+    {
+      "id": "P118",
+      "task": "rb-py-dspy-10447",
+      "severity": "medium"
+    },
+    {
+      "id": "P120",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "medium"
+    },
+    {
+      "id": "P122",
+      "task": "rb-py-dspy-10447",
+      "severity": "medium"
+    },
+    {
+      "id": "P123",
+      "task": "rb-py-dspy-10447",
+      "severity": "medium"
+    },
+    {
+      "id": "P124",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "medium"
+    },
+    {
+      "id": "P125",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P126",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P127",
+      "task": "workflow-java-T10",
+      "severity": "low"
+    },
+    {
+      "id": "P128",
+      "task": "rb-py-laya-1224",
+      "severity": "medium"
+    },
+    {
+      "id": "P129",
+      "task": "rb-java-agentscope-java-3580",
+      "severity": "low"
+    },
+    {
+      "id": "P130",
+      "task": "rb-java-fory-4000",
+      "severity": "low"
+    },
+    {
+      "id": "P132",
+      "task": "rb-py-lmcache-4748",
+      "severity": "medium"
+    },
+    {
+      "id": "P133",
+      "task": "ledger-ts-T04",
+      "severity": "low"
+    },
+    {
+      "id": "P134",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P135",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P136",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P137",
+      "task": "rb-java-fory-4000",
+      "severity": "high"
+    },
+    {
+      "id": "P138",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P139",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P140",
+      "task": "rb-java-fory-4000",
+      "severity": "high"
+    },
+    {
+      "id": "P141",
+      "task": "ledger-ts-T05",
+      "severity": "low"
+    },
+    {
+      "id": "P142",
+      "task": "rb-py-lmcache-4748",
+      "severity": "medium"
+    },
+    {
+      "id": "P145",
+      "task": "ledger-ts-T10",
+      "severity": "medium"
+    },
+    {
+      "id": "P146",
+      "task": "rb-java-fory-4000",
+      "severity": "high"
+    },
+    {
+      "id": "P148",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    },
+    {
+      "id": "P149",
+      "task": "rb-ts-e2e-1150",
+      "severity": "medium"
+    },
+    {
+      "id": "P150",
+      "task": "rb-ts-e2e-1150",
+      "severity": "medium"
+    },
+    {
+      "id": "P151",
+      "task": "rb-ts-e2e-1150",
+      "severity": "low"
+    },
+    {
+      "id": "P152",
+      "task": "rb-java-wxjava-4115",
+      "severity": "high"
+    },
+    {
+      "id": "P154",
+      "task": "rb-ts-hunk-784",
+      "severity": "medium"
+    },
+    {
+      "id": "P155",
+      "task": "rb-java-wxjava-4115",
+      "severity": "medium"
+    },
+    {
+      "id": "P156",
+      "task": "rb-java-wxjava-4115",
+      "severity": "low"
+    },
+    {
+      "id": "P157",
+      "task": "authz-py-T14",
+      "severity": "medium"
+    },
+    {
+      "id": "P158",
+      "task": "rb-ts-hunk-784",
+      "severity": "medium"
+    },
+    {
+      "id": "P159",
+      "task": "rb-ts-hunk-784",
+      "severity": "medium"
+    },
+    {
+      "id": "P160",
+      "task": "rb-ts-hunk-784",
+      "severity": "low"
+    },
+    {
+      "id": "P161",
+      "task": "jobqueue-go-T01",
+      "severity": "medium"
+    },
+    {
+      "id": "P162",
+      "task": "rb-ts-hunk-784",
+      "severity": "low"
+    },
+    {
+      "id": "P163",
+      "task": "rb-ts-hunk-784",
+      "severity": "low"
+    },
+    {
+      "id": "P164",
+      "task": "jobqueue-go-T10",
+      "severity": "high"
+    },
+    {
+      "id": "P165",
+      "task": "rb-ts-oh-my-opencode-slim-1366",
+      "severity": "medium"
+    },
+    {
+      "id": "P166",
+      "task": "rb-ts-oh-my-opencode-slim-1366",
+      "severity": "medium"
+    },
+    {
+      "id": "P167",
+      "task": "rb-ts-oh-my-opencode-slim-1366",
+      "severity": "medium"
+    },
+    {
+      "id": "P168",
+      "task": "rb-ts-oh-my-opencode-slim-1366",
+      "severity": "medium"
+    },
+    {
+      "id": "P169",
+      "task": "rb-ts-react-router-15612",
+      "severity": "medium"
+    },
+    {
+      "id": "P170",
+      "task": "rb-ts-react-router-15612",
+      "severity": "low"
+    },
+    {
+      "id": "P171",
+      "task": "rb-java-fory-4000",
+      "severity": "medium"
+    }
+  ]
+}

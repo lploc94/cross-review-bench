@@ -1,0 +1,15 @@
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java b/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
+index 8e32b5a..c0be0bf 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
+@@ -77,6 +77,10 @@ public class DocumentQueriesImpl implements DocumentQueries {
+       matches.add(
+           new TitleMatch(((Number) columns[0]).longValue(), ((Number) columns[1]).floatValue()));
+     }
++    if (after == null && matches.size() < limit) {
++      // Every visible match is on this first page.
++      return new TitleMatch.Page(matches, matches.size());
++    }
+     Number total =
+         (Number)
+             em.createNativeQuery("select count(*) from document d where " + TITLE_MATCHES)

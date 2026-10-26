@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T13",
+  "repo": "etl-py",
+  "kind": "clean",
+  "title": "Stale-source alert: etl sources stale",
+  "description": "Last month the shop export stopped arriving for a day and nobody noticed until the sales report came out empty: a run that never starts fails nothing. This adds a freshness check monitoring can call.\n\n- `SourceSpec.max_age` (default one day, must be positive): orders 2 h, customers 26 h (a daily export with some slack), products 7 days. `sources show` prints it and its JSON has `max_age`.\n- `etl sources stale [--json]` lists every source with its max age, its last succeeded run, when that run finished and how long ago (`age`). A source is stale when that run finished more than `max_age` ago, or when it never had a succeeded run; failed and still-running runs do not count. Exactly `max_age` ago is still fresh. A finish time ahead of the local clock counts as age 0.\n- The command exits 0 when no source is stale and with a new code, 17 (`SourcesStale`), when any is, after printing the table or JSON, so cron, systemd timers or a Nagios-style check can alert on the exit status alone. The message names the stale sources. 17 was unused; `EXIT_CODES` and the README table list it.\n\nTests: `tests/cli/test_sources_commands.py` (never loaded, fresh, only the sources past their max age, JSON), registry validation and the exit-code table in `tests/unit/test_errors.py`. README updated (sources table, Runs, CLI, exit codes).",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "tests/hidden/test_source_freshness.py"
+  ],
+  "clean_hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_source_freshness.py"
+}

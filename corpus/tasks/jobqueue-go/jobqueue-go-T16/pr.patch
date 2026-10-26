@@ -1,0 +1,308 @@
+diff --git a/README.md b/README.md
+index 7c29825..ad63d65 100644
+--- a/README.md
++++ b/README.md
+@@ -46,6 +46,13 @@ available ──cancel──▶ cancelled
+   `worker.WithTimeout`). A handler that may outlive its lease calls `worker.ExtendLease(ctx)`;
+   the `sleep` handler shows how.
+ - A panicking handler fails its attempt with the panic message; the worker carries on.
++- `worker.IsFinalAttempt(ctx)` tells a handler that this attempt is the job's last: if it fails
++  with a retryable error, the job goes to the dead-letter queue. Handlers use it to escalate
++  only when no retry follows. Programs embedding the pool can set `Options.OnExhausted`: it is
++  called once, from the worker goroutine that ran the job, when the job's last attempt fails
++  with an error that is not permanent and the outcome is recorded, so the job is dead. It is
++  not called for a permanent error, for an outcome that could not be recorded (such as a lost
++  lease), or for a job whose last lease expired, which the reaper moves to dead.
+ - `Stop` (on SIGTERM or SIGINT) stops leasing and waits for running handlers to return. It does
+   not cancel them.
+ 
+@@ -78,6 +85,10 @@ go run ./cmd/jobctl wait 1
+ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ ```
+ 
++`jobctl wait` prints the job's JSON once it has finished and reports its progress on stderr in
++the meantime: `job 1: running, attempt 2/5`, `job 1: available, attempt 2/5 failed, retrying at
++…`, and `(last)` on a job's final attempt.
++
+ ### Configuration
+ 
+ | Variable | Default | Meaning |
+diff --git a/cmd/jobctl/commands.go b/cmd/jobctl/commands.go
+index db41117..ce84b18 100644
+--- a/cmd/jobctl/commands.go
++++ b/cmd/jobctl/commands.go
+@@ -122,7 +122,8 @@ func cancelCmd(ctx context.Context, c *client.Client, args []string, stdout, std
+ var errNotSucceeded = errors.New("job did not succeed")
+ 
+ // waitCmd polls a job until it reaches a terminal state, so that scripts can enqueue a job and
+-// wait for its result. It succeeds only if the job succeeded.
++// wait for its result. It succeeds only if the job succeeded. Each change of the job's progress
++// is reported on stderr ("job 42: running, attempt 3/5"), stdout carries only the final JSON.
+ func waitCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
+ 	fs := newFlags("wait", stderr)
+ 	timeout := fs.Duration("timeout", 10*time.Minute, "give up after this long")
+@@ -142,11 +143,16 @@ func waitCmd(ctx context.Context, c *client.Client, args []string, stdout, stder
+ 	defer cancel()
+ 	ticker := time.NewTicker(*interval)
+ 	defer ticker.Stop()
++	reported := ""
+ 	for {
+ 		job, err := c.GetJob(ctx, ids[0])
+ 		if err != nil {
+ 			return err
+ 		}
++		if p := progress(job); p != reported {
++			fmt.Fprintf(stderr, "job %d: %s\n", job.ID, p)
++			reported = p
++		}
+ 		if terminalStates[job.State] {
+ 			if err := printJSON(stdout, job); err != nil {
+ 				return err
+@@ -166,6 +172,23 @@ func waitCmd(ctx context.Context, c *client.Client, args []string, stdout, stder
+ 
+ var terminalStates = map[string]bool{"succeeded": true, "failed": true, "cancelled": true, "dead": true}
+ 
++// progress describes where a job stands for wait: its state and, once it has been leased, the
++// attempt it is on or the last one that ran ("running, attempt 3/5"). A job running its last
++// attempt is marked as such.
++func progress(j client.Job) string {
++	switch {
++	case j.Attempts == 0:
++		return j.State
++	case j.State == "running" && j.Attempts >= j.MaxAttempts:
++		return fmt.Sprintf("running, attempt %d/%d (last)", j.Attempts, j.MaxAttempts)
++	case j.State == "available":
++		return fmt.Sprintf("available, attempt %d/%d failed, retrying at %s", j.Attempts, j.MaxAttempts,
++			j.RunAt.Format(time.RFC3339))
++	default:
++		return fmt.Sprintf("%s, attempt %d/%d", j.State, j.Attempts, j.MaxAttempts)
++	}
++}
++
+ // requeueCmd requeues each dead job given and reports every failure, not only the first.
+ func requeueCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
+ 	ids, err := parseIDs("requeue", args, stderr, 0)
+diff --git a/cmd/jobctl/main_test.go b/cmd/jobctl/main_test.go
+index 192d594..ed1f1cd 100644
+--- a/cmd/jobctl/main_test.go
++++ b/cmd/jobctl/main_test.go
+@@ -117,6 +117,37 @@ func TestWaitCommand(t *testing.T) {
+ 	}
+ }
+ 
++func TestWaitCommandReportsProgress(t *testing.T) {
++	job := func(state string, attempts int, runAt string) response {
++		return response{200, fmt.Sprintf(`{"id":9,"queue":"default","type":"noop","state":"%s","attempts":%d,"max_attempts":3,"run_at":"%s"}`,
++			state, attempts, runAt)}
++	}
++	api := &fakeAPI{routes: map[string][]response{"GET /v1/jobs/9": {
++		job("available", 0, "2025-03-10T09:00:00Z"),
++		job("running", 1, "2025-03-10T09:00:00Z"),
++		job("running", 1, "2025-03-10T09:00:00Z"),
++		job("available", 1, "2025-03-10T09:00:30Z"),
++		job("running", 3, "2025-03-10T09:02:00Z"),
++		job("succeeded", 3, "2025-03-10T09:02:00Z"),
++	}}}
++	code, out, errOut := runCLI(t, api, "wait", "-interval", "1ms", "9")
++	if code != 0 {
++		t.Fatalf("exit %d: %s", code, errOut)
++	}
++	want := `job 9: available
++job 9: running, attempt 1/3
++job 9: available, attempt 1/3 failed, retrying at 2025-03-10T09:00:30Z
++job 9: running, attempt 3/3 (last)
++job 9: succeeded, attempt 3/3
++`
++	if errOut != want {
++		t.Errorf("stderr:\n%s\nwant:\n%s", errOut, want)
++	}
++	if !strings.Contains(out, `"state": "succeeded"`) || strings.Contains(out, "job 9:") {
++		t.Errorf("stdout = %s, want only the job's JSON", out)
++	}
++}
++
+ func TestScheduleCommands(t *testing.T) {
+ 	sc := `{"name":"nightly","spec":"0 3 * * *","queue":"default","type":"noop","enabled":true,"next_run_at":"2025-03-11T03:00:00Z"}`
+ 	api := &fakeAPI{routes: map[string][]response{
+diff --git a/internal/worker/lease.go b/internal/worker/lease.go
+index f9cb6d3..6c85e7e 100644
+--- a/internal/worker/lease.go
++++ b/internal/worker/lease.go
+@@ -17,6 +17,7 @@ type leaseKey struct{}
+ type lease struct {
+ 	jobID    int64
+ 	workerID string
++	final    bool // the job has no attempts left after this one
+ 	store    Store
+ 	clock    clock.Clock
+ 	duration time.Duration
+@@ -38,6 +39,15 @@ func ExtendLease(ctx context.Context) error {
+ 	return l.store.ExtendLease(ctx, l.jobID, l.workerID, l.clock.Now().Add(l.duration))
+ }
+ 
++// IsFinalAttempt reports whether the job running under ctx is on its last attempt: if the
++// handler returns an error now, the job becomes dead instead of being retried. Handlers use it
++// to escalate only when no retry will follow, for example to notify a person or to release
++// something the job reserved. It returns false when ctx does not belong to a running job.
++func IsFinalAttempt(ctx context.Context) bool {
++	l, ok := ctx.Value(leaseKey{}).(*lease)
++	return ok && l.final
++}
++
+ // WorkerID returns the lease owner name of the worker running the job under ctx, or "" when
+ // ctx does not belong to a running job.
+ func WorkerID(ctx context.Context) string {
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index f7ebeed..0e6d234 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -45,6 +45,11 @@ type Options struct {
+ 	// OnSettled, if set, is called after each job's outcome has been recorded (or failed to
+ 	// be), from the goroutine that ran the job.
+ 	OnSettled func(Outcome)
++	// OnExhausted, if set, is called when the last attempt of a job failed with an error that
++	// is not permanent and the job was moved to dead, before OnSettled and from the same
++	// goroutine. Jobs whose last lease expires are moved to dead by the reaper and are not
++	// reported here.
++	OnExhausted func(Outcome)
+ }
+ 
+ // Outcome describes one finished attempt.
+@@ -235,9 +240,11 @@ func (p *Pool) run(queue, workerID string, job domain.Job) {
+ 	p.metrics.busy.Add(1, queue)
+ 	defer p.metrics.busy.Add(-1, queue)
+ 
+-	log := p.log.With("job_id", job.ID, "queue", job.Queue, "type", job.Type, "attempt", job.Attempts, "worker", workerID)
++	final := job.Attempts >= job.MaxAttempts
++	log := p.log.With("job_id", job.ID, "queue", job.Queue, "type", job.Type,
++		"attempt", job.Attempts, "max_attempts", job.MaxAttempts, "worker", workerID)
+ 	start := p.opts.Clock.Now()
+-	herr := p.execute(job, workerID)
++	herr := p.execute(job, workerID, final)
+ 	elapsed := p.opts.Clock.Now().Sub(start)
+ 
+ 	var panicErr *PanicError
+@@ -266,13 +273,17 @@ func (p *Pool) run(queue, workerID string, job domain.Job) {
+ 	default:
+ 		log.Warn("job attempt failed", "error", herr, "state", out.State, "duration", elapsed)
+ 	}
++	if p.opts.OnExhausted != nil && final && herr != nil && !domain.IsPermanent(herr) && out.SettleErr == nil {
++		p.opts.OnExhausted(out)
++	}
+ 	if p.opts.OnSettled != nil {
+ 		p.opts.OnSettled(out)
+ 	}
+ }
+ 
+-// execute runs the job's handler with the type's timeout and turns a panic into an error.
+-func (p *Pool) execute(job domain.Job, workerID string) error {
++// execute runs the job's handler with the type's timeout and turns a panic into an error. final
++// is what IsFinalAttempt reports to the handler.
++func (p *Pool) execute(job domain.Job, workerID string, final bool) error {
+ 	h, ok := p.registry.lookup(job.Type)
+ 	if !ok {
+ 		return fmt.Errorf("no handler registered for job type %q", job.Type)
+@@ -280,6 +291,7 @@ func (p *Pool) execute(job domain.Job, workerID string) error {
+ 	ctx := withLease(p.ctx, &lease{
+ 		jobID:    job.ID,
+ 		workerID: workerID,
++		final:    final,
+ 		store:    p.store,
+ 		clock:    p.opts.Clock,
+ 		duration: p.opts.LeaseDuration,
+diff --git a/internal/worker/pool_test.go b/internal/worker/pool_test.go
+index b001dd8..9255371 100644
+--- a/internal/worker/pool_test.go
++++ b/internal/worker/pool_test.go
+@@ -247,6 +247,91 @@ func TestExtendLeaseOutsideAJob(t *testing.T) {
+ 	}
+ }
+ 
++func TestIsFinalAttempt(t *testing.T) {
++	cases := []struct {
++		name        string
++		attempts    int // attempts made before this lease
++		maxAttempts int
++		want        bool
++	}{
++		{"first of three", 0, 3, false},
++		{"second of three", 1, 3, false},
++		{"third of three", 2, 3, true},
++		{"only attempt", 0, 1, true},
++		{"requeued dead job", 0, 5, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			st := newFakeStore(domain.Job{ID: 1, Type: "probe", Attempts: tc.attempts, MaxAttempts: tc.maxAttempts})
++			var final bool
++			h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++				"probe": func(ctx context.Context, _ domain.Job) error {
++					final = worker.IsFinalAttempt(ctx)
++					return nil
++				},
++			}))
++			h.start(t, context.Background())
++
++			out := h.next(t)
++			if final != tc.want {
++				t.Errorf("IsFinalAttempt on attempt %d/%d = %v, want %v", out.Job.Attempts, out.Job.MaxAttempts, final, tc.want)
++			}
++		})
++	}
++	if worker.IsFinalAttempt(context.Background()) {
++		t.Error("IsFinalAttempt outside a job = true")
++	}
++}
++
++func TestPoolOnExhausted(t *testing.T) {
++	st := newFakeStore(
++		domain.Job{ID: 1, Type: "flaky", Attempts: 0, MaxAttempts: 3},  // attempts left
++		domain.Job{ID: 2, Type: "flaky", Attempts: 2, MaxAttempts: 3},  // its last attempt fails
++		domain.Job{ID: 3, Type: "strict", Attempts: 2, MaxAttempts: 3}, // permanent failure: failed, not dead
++		domain.Job{ID: 4, Type: "ok", Attempts: 2, MaxAttempts: 3},     // its last attempt succeeds
++	)
++	exhausted := make(chan worker.Outcome, 4)
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"flaky":  func(context.Context, domain.Job) error { return errors.New("upstream unavailable") },
++		"strict": func(context.Context, domain.Job) error { return domain.Permanent(errors.New("bad payload")) },
++		"ok":     func(context.Context, domain.Job) error { return nil },
++	}), func(o *worker.Options) {
++		o.OnExhausted = func(out worker.Outcome) { exhausted <- out }
++	})
++	h.start(t, context.Background())
++
++	// OnExhausted runs before OnSettled, so once every outcome is in, so is every call.
++	for range 4 {
++		h.next(t)
++	}
++	if len(exhausted) != 1 {
++		t.Fatalf("OnExhausted called %d times, want once", len(exhausted))
++	}
++	out := <-exhausted
++	if out.Job.ID != 2 || out.State != domain.StateDead || out.Err == nil || out.Job.Attempts != 3 {
++		t.Errorf("OnExhausted outcome = %+v, want job 2 dead after attempt 3", out)
++	}
++}
++
++func TestPoolOnExhaustedSkipsLostLease(t *testing.T) {
++	st := newFakeStore(domain.Job{ID: 1, Type: "flaky", Attempts: 2, MaxAttempts: 3})
++	st.settleErr = domain.ErrLeaseLost
++	called := false
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"flaky": func(context.Context, domain.Job) error { return errors.New("upstream unavailable") },
++	}), func(o *worker.Options) {
++		o.OnExhausted = func(worker.Outcome) { called = true }
++	})
++	h.start(t, context.Background())
++
++	if out := h.next(t); !errors.Is(out.SettleErr, domain.ErrLeaseLost) {
++		t.Fatalf("outcome = %+v, want a lost lease", out)
++	}
++	if called {
++		t.Error("OnExhausted called for an attempt whose outcome was not recorded")
++	}
++}
++
+ func TestPoolStopWaitsForRunningHandler(t *testing.T) {
+ 	started := make(chan struct{})
+ 	release := make(chan struct{})

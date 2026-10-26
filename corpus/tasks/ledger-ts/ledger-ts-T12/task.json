@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T12",
+  "repo": "ledger-ts",
+  "kind": "clean",
+  "title": "Account names and labels: PATCH /accounts/:id and label filters",
+  "description": "Tenants with hundreds of wallets want to tag them (team, region, cost centre) and find them again, and to fix a typo in an account name without opening a new account.\n\n- Migration 0009 adds `accounts.labels jsonb NOT NULL DEFAULT '{}'` (must be an object) with a GIN `jsonb_path_ops` index for containment queries.\n- `PATCH /accounts/:id` (scope `accounts:write`) takes `name` and/or `labels`; `name` follows the same rules as when an account is opened. `labels` replaces the whole set (`{}` clears it): at most 20 pairs, keys of letters, digits, `_`, `.` and `-` up to 40 characters, string values up to 100 that contain no NUL character and no unpaired surrogate (Postgres rejects both, so they are a 400). Closed accounts can be updated too since only descriptive fields change; balances are never touched. Unknown fields and an empty body are 400.\n- `GET /accounts?label=key:value` filters by label; repeat `label` and every pair must match (each becomes a `labels @> '{\"key\": \"value\"}'` condition). The first `:` separates key and value, so values may contain colons.\n- Account responses now include `labels`.\n\nTests in `test/api/accountLabels.test.ts` cover renaming and relabelling, validation, filtering by one and several labels, malformed filters, scopes and tenant isolation. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["test/hidden/accountLabelsClean.test.ts"],
+  "clean_hidden_test_cmd": "npx vitest run test/hidden/accountLabelsClean.test.ts"
+}

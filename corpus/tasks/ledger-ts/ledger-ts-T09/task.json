@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T09",
+  "repo": "ledger-ts",
+  "kind": "buggy",
+  "title": "Cache account reads in Redis and add historical balances",
+  "description": "Wallet front ends poll `GET /accounts/:id` every few seconds per open session, and that query is now the top statement by call count on the primary. This puts a Redis cache in front of it and adds a historical balance endpoint that reconciliation has been asking for.\n\n- New `BalanceCache` (`src/services/balanceCache.ts`). `AccountService.getAccount` reads through it and stores the account for `BALANCE_CACHE_TTL_S` seconds (new setting, default `0` = off, so nothing changes until we turn it on per environment).\n- Cached reads are dropped after the transaction commits whenever money moves on the account: `TransferService.createTransfer` (both accounts), `HoldService.captureHold` (held account and destination) and `AccountService.closeAccount`.\n- `GET /accounts/:id/balance?as_of=<timestamp>` (scope `accounts:read`) returns the balance right after the account's entries created at or before that instant, summed from `entries`. Instants more than a minute old (`AS_OF_SETTLE_MS`) are cached too, since no transaction in flight can still add entries before them; `as_of` in the future is a 400.\n- Redis errors never fail a request: reads fall back to Postgres, writes and deletes are logged.\n\nTests: `test/api/balanceCache.test.ts` runs the app with the cache on and covers repeated reads, invalidation after transfers and captures, historical balances at and around entry timestamps, the settle window, validation and tenant isolation. The rest of the suite runs with the cache off.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/holdService.ts",
+      "lines": [149, 151],
+      "category": "data-integrity",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "Cached account reads are invalidated after captures (and transfers) only; createHold and voidHold change held_minor and therefore available without dropping the cached account, so GET /accounts/:id keeps serving the old held/available amounts for up to the TTL.",
+      "trigger": "With BALANCE_CACHE_TTL_S > 0: read an account (cached), then create or void a hold on it and read it again.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/balanceCacheHolds.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/balanceCacheHolds.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Creating or voiding a hold does not need an invalidation: the cache only serves the posted balance, and `available` is derived on every response by `serializeAccount` in src/api/serializers.ts from the live hold totals, so a cached copy can never show a stale available amount.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/services/balanceCache.ts",
+      "lines": [76, 77],
+      "category": "resource-leak",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "as_of balances are stored with SET and no expiry under a key built from the client-supplied timestamp (millisecond precision), so every distinct past as_of a client sends adds a permanent Redis key: unbounded memory growth.",
+      "trigger": "Call GET /accounts/:id/balance with many different past as_of values (any client or script iterating timestamps) while the cache is on.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/balanceAsOfExpiry.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/balanceAsOfExpiry.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "The as_of keys are bounded: `balanceQuerySchema` in src/api/schemas/accounts.ts only accepts instants at which the account has entries, and `getBalanceAsOf` in src/services/accountService.ts caches only settled instants, so each account gets at most one key per entry it has ever had, which is the same order of size as the entries table.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

@@ -1,0 +1,649 @@
+diff --git a/README.md b/README.md
+index 3b717d1..a5c24c1 100644
+--- a/README.md
++++ b/README.md
+@@ -29,6 +29,12 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+   Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+   is rounded with HALF_EVEN to the currency's minor units.
++- **Display currencies.** `?display=<ISO code>` on a quote or reservation adds `display`: the
++  currency, the rate, `indicative: true`, and the total and each line converted one by one and
++  rounded with HALF_EVEN to the display currency's minor units (so the lines may differ from the
++  total by a minor unit). Rates come from `booking.display-rates`; the property's own currency is
++  always available at rate 1, any other currency without a rate is a 400. Money is still charged
++  and refunded in the property's currency.
+ - **Reservations.** Status moves `CONFIRMED` to `CHECKED_IN` (on or after the check-in date, before
+   check-out) to `COMPLETED`, or to `CANCELLED`. A cancellation made at or before the full-refund
+   deadline is refunded in full; later ones follow the property policy. Cancelling twice is a
+@@ -78,7 +84,17 @@ curl -s -X POST localhost:8080/api/v1/admin/properties \
+ 
+ Other settings sit under `booking.*` in `src/main/resources/application.yml`: `hold-ttl`,
+ `hold-cleanup-interval`, `hold-cleanup-batch-size`, `max-rooms-per-booking`, `max-nights-per-stay`,
+-`max-retry-attempts` and `scheduling-enabled`. Invalid values fail the startup.
++`max-retry-attempts`, `scheduling-enabled` and `display-rates`. Invalid values fail the startup.
++`display-rates` maps a property currency to display currencies and the units of each that one unit
++buys (ISO 4217 codes with minor units, positive rates):
++
++```yaml
++booking:
++  display-rates:
++    EUR:
++      USD: 1.085
++      JPY: 162
++```
+ 
+ ## Testing
+ 
+@@ -121,10 +137,10 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `GET /api/v1/properties/{code}/room-types/{roomType}/calendar` | public | night by night: rooms free, nightly price |
+ | `GET /api/v1/properties/{code}/availability` | public | room types with enough rooms, minimum availability and quoted total |
+ | `GET /api/v1/properties/{code}/occupancy` | public | rooms held and booked per night |
+-| `POST /api/v1/properties/{code}/quotes` | public | per-night price breakdown |
++| `POST /api/v1/properties/{code}/quotes[?display=USD]` | public | per-night price breakdown, optionally also in a display currency |
+ | `POST /api/v1/properties/{code}/holds` | public | create a hold (201, `Location`) |
+ | `GET /api/v1/holds/{id}`, `POST /api/v1/holds/{id}/release`, `POST /api/v1/holds/{id}/confirm` | public | hold lifecycle |
+-| `GET /api/v1/reservations/{reference}` | public | one reservation with its price lines |
++| `GET /api/v1/reservations/{reference}[?display=USD]` | public | one reservation with its price lines, optionally also in a display currency |
+ | `GET /api/v1/reservations/{reference}/cancellation-quote` | public | refund a cancellation would get |
+ | `POST /api/v1/reservations/{reference}/cancel` | public | cancel and refund |
+ | `GET /api/v1/admin/reservations` | admin | paged list with filters (property, status, dates, guest email, guest name) |
+diff --git a/src/main/java/com/innkeep/booking/api/QuoteController.java b/src/main/java/com/innkeep/booking/api/QuoteController.java
+index 1fb7302..baed70a 100644
+--- a/src/main/java/com/innkeep/booking/api/QuoteController.java
++++ b/src/main/java/com/innkeep/booking/api/QuoteController.java
+@@ -3,12 +3,15 @@ package com.innkeep.booking.api;
+ import com.innkeep.booking.api.dto.QuoteResponse;
+ import com.innkeep.booking.api.dto.StayRequest;
+ import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.Quote;
++import com.innkeep.booking.service.DisplayCurrencyService;
+ import com.innkeep.booking.service.PricingService;
+ import jakarta.validation.Valid;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.PostMapping;
+ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
+ 
+ @RestController
+@@ -16,15 +19,22 @@ import org.springframework.web.bind.annotation.RestController;
+ public class QuoteController {
+ 
+   private final PricingService pricing;
++  private final DisplayCurrencyService displayCurrencies;
+ 
+-  public QuoteController(PricingService pricing) {
++  public QuoteController(PricingService pricing, DisplayCurrencyService displayCurrencies) {
+     this.pricing = pricing;
++    this.displayCurrencies = displayCurrencies;
+   }
+ 
++  /** Prices the stay; {@code display} adds the same price in another currency, indicatively. */
+   @PostMapping
+-  public QuoteResponse quote(@PathVariable String code, @Valid @RequestBody StayRequest request) {
++  public QuoteResponse quote(
++      @PathVariable String code,
++      @RequestParam(required = false) String display,
++      @Valid @RequestBody StayRequest request) {
+     var stay = new DateRange(request.checkIn(), request.checkOut());
++    Quote quote = pricing.quote(code, request.roomType(), stay, request.rooms(), request.guests());
+     return QuoteResponse.from(
+-        pricing.quote(code, request.roomType(), stay, request.rooms(), request.guests()));
++        quote, display == null ? null : displayCurrencies.rate(quote.total().currency(), display));
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/ReservationController.java b/src/main/java/com/innkeep/booking/api/ReservationController.java
+index 54c6a92..5945e62 100644
+--- a/src/main/java/com/innkeep/booking/api/ReservationController.java
++++ b/src/main/java/com/innkeep/booking/api/ReservationController.java
+@@ -3,6 +3,8 @@ package com.innkeep.booking.api;
+ import com.innkeep.booking.api.dto.CancellationQuoteResponse;
+ import com.innkeep.booking.api.dto.CancellationResponse;
+ import com.innkeep.booking.api.dto.ReservationResponse;
++import com.innkeep.booking.domain.Reservation;
++import com.innkeep.booking.service.DisplayCurrencyService;
+ import com.innkeep.booking.service.ReservationService;
+ import java.time.Instant;
+ import org.springframework.web.bind.annotation.GetMapping;
+@@ -22,14 +24,24 @@ import org.springframework.web.bind.annotation.RestController;
+ public class ReservationController {
+ 
+   private final ReservationService reservations;
++  private final DisplayCurrencyService displayCurrencies;
+ 
+-  public ReservationController(ReservationService reservations) {
++  public ReservationController(
++      ReservationService reservations, DisplayCurrencyService displayCurrencies) {
+     this.reservations = reservations;
++    this.displayCurrencies = displayCurrencies;
+   }
+ 
++  /** One reservation; {@code display} adds its price in another currency, indicatively. */
+   @GetMapping("/{reference}")
+-  public ReservationResponse get(@PathVariable String reference) {
+-    return ReservationResponse.from(reservations.get(reference));
++  public ReservationResponse get(
++      @PathVariable String reference, @RequestParam(required = false) String display) {
++    Reservation reservation = reservations.get(reference);
++    return ReservationResponse.from(
++        reservation,
++        display == null
++            ? null
++            : displayCurrencies.rate(reservation.getTotal().currency(), display));
+   }
+ 
+   @GetMapping("/{reference}/cancellation-quote")
+diff --git a/src/main/java/com/innkeep/booking/api/dto/DisplayPriceResponse.java b/src/main/java/com/innkeep/booking/api/dto/DisplayPriceResponse.java
+new file mode 100644
+index 0000000..1c7282f
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/DisplayPriceResponse.java
+@@ -0,0 +1,33 @@
++package com.innkeep.booking.api.dto;
++
++import com.innkeep.booking.domain.DisplayRate;
++import com.innkeep.booking.domain.Money;
++import com.innkeep.booking.domain.PriceLine;
++import java.math.BigDecimal;
++import java.util.List;
++
++/** A price shown in another currency at an indicative rate, each amount converted on its own. */
++public record DisplayPriceResponse(
++    String currency,
++    BigDecimal rate,
++    boolean indicative,
++    BigDecimal total,
++    List<PriceLineResponse> lines) {
++
++  public static DisplayPriceResponse of(DisplayRate rate, Money total, List<PriceLine> lines) {
++    return new DisplayPriceResponse(
++        rate.to().getCurrencyCode(),
++        rate.rate(),
++        true,
++        rate.convert(total.amount()),
++        lines.stream()
++            .map(
++                line ->
++                    new PriceLineResponse(
++                        line.getKind().name(),
++                        line.getNight(),
++                        line.getDescription(),
++                        rate.convert(line.getAmount())))
++            .toList());
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java b/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java
+index 428d527..8833a91 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java
+@@ -1,5 +1,7 @@
+ package com.innkeep.booking.api.dto;
+ 
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.innkeep.booking.domain.DisplayRate;
+ import com.innkeep.booking.domain.Quote;
+ import java.math.BigDecimal;
+ import java.time.LocalDate;
+@@ -13,9 +15,15 @@ public record QuoteResponse(
+     int guests,
+     String currency,
+     BigDecimal total,
+-    List<PriceLineResponse> lines) {
++    List<PriceLineResponse> lines,
++    @JsonInclude(JsonInclude.Include.NON_NULL) DisplayPriceResponse display) {
+ 
+   public static QuoteResponse from(Quote quote) {
++    return from(quote, null);
++  }
++
++  /** The quote, with the same price in a display currency when {@code displayRate} is given. */
++  public static QuoteResponse from(Quote quote, DisplayRate displayRate) {
+     return new QuoteResponse(
+         quote.roomTypeCode(),
+         quote.stay().checkIn(),
+@@ -24,6 +32,9 @@ public record QuoteResponse(
+         quote.guests(),
+         quote.total().currency().getCurrencyCode(),
+         quote.total().amount(),
+-        PriceLineResponse.fromAll(quote.lines()));
++        PriceLineResponse.fromAll(quote.lines()),
++        displayRate == null
++            ? null
++            : DisplayPriceResponse.of(displayRate, quote.total(), quote.lines()));
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/ReservationResponse.java b/src/main/java/com/innkeep/booking/api/dto/ReservationResponse.java
+index c2fa504..ad784a0 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/ReservationResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/ReservationResponse.java
+@@ -1,6 +1,8 @@
+ package com.innkeep.booking.api.dto;
+ 
++import com.fasterxml.jackson.annotation.JsonInclude;
+ import com.fasterxml.jackson.annotation.JsonUnwrapped;
++import com.innkeep.booking.domain.DisplayRate;
+ import com.innkeep.booking.domain.Reservation;
+ import java.time.Instant;
+ import java.util.List;
+@@ -11,14 +13,24 @@ public record ReservationResponse(
+     List<PriceLineResponse> lines,
+     Instant createdAt,
+     Instant updatedAt,
+-    Instant cancelledAt) {
++    Instant cancelledAt,
++    @JsonInclude(JsonInclude.Include.NON_NULL) DisplayPriceResponse display) {
+ 
+   public static ReservationResponse from(Reservation reservation) {
++    return from(reservation, null);
++  }
++
++  /** The reservation, with its price in a display currency when {@code displayRate} is given. */
++  public static ReservationResponse from(Reservation reservation, DisplayRate displayRate) {
+     return new ReservationResponse(
+         ReservationSummary.from(reservation),
+         PriceLineResponse.fromAll(reservation.getPriceLines()),
+         reservation.getCreatedAt(),
+         reservation.getUpdatedAt(),
+-        reservation.getCancelledAt());
++        reservation.getCancelledAt(),
++        displayRate == null
++            ? null
++            : DisplayPriceResponse.of(
++                displayRate, reservation.getTotal(), reservation.getPriceLines()));
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/config/BookingConfig.java b/src/main/java/com/innkeep/booking/config/BookingConfig.java
+index f70a625..b88af9f 100644
+--- a/src/main/java/com/innkeep/booking/config/BookingConfig.java
++++ b/src/main/java/com/innkeep/booking/config/BookingConfig.java
+@@ -5,7 +5,12 @@ import com.innkeep.booking.domain.ValidationException;
+ import jakarta.validation.constraints.Max;
+ import jakarta.validation.constraints.Min;
+ import jakarta.validation.constraints.NotBlank;
++import java.math.BigDecimal;
+ import java.time.Duration;
++import java.util.Collections;
++import java.util.Currency;
++import java.util.Map;
++import java.util.TreeMap;
+ import org.springframework.boot.context.properties.ConfigurationProperties;
+ import org.springframework.boot.context.properties.bind.DefaultValue;
+ import org.springframework.validation.annotation.Validated;
+@@ -25,7 +30,8 @@ public record BookingConfig(
+     @DefaultValue("60") @Min(1) @Max(365) int maxNightsPerStay,
+     @DefaultValue("3") @Min(1) @Max(10) int maxRetryAttempts,
+     @DefaultValue("true") boolean schedulingEnabled,
+-    @DefaultValue("PT3S") Duration lockTimeout) {
++    @DefaultValue("PT3S") Duration lockTimeout,
++    Map<String, Map<String, BigDecimal>> displayRates) {
+ 
+   private static final Duration MAX_HOLD_TTL = Duration.ofDays(1);
+   private static final Duration MAX_LOCK_TIMEOUT = Duration.ofSeconds(30);
+@@ -48,6 +54,42 @@ public record BookingConfig(
+         || holdCleanupInterval.isNegative()) {
+       throw new IllegalArgumentException("booking.hold-cleanup-interval must be positive");
+     }
++    displayRates = checkedDisplayRates(displayRates);
++  }
++
++  private static Map<String, Map<String, BigDecimal>> checkedDisplayRates(
++      Map<String, Map<String, BigDecimal>> rates) {
++    var checked = new TreeMap<String, Map<String, BigDecimal>>();
++    if (rates != null) {
++      rates.forEach(
++          (from, targets) -> {
++            requireCurrencyCode(from);
++            var byTarget = new TreeMap<>(targets);
++            byTarget.forEach(
++                (to, rate) -> {
++                  requireCurrencyCode(to);
++                  if (rate == null || rate.signum() <= 0) {
++                    throw new IllegalArgumentException(
++                        "booking.display-rates." + from + "." + to + " must be positive");
++                  }
++                });
++            checked.put(from, Collections.unmodifiableMap(byTarget));
++          });
++    }
++    return Collections.unmodifiableMap(checked);
++  }
++
++  /** An ISO 4217 code with minor units, so converted amounts can be rounded to them. */
++  private static void requireCurrencyCode(String code) {
++    try {
++      if (Currency.getInstance(code).getDefaultFractionDigits() >= 0) {
++        return;
++      }
++    } catch (IllegalArgumentException e) {
++      // reported below
++    }
++    throw new IllegalArgumentException(
++        "booking.display-rates: " + code + " is not an ISO 4217 currency with minor units");
+   }
+ 
+   /** Rejects stays and room counts above the configured maximums. */
+diff --git a/src/main/java/com/innkeep/booking/domain/DisplayRate.java b/src/main/java/com/innkeep/booking/domain/DisplayRate.java
+new file mode 100644
+index 0000000..63c6587
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/DisplayRate.java
+@@ -0,0 +1,23 @@
++package com.innkeep.booking.domain;
++
++import java.math.BigDecimal;
++import java.math.RoundingMode;
++import java.util.Currency;
++
++/**
++ * An indicative exchange rate from a property's currency to a currency a guest wants to read prices
++ * in. Converted amounts are for display only: charges and refunds stay in the property's currency.
++ */
++public record DisplayRate(Currency from, Currency to, BigDecimal rate) {
++
++  public DisplayRate {
++    if (rate == null || rate.signum() <= 0) {
++      throw new IllegalArgumentException("a display rate must be positive");
++    }
++  }
++
++  /** An amount in the {@code from} currency, converted and rounded to the display currency. */
++  public BigDecimal convert(BigDecimal amount) {
++    return amount.multiply(rate).setScale(to.getDefaultFractionDigits(), RoundingMode.HALF_UP);
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/service/DisplayCurrencyService.java b/src/main/java/com/innkeep/booking/service/DisplayCurrencyService.java
+new file mode 100644
+index 0000000..0ddde78
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/DisplayCurrencyService.java
+@@ -0,0 +1,44 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.config.BookingConfig;
++import com.innkeep.booking.domain.DisplayRate;
++import com.innkeep.booking.domain.ValidationException;
++import java.math.BigDecimal;
++import java.util.Currency;
++import java.util.Locale;
++import java.util.Map;
++import java.util.regex.Pattern;
++import org.springframework.stereotype.Service;
++
++/**
++ * Looks up the configured display rates ({@code booking.display-rates}). A price can always be
++ * shown in its own currency; any other currency needs a rate from the property's currency.
++ */
++@Service
++public class DisplayCurrencyService {
++
++  private static final Pattern CODE = Pattern.compile("[A-Z]{3}");
++
++  private final Map<String, Map<String, BigDecimal>> rates;
++
++  public DisplayCurrencyService(BookingConfig config) {
++    this.rates = config.displayRates();
++  }
++
++  /** The rate from {@code from} to the requested display currency, or a validation error. */
++  public DisplayRate rate(Currency from, String displayCurrency) {
++    String code = displayCurrency == null ? "" : displayCurrency.trim().toUpperCase(Locale.ROOT);
++    if (!CODE.matcher(code).matches()) {
++      throw new ValidationException("display must be a three-letter currency code");
++    }
++    if (code.equals(from.getCurrencyCode())) {
++      return new DisplayRate(from, from, BigDecimal.ONE);
++    }
++    BigDecimal rate = rates.getOrDefault(from.getCurrencyCode(), Map.of()).get(code);
++    if (rate == null) {
++      throw new ValidationException(
++          "prices in " + from.getCurrencyCode() + " cannot be shown in " + code);
++    }
++    return new DisplayRate(from, Currency.getInstance(code), rate);
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/api/DisplayCurrencyApiTest.java b/src/test/java/com/innkeep/booking/api/DisplayCurrencyApiTest.java
+new file mode 100644
+index 0000000..a792b29
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/DisplayCurrencyApiTest.java
+@@ -0,0 +1,90 @@
++package com.innkeep.booking.api;
++
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++/** Prices shown in another currency; the test context sets EUR→USD 1.085 and EUR→JPY 162. */
++class DisplayCurrencyApiTest extends IntegrationTestBase {
++
++  private Property property;
++  private RoomType room;
++
++  @BeforeEach
++  void setUp() {
++    property = data.harbourHouse();
++    room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, LocalDate.parse("2027-06-01"), LocalDate.parse("2027-06-12"), 2);
++  }
++
++  /** Thursday and Friday night: 100.00 and 110.00 with the weekend surcharge. */
++  private ResultActions quote(String display) throws Exception {
++    var request =
++        post("/api/v1/properties/harbour-house/quotes")
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(
++                "{\"roomType\":\"double\",\"checkIn\":\"2027-06-10\","
++                    + "\"checkOut\":\"2027-06-12\",\"rooms\":1,\"guests\":2}");
++    return mvc.perform(display == null ? request : request.param("display", display));
++  }
++
++  @Test
++  void aQuoteShowsEveryLineAndTheTotalInTheDisplayCurrency() throws Exception {
++    quote("USD")
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.currency").value("EUR"))
++        .andExpect(jsonPath("$.total").value(210.00))
++        .andExpect(jsonPath("$.display.currency").value("USD"))
++        .andExpect(jsonPath("$.display.rate").value(1.085))
++        .andExpect(jsonPath("$.display.indicative").value(true))
++        .andExpect(jsonPath("$.display.total").value(227.85))
++        .andExpect(jsonPath("$.display.lines[0].amount").value(108.50))
++        .andExpect(jsonPath("$.display.lines[1].amount").value(119.35));
++    quote(null).andExpect(status().isOk()).andExpect(jsonPath("$.display").doesNotExist());
++  }
++
++  @Test
++  void displayCurrenciesKeepTheirOwnMinorUnits() throws Exception {
++    quote("jpy")
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.display.currency").value("JPY"))
++        .andExpect(jsonPath("$.display.total").value(34020))
++        .andExpect(jsonPath("$.display.lines[0].amount").value(16200));
++    quote("EUR")
++        .andExpect(jsonPath("$.display.rate").value(1))
++        .andExpect(jsonPath("$.display.total").value(210.00));
++  }
++
++  @Test
++  void aCurrencyWithoutARateIsABadRequest() throws Exception {
++    quote("GBP")
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:innkeep:problem:invalid-request"));
++    quote("dollars").andExpect(status().isBadRequest());
++  }
++
++  @Test
++  void aReservationShowsItsStoredPriceInTheDisplayCurrency() throws Exception {
++    String reference =
++        data.book(property, room, LocalDate.parse("2027-06-10"), LocalDate.parse("2027-06-12"), 1)
++            .getReference();
++
++    mvc.perform(get("/api/v1/reservations/" + reference).param("display", "USD"))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.total").value(210.00))
++        .andExpect(jsonPath("$.display.total").value(227.85))
++        .andExpect(jsonPath("$.display.lines.length()").value(2));
++    mvc.perform(get("/api/v1/reservations/" + reference).param("display", "CHF"))
++        .andExpect(status().isBadRequest());
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/config/BookingConfigTest.java b/src/test/java/com/innkeep/booking/config/BookingConfigTest.java
+index 561f158..c430a7c 100644
+--- a/src/test/java/com/innkeep/booking/config/BookingConfigTest.java
++++ b/src/test/java/com/innkeep/booking/config/BookingConfigTest.java
+@@ -1,12 +1,15 @@
+ package com.innkeep.booking.config;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatCode;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ 
+ import com.innkeep.booking.domain.DateRange;
+ import com.innkeep.booking.domain.ValidationException;
++import java.math.BigDecimal;
+ import java.time.Duration;
+ import java.time.LocalDate;
++import java.util.Map;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.ValueSource;
+@@ -14,8 +17,22 @@ import org.junit.jupiter.params.provider.ValueSource;
+ class BookingConfigTest {
+ 
+   private static BookingConfig config(Duration holdTtl) {
++    return config(holdTtl, Map.of());
++  }
++
++  private static BookingConfig config(
++      Duration holdTtl, Map<String, Map<String, BigDecimal>> displayRates) {
+     return new BookingConfig(
+-        "token", holdTtl, 200, Duration.ofMinutes(1), 10, 60, 3, true, Duration.ofSeconds(3));
++        "token",
++        holdTtl,
++        200,
++        Duration.ofMinutes(1),
++        10,
++        60,
++        3,
++        true,
++        Duration.ofSeconds(3),
++        displayRates);
+   }
+ 
+   @ParameterizedTest
+@@ -47,7 +64,8 @@ class BookingConfigTest {
+                     60,
+                     3,
+                     true,
+-                    Duration.parse(timeout)))
++                    Duration.parse(timeout),
++                    Map.of()))
+         .isInstanceOf(IllegalArgumentException.class)
+         .hasMessageContaining("lock-timeout");
+   }
+@@ -77,4 +95,28 @@ class BookingConfigTest {
+     assertThatThrownBy(() -> config(Duration.ofMinutes(15)).requireWithinLimits(stay, rooms))
+         .isInstanceOf(ValidationException.class);
+   }
++
++  @Test
++  void displayRatesAreOptionalAndKeptPerPropertyCurrency() {
++    assertThat(config(Duration.ofMinutes(15), null).displayRates()).isEmpty();
++    var rates = Map.of("EUR", Map.of("USD", new BigDecimal("1.085")));
++    assertThat(config(Duration.ofMinutes(15), rates).displayRates()).isEqualTo(rates);
++  }
++
++  @ParameterizedTest
++  @ValueSource(strings = {"usd", "XYZ", "XAU"})
++  void displayRatesNeedIsoCurrencyCodesWithMinorUnits(String code) {
++    assertThatThrownBy(
++            () -> config(Duration.ofMinutes(15), Map.of("EUR", Map.of(code, BigDecimal.TEN))))
++        .isInstanceOf(IllegalArgumentException.class)
++        .hasMessageContaining("booking.display-rates");
++  }
++
++  @Test
++  void displayRatesMustBePositive() {
++    var rates = Map.of("EUR", Map.of("USD", BigDecimal.ZERO));
++    assertThatThrownBy(() -> config(Duration.ofMinutes(15), rates))
++        .isInstanceOf(IllegalArgumentException.class)
++        .hasMessageContaining("booking.display-rates.EUR.USD");
++  }
+ }
+diff --git a/src/test/java/com/innkeep/booking/service/OptimisticRetryTest.java b/src/test/java/com/innkeep/booking/service/OptimisticRetryTest.java
+index 5f65844..4bdce0e 100644
+--- a/src/test/java/com/innkeep/booking/service/OptimisticRetryTest.java
++++ b/src/test/java/com/innkeep/booking/service/OptimisticRetryTest.java
+@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import com.innkeep.booking.config.BookingConfig;
+ import com.innkeep.booking.domain.ConflictException;
+ import java.time.Duration;
++import java.util.Map;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.orm.ObjectOptimisticLockingFailureException;
+@@ -23,7 +24,8 @@ class OptimisticRetryTest {
+             60,
+             maxAttempts,
+             true,
+-            Duration.ofSeconds(3)));
++            Duration.ofSeconds(3),
++            Map.of()));
+   }
+ 
+   private static ObjectOptimisticLockingFailureException lost() {
+diff --git a/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java b/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java
+index 2a9c1b7..3f2dd73 100644
+--- a/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java
++++ b/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java
+@@ -22,6 +22,8 @@ import org.springframework.test.web.servlet.MockMvc;
+       "booking.scheduling-enabled=false",
+       "booking.lock-timeout=500ms",
+       "booking.hold-cleanup-batch-size=2",
++      "booking.display-rates.EUR.USD=1.085",
++      "booking.display-rates.EUR.JPY=162",
+       "spring.jpa.properties.hibernate.generate_statistics=true"
+     })
+ @AutoConfigureMockMvc
+diff --git a/src/test/java/com/innkeep/booking/unit/DisplayRateTest.java b/src/test/java/com/innkeep/booking/unit/DisplayRateTest.java
+new file mode 100644
+index 0000000..8e38864
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/unit/DisplayRateTest.java
+@@ -0,0 +1,25 @@
++package com.innkeep.booking.unit;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.innkeep.booking.domain.DisplayRate;
++import java.math.BigDecimal;
++import java.util.Currency;
++import org.junit.jupiter.api.Test;
++
++class DisplayRateTest {
++
++  private static final Currency EUR = Currency.getInstance("EUR");
++
++  private static BigDecimal convert(String to, String rate, String amount) {
++    return new DisplayRate(EUR, Currency.getInstance(to), new BigDecimal(rate))
++        .convert(new BigDecimal(amount));
++  }
++
++  @Test
++  void convertsAndRoundsToTheMinorUnitsOfTheDisplayCurrency() {
++    assertThat(convert("USD", "1.085", "210.00")).isEqualTo(new BigDecimal("227.85"));
++    assertThat(convert("USD", "1.085", "99.99")).isEqualTo(new BigDecimal("108.49"));
++    assertThat(convert("JPY", "162", "99.99")).isEqualTo(new BigDecimal("16198"));
++  }
++}

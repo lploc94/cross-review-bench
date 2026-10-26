@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T05",
+  "repo": "ledger-ts",
+  "kind": "buggy",
+  "title": "Outbox: deliver webhook batches in parallel (OUTBOX_CONCURRENCY)",
+  "description": "The outbox dispatcher posts one event at a time, and `claimDueEvents` never puts more than one event of an aggregate into a batch, so a slow endpoint stalls every tenant and a burst on one hold (created, then captured or voided) needs one batch per event.\n\nThis change:\n\n- adds `OUTBOX_CONCURRENCY` (default 8, 1–64): the dispatcher delivers a claimed batch through a small worker pool, taking events in id order with up to that many HTTP deliveries in flight. The outcomes are still written in the batch's transaction, one query at a time on its client.\n- changes the claim so a batch is not limited to one event per aggregate: it locks each aggregate's earliest undelivered event (its head) with `SKIP LOCKED` as before and takes the later due events of that aggregate along with it. An aggregate whose head is waiting for a retry contributes nothing, and another dispatcher cannot claim events behind a head this one holds.\n- per-aggregate order is preserved: each aggregate's events are delivered in id order, and a failing event still holds back the later events of its aggregate.\n- loads the batch's endpoints once per tenant before delivering, and logs the batch duration.\n\nTests: burst of one aggregate delivered in one batch and in order, the claim leaving events behind a locked head alone, the concurrency limit (an overlap-counting sender), config bounds, and the existing retry/hold-back test updated for the new batching.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/outboxDispatcher.ts",
+      "lines": [81, 88],
+      "category": "concurrency",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "The worker pool takes the batch event by event, so a head event and the later events of its aggregate that the new claim puts in the same batch are delivered concurrently, and when the head fails the later events are still delivered: per-aggregate ordering and hold-back are broken.",
+      "trigger": "Two undelivered due events of one aggregate (hold.created, hold.voided) in one batch with OUTBOX_CONCURRENCY > 1; the first delivery is slow or fails.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/outboxAggregateOrder.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/outboxAggregateOrder.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Ordering is handled by the claim: claimDueEvents in src/repositories/outbox.ts only returns an aggregate's events starting at its head, ORDER BY id, and forEachConcurrently takes items strictly in that order, so the head's delivery is always started before any later event of the same aggregate. A failed head gets a future next_attempt_at, and the heads CTE then skips the whole aggregate, so nothing behind it can go out.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

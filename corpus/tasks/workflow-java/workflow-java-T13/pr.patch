@@ -1,0 +1,482 @@
+diff --git a/README.md b/README.md
+index fe11f01..297f88d 100644
+--- a/README.md
++++ b/README.md
+@@ -167,6 +167,8 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `DELETE /admin/definitions/{id}` | discard a draft (409 once published) |
+ | `POST /admin/definitions/{id}/publish` | publish a draft |
+ | `POST /admin/definitions/{id}/revise` (201) | start the next version of a published definition as a draft with the same steps |
++| `GET /admin/definitions/{id}/export` | the definition as a portable JSON document (see Moving definitions) |
++| `POST /admin/definitions/import` (201) | create a draft from an exported document |
+ | `GET /admin/outbox?status=&cursor=&size=`, `GET /admin/outbox/{id}` | notification rows for operators (recipient and payload left out) |
+ | `POST /admin/outbox/{id}/requeue`, `POST /admin/outbox/requeue-failed` | put a given-up event back in line; a pending event is refused (409) |
+ | `DELETE /admin/outbox/{id}` | discard a given-up event (409 unless it failed) |
+@@ -181,6 +183,29 @@ reported as not found. The slugs a client can meet are `invalid-request`, `malfo
+ `concurrent-update`, `unauthorized`, `ambiguous-path`, `method-not-allowed`, `unsupported-media-type`,
+ `not-acceptable` and `unexpected`.
+ 
++### Moving definitions between installations
++
++An export carries no database ids, so it can be imported into another installation (from a test
++system into production, for example):
++
++```json
++{"name":"Expenses","version":3,"steps":[
++  {"order":1,"kind":"SINGLE","assignee":"tomas@example.com","group":null,"quorum":0,"sla":"PT8H"},
++  {"order":2,"kind":"QUORUM","assignee":null,"group":"finance","quorum":2,"sla":"PT1H30M"}]}
++```
++
++- A `SINGLE` step names its approver by email address and a group step names its group; the import
++  finds them on the installation it runs on. An unknown group, or an address no account has, fails
++  the import with 400 and nothing is created. Steps keep their order and kind.
++- `sla` is an ISO-8601 duration in whole minutes, from `PT1M` to `PT720H` (`P1D` is read as
++  `PT24H`). An export writes hours and minutes, such as `PT8H` or `PT1H30M`.
++- The import always creates a draft, to be reviewed and published as usual. Without `version` it
++  takes the next version of its name. With `version`, that number is kept only when it is above
++  every version of the name on this installation; otherwise the import is refused with 409, so an
++  import never reuses an existing version number or goes below the latest one. Remove `version` to
++  import a definition again on the installation it came from.
++- Exporting the imported draft gives the same steps again.
++
+ ## Operator rules
+ 
+ - A draft is the only definition that can change; a published one is refused with 409 when steps are added,
+diff --git a/src/main/java/com/papertrail/workflow/api/AdminController.java b/src/main/java/com/papertrail/workflow/api/AdminController.java
+index 59fd529..cff0f41 100644
+--- a/src/main/java/com/papertrail/workflow/api/AdminController.java
++++ b/src/main/java/com/papertrail/workflow/api/AdminController.java
+@@ -4,6 +4,7 @@ import com.papertrail.workflow.api.dto.Requests.CreateDefinitionRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateGroupRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateStepRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateUserRequest;
++import com.papertrail.workflow.api.dto.Requests.ImportDefinitionRequest;
+ import com.papertrail.workflow.api.dto.Requests.UpdateUserRequest;
+ import com.papertrail.workflow.api.dto.Responses.CountResponse;
+ import com.papertrail.workflow.api.dto.Responses.IdResponse;
+@@ -15,11 +16,13 @@ import com.papertrail.workflow.integration.OutboxDispatcher.DispatchResult;
+ import com.papertrail.workflow.integration.SlaEscalationJob;
+ import com.papertrail.workflow.service.DefinitionService;
+ import com.papertrail.workflow.service.IdentityService;
++import com.papertrail.workflow.service.ImportedStep;
+ import com.papertrail.workflow.service.OperatorSummary;
+ import com.papertrail.workflow.service.OutboxService;
+ import com.papertrail.workflow.service.StepSpec;
+ import com.papertrail.workflow.service.TaskQueries;
+ import com.papertrail.workflow.service.Views.AuditView;
++import com.papertrail.workflow.service.Views.DefinitionExport;
+ import com.papertrail.workflow.service.Views.DefinitionView;
+ import com.papertrail.workflow.service.Views.GroupView;
+ import com.papertrail.workflow.service.Views.OutboxView;
+@@ -174,6 +177,31 @@ public class AdminController {
+     return definitions.view(id);
+   }
+ 
++  @GetMapping("/definitions/{id}/export")
++  public DefinitionExport exportDefinition(@PathVariable long id) {
++    return definitions.export(id);
++  }
++
++  @PostMapping("/definitions/import")
++  public ResponseEntity<IdResponse> importDefinition(
++      @Valid @RequestBody ImportDefinitionRequest request) {
++    List<ImportedStep> steps =
++        request.steps().stream()
++            .map(
++                step ->
++                    new ImportedStep(
++                        step.order(),
++                        step.kind(),
++                        step.assignee(),
++                        step.group(),
++                        step.quorum(),
++                        step.sla()))
++            .toList();
++    long id = definitions.importDraft(request.name(), request.version(), steps);
++    return ResponseEntity.created(URI.create("/api/v1/admin/definitions/" + id))
++        .body(new IdResponse(id));
++  }
++
+   @GetMapping("/users/{id}/tasks")
+   public List<TaskView> tasksOf(@PathVariable long id) {
+     identity.view(id);
+diff --git a/src/main/java/com/papertrail/workflow/api/dto/Requests.java b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+index 9bf7430..6a94f9b 100644
+--- a/src/main/java/com/papertrail/workflow/api/dto/Requests.java
++++ b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+@@ -36,6 +36,19 @@ public final class Requests {
+   public record CreateDefinitionRequest(
+       @NotBlank @Size(max = 80) String name, @NotEmpty @Valid List<CreateStepRequest> steps) {}
+ 
++  public record ImportStepRequest(
++      @Min(1) @Max(100) int order,
++      @NotNull StepKind kind,
++      @Size(max = 254) String assignee,
++      @Size(max = 80) String group,
++      @Min(0) @Max(1000) int quorum,
++      @NotBlank @Size(max = 40) String sla) {}
++
++  public record ImportDefinitionRequest(
++      @NotBlank @Size(max = 80) String name,
++      @Min(1) @Max(100_000) Integer version,
++      @NotEmpty List<@NotNull @Valid ImportStepRequest> steps) {}
++
+   public record CreateDocumentRequest(
+       @NotBlank @Size(max = 200) String title,
+       @NotBlank @Size(max = 10_000) String body,
+diff --git a/src/main/java/com/papertrail/workflow/service/DefinitionService.java b/src/main/java/com/papertrail/workflow/service/DefinitionService.java
+index d0289c2..71fdb2f 100644
+--- a/src/main/java/com/papertrail/workflow/service/DefinitionService.java
++++ b/src/main/java/com/papertrail/workflow/service/DefinitionService.java
+@@ -5,12 +5,16 @@ import com.papertrail.workflow.domain.ConflictException;
+ import com.papertrail.workflow.domain.NotFoundException;
+ import com.papertrail.workflow.domain.StepDefinition;
+ import com.papertrail.workflow.domain.UserGroup;
++import com.papertrail.workflow.domain.ValidationException;
+ import com.papertrail.workflow.domain.WorkflowDefinition;
+ import com.papertrail.workflow.persistence.AppUserRepository;
+ import com.papertrail.workflow.persistence.UserGroupRepository;
+ import com.papertrail.workflow.persistence.WorkflowDefinitionRepository;
++import com.papertrail.workflow.service.Views.DefinitionExport;
+ import com.papertrail.workflow.service.Views.DefinitionView;
+ import java.time.Clock;
++import java.time.Duration;
++import java.time.format.DateTimeParseException;
+ import java.util.List;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+@@ -19,6 +23,8 @@ import org.springframework.transaction.annotation.Transactional;
+ @Service
+ public class DefinitionService {
+ 
++  static final int MAX_SLA_MINUTES = 43_200;
++
+   private final WorkflowDefinitionRepository definitions;
+   private final AppUserRepository users;
+   private final UserGroupRepository groups;
+@@ -133,6 +139,77 @@ public class DefinitionService {
+     return definitions.save(draft).getId();
+   }
+ 
++  /** The definition with its steps in the portable form that {@link #importDraft} reads. */
++  @Transactional(readOnly = true)
++  public DefinitionExport export(long definitionId) {
++    return DefinitionExport.of(get(definitionId));
++  }
++
++  /**
++   * Creates a draft from an exported definition. Groups are found by name and single approvers by
++   * address; an unknown one fails the whole import. Without a version the draft takes the next
++   * version of its name. A version that is given must be above every version of that name here, so
++   * an import never reuses an existing version number or goes below the latest one.
++   */
++  @Transactional
++  public long importDraft(String name, Integer version, List<ImportedStep> steps) {
++    String trimmed = name.trim();
++    int latest = definitions.findMaxVersion(trimmed).orElse(0);
++    if (version != null && version <= latest) {
++      throw new ConflictException(
++          "definition " + trimmed + " already has versions up to " + latest);
++    }
++    WorkflowDefinition definition =
++        new WorkflowDefinition(trimmed, version == null ? latest + 1 : version, clock.instant());
++    for (ImportedStep step : steps) {
++      AppUser assignee = blank(step.assignee()) ? null : userByAddress(step);
++      UserGroup group = blank(step.group()) ? null : groupByName(step.group().trim());
++      definition.addStep(
++          step.order(), step.kind(), assignee, group, step.quorum(), slaMinutes(step));
++    }
++    return definitions.save(definition).getId();
++  }
++
++  private AppUser userByAddress(ImportedStep step) {
++    return users
++        .findByEmail(AppUser.normaliseEmail(step.assignee()))
++        .orElseThrow(
++            () ->
++                new ValidationException(
++                    "step " + step.order() + ": no user has the assignee's address"));
++  }
++
++  private UserGroup groupByName(String name) {
++    return groups
++        .findByName(name)
++        .orElseThrow(() -> new ValidationException("unknown group " + name));
++  }
++
++  /** The SLA in whole minutes, checked before it is narrowed to an int. */
++  static int slaMinutes(ImportedStep step) {
++    Duration sla;
++    try {
++      sla = Duration.parse(step.sla().trim());
++    } catch (DateTimeParseException e) {
++      throw new ValidationException(
++          "step " + step.order() + ": sla must be an ISO-8601 duration such as PT8H");
++    }
++    long minutes = sla.toMinutes();
++    if (!sla.equals(Duration.ofMinutes(minutes)) || minutes < 1 || minutes > MAX_SLA_MINUTES) {
++      throw new ValidationException(
++          "step "
++              + step.order()
++              + ": sla must be whole minutes between PT1M and PT"
++              + MAX_SLA_MINUTES / 60
++              + "H");
++    }
++    return (int) minutes;
++  }
++
++  private static boolean blank(String value) {
++    return value == null || value.isBlank();
++  }
++
+   private void addStepTo(WorkflowDefinition definition, StepSpec step) {
+     AppUser assignee = step.assigneeId() == null ? null : requireUser(step.assigneeId());
+     UserGroup group = step.groupId() == null ? null : requireGroup(step.groupId());
+diff --git a/src/main/java/com/papertrail/workflow/service/ImportedStep.java b/src/main/java/com/papertrail/workflow/service/ImportedStep.java
+new file mode 100644
+index 0000000..caa6aa2
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/service/ImportedStep.java
+@@ -0,0 +1,10 @@
++package com.papertrail.workflow.service;
++
++import com.papertrail.workflow.domain.StepKind;
++
++/**
++ * One step of an imported definition: the approver by address, the group by name and the SLA as an
++ * ISO-8601 duration, resolved against this installation when the draft is created.
++ */
++public record ImportedStep(
++    int order, StepKind kind, String assignee, String group, int quorum, String sla) {}
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..6be8911 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -175,6 +175,34 @@ public final class Views {
+     }
+   }
+ 
++  /**
++   * A definition as a portable document for another installation: groups by name, a single approver
++   * by address, SLAs as ISO-8601 durations, and no database ids.
++   */
++  public record DefinitionExport(String name, int version, List<ExportedStep> steps) {
++
++    public static DefinitionExport of(WorkflowDefinition definition) {
++      return new DefinitionExport(
++          definition.getName(),
++          definition.getVersion(),
++          definition.getSteps().stream().map(ExportedStep::of).toList());
++    }
++  }
++
++  public record ExportedStep(
++      int order, StepKind kind, String assignee, String group, int quorum, String sla) {
++
++    public static ExportedStep of(StepDefinition step) {
++      return new ExportedStep(
++          step.getStepOrder(),
++          step.getKind(),
++          step.getAssignee() == null ? null : step.getAssignee().getEmail(),
++          step.getGroup() == null ? null : step.getGroup().getName(),
++          step.getQuorum(),
++          step.getSla().toString());
++    }
++  }
++
+   public record GroupView(long id, String name, List<UserView> members) {
+ 
+     public static GroupView of(UserGroup group) {
+diff --git a/src/test/java/com/papertrail/workflow/api/DefinitionTransferApiTest.java b/src/test/java/com/papertrail/workflow/api/DefinitionTransferApiTest.java
+new file mode 100644
+index 0000000..a7bea3a
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/DefinitionTransferApiTest.java
+@@ -0,0 +1,188 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.node.ObjectNode;
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.MvcResult;
++
++class DefinitionTransferApiTest extends IntegrationTestBase {
++
++  @Autowired private ObjectMapper json;
++
++  private long publishExpenses() {
++    long approver = data.user("Tomas Vale");
++    long a = data.user("Ines Berg");
++    long b = data.user("Marta Quill");
++    long finance = data.group("finance", a, b);
++    return data.publish(
++        "Expenses",
++        TestData.step(1, StepKind.SINGLE, approver, null, 0, 480),
++        TestData.step(2, StepKind.QUORUM, null, finance, 2, 90));
++  }
++
++  private JsonNode export(long id) throws Exception {
++    String body =
++        mvc.perform(
++                get("/api/v1/admin/definitions/" + id + "/export")
++                    .header("Authorization", ADMIN_AUTH))
++            .andExpect(status().isOk())
++            .andReturn()
++            .getResponse()
++            .getContentAsString();
++    return json.readTree(body);
++  }
++
++  private MvcResult importDefinition(String body) throws Exception {
++    return mvc.perform(
++            post("/api/v1/admin/definitions/import")
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(body))
++        .andReturn();
++  }
++
++  @Test
++  void anExportNamesGroupsAndApproversAndWritesSlasAsDurations() throws Exception {
++    long id = publishExpenses();
++
++    JsonNode exported = export(id);
++
++    assertThat(exported.get("name").asText()).isEqualTo("Expenses");
++    assertThat(exported.get("version").asInt()).isEqualTo(1);
++    assertThat(exported.has("id")).isFalse();
++    JsonNode first = exported.get("steps").get(0);
++    assertThat(first.get("assignee").asText()).isEqualTo("tomas.vale@example.com");
++    assertThat(first.get("sla").asText()).isEqualTo("PT8H");
++    JsonNode second = exported.get("steps").get(1);
++    assertThat(second.get("group").asText()).isEqualTo("finance");
++    assertThat(second.get("quorum").asInt()).isEqualTo(2);
++    assertThat(second.get("sla").asText()).isEqualTo("PT1H30M");
++  }
++
++  @Test
++  void anImportWithoutVersionIsTheNextDraftWithTheSameSteps() throws Exception {
++    JsonNode exported = export(publishExpenses());
++    ObjectNode again = exported.deepCopy();
++    again.remove("version");
++
++    MvcResult created = importDefinition(again.toString());
++
++    assertThat(created.getResponse().getStatus()).isEqualTo(201);
++    long draft = idFrom(created);
++    mvc.perform(get("/api/v1/admin/definitions/" + draft).header("Authorization", ADMIN_AUTH))
++        .andExpect(jsonPath("$.version").value(2))
++        .andExpect(jsonPath("$.published").value(false));
++    assertThat(export(draft).get("steps")).isEqualTo(exported.get("steps"));
++  }
++
++  @Test
++  void aVersionThatAlreadyExistsIsAConflict() throws Exception {
++    JsonNode exported = export(publishExpenses());
++
++    MvcResult result = importDefinition(exported.toString());
++
++    assertThat(result.getResponse().getStatus()).isEqualTo(409);
++    assertThat(jdbc.queryForObject("select count(*) from workflow_definition", Integer.class))
++        .isEqualTo(1);
++  }
++
++  @Test
++  void aHigherVersionIsKept() throws Exception {
++    ObjectNode exported = export(publishExpenses()).deepCopy();
++    exported.put("version", 7);
++
++    long draft = idFrom(importDefinition(exported.toString()));
++
++    mvc.perform(get("/api/v1/admin/definitions/" + draft).header("Authorization", ADMIN_AUTH))
++        .andExpect(jsonPath("$.version").value(7));
++  }
++
++  @Test
++  void anUnknownGroupIsNamedAndNothingIsCreated() throws Exception {
++    String body =
++        """
++        {"name":"Contracts","steps":[
++          {"order":1,"kind":"ANY_OF","group":"legal","quorum":0,"sla":"PT4H"}]}""";
++
++    mvc.perform(
++            post("/api/v1/admin/definitions/import")
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(body))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:invalid-request"))
++        .andExpect(jsonPath("$.detail").value("unknown group legal"));
++    assertThat(jdbc.queryForObject("select count(*) from workflow_definition", Integer.class))
++        .isZero();
++  }
++
++  @Test
++  void anUnknownApproverIsRefusedWithoutEchoingTheAddress() throws Exception {
++    String body =
++        """
++        {"name":"Contracts","steps":[
++          {"order":1,"kind":"SINGLE","assignee":"nobody@example.com","quorum":0,"sla":"PT4H"}]}""";
++
++    MvcResult result = importDefinition(body);
++
++    assertThat(result.getResponse().getStatus()).isEqualTo(400);
++    assertThat(result.getResponse().getContentAsString()).doesNotContain("nobody@example.com");
++  }
++
++  @Test
++  void aNullStepIsAValidationError() throws Exception {
++    mvc.perform(
++            post("/api/v1/admin/definitions/import")
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("{\"name\":\"Contracts\",\"steps\":[null]}"))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:validation-failed"));
++    assertThat(jdbc.queryForObject("select count(*) from workflow_definition", Integer.class))
++        .isZero();
++  }
++
++  @Test
++  void anSlaMustBeWholeMinutesInRange() throws Exception {
++    data.user("Tomas Vale");
++    String template =
++        """
++        {"name":"Contracts","steps":[
++          {"order":1,"kind":"SINGLE","assignee":"tomas.vale@example.com","quorum":0,"sla":"%s"}]}""";
++
++    for (String sla : new String[] {"PT90S", "480", "PT-8H", "PT721H"}) {
++      assertThat(importDefinition(template.formatted(sla)).getResponse().getStatus())
++          .as(sla)
++          .isEqualTo(400);
++    }
++    long draft = idFrom(importDefinition(template.formatted("P1D")));
++    assertThat(export(draft).get("steps").get(0).get("sla").asText()).isEqualTo("PT24H");
++  }
++
++  @Test
++  void userTokensCannotExportOrImport() throws Exception {
++    long id = publishExpenses();
++    String user = data.bearer(data.user("Lena Hart"));
++
++    mvc.perform(get("/api/v1/admin/definitions/" + id + "/export").header("Authorization", user))
++        .andExpect(status().isUnauthorized());
++    mvc.perform(
++            post("/api/v1/admin/definitions/import")
++                .header("Authorization", user)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("{}"))
++        .andExpect(status().isUnauthorized());
++  }
++}

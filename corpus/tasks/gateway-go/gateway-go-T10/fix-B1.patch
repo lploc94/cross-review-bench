@@ -1,0 +1,14 @@
+diff --git a/internal/proxy/cors.go b/internal/proxy/cors.go
+index c7aac2b..53a8a2f 100644
+--- a/internal/proxy/cors.go
++++ b/internal/proxy/cors.go
+@@ -56,6 +56,9 @@ func applyCORS(h http.Header, ex *exchange) {
+ // setCORS sets the allow-origin, credentials and expose fields for a request from origin. It
+ // reports whether the origin is allowed; a request without an origin is not a CORS request.
+ func setCORS(h http.Header, c *core.CORSPolicy, origin string) bool {
++	// The fields depend on the request's origin, also when they are left out, so a cache must
++	// not serve the answer to a request from another origin, or from none.
++	h.Add("Vary", "Origin")
+ 	if origin == "" {
+ 		return false
+ 	}

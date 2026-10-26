@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T10",
+  "repo": "etl-py",
+  "kind": "buggy",
+  "title": "Placeholder customers for late-arriving CRM rows",
+  "description": "The shop exports orders every hour, the CRM exports customers once a night, so a new customer's first orders usually arrive before the customer does. Today such an orders run fails on the error-level `orders.customer_id.references_customers` check and the whole file is held back until the next customers run, which delays every other order in it.\n\nWith this change an orders run creates a placeholder customer version for every customer it does not know, in the same transaction as the orders:\n\n- Migration 0005 adds `warehouse.customers.is_placeholder` (boolean, default false). A placeholder is a current version with every attribute NULL, so the order gets a `customer_key` and the referential check passes.\n- When the CRM row arrives, it replaces the placeholder: the customers loader treats a placeholder like any current version, and counts it as changed, so the CRM row closes it and opens a real version (`is_placeholder` false). Orders keep the customer version that was current when they were loaded, as for any customer change.\n- Orders runs and customers runs now both write `warehouse.customers`, so both take `LOCK TABLE warehouse.customers IN SHARE ROW EXCLUSIVE MODE` before writing (`lock_customers`): they serialise on it and the second one sees the first one's versions, so a customer never gets two current versions. Reads are not blocked.\n- `OrdersLoader.target_tables` includes `customers`, so an orders run also runs the customers checks.\n- Until the CRM row arrives, `report customers` counts a placeholder as a customer with an unknown country.\n\nTests: tests/load/test_placeholder_customers.py (the placeholder and the order's key, one placeholder per customer across orders and runs, known customers untouched, the CRM row replacing the placeholder, the customers checks in an orders run). The tests that used an unknown customer to make an orders run fail an error-level check (tests/pipeline/test_quality.py, tests/cli/test_run_command.py, tests/cli/test_runs_commands.py) now add an error-level check on the order's country instead; the rollback test also checks that the placeholder is rolled back. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/etl/load/orders.py",
+      "lines": [
+        203,
+        210
+      ],
+      "category": "data-integrity",
+      "severity": "critical",
+      "difficulty": "L4",
+      "summary": "_add_placeholder_customers gives the placeholder updated_at (and valid_from) = the order run's loaded_at. The customers loader only acts on a CRM row whose updated_at is strictly newer than the current version's (newer_current); a CRM row carries the customer's CRM change time, which is normally earlier than the orders run that created the placeholder (the customer was created in the CRM before ordering). Such a row is 'not newer', so nothing changes: the customer stays a placeholder forever, with NULL email, name, phone and country, and later CRM rows older than the run are dropped the same way. The description promises the CRM row replaces the placeholder.",
+      "trigger": "An orders run at 2026-04-01 08:00 meets customer C-7; the next customers run brings C-7 with updated_at 2026-03-01: the current version of C-7 is still the placeholder (is_placeholder true, email NULL) and the run loads 0 rows.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_crm_replaces_placeholder.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_crm_replaces_placeholder.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The placeholder cannot block the CRM row: CustomersLoader.merge in src/etl/load/customers.py now counts `current.c.is_placeholder` as a change, so the CRM row always closes the placeholder and opens a real version, and test_the_crm_row_replaces_the_placeholder covers exactly that. Keeping newer-wins for the timestamps is deliberate: it protects the warehouse from old CRM rows.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

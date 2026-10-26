@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-java-cucumber-jvm-3248",
+  "repo": "rb-java-cucumber-jvm-3248",
+  "kind": "realbug",
+  "title": "[Core] Support both DocString and DataTable arguments on steps",
+  "description": "### 🤔 What's changed?\r\n\r\nIt is now possible write step definitions steps that use both data tables and doc strings. For example:\r\n\r\n```feature\r\nFeature: Data Tables and Doc Strings\r\n\r\n  Steps can have both Data Table and Doc String as arguments at the same time\r\n\r\n  Scenario: DataTable followed by DocString\r\n    Given a step with a data table a doc string\r\n      | hello |\r\n      \"\"\"\r\n      world\r\n      \"\"\"\r\n\r\n  Scenario: DocString followed by DataTable\r\n    Given a step with a doc string a data table\r\n      \"\"\"\r\n      hello\r\n      \"\"\"\r\n      | world |\r\n```\r\n\r\nNote: Not all formatters will render this correctly.\r\n\r\n### ⚡️ What's your motivation? \r\n\r\nContribute to https://github.com/cucumber/common/issues/2315.\r\n\r\n### 🏷️ What kind of change is this?\r\n\r\n- :zap: New feature (non-breaking change which adds new behaviour)\r\n\r\n### 📋 Checklist:\r\n\r\n- [x] I agree to respect and uphold the [Cucumber Community Code of Conduct](https://github.com/cucumber/.github/tree/main?tab=coc-ov-file)\r\n- [x] I've changed the behaviour of the code\r\n  - [x] I have added/updated tests to cover my changes.\r\n- [x] My change requires a change to the documentation.\r\n  - [ ] I have updated the documentation accordingly.\r\n- [x] Users should know about my change\r\n  - [x] I have added an entry to the \"Unreleased\" section of the [**CHANGELOG**](../blob/main/CHANGELOG.md), linking to this pull request.\r\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java",
+      "lines": [
+        48,
+        51
+      ],
+      "category": "boundary",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "StepExpression.match appends the step's doc string / data table arguments after the cucumber-expression arguments, but creates each with index i counted from 0 within the step arguments instead of offset by the number of expression arguments. The index selects the step definition parameter type used for conversion, so a doc string or data table is converted to the type of the first expression parameter instead of its own parameter.",
+      "trigger": "A step definition with at least one expression parameter plus a doc string or data table, e.g. @Given(\"var {word}=\") setVar(String name, StringBuilder value) with a custom @DocStringType: the doc string is converted for parameter 0 (String), so the custom type is ignored and invoking the step fails, or a DocString/DataTable parameter receives the wrong type.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "cucumber-core/src/test/java/io/cucumber/core/stepexpression/StepExpressionFactoryTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -pl cucumber-core -am test -Dsurefire.failIfNoSpecifiedTests=false -Dtest=StepExpressionFactoryTest"
+    }
+  ]
+}

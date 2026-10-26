@@ -1,0 +1,498 @@
+diff --git a/README.md b/README.md
+index c9415f9..58c94a8 100644
+--- a/README.md
++++ b/README.md
+@@ -95,7 +95,10 @@ Every response the gateway produces itself is JSON:
+       "transforms": {
+         "request":  {"add": {"X-Env": "prod"}, "remove": ["X-Debug"], "rename": {"X-Ver": "X-Version"}},
+         "response": {"remove": ["Server"]}
+-      }
++      },
++      "cors": {"allow_origins": ["https://app.example.com"], "allow_methods": ["GET", "POST"],
++               "allow_headers": ["Authorization", "Content-Type"], "expose_headers": ["X-Total"],
++               "allow_credentials": false, "max_age": "10m"}
+     }
+   ]
+ }
+@@ -103,7 +106,14 @@ Every response the gateway produces itself is JSON:
+ 
+ Only `id`, one of `path` or `path_prefix`, and `upstreams` are required; the values above for
+ `retry`, `circuit_breaker` and `health_check` are the defaults filled in when the object is present.
+-`auth` defaults to `none` and `timeout` to `30s`. Transforms run rename, then remove, then add; they
++`auth` defaults to `none` and `timeout` to `30s`. `cors` lets browsers on other origins call the
++route: `allow_origins` lists exact origins, or `"*"` alone (which is sent as `*` only without
++`allow_credentials`; with credentials the request's origin is echoed back). A preflight (an
++`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is matched by the method it asks for
++and answered `204` by the gateway, without authentication, rate limiting or an upstream call. An
++actual response from an allowed origin gets `Access-Control-Allow-Origin`, `-Credentials` and
++`-Expose-Headers`, replacing any the upstream sent; a disallowed origin gets none of them. Gateway
++errors carry the same fields, so a browser can read them. Transforms run rename, then remove, then add; they
+ may not touch hop-by-hop fields, `Host`, `Content-Length`, `Trailer` or the headers the gateway
+ owns (`X-Request-Id`, `X-Forwarded-For`, `-Proto` and `-Host`, `X-Consumer-Id`).
+ 
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..54c0297 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -76,6 +76,7 @@ type Route struct {
+ 	CircuitBreaker *CircuitBreaker `json:"circuit_breaker,omitempty"`
+ 	HealthCheck    *HealthCheck    `json:"health_check,omitempty"`
+ 	Transforms     *Transforms     `json:"transforms,omitempty"`
++	CORS           *CORS           `json:"cors,omitempty"`
+ }
+ 
+ // Upstream is one backend of a route.
+@@ -119,6 +120,18 @@ type HealthCheck struct {
+ 	UnhealthyThreshold int      `json:"unhealthy_threshold,omitempty"`
+ }
+ 
++// CORS lets browsers on other origins call the route. The gateway answers preflight requests
++// itself, without authentication or an upstream call, and adds the CORS fields to responses from
++// allowed origins.
++type CORS struct {
++	AllowOrigins     []string `json:"allow_origins"` // exact origins, or "*" alone
++	AllowMethods     []string `json:"allow_methods"` // answered to preflights
++	AllowHeaders     []string `json:"allow_headers,omitempty"`
++	ExposeHeaders    []string `json:"expose_headers,omitempty"`
++	AllowCredentials bool     `json:"allow_credentials,omitempty"`
++	MaxAge           Duration `json:"max_age,omitempty"`
++}
++
+ // Transforms change the headers of forwarded requests and of the responses returned to clients.
+ type Transforms struct {
+ 	Request  *HeaderTransform `json:"request,omitempty"`
+diff --git a/internal/config/routes_test.go b/internal/config/routes_test.go
+index d62f5f0..fd04edd 100644
+--- a/internal/config/routes_test.go
++++ b/internal/config/routes_test.go
+@@ -117,6 +117,9 @@ func TestValidationNamesRouteAndField(t *testing.T) {
+ 		{"rate window", `{"id":"a","path":"/a","rate_limit":{"requests":1,"window":"500ms"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.window: must be a whole number of milliseconds`},
+ 		{"rate requests", `{"id":"a","path":"/a","rate_limit":{"requests":0,"window":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.requests: must be at least 1`},
+ 		{"retry attempts", `{"id":"a","path":"/a","retry":{"attempts":11},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.attempts: must be between 1 and 10`},
++		{"cors origin", `{"id":"a","path":"/a","cors":{"allow_origins":["app.example.com"]},"upstreams":[{"url":"http://a"}]}`, `route "a": cors.allow_origins[0]: must be "*" or an origin`},
++		{"cors wildcard mix", `{"id":"a","path":"/a","cors":{"allow_origins":["*","https://b.example.com"]},"upstreams":[{"url":"http://a"}]}`, `route "a": cors.allow_origins[0]: "*" cannot be combined`},
++		{"cors method", `{"id":"a","path":"/a","cors":{"allow_origins":["*"],"allow_methods":["FETCH"]},"upstreams":[{"url":"http://a"}]}`, `route "a": cors.allow_methods[0]: must be one of`},
+ 		{"retry status", `{"id":"a","path":"/a","retry":{"attempts":2,"on_status":[404]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_status[0]: must be a 5xx status`},
+ 		{"retry error", `{"id":"a","path":"/a","retry":{"attempts":2,"on_errors":["dns"]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_errors[0]: must be`},
+ 		{"backoff order", `{"id":"a","path":"/a","retry":{"attempts":2,"backoff":"2s","max_backoff":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.max_backoff: must not be shorter than retry.backoff`},
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..bd27b2c 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -138,6 +138,33 @@ func (r *Route) validate(p routeProblems) {
+ 		t.Request.validate(p, "transforms.request")
+ 		t.Response.validate(p, "transforms.response")
+ 	}
++	if r.CORS != nil {
++		r.CORS.validate(p)
++	}
++}
++
++func (c *CORS) validate(p routeProblems) {
++	if len(c.AllowOrigins) == 0 {
++		p.add("cors.allow_origins", "at least one origin is required")
++	}
++	for i, o := range c.AllowOrigins {
++		u, err := url.Parse(o)
++		switch {
++		case o == "*" && len(c.AllowOrigins) > 1:
++			p.add(fmt.Sprintf("cors.allow_origins[%d]", i), "\"*\" cannot be combined with other origins")
++		case o == "*":
++		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" || u.RawQuery != "":
++			p.add(fmt.Sprintf("cors.allow_origins[%d]", i), "must be \"*\" or an origin such as https://app.example.com, got %q", o)
++		}
++	}
++	for i, m := range c.AllowMethods {
++		if !slices.Contains(knownMethods, m) {
++			p.add(fmt.Sprintf("cors.allow_methods[%d]", i), "must be one of %s, got %q", strings.Join(knownMethods, ", "), m)
++		}
++	}
++	if c.MaxAge.D() < 0 || c.MaxAge.D() > 24*time.Hour {
++		p.add("cors.max_age", "must not be negative and at most 24h")
++	}
+ }
+ 
+ // checkMatchPath returns why a configured path cannot be matched, or "".
+diff --git a/internal/core/route.go b/internal/core/route.go
+index 9872989..7615a95 100644
+--- a/internal/core/route.go
++++ b/internal/core/route.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/http"
+ 	"net/textproto"
+ 	"net/url"
++	"slices"
+ 	"strings"
+ 	"time"
+ 
+@@ -28,6 +29,7 @@ type Route struct {
+ 	Request     HeaderTransform // applied to forwarded requests
+ 	Response    HeaderTransform // applied to responses returned to the client
+ 	Upstreams   []*Upstream
++	CORS        *CORSPolicy // nil when the route answers no cross-origin requests
+ 
+ 	balancer *Balancer
+ 	spec     config.Route
+@@ -89,6 +91,48 @@ func (r *Route) ForwardPath(u *url.URL) (path, rawPath string) {
+ // Next picks the upstream for the next attempt, see Balancer.Next.
+ func (r *Route) Next(skip func(*Upstream) bool) *Upstream { return r.balancer.Next(skip) }
+ 
++// CORSPolicy is a compiled config.CORS.
++type CORSPolicy struct {
++	AnyOrigin   bool     // allow_origins is "*"
++	Origins     []string // the exact origins allowed otherwise
++	Methods     string   // Access-Control-Allow-Methods, "" when none
++	Headers     string   // Access-Control-Allow-Headers, "" when none
++	Expose      string   // Access-Control-Expose-Headers, "" when none
++	Credentials bool
++	MaxAge      int // seconds; 0 leaves the field out
++}
++
++// Allow returns the Access-Control-Allow-Origin value for a request from origin, and false when
++// the origin is not allowed. A wildcard is sent only without credentials; otherwise the origin is
++// echoed back.
++func (c *CORSPolicy) Allow(origin string) (string, bool) {
++	switch {
++	case c.AnyOrigin && !c.Credentials:
++		return "*", true
++	case c.AnyOrigin || slices.Contains(c.Origins, origin):
++		return origin, true
++	}
++	return "", false
++}
++
++func compileCORS(c *config.CORS) *CORSPolicy {
++	p := &CORSPolicy{
++		Methods:     strings.Join(c.AllowMethods, ", "),
++		Headers:     strings.Join(c.AllowHeaders, ", "),
++		Expose:      strings.Join(c.ExposeHeaders, ", "),
++		Credentials: c.AllowCredentials,
++		MaxAge:      int(c.MaxAge.D() / time.Second),
++	}
++	for _, o := range c.AllowOrigins {
++		if o == "*" {
++			p.AnyOrigin = true
++		} else {
++			p.Origins = append(p.Origins, o)
++		}
++	}
++	return p
++}
++
+ // HeaderTransform is a compiled config.HeaderTransform.
+ type HeaderTransform struct {
+ 	Rename [][2]string // from, to; in a stable order
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..62402e9 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -207,6 +207,9 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		r.Request = compileTransform(t.Request)
+ 		r.Response = compileTransform(t.Response)
+ 	}
++	if c := spec.CORS; c != nil {
++		r.CORS = compileCORS(c)
++	}
+ 	for _, us := range spec.Upstreams {
+ 		u, err := url.Parse(us.URL)
+ 		if err != nil {
+diff --git a/internal/proxy/cors.go b/internal/proxy/cors.go
+new file mode 100644
+index 0000000..c7aac2b
+--- /dev/null
++++ b/internal/proxy/cors.go
+@@ -0,0 +1,74 @@
++package proxy
++
++import (
++	"net/http"
++	"strconv"
++	"strings"
++
++	"github.com/relaywork/gateway/internal/core"
++	"github.com/relaywork/gateway/internal/header"
++)
++
++// isPreflight reports whether r is a CORS preflight request: an OPTIONS request that names an
++// origin and the method of the request it precedes.
++func isPreflight(r *http.Request) bool {
++	return r.Method == http.MethodOptions &&
++		r.Header.Get("Origin") != "" &&
++		r.Header.Get("Access-Control-Request-Method") != ""
++}
++
++// preflight answers a preflight request of a route with a CORS policy. The gateway answers it
++// itself: no authentication, rate limit or upstream call stands in front of it. The allow
++// fields are sent only to an allowed origin.
++func (h *Handler) preflight(w *statusRecorder, ex *exchange) {
++	c := ex.route.CORS
++	hdr := w.Header()
++	hdr.Set(header.RequestID, ex.id)
++	hdr.Set("Vary", "Access-Control-Request-Method, Access-Control-Request-Headers")
++	if setCORS(hdr, c, ex.req.Header.Get("Origin")) {
++		if c.Methods != "" {
++			hdr.Set("Access-Control-Allow-Methods", c.Methods)
++		}
++		if c.Headers != "" {
++			hdr.Set("Access-Control-Allow-Headers", c.Headers)
++		}
++		if c.MaxAge > 0 {
++			hdr.Set("Access-Control-Max-Age", strconv.Itoa(c.MaxAge))
++		}
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++// applyCORS sets the CORS fields of an actual response on h. The route's policy replaces any
++// Access-Control field the upstream sent, so an origin that is not allowed gets none.
++func applyCORS(h http.Header, ex *exchange) {
++	if ex.route == nil || ex.route.CORS == nil {
++		return
++	}
++	for name := range h {
++		if strings.HasPrefix(name, "Access-Control-") {
++			delete(h, name)
++		}
++	}
++	setCORS(h, ex.route.CORS, ex.req.Header.Get("Origin"))
++}
++
++// setCORS sets the allow-origin, credentials and expose fields for a request from origin. It
++// reports whether the origin is allowed; a request without an origin is not a CORS request.
++func setCORS(h http.Header, c *core.CORSPolicy, origin string) bool {
++	if origin == "" {
++		return false
++	}
++	value, ok := c.Allow(origin)
++	if !ok {
++		return false
++	}
++	h.Set("Access-Control-Allow-Origin", value)
++	if c.Credentials {
++		h.Set("Access-Control-Allow-Credentials", "true")
++	}
++	if c.Expose != "" {
++		h.Set("Access-Control-Expose-Headers", c.Expose)
++	}
++	return true
++}
+diff --git a/internal/proxy/cors_test.go b/internal/proxy/cors_test.go
+new file mode 100644
+index 0000000..07313e6
+--- /dev/null
++++ b/internal/proxy/cors_test.go
+@@ -0,0 +1,163 @@
++package proxy
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/relaywork/gateway/internal/auth"
++	"github.com/relaywork/gateway/internal/config"
++	"github.com/relaywork/gateway/internal/model"
++)
++
++const corsRoutes = `{"routes":[{"id":"api","path_prefix":"/api","methods":["GET","PUT"],
++	"upstreams":[{"url":"http://up.test"}],"auth":"api_key",
++	"cors":{"allow_origins":["https://app.example.com"],"allow_methods":["GET","PUT"],
++		"allow_headers":["Authorization","Content-Type"],"expose_headers":["X-Total"],"max_age":"10m"}}]}`
++
++// corsFixture serves corsRoutes; the upstream is not expected to be called by preflights.
++func corsFixture(t *testing.T, tr *fakeTransport) *fixture {
++	t.Helper()
++	modes := auth.Modes{config.AuthAPIKey: &fakeAuth{consumer: model.Consumer{ID: "c1"}}}
++	return newFixture(t, corsRoutes, fixtureOptions{transport: tr, auth: modes})
++}
++
++func preflightRequest(origin, method string) *http.Request {
++	r := httptest.NewRequest(http.MethodOptions, "/api/orders", nil)
++	r.Header.Set("Origin", origin)
++	r.Header.Set("Access-Control-Request-Method", method)
++	return r
++}
++
++func TestPreflightIsAnsweredByTheGateway(t *testing.T) {
++	f := corsFixture(t, &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		t.Error("a preflight reached the upstream")
++		return reply(r, 200, "x"), nil
++	}})
++
++	w := f.do(preflightRequest("https://app.example.com", "PUT"))
++	h := w.Header()
++	if w.Code != http.StatusNoContent {
++		t.Fatalf("preflight status = %d, want 204 without credentials", w.Code)
++	}
++	if got := h.Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
++		t.Errorf("Access-Control-Allow-Origin = %q", got)
++	}
++	if got := h.Get("Access-Control-Allow-Methods"); got != "GET, PUT" {
++		t.Errorf("Access-Control-Allow-Methods = %q", got)
++	}
++	if got := h.Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type" {
++		t.Errorf("Access-Control-Allow-Headers = %q", got)
++	}
++	if got := h.Get("Access-Control-Max-Age"); got != "600" {
++		t.Errorf("Access-Control-Max-Age = %q, want 600", got)
++	}
++	if h.Get("X-Request-Id") == "" {
++		t.Error("preflight lacks the gateway's request id")
++	}
++}
++
++func TestPreflightFromOtherOriginGetsNoAllowFields(t *testing.T) {
++	f := corsFixture(t, &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		t.Error("a preflight reached the upstream")
++		return reply(r, 200, "x"), nil
++	}})
++
++	w := f.do(preflightRequest("https://evil.example.net", "GET"))
++	if w.Code != http.StatusNoContent {
++		t.Fatalf("status = %d, want 204", w.Code)
++	}
++	for _, name := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Max-Age"} {
++		if v := w.Header().Get(name); v != "" {
++			t.Errorf("%s = %q for a disallowed origin", name, v)
++		}
++	}
++}
++
++func TestActualResponseGetsCORSFieldsAndDropsTheUpstreams(t *testing.T) {
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		return reply(r, 200, "[]", "Access-Control-Allow-Origin", "*", "Access-Control-Allow-Credentials", "true"), nil
++	}}
++	f := corsFixture(t, tr)
++
++	r := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
++	r.Header.Set("Origin", "https://app.example.com")
++	r.Header.Set("Authorization", "Bearer k")
++	w := f.do(r)
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d", w.Code)
++	}
++	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
++		t.Errorf("Access-Control-Allow-Origin = %q; the route's policy must replace the upstream's", got)
++	}
++	if got := w.Header().Get("Access-Control-Expose-Headers"); got != "X-Total" {
++		t.Errorf("Access-Control-Expose-Headers = %q", got)
++	}
++	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
++		t.Errorf("Access-Control-Allow-Credentials = %q without allow_credentials", got)
++	}
++}
++
++func TestDisallowedOriginGetsNoAllowOriginFromTheUpstream(t *testing.T) {
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		return reply(r, 200, "[]", "Access-Control-Allow-Origin", "*"), nil
++	}}
++	f := corsFixture(t, tr)
++
++	r := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
++	r.Header.Set("Origin", "https://evil.example.net")
++	r.Header.Set("Authorization", "Bearer k")
++	if w := f.do(r); w.Header().Get("Access-Control-Allow-Origin") != "" {
++		t.Errorf("Access-Control-Allow-Origin = %q for a disallowed origin", w.Header().Get("Access-Control-Allow-Origin"))
++	}
++}
++
++func TestGatewayErrorsCarryCORSFields(t *testing.T) {
++	f := corsFixture(t, &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		t.Error("an unauthenticated request reached the upstream")
++		return reply(r, 200, "x"), nil
++	}})
++	r := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
++	r.Header.Set("Origin", "https://app.example.com")
++	w := f.do(r)
++	if w.Code != http.StatusUnauthorized {
++		t.Fatalf("status = %d, want 401", w.Code)
++	}
++	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
++		t.Errorf("Access-Control-Allow-Origin on a 401 = %q; the browser must be able to read the error", got)
++	}
++}
++
++func TestWildcardOriginWithCredentialsEchoesTheOrigin(t *testing.T) {
++	const routes = `{"routes":[{"id":"open","path_prefix":"/","upstreams":[{"url":"http://up.test"}],
++		"cors":{"allow_origins":["*"],"allow_methods":["GET"],"allow_credentials":true}}]}`
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		return reply(r, 200, "ok"), nil
++	}}
++	f := newFixture(t, routes, fixtureOptions{transport: tr})
++
++	r := httptest.NewRequest(http.MethodGet, "/x", nil)
++	r.Header.Set("Origin", "https://any.example.org")
++	w := f.do(r)
++	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://any.example.org" {
++		t.Errorf("Access-Control-Allow-Origin = %q, want the origin echoed (a wildcard is not sent with credentials)", got)
++	}
++	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
++		t.Errorf("Access-Control-Allow-Credentials = %q", got)
++	}
++}
++
++func TestWildcardOriginWithoutCredentialsSendsStar(t *testing.T) {
++	const routes = `{"routes":[{"id":"open","path_prefix":"/","upstreams":[{"url":"http://up.test"}],
++		"cors":{"allow_origins":["*"],"allow_methods":["GET"]}}]}`
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		return reply(r, 200, "ok"), nil
++	}}
++	f := newFixture(t, routes, fixtureOptions{transport: tr})
++
++	r := httptest.NewRequest(http.MethodGet, "/x", nil)
++	r.Header.Set("Origin", "https://any.example.org")
++	if got := f.do(r).Header().Get("Access-Control-Allow-Origin"); got != "*" {
++		t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
++	}
++}
+diff --git a/internal/proxy/handler.go b/internal/proxy/handler.go
+index 5767e69..00baed4 100644
+--- a/internal/proxy/handler.go
++++ b/internal/proxy/handler.go
+@@ -133,7 +133,14 @@ func (h *Handler) serve(w *statusRecorder, ex *exchange) {
+ 			"the request path must be absolute, without empty, '.' or '..' segments"))
+ 		return
+ 	}
+-	route, err := h.routes.Table().Match(r.Host, r.URL.Path, r.Method)
++	// A preflight is matched by the method it asks for, so that a route which lists its
++	// methods still answers it.
++	method := r.Method
++	preflight := isPreflight(r)
++	if preflight {
++		method = r.Header.Get("Access-Control-Request-Method")
++	}
++	route, err := h.routes.Table().Match(r.Host, r.URL.Path, method)
+ 	if err != nil {
+ 		var mna *core.MethodNotAllowedError
+ 		if errors.As(err, &mna) {
+@@ -145,6 +152,10 @@ func (h *Handler) serve(w *statusRecorder, ex *exchange) {
+ 		return
+ 	}
+ 	ex.route = route
++	if preflight && route.CORS != nil {
++		h.preflight(w, ex)
++		return
++	}
+ 
+ 	body, ok := h.authenticate(w, ex)
+ 	if !ok {
+@@ -279,6 +290,7 @@ func (h *Handler) fail(w *statusRecorder, ex *exchange, e *gatewayError) {
+ 	for name, values := range ex.headers {
+ 		w.Header()[name] = values
+ 	}
++	applyCORS(w.Header(), ex)
+ 	writeError(w, e, ex.id)
+ }
+ 
+diff --git a/internal/proxy/response.go b/internal/proxy/response.go
+index 23ceca6..cd1f37f 100644
+--- a/internal/proxy/response.go
++++ b/internal/proxy/response.go
+@@ -40,6 +40,7 @@ func (h *Handler) respond(w *statusRecorder, ex *exchange, res *attemptResult) {
+ 	for name, values := range ex.headers {
+ 		w.Header()[name] = values
+ 	}
++	applyCORS(w.Header(), ex)
+ 	announced := announceTrailers(w.Header(), relayedTrailer(resp.Trailer, resp.Header, ex.headers, ex.route))
+ 	w.WriteHeader(resp.StatusCode)
+ 	if ex.req.Method == http.MethodHead {

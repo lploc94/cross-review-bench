@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-py-lmcache-4748",
+  "repo": "rb-py-lmcache-4748",
+  "kind": "realbug",
+  "title": "[CLI] Add `lmcache query coordinator`",
+  "description": " ## Description \r\n\r\nFollow up PR on #4639\r\n\r\nReading the coordinator meant `curl` + `jq` + mental arithmetic on raw byte counts. This wires its read-only HTTP surface into the CLI:\r\n\r\n    $ lmcache query coordinator --api usage\r\n    ============== Coordinator: usage ==============\r\n    instance  compartment     used  capacity  ratio\r\n    -----------------------------------------------\r\n    mp-gpu7   l1/dram      8.16 GB  20.00 GB  40.8%\r\n    mp-gpu6   l1/dram      5.19 GB  16.00 GB  32.4%\r\n    mp-gpu5   l1/dram      3.16 GB  12.00 GB  26.3%\r\n    mp-gpu4   l1/dram      1.59 GB   8.00 GB  19.9%\r\n    ================================================\r\n\r\nNine read-only APIs: `usage`, `instances`, `health`, `directory`, `keys`, `quota`, `quota-config`, `prefetch`, `metrics`. Narrow with `--instance` / `--cache-salt`; `--api metrics` passes Prometheus text through verbatim.\r\n\r\nMutating routes are out of scope: `POST /events`, `POST /instances` and the heartbeat are server-to-coordinator plumbing, and `/cache` actions belong to a command that owns the action, not to `query`.\r\n\r\n## Output\r\n\r\n`Section` gains a table mode (`set_columns()` / `add_row()`), so one report renders as aligned columns on a terminal and as a JSON list under `--format json` — no second output path to keep in sync. Existing key-value sections are untouched.\r\n\r\nColumn widths come from the content. A column right-aligns when every value-bearing cell starts with a digit; placeholders don't vote, otherwise a single `--` in a capacity column left-aligns everything and the sizes stop lining up.\r\n\r\nEndpoint conventions are carried through, not flattened: undeclared capacity prints `--` with ratio `unknown` rather than `0` (a zero reads as an empty tier, not an unmeasured one), shared pools show as `(fleet-shared)`, and rows sort busiest first.\r\n\r\n## Notes for reviewers\r\n\r\n- Byte counts reuse `describe.fmt_bytes` — no second byte format.\r\n- `--format json` carries display strings, not raw numbers. `curl` the endpoint for machine-readable values.\r\n- The HTTP client duplicates ~30 lines of `commands/quota/_helpers.py`. A shared `commands/_http.py` is the obvious convergence; left out to keep the diff to one command.\r\n- Exit codes: 0 success, 1 unreachable/erroring coordinator, 2 usage error (e.g. `--api prefetch` without `--request-id`).\r\n- Pre-existing: `lmcache.logging` imports torch, so every command prints a few INFO lines first. It all goes to stderr, so piping is unaffected. `LMCACHE_DISABLE_BANNER=1 LMCACHE_LOG_LEVEL=WARNING` quiets it.\r\n\r\n## Testing\r\n\r\n20 unit tests over renderers, paths and required-argument handling, plus a manual run against a live coordinator (4 MP servers, 4 vLLM instances, 4 GPUs) covering a real ratio, an undeclared L2 adapter, and a shared pool.\r\n\r\nBased on `feat/coordinotor-memory-pressure-api` (the `/instances/usage` endpoint this reads).\r\n\r\n- [ ] this PR contains user facing changes - docs added\r\n- [x] this PR contains unit tests",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "lmcache/cli/commands/query/_coordinator.py",
+      "lines": [
+        57,
+        72
+      ],
+      "category": "error-handling",
+      "severity": "low",
+      "difficulty": "L3",
+      "summary": "_fetch promises to turn connection failures into a one-line CLI error with exit 1, but it only catches HTTPError and URLError; when the coordinator accepts the connection and then answers slower than the 10 s timeout, urlopen/read raise a bare TimeoutError (socket.timeout), which is neither, so lmcache query coordinator crashes with an uncaught traceback.",
+      "trigger": "Run lmcache query coordinator --api usage (or any API) against a coordinator that accepts the connection but does not answer within the timeout, so urllib raises TimeoutError.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "tests/v1/cli/test_query_coordinator.py"
+      ],
+      "hidden_test_cmd": ".venv/bin/python -m pytest -q -p no:cacheprovider --noconftest \"tests/v1/cli/test_query_coordinator.py::TestFetchErrors\""
+    }
+  ]
+}

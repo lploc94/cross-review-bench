@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-java-configuration-as-code-plugin-2895",
+  "repo": "rb-java-configuration-as-code-plugin-2895",
+  "kind": "realbug",
+  "title": "Introduce extensible configuration fetcher SPI for JCasC",
+  "description": "Fixes #1365\r\n\r\nIntroduce a pluggable configuration fetcher API that allows Configuration as Code to load YAML from extensible sources while preserving existing behavior. Add default fetchers for local filesystem paths and HTTP/HTTPS URLs, along with a credential-resolution abstraction and a bootstrap environment-variable provider. Refactor configuration loading to use the new fetcher pipeline with managed resource lifecycles, and add unit and integration tests covering fetchers, credential providers, resource cleanup, and end-to-end configuration loading.\r\n\r\n### Your checklist for this pull request\r\n\r\n🚨 Please review the [guidelines for contributing](../blob/master/docs/CONTRIBUTING.md) to this repository.\r\n\r\n- [x] Make sure you are requesting to **pull a topic/feature/bugfix branch** (right side) and not your master branch!\r\n- [x] Ensure that the pull request title represents the desired changelog entry\r\n- [x] Please describe what you did\r\n- [x] Link to relevant issues in GitHub or in [Jenkins JIRA](https://issues.jenkins-ci.org)\r\n- [x] Link to relevant pull requests, esp. upstream and downstream changes\r\n- [x] Did you provide a test-case? That demonstrates the feature works or fixes the issue.\r\n\r\n<!--\r\nPut an `x` into the [ ] to show you have filled the information\r\n-->\r\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "plugin/src/main/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcher.java",
+      "lines": [
+        62,
+        66
+      ],
+      "category": "spec-deviation",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "The new LocalFileSystemFetcher scans a configuration directory with Files.find and only filters directories and the YAML glob; the hidden-path check that ConfigurationAsCode applied before (skipping any path component starting with a dot) is gone, so hidden files and files under hidden directories are loaded, contrary to the PR promise of preserving existing behaviour.",
+      "trigger": "CASC_JENKINS_CONFIG points at a directory that contains dot-files or dot-directories, e.g. a Kubernetes ConfigMap volume (..data symlink and ..<timestamp> dir): each YAML is loaded two or three times, giving duplicate or conflicting configuration.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "plugin/src/test/java/io/jenkins/plugins/casc/fetcher/LocalFileSystemFetcherTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -pl plugin -am test -Dsurefire.failIfNoSpecifiedTests=false -Dtest=LocalFileSystemFetcherTest"
+    }
+  ]
+}

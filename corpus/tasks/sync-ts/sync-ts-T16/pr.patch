@@ -1,0 +1,330 @@
+diff --git a/README.md b/README.md
+index 603ec06..cf874ec 100644
+--- a/README.md
++++ b/README.md
+@@ -59,6 +59,14 @@ change nothing, because their timestamps are not newer than what the replica hol
+ `after = N` records `N` as the device's cursor; `GET /v1/sync/status` returns it with the user's
+ latest seq.
+ 
++**Changed documents.** Integrations that want the current state rather than every write use
++`GET /v1/documents/changes?after=<seq>&limit=<n>`: the user's documents whose `updatedSeq` (the
++seq of the last event that changed them) is greater than `after`, in `updatedSeq` order, with
++`nextAfter` and `hasMore` as in a pull and the same limits. Paging from `after = 0` until
++`hasMore` is false lists every document, each with its state at the time of its page; a
++document that changes meanwhile comes again on a later page with its new state. Keep the last `nextAfter` to fetch only what
++changed since. It needs a device token but no `Sync-Protocol` header, and records no cursor.
++
+ **Client sync.** `SyncClient.sync()` pushes the outbox in batches, oldest first, removing what
+ the server acknowledged; then it pulls pages until `hasMore` is false, applying each page
+ together with the new cursor and clock in one SQLite transaction. A failure leaves everything
+@@ -85,6 +93,7 @@ version is answered 426 `protocol_mismatch` with the server's version. Every ans
+ | POST | `/v1/sync/push` | `{ "mutations": [...] }` → `{ "acked": [...], "serverHlc" }` |
+ | GET | `/v1/sync/pull?after=&limit=` | `{ "events": [...], "nextAfter", "hasMore" }` |
+ | GET | `/v1/sync/status` | `{ "latestSeq", "cursor" }` |
++| GET | `/v1/documents/changes?after=&limit=` | `{ "documents": [...], "nextAfter", "hasMore" }`: documents changed after a seq |
+ | GET | `/v1/documents/:collection/:id` | the server's state of a document, with its field timestamps |
+ | GET | `/v1/me` | the calling device and its user |
+ | GET | `/v1/devices` | the user's devices with their cursors |
+@@ -152,7 +161,7 @@ packages/*/test/            vitest suites; test/helpers have the app builders an
+ | `SERVER_NODE_ID` | `server` | the server's HLC node id; give each instance its own |
+ | `MAX_CLOCK_DRIFT_MS` | `60000` | how far ahead of the server clock a mutation may be |
+ | `PUSH_MAX_MUTATIONS` | `500` | mutations per push |
+-| `PULL_MAX_LIMIT`, `PULL_DEFAULT_LIMIT` | `1000`, `200` | events per pull page |
++| `PULL_MAX_LIMIT`, `PULL_DEFAULT_LIMIT` | `1000`, `200` | events per pull page, documents per page of changes |
+ | `BODY_LIMIT_BYTES` | `33554432` | largest request body (a full push of the largest documents fits) |
+ | `SHUTDOWN_TIMEOUT_MS` | `10000` | graceful shutdown limit |
+ 
+diff --git a/packages/server/migrations/0005_documents_updated_seq.sql b/packages/server/migrations/0005_documents_updated_seq.sql
+new file mode 100644
+index 0000000..e60aae4
+--- /dev/null
++++ b/packages/server/migrations/0005_documents_updated_seq.sql
+@@ -0,0 +1,2 @@
++-- Serves GET /v1/documents/changes: a user's documents in updated_seq order.
++CREATE INDEX documents_user_updated_seq_idx ON documents (user_id, updated_seq);
+diff --git a/packages/server/src/api/routes/documents.ts b/packages/server/src/api/routes/documents.ts
+index efb62af..8f797d1 100644
+--- a/packages/server/src/api/routes/documents.ts
++++ b/packages/server/src/api/routes/documents.ts
+@@ -1,13 +1,24 @@
+ import type { FastifyInstance } from "fastify";
+ import { authOf } from "../plugins/auth.js";
+-import { documentParamsSchema } from "../schemas/documents.js";
++import { documentChangesQuerySchema, documentParamsSchema } from "../schemas/documents.js";
+ import { serializeDocument } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+-/** `/v1/documents`: the server's materialised state of one document. */
++/** `/v1/documents`: the server's materialised state of the caller's documents. */
+ export async function documentRoutes(app: FastifyInstance, options: RouteOptions): Promise<void> {
+   const { documents } = options.services;
++  const changesQuery = documentChangesQuerySchema({
++    maxLimit: options.limits.pullMaxLimit,
++    defaultLimit: options.limits.pullDefaultLimit,
++  });
++
++  app.get("/documents/changes", async (request) => {
++    const auth = authOf(request);
++    const query = parse(changesQuery, request.query, "query");
++    const page = await documents.changes(auth, query.after, query.limit);
++    return { documents: page.documents.map(serializeDocument), nextAfter: page.nextAfter, hasMore: page.hasMore };
++  });
+ 
+   app.get("/documents/:collection/:id", async (request) => {
+     const auth = authOf(request);
+diff --git a/packages/server/src/api/schemas/documents.ts b/packages/server/src/api/schemas/documents.ts
+index 13987ac..966ef4e 100644
+--- a/packages/server/src/api/schemas/documents.ts
++++ b/packages/server/src/api/schemas/documents.ts
+@@ -1,7 +1,16 @@
+ import { docIdSchema } from "@sync/shared";
+ import { z } from "zod";
++import { queryInteger } from "./sync.js";
+ 
+ export const documentParamsSchema = z.object({
+   collection: z.string().min(1).max(64),
+   id: docIdSchema,
+ });
++
++/** `GET /v1/documents/changes` query: the same `after` and `limit` as a pull. */
++export function documentChangesQuerySchema(limits: { maxLimit: number; defaultLimit: number }) {
++  return z.object({
++    after: queryInteger(0, Number.MAX_SAFE_INTEGER).default(0),
++    limit: queryInteger(1, limits.maxLimit).default(limits.defaultLimit),
++  });
++}
+diff --git a/packages/server/src/api/schemas/sync.ts b/packages/server/src/api/schemas/sync.ts
+index ea362e8..af69d88 100644
+--- a/packages/server/src/api/schemas/sync.ts
++++ b/packages/server/src/api/schemas/sync.ts
+@@ -2,7 +2,7 @@ import { mutationSchema } from "@sync/shared";
+ import { z } from "zod";
+ 
+ /** A decimal integer in a query string, within [min, max]. */
+-const queryInteger = (min: number, max: number) =>
++export const queryInteger = (min: number, max: number) =>
+   z
+     .string()
+     .regex(/^\d{1,16}$/, "must be a non-negative integer")
+diff --git a/packages/server/src/repositories/documents.ts b/packages/server/src/repositories/documents.ts
+index 457f96f..bde1c02 100644
+--- a/packages/server/src/repositories/documents.ts
++++ b/packages/server/src/repositories/documents.ts
+@@ -130,6 +130,28 @@ export async function listDocumentsPage(
+   return result.rows.map(toDocument);
+ }
+ 
++/**
++ * At most `limit` documents of the user with `updated_seq > after`, in updated_seq order. A
++ * document's updated_seq is the seq of the last event that changed it, so no two documents of a
++ * user share one.
++ */
++export async function listDocumentsUpdatedAfter(
++  db: Queryable,
++  userId: string,
++  after: number,
++  limit: number,
++): Promise<StoredDocument[]> {
++  const result = await db.query<DocumentRow>(
++    `SELECT ${COLUMNS}
++       FROM documents
++      WHERE user_id = $1 AND updated_seq > $2
++      ORDER BY updated_seq
++      LIMIT $3`,
++    [userId, after, limit],
++  );
++  return result.rows.map(toDocument);
++}
++
+ /** Number of documents of the user, per collection. */
+ export async function countDocumentsByCollection(db: Queryable, userId: string): Promise<Map<string, number>> {
+   const result = await db.query<{ collection: string; count: string }>(
+diff --git a/packages/server/src/services/documentService.ts b/packages/server/src/services/documentService.ts
+index 76c3bbf..c183f98 100644
+--- a/packages/server/src/services/documentService.ts
++++ b/packages/server/src/services/documentService.ts
+@@ -2,7 +2,16 @@ import { isCollectionName } from "@sync/shared";
+ import type { Pool } from "../db/pool.js";
+ import type { AuthContext } from "../domain/accounts.js";
+ import { NotFoundError } from "../domain/errors.js";
+-import { findDocument, type StoredDocument } from "../repositories/documents.js";
++import { findDocument, listDocumentsUpdatedAfter, type StoredDocument } from "../repositories/documents.js";
++
++export interface DocumentChanges {
++  /** Documents with `updatedSeq > after`, at most `limit`, in updatedSeq order. */
++  readonly documents: StoredDocument[];
++  /** What to send as `after` next: the last document's updatedSeq, or `after`. */
++  readonly nextAfter: number;
++  /** Whether more changed documents exist already. */
++  readonly hasMore: boolean;
++}
+ 
+ /** Read access to the materialised documents of the caller's user. */
+ export class DocumentService {
+@@ -20,4 +29,17 @@ export class DocumentService {
+     if (!doc) throw NotFoundError.resource("document", `${collection}/${docId}`);
+     return doc;
+   }
++
++  /**
++   * The current state of the documents changed after `after`, oldest change first. Paging with
++   * `nextAfter` until `hasMore` is false reaches every document; one that changes meanwhile
++   * comes again on a later page with its new state.
++   */
++  async changes(auth: AuthContext, after: number, limit: number): Promise<DocumentChanges> {
++    // One row more than the page tells whether another page follows.
++    const rows = await listDocumentsUpdatedAfter(this.pool, auth.userId, after, limit + 1);
++    const hasMore = rows.length > limit;
++    const documents = hasMore ? rows.slice(0, limit) : rows;
++    return { documents, nextAfter: documents.at(-1)?.updatedSeq ?? after, hasMore };
++  }
+ }
+diff --git a/packages/server/test/api/documentChanges.test.ts b/packages/server/test/api/documentChanges.test.ts
+new file mode 100644
+index 0000000..764a7a4
+--- /dev/null
++++ b/packages/server/test/api/documentChanges.test.ts
+@@ -0,0 +1,142 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { createUser, hlc, mutation, push, type TestDevice } from "../helpers/fixtures.js";
++
++let t: TestApp;
++let ada: TestDevice;
++
++beforeEach(async () => {
++  t = await buildTestApp({ env: { PULL_MAX_LIMIT: "50", PULL_DEFAULT_LIMIT: "3" } });
++  ada = await createUser(t);
++});
++
++afterEach(async () => {
++  await t.close();
++});
++
++interface ChangedDocument {
++  collection: string;
++  id: string;
++  fields: Record<string, unknown>;
++  fieldHlcs: Record<string, string>;
++  updatedSeq: number;
++}
++
++interface ChangesPage {
++  documents: ChangedDocument[];
++  nextAfter: number;
++  hasMore: boolean;
++}
++
++function changes(device: TestDevice, query = "") {
++  return t.app.inject({
++    method: "GET",
++    url: `/v1/documents/changes${query}`,
++    headers: { authorization: `Bearer ${device.token}` },
++  });
++}
++
++async function page(device: TestDevice, after: number, limit: number): Promise<ChangesPage> {
++  const res = await changes(device, `?after=${after}&limit=${limit}`);
++  expect(res.statusCode).toBe(200);
++  return res.json<ChangesPage>();
++}
++
++/** One push per document, so each gets its own updatedSeq. */
++async function setTitles(device: TestDevice, titles: Record<string, string>): Promise<void> {
++  for (const [docId, title] of Object.entries(titles)) {
++    t.clock.advance(1);
++    const res = await push(t, device, [mutation({ docId, hlc: hlc(t.clock.now()), fields: { title } })]);
++    expect(res.statusCode).toBe(200);
++  }
++}
++
++describe("GET /v1/documents/changes", () => {
++  it("lists the documents in the order they last changed, with their current state", async () => {
++    await setTitles(ada, { a: "A1", b: "B1", c: "C1" });
++    await setTitles(ada, { a: "A2" });
++    const res = await changes(ada);
++    expect(res.statusCode).toBe(200);
++    const body = res.json<ChangesPage>();
++    expect(body.documents.map((d) => [d.id, d.fields.title])).toEqual([
++      ["b", "B1"],
++      ["c", "C1"],
++      ["a", "A2"],
++    ]);
++    const docB = (await t.app.inject({
++      method: "GET",
++      url: "/v1/documents/notes/b",
++      headers: { authorization: `Bearer ${ada.token}` },
++    })).json<ChangedDocument>();
++    expect(body.documents[0]).toEqual(docB);
++    expect(body.nextAfter).toBe(body.documents.at(-1)?.updatedSeq);
++    expect(body.hasMore).toBe(false);
++  });
++
++  it("pages with nextAfter and tells when more documents follow", async () => {
++    await setTitles(ada, { a: "A", b: "B", c: "C", d: "D", e: "E" });
++    const first = await page(ada, 0, 2);
++    expect(first.documents.map((d) => d.id)).toEqual(["a", "b"]);
++    expect(first.hasMore).toBe(true);
++    expect(first.nextAfter).toBe(first.documents[1]?.updatedSeq);
++    const second = await page(ada, first.nextAfter, 2);
++    expect(second.documents.map((d) => d.id)).toEqual(["c", "d"]);
++    expect(second.hasMore).toBe(true);
++    const third = await page(ada, second.nextAfter, 2);
++    expect(third.documents.map((d) => d.id)).toEqual(["e"]);
++    expect(third.hasMore).toBe(false);
++    const empty = await page(ada, third.nextAfter, 2);
++    expect(empty).toEqual({ documents: [], nextAfter: third.nextAfter, hasMore: false });
++  });
++
++  it("lists a document again on a later page when it changes after being listed", async () => {
++    await setTitles(ada, { a: "A1", b: "B1", c: "C1" });
++    const first = await page(ada, 0, 2);
++    expect(first.documents.map((d) => d.id)).toEqual(["a", "b"]);
++    await setTitles(ada, { a: "A2" });
++    const second = await page(ada, first.nextAfter, 2);
++    expect(second.documents.map((d) => [d.id, d.fields.title])).toEqual([
++      ["c", "C1"],
++      ["a", "A2"],
++    ]);
++    expect(second.hasMore).toBe(false);
++  });
++
++  it("only returns documents changed after the given seq", async () => {
++    await setTitles(ada, { a: "A", b: "B" });
++    const all = await page(ada, 0, 10);
++    const since = await page(ada, all.documents[0]?.updatedSeq ?? 0, 10);
++    expect(since.documents.map((d) => d.id)).toEqual(["b"]);
++  });
++
++  it("uses the pull limits", async () => {
++    await setTitles(ada, { a: "A", b: "B", c: "C", d: "D" });
++    const res = await changes(ada);
++    expect(res.json<ChangesPage>().documents).toHaveLength(3);
++    expect(res.json<ChangesPage>().hasMore).toBe(true);
++    expect((await changes(ada, "?limit=51")).statusCode).toBe(400);
++    expect((await changes(ada, "?limit=50")).statusCode).toBe(200);
++  });
++
++  it("never returns another user's documents", async () => {
++    const grace = await createUser(t, "Grace");
++    await setTitles(grace, { g: "G" });
++    await setTitles(ada, { a: "A" });
++    expect((await page(ada, 0, 10)).documents.map((d) => d.id)).toEqual(["a"]);
++    expect((await page(grace, 0, 10)).documents.map((d) => d.id)).toEqual(["g"]);
++  });
++
++  it("rejects invalid paging parameters", async () => {
++    for (const query of ["?after=-1", "?after=abc", "?limit=0", "?limit=1.5", "?after=99999999999999999"]) {
++      const res = await changes(ada, query);
++      expect(res.statusCode, query).toBe(400);
++      expect(res.json()).toMatchObject({ error: { code: "validation_error" } });
++    }
++  });
++
++  it("needs a device token but no protocol header", async () => {
++    const res = await t.app.inject({ method: "GET", url: "/v1/documents/changes" });
++    expect(res.statusCode).toBe(401);
++    expect((await changes(ada)).statusCode).toBe(200);
++  });
++});

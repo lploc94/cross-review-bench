@@ -1,0 +1,14 @@
+diff --git a/src/services/balanceCache.ts b/src/services/balanceCache.ts
+index 0b30ab7..bd5334a 100644
+--- a/src/services/balanceCache.ts
++++ b/src/services/balanceCache.ts
+@@ -72,7 +72,8 @@ export class BalanceCache {
+     asOf: Date,
+     balanceMinor: bigint,
+   ): Promise<void> {
+-    if (!this.enabled) return;
++    // Only whole minutes are cached, so arbitrary client timestamps cannot fill Redis.
++    if (!this.enabled || asOf.getTime() % 60_000 !== 0) return;
+     const key = this.asOfKey(tenantId, accountId, asOf);
+     await this.write("put as_of", () => this.redis.set(key, balanceMinor.toString()));
+   }

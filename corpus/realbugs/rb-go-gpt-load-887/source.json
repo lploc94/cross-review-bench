@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/tbphp/gpt-load",
+  "intro_pr": 616,
+  "intro_merged_at": "2026-09-10T13:18:41Z",
+  "fix_pr": 887,
+  "fix_merged_at": "2026-10-19T05:58:10Z",
+  "license": "MIT",
+  "base_commit": "0c9d188892aa4e998f7ec3fcea0f3219da25afcb",
+  "intro_commit": "f091528bdbc3ea3cd9ba8130f3927c4dd73c83f8",
+  "fix_commit": "886a5ab724fe7181857427af07e7e0712c6a0680",
+  "fix_ported": true,
+  "snapshot_changes": []
+}

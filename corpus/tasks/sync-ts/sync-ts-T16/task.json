@@ -1,0 +1,25 @@
+{
+  "schema": "crb-task/v1",
+  "id": "sync-ts-T16",
+  "repo": "sync-ts",
+  "kind": "decoy",
+  "title": "List documents changed since a seq",
+  "description": "Integrations that mirror a user's notes and tasks into another system want the current state of each document, not every field write: replaying the pull feed means applying last-writer-wins themselves, and fetching documents one by one means knowing their ids. This adds a feed of materialised documents ordered by when they last changed.\n\n- `GET /v1/documents/changes?after=<seq>&limit=<n>` returns `{documents, nextAfter, hasMore}`: the caller's documents whose `updatedSeq` (the seq of the last event that changed them) is greater than `after`, in `updatedSeq` order, each in the same shape as `GET /v1/documents/:collection/:id`. `nextAfter` is the last document's `updatedSeq` (or `after` when the page is empty) and `hasMore` comes from reading one row more than the page, as in a pull. `after` defaults to 0; `limit` uses the pull limits (`PULL_DEFAULT_LIMIT`, at most `PULL_MAX_LIMIT`).\n- Paging from 0 until `hasMore` is false lists every document; a document that changes meanwhile comes again on a later page with its new state, and keeping the last `nextAfter` gives only what changed since.\n- Like the other `/v1/documents` routes it needs a device token and no `Sync-Protocol` header, and it records no cursor.\n- Migration `0005` adds an index on `documents (user_id, updated_seq)` for the query.\n\nTests in packages/server/test/api/documentChanges.test.ts: order and state, paging with `nextAfter`/`hasMore`, a document changed after it was listed, `after` in the middle, default and maximum limits, other users' documents, invalid parameters, the token. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "packages/server/src/repositories/documents.ts",
+      "lines": [138, 153],
+      "looks_like": "Keyset paging on a value taken from a bigserial, read under READ COMMITTED with no snapshot, lock or high-water mark: a push that drew a lower seq but commits after the reader's page has already returned a higher updated_seq seems to stay below the reader's `nextAfter` forever, so that document (or its latest change) is never listed. The keyset also has no tie-breaker on a column that is not declared unique.",
+      "why_correct": "Every push runs its whole transaction under lockUser (SELECT … FOR UPDATE on the user's row, taken before insertEvents draws any seq; packages/server/src/services/pushService.ts, whose comment says so), so a user's pushes draw their seqs and commit one at a time: a push of the same user that has not committed has not drawn a seq yet, and when it does, its seqs are greater than every seq of the user already visible. The query is scoped to that one user (`user_id = $1`); other users' pushes interleave in the shared sequence but never appear in this feed. saveDocuments writes updated_seq in the same transaction as the events, so a document's updated_seq becomes visible together with them, and a document that changes after being listed gets a higher updated_seq and is listed again on a later page. updated_seq is the seq of the last event of that document in its push (PushService.push computes it per document from the inserted events), and every event belongs to one document, so no two documents of a user share an updated_seq and `updated_seq > after` alone is an exact keyset.",
+      "valid_rebuttal": "Seqs of one user become visible in increasing order: PushService.push (packages/server/src/services/pushService.ts) takes lockUser, a row lock on the user held until commit, before claimMutations and insertEvents draw any seq, as its comment explains (\"their events get sequence numbers in commit order, so a pull that has seen seq N can never later miss an event below N\"). The changes query is per user (`WHERE user_id = $1 AND updated_seq > $2`), and saveDocuments sets updated_seq in that same transaction, so a document cannot appear later with an updated_seq at or below a `nextAfter` the reader already got; a document that changes moves to a higher updated_seq and comes again. updated_seq is unique per user because it is the seq of a distinct event of that document (lastSeq in PushService.push), so no tie-breaker is needed. This is the same reasoning the existing pull relies on with `seq > after`.",
+      "hidden_tests": ["packages/server/test/hidden/documentChangesPaging.test.ts"],
+      "hidden_test_cmd": "npx vitest run packages/server/test/hidden/documentChangesPaging.test.ts"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

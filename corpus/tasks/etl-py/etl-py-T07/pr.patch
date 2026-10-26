@@ -1,0 +1,725 @@
+diff --git a/README.md b/README.md
+index 2ae945d..532e777 100644
+--- a/README.md
++++ b/README.md
+@@ -23,7 +23,14 @@ are read, and the lookback of its incremental window:
+ 
+ Any file may be gzip-compressed (recognised by its content, not its name). Readers stream the
+ file and number its lines. A header that lacks a required column or names one twice fails the
+-run (`SchemaMismatch`); columns the source does not declare are ignored.
++run (`SchemaMismatch`).
++
++**Schema drift.** A CSV header that names a column the source does not declare, or lacks one of
++its optional columns, has drifted. Each source has a drift policy: `ignore` loads as before,
++`warn` (the default) loads and records the drifted columns with the run in `etl.schema_drift`
++(`etl runs show` lists them), and `fail` records them and fails the run before anything loads
++(`SchemaDrift`). `products` uses `fail`, the other sources `warn`. Undeclared columns are never
++loaded. JSON Lines files have no header, so customers never drift.
+ 
+ **Normalisation.** Money is a `Decimal` with an ISO 4217 currency and never has more decimals
+ than the currency's minor unit (12.345 EUR or 100.5 JPY is refused, not rounded). Timestamps
+@@ -104,7 +111,7 @@ Each report prints a table (or JSON) and writes a CSV file to `REPORT_DIR`.
+ etl run <source> <path> [--json]             load one export file
+ etl status [--source S] [--json]             per source: running?, watermark, latest runs
+ etl runs list [--source S] [--status S] [--limit N] [--json]
+-etl runs show <run-id> [--json]              counts, check results, reject reasons
++etl runs show <run-id> [--json]              counts, check results, reject reasons, drift
+ etl rejects list <run-id> [--reason R] [--after LINE] [--limit N] [--json]
+ etl rejects prune --before D [--source S] [--yes]
+ etl checks list [--source S] [--json]        declared checks and their last results
+@@ -142,6 +149,7 @@ fails. Exit codes:
+ | 14 | `WatermarkConflict`: the watermark changed during the run |
+ | 15 | `RunLocked`: another run of the source is in progress |
+ | 16 | `SchemaNotCurrent`: the database schema is behind the code (`db check`) |
++| 17 | `SchemaDrift`: the file's header drifted and the source's drift policy is `fail` |
+ | 20 | other `EtlError` |
+ 
+ The mapping lives in `src/etl/errors.py` (`EXIT_CODES`).
+diff --git a/migrations/versions/0005_schema_drift.py b/migrations/versions/0005_schema_drift.py
+new file mode 100644
+index 0000000..b28a113
+--- /dev/null
++++ b/migrations/versions/0005_schema_drift.py
+@@ -0,0 +1,38 @@
++"""schema_drift: header drift recorded per run
++
++Revision ID: 0005
++Revises: 0004
++Create Date: 2026-10-14 11:20:00+00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "0005"
++down_revision: str | None = "0004"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "schema_drift",
++        sa.Column("id", sa.BigInteger(), sa.Identity(), primary_key=True),
++        sa.Column(
++            "run_id",
++            sa.BigInteger(),
++            sa.ForeignKey("etl.runs.id", ondelete="CASCADE"),
++            nullable=False,
++        ),
++        sa.Column("column_name", sa.Text(), nullable=False),
++        sa.Column("kind", sa.Text(), nullable=False),
++        sa.CheckConstraint("kind IN ('undeclared', 'missing')", name="ck_schema_drift_kind"),
++        schema="etl",
++    )
++    op.create_index("ix_schema_drift_run_id", "schema_drift", ["run_id"], schema="etl")
++
++
++def downgrade() -> None:
++    op.drop_table("schema_drift", schema="etl")
+diff --git a/src/etl/api/runs.py b/src/etl/api/runs.py
+index 5bf04c3..6a95e97 100644
+--- a/src/etl/api/runs.py
++++ b/src/etl/api/runs.py
+@@ -6,9 +6,9 @@ from pathlib import Path
+ 
+ from etl.api.context import AppContext
+ from etl.errors import InvalidRequest, RunNotFound
+-from etl.schemas.views import CheckResultView, RejectReasonView, RunDetail, RunView
++from etl.schemas.views import CheckResultView, DriftView, RejectReasonView, RunDetail, RunView
+ from etl.sources.registry import get_source
+-from etl.store import check_results, rejects, runs
++from etl.store import check_results, rejects, runs, schema_drift
+ from etl.store.runs import RunStatus
+ 
+ MAX_LIST_LIMIT = 1000
+@@ -47,6 +47,7 @@ def show_run(context: AppContext, run_id: int) -> RunDetail:
+             raise RunNotFound(run_id)
+         stored = check_results.for_run(connection, run_id)
+         reasons = rejects.reasons(connection, run_id)
++        drift = schema_drift.for_run(connection, run_id)
+     return RunDetail(
+         run=RunView.of(record),
+         checks=[CheckResultView.of(item.result) for item in stored],
+@@ -56,4 +57,5 @@ def show_run(context: AppContext, run_id: int) -> RunDetail:
+             )
+             for reason in reasons
+         ],
++        schema_drift=[DriftView(column=item.column, kind=item.kind) for item in drift],
+     )
+diff --git a/src/etl/api/sources.py b/src/etl/api/sources.py
+index e54a328..02bb3cc 100644
+--- a/src/etl/api/sources.py
++++ b/src/etl/api/sources.py
+@@ -25,6 +25,7 @@ def _view(spec: SourceSpec) -> SourceView:
+         lookback=spec.lookback,
+         required_columns=list(spec.required_columns),
+         optional_columns=list(spec.optional_columns),
++        drift_policy=str(spec.drift_policy),
+         description=spec.description,
+     )
+ 
+diff --git a/src/etl/cli/runs.py b/src/etl/cli/runs.py
+index d994fc1..b4372b2 100644
+--- a/src/etl/cli/runs.py
++++ b/src/etl/cli/runs.py
+@@ -79,4 +79,7 @@ def show_command(
+         parts.append(
+             "\nrejects\n" + render_table(["reason", "rows", "first line"], rows, right=(1, 2))
+         )
++    if detail.schema_drift:
++        rows = [[item.column, str(item.kind)] for item in detail.schema_drift]
++        parts.append("\nschema drift\n" + render_table(["column", "drift"], rows))
+     typer.echo("\n".join(parts))
+diff --git a/src/etl/cli/sources.py b/src/etl/cli/sources.py
+index 452cb0a..c85232a 100644
+--- a/src/etl/cli/sources.py
++++ b/src/etl/cli/sources.py
+@@ -30,6 +30,7 @@ def describe_source(view: SourceView) -> str:
+         f"  lookback         {view.lookback}",
+         f"  required         {', '.join(view.required_columns)}",
+         f"  optional         {', '.join(view.optional_columns) or '-'}",
++        f"  drift policy     {view.drift_policy}",
+     ]
+     return "\n".join(lines)
+ 
+diff --git a/src/etl/errors.py b/src/etl/errors.py
+index e6ef784..d36b39e 100644
+--- a/src/etl/errors.py
++++ b/src/etl/errors.py
+@@ -78,18 +78,27 @@ class SchemaMismatch(EtlError):
+         *,
+         missing: Sequence[str] = (),
+         duplicated: Sequence[str] = (),
++        undeclared: Sequence[str] = (),
+     ) -> None:
+         self.source = source
+         self.missing = list(missing)
+         self.duplicated = list(duplicated)
++        self.undeclared = list(undeclared)
+         problems = []
+         if self.missing:
+             problems.append("missing columns: " + ", ".join(self.missing))
+         if self.duplicated:
+             problems.append("duplicated columns: " + ", ".join(self.duplicated))
++        if self.undeclared:
++            problems.append("undeclared columns: " + ", ".join(self.undeclared))
+         super().__init__(f"{source}: " + "; ".join(problems))
+ 
+ 
++class SchemaDrift(SchemaMismatch):
++    """The header names undeclared columns or lacks declared optional ones, and the source's
++    drift policy is `fail`. Nothing was loaded; the drift is recorded with the failed run."""
++
++
+ class TooManyRejects(EtlError):
+     """More rows were rejected than the configured ratio allows."""
+ 
+diff --git a/src/etl/infra/tables.py b/src/etl/infra/tables.py
+index efeba2d..354f59d 100644
+--- a/src/etl/infra/tables.py
++++ b/src/etl/infra/tables.py
+@@ -113,6 +113,24 @@ check_results = Table(
+     schema=ETL_SCHEMA,
+ )
+ 
++# How a run's file header differed from its source's declaration (drift policy warn or fail).
++schema_drift = Table(
++    "schema_drift",
++    metadata,
++    Column("id", BigInteger, Identity(), primary_key=True),
++    Column(
++        "run_id",
++        BigInteger,
++        ForeignKey("etl.runs.id", ondelete="CASCADE"),
++        nullable=False,
++    ),
++    Column("column_name", Text, nullable=False),
++    Column("kind", Text, nullable=False),
++    CheckConstraint("kind IN ('undeclared', 'missing')", name="ck_schema_drift_kind"),
++    Index("ix_schema_drift_run_id", "run_id"),
++    schema=ETL_SCHEMA,
++)
++
+ # --- warehouse: dimensions ------------------------------------------------------------------
+ 
+ products = Table(
+@@ -216,5 +234,5 @@ order_lines = Table(
+     schema=WAREHOUSE_SCHEMA,
+ )
+ 
+-ETL_TABLES = (runs, watermarks, rejects, check_results)
++ETL_TABLES = (runs, watermarks, rejects, check_results, schema_drift)
+ WAREHOUSE_TABLES = (products, customers, orders, order_lines)
+diff --git a/src/etl/pipeline/runner.py b/src/etl/pipeline/runner.py
+index 5f697fe..a1c5135 100644
+--- a/src/etl/pipeline/runner.py
++++ b/src/etl/pipeline/runner.py
+@@ -4,7 +4,8 @@
+    dead process are marked failed.
+ 2. Record the run as `running` (committed on its own, so failures stay visible).
+ 3. In one transaction: read the watermark; stream the file through the normaliser into a
+-   temporary staging table, keeping rows inside the incremental window; reject what is
++   temporary staging table, keeping rows inside the incremental window (a header that drifted
++   from the source's declaration is recorded, or refused under the `fail` policy); reject what is
+    invalid; fail when the reject ratio is too high; merge the deduplicated batch into the
+    warehouse (newer wins); run the quality checks; advance the watermark; record the checks
+    and the finished run; commit.
+@@ -28,6 +29,7 @@ from etl.domain.records import RejectedGroups
+ from etl.errors import (
+     EtlError,
+     QualityCheckFailed,
++    SchemaDrift,
+     SourceFileNotFound,
+     TooManyRejects,
+     describe_error,
+@@ -43,9 +45,10 @@ from etl.pipeline.window import IncrementalWindow
+ from etl.quality.checks import Check
+ from etl.quality.registry import CHECKS, checks_for
+ from etl.quality.runner import CheckResult, blocking_failures, run_checks
++from etl.sources.base import ColumnDrift, DriftKind, HeaderCallback, find_drift
+ from etl.sources.readers import open_reader
+-from etl.sources.registry import SOURCES, Dataset, SourceSpec, get_source
+-from etl.store import check_results, runs, watermarks
++from etl.sources.registry import SOURCES, Dataset, DriftPolicy, SourceSpec, get_source
++from etl.store import check_results, runs, schema_drift, watermarks
+ from etl.store.check_results import SucceededRunHistory
+ from etl.store.runs import RunCounts, RunStatus
+ 
+@@ -73,6 +76,7 @@ class _Attempt:
+     rejected: RejectedGroups = field(default_factory=RejectedGroups)
+     loaded: int = 0
+     checks: list[CheckResult] = field(default_factory=list)
++    drift: list[ColumnDrift] = field(default_factory=list)
+ 
+     def counts(self, *, loaded: int) -> RunCounts:
+         return RunCounts(
+@@ -130,6 +134,18 @@ class Pipeline:
+             )
+             try:
+                 high_water = self._load(spec, binding, path, attempt)
++            except SchemaDrift as drift:
++                # The drift policy refused the file before anything was staged: the run is
++                # recorded as failed together with its drift, which `etl runs show` lists.
++                self._record_failure(spec, attempt, drift)
++                return RunResult(
++                    run_id=run_id,
++                    source=spec.name,
++                    counts=attempt.counts(loaded=0),
++                    high_water=None,
++                    checks=[],
++                    abandoned_runs=abandoned,
++                )
+             except BaseException as error:
+                 self._record_failure(spec, attempt, error)
+                 if isinstance(error, EtlError):
+@@ -174,7 +190,7 @@ class Pipeline:
+             stage = loader.stage_table(MetaData())
+             stage.create(connection)
+ 
+-            with open_reader(spec, path) as items:
++            with open_reader(spec, path, on_header=self._drift_check(spec, attempt)) as items:
+                 records = extract(
+                     items,
+                     spec=spec,
+@@ -227,6 +243,7 @@ class Pipeline:
+             check_results.save(
+                 connection, run_id=attempt.run_id, results=attempt.checks, checked_at=finished_at
+             )
++            schema_drift.save(connection, run_id=attempt.run_id, drift=attempt.drift)
+             runs.finish(
+                 connection,
+                 attempt.run_id,
+@@ -236,6 +253,31 @@ class Pipeline:
+             )
+         return high_water if high_water is not None else window.high_water
+ 
++    def _drift_check(self, spec: SourceSpec, attempt: _Attempt) -> HeaderCallback:
++        """Notes how a file's header drifted from the declaration on the attempt, and raises
++        SchemaDrift when the source's policy is `fail`."""
++
++        def check(header: Sequence[str]) -> None:
++            if spec.drift_policy is DriftPolicy.IGNORE:
++                return
++            attempt.drift = find_drift(header, spec.required_columns, spec.optional_columns)
++            if not attempt.drift:
++                return
++            log.warning(
++                "run.schema_drift",
++                source=spec.name,
++                run_id=attempt.run_id,
++                columns=[f"{item.column} ({item.kind})" for item in attempt.drift],
++            )
++            if spec.drift_policy is DriftPolicy.FAIL:
++                raise SchemaDrift(
++                    spec.name,
++                    missing=[i.column for i in attempt.drift if i.kind is DriftKind.MISSING],
++                    undeclared=[i.column for i in attempt.drift if i.kind is DriftKind.UNDECLARED],
++                )
++
++        return check
++
+     def _record_failure(self, spec: SourceSpec, attempt: _Attempt, error: BaseException) -> None:
+         """Record the failed run. Problems doing so are logged, never raised over `error`."""
+         message = describe_error(error)
+@@ -255,6 +297,7 @@ class Pipeline:
+                     results=attempt.checks,
+                     checked_at=self._clock.now(),
+                 )
++                schema_drift.save(connection, run_id=attempt.run_id, drift=attempt.drift)
+                 runs.finish(
+                     connection,
+                     attempt.run_id,
+diff --git a/src/etl/schemas/views.py b/src/etl/schemas/views.py
+index c5592cf..8a257b9 100644
+--- a/src/etl/schemas/views.py
++++ b/src/etl/schemas/views.py
+@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
+ 
+ from etl.quality.checks import Severity
+ from etl.quality.runner import CheckResult
++from etl.sources.base import DriftKind
+ from etl.store.runs import RunRecord, RunStatus
+ 
+ 
+@@ -73,10 +74,16 @@ class RejectReasonView(View):
+     first_line_no: int
+ 
+ 
++class DriftView(View):
++    column: str
++    kind: DriftKind
++
++
+ class RunDetail(View):
+     run: RunView
+     checks: list[CheckResultView]
+     reject_reasons: list[RejectReasonView]
++    schema_drift: list[DriftView]
+ 
+ 
+ class CheckView(View):
+@@ -111,6 +118,7 @@ class SourceView(View):
+     lookback: timedelta
+     required_columns: list[str]
+     optional_columns: list[str]
++    drift_policy: str
+     description: str
+ 
+ 
+diff --git a/src/etl/sources/base.py b/src/etl/sources/base.py
+index ec9b280..b36b6e5 100644
+--- a/src/etl/sources/base.py
++++ b/src/etl/sources/base.py
+@@ -3,8 +3,9 @@
+ from __future__ import annotations
+ 
+ from collections import Counter
+-from collections.abc import Iterator, Mapping, Sequence
++from collections.abc import Callable, Iterator, Mapping, Sequence
+ from dataclasses import dataclass
++from enum import StrEnum
+ from typing import Protocol
+ 
+ from etl.errors import SchemaMismatch
+@@ -33,6 +34,20 @@ class MalformedRow:
+ 
+ SourceItem = SourceRow | MalformedRow
+ 
++# Called with the normalised header once it passed check_header.
++HeaderCallback = Callable[[Sequence[str]], None]
++
++
++class DriftKind(StrEnum):
++    UNDECLARED = "undeclared"  # in the header, not declared by the source
++    MISSING = "missing"  # a declared optional column the header lacks
++
++
++@dataclass(frozen=True, slots=True)
++class ColumnDrift:
++    column: str
++    kind: DriftKind
++
+ 
+ class Reader(Protocol):
+     """A streaming reader of one source file. Iterating reads the file lazily, row by row."""
+@@ -60,3 +75,18 @@ def check_header(source: str, header: Sequence[str], required: Sequence[str]) ->
+     missing = [name for name in required if name not in present]
+     if missing or duplicated:
+         raise SchemaMismatch(source, missing=missing, duplicated=duplicated)
++
++
++def find_drift(
++    header: Sequence[str], required: Sequence[str], optional: Sequence[str]
++) -> list[ColumnDrift]:
++    """How a header differs from the declared columns, apart from what check_header refuses:
++    undeclared columns in header order, then missing optional columns in declaration order.
++    An empty header cell (a trailing delimiter) names no column."""
++    declared = {*required, *optional}
++    present = set(header)
++    drift = [
++        ColumnDrift(name, DriftKind.UNDECLARED) for name in header if name and name not in declared
++    ]
++    drift += [ColumnDrift(name, DriftKind.MISSING) for name in optional if name not in present]
++    return drift
+diff --git a/src/etl/sources/csv_reader.py b/src/etl/sources/csv_reader.py
+index 1f18b7d..fef902e 100644
+--- a/src/etl/sources/csv_reader.py
++++ b/src/etl/sources/csv_reader.py
+@@ -7,7 +7,14 @@ from collections.abc import Iterator, Sequence
+ from typing import TextIO
+ 
+ from etl.errors import SourceFormatError
+-from etl.sources.base import MalformedRow, SourceItem, SourceRow, check_header, normalise_header
++from etl.sources.base import (
++    HeaderCallback,
++    MalformedRow,
++    SourceItem,
++    SourceRow,
++    check_header,
++    normalise_header,
++)
+ from etl.sources.registry import CsvFormat
+ 
+ 
+@@ -17,7 +24,8 @@ class CsvReader:
+     The first record is the header; it must name every required column once. Line numbers
+     are physical lines, starting at 1 for the header: a record with a quoted line break
+     reports the line it starts on. Empty lines are skipped. A record with a different number
+-    of fields than the header is yielded as a MalformedRow.
++    of fields than the header is yielded as a MalformedRow. `on_header` sees the checked
++    header before the first row is read.
+     """
+ 
+     def __init__(
+@@ -27,11 +35,13 @@ class CsvReader:
+         source: str,
+         file_format: CsvFormat,
+         required: Sequence[str],
++        on_header: HeaderCallback | None = None,
+     ) -> None:
+         self._handle = handle
+         self._source = source
+         self._format = file_format
+         self._required = tuple(required)
++        self._on_header = on_header
+         self._last_line_no = 0
+ 
+     @property
+@@ -52,6 +62,8 @@ class CsvReader:
+         self._last_line_no = reader.line_num
+         header = normalise_header(raw_header)
+         check_header(self._source, header, self._required)
++        if self._on_header is not None:
++            self._on_header(header)
+         width = len(header)
+         for values in reader:
+             start = self._last_line_no + 1
+diff --git a/src/etl/sources/readers.py b/src/etl/sources/readers.py
+index ea952d6..2ee71fc 100644
+--- a/src/etl/sources/readers.py
++++ b/src/etl/sources/readers.py
+@@ -11,15 +11,18 @@ from pathlib import Path
+ 
+ from etl.errors import SourceFileNotFound, SourceFormatError
+ from etl.infra.fs import SourceLines, open_text
+-from etl.sources.base import Reader, SourceItem
++from etl.sources.base import HeaderCallback, Reader, SourceItem
+ from etl.sources.csv_reader import CsvReader
+ from etl.sources.jsonl_reader import JsonLinesReader
+ from etl.sources.registry import CsvFormat, JsonLinesFormat, SourceSpec
+ 
+ 
+ @contextmanager
+-def open_reader(spec: SourceSpec, path: Path) -> Iterator[Iterator[SourceItem]]:
+-    """Open `path` as a file of `spec` and give a lazy iterator over its rows.
++def open_reader(
++    spec: SourceSpec, path: Path, *, on_header: HeaderCallback | None = None
++) -> Iterator[Iterator[SourceItem]]:
++    """Open `path` as a file of `spec` and give a lazy iterator over its rows. `on_header`
++    sees the header of a CSV file before its first row.
+ 
+     Problems that make the rest of the file unreadable (damaged gzip data, bytes that are not
+     valid in the source's encoding, broken CSV quoting) raise SourceFormatError.
+@@ -36,6 +39,7 @@ def open_reader(spec: SourceSpec, path: Path) -> Iterator[Iterator[SourceItem]]:
+                     source=spec.name,
+                     file_format=file_format,
+                     required=spec.required_columns,
++                    on_header=on_header,
+                 )
+             case JsonLinesFormat():
+                 reader = JsonLinesReader(handle)
+diff --git a/src/etl/sources/registry.py b/src/etl/sources/registry.py
+index 2d7a0fb..5bc96ae 100644
+--- a/src/etl/sources/registry.py
++++ b/src/etl/sources/registry.py
+@@ -24,6 +24,15 @@ class Dataset(StrEnum):
+     PRODUCTS = "products"
+ 
+ 
++class DriftPolicy(StrEnum):
++    """What a run does when a CSV header drifts from the declaration: it names a column the
++    source does not declare, or lacks a declared optional column."""
++
++    IGNORE = "ignore"  # load as before, record nothing
++    WARN = "warn"  # load, and record the drift with the run
++    FAIL = "fail"  # record the drift and fail the run before anything loads
++
++
+ @dataclass(frozen=True, slots=True)
+ class CsvFormat:
+     delimiter: str
+@@ -61,6 +70,8 @@ class SourceSpec:
+     timestamp_formats: tuple[str, ...] = ()
+     # Rows with updated_at at or before (watermark - lookback) are skipped.
+     lookback: timedelta = timedelta(hours=1)
++    # Headers only: JSON Lines files have none, and their objects may leave out optional keys.
++    drift_policy: DriftPolicy = DriftPolicy.WARN
+     description: str = field(default="", compare=False)
+ 
+     def __post_init__(self) -> None:
+@@ -123,6 +134,8 @@ PRODUCTS = SourceSpec(
+     optional_columns=("category", "active"),
+     zone="UTC",
+     lookback=timedelta(hours=1),
++    # Written by our own catalogue job: a changed column is a deployment mistake.
++    drift_policy=DriftPolicy.FAIL,
+     description="Catalogue export: UTF-8 CSV, with or without a byte-order mark",
+ )
+ 
+diff --git a/src/etl/store/schema_drift.py b/src/etl/store/schema_drift.py
+new file mode 100644
+index 0000000..3171617
+--- /dev/null
++++ b/src/etl/store/schema_drift.py
+@@ -0,0 +1,28 @@
++"""Header drift recorded per run in `etl.schema_drift`."""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++
++from sqlalchemy import Connection, insert, select
++
++from etl.infra.tables import schema_drift
++from etl.sources.base import ColumnDrift, DriftKind
++
++
++def save(connection: Connection, *, run_id: int, drift: Sequence[ColumnDrift]) -> None:
++    if not drift:
++        return
++    connection.execute(
++        insert(schema_drift),
++        [{"run_id": run_id, "column_name": item.column, "kind": item.kind} for item in drift],
++    )
++
++
++def for_run(connection: Connection, run_id: int) -> list[ColumnDrift]:
++    rows = connection.execute(
++        select(schema_drift.c.column_name, schema_drift.c.kind)
++        .where(schema_drift.c.run_id == run_id)
++        .order_by(schema_drift.c.id)
++    )
++    return [ColumnDrift(row.column_name, DriftKind(row.kind)) for row in rows]
+diff --git a/tests/pipeline/test_schema_drift.py b/tests/pipeline/test_schema_drift.py
+new file mode 100644
+index 0000000..5ccea9c
+--- /dev/null
++++ b/tests/pipeline/test_schema_drift.py
+@@ -0,0 +1,134 @@
++"""Header drift: undeclared or missing optional columns, recorded or refused per source."""
++
++from __future__ import annotations
++
++import dataclasses
++
++from etl.infra.tables import order_lines, products, runs, schema_drift
++from etl.pipeline.runner import Pipeline
++from etl.sources.base import ColumnDrift, DriftKind, find_drift
++from etl.sources.registry import ORDERS, PRODUCTS, SOURCES, DriftPolicy, SourceSpec
++from tests.helpers.db import count, rows
++from tests.helpers.factories import (
++    ORDER_HEADER,
++    PRODUCT_HEADER,
++    customer_obj,
++    order_row,
++    product_row,
++    write_customers,
++)
++from tests.helpers.files import write_csv
++
++
++def with_policy(name: str, policy: DriftPolicy) -> dict[str, SourceSpec]:
++    return {**SOURCES, name: dataclasses.replace(SOURCES[name], drift_policy=policy)}
++
++
++def drift_rows(db):
++    return [(row["column_name"], row["kind"]) for row in rows(db, schema_drift, order_by="id")]
++
++
++def test_drift_is_undeclared_columns_then_missing_optional_ones():
++    header = ["note", "sku", "name", "price", "currency", "updated_at", "category", "colour"]
++
++    drift = find_drift(header, PRODUCTS.required_columns, PRODUCTS.optional_columns)
++
++    assert drift == [
++        ColumnDrift("note", DriftKind.UNDECLARED),
++        ColumnDrift("colour", DriftKind.UNDECLARED),
++        ColumnDrift("active", DriftKind.MISSING),
++    ]
++    assert find_drift(list(PRODUCT_HEADER), PRODUCTS.required_columns, ("category",)) == [
++        ColumnDrift("active", DriftKind.UNDECLARED)
++    ]
++
++
++def test_the_declared_policies():
++    assert PRODUCTS.drift_policy is DriftPolicy.FAIL
++    assert ORDERS.drift_policy is DriftPolicy.WARN
++
++
++def test_warn_loads_the_file_and_records_the_drift(pipeline, db, tmp_path):
++    pipeline.run("customers", write_customers(tmp_path, [customer_obj()]))
++    path = write_csv(
++        tmp_path / "orders.csv",
++        ("channel", *ORDER_HEADER),
++        [{**order_row(), "channel": "app"}],
++        delimiter=";",
++    )
++
++    result = pipeline.run("orders", path)
++
++    assert result.counts.loaded == 1
++    assert count(db, order_lines) == 1
++    assert drift_rows(db) == [("channel", "undeclared")]
++    assert {row["run_id"] for row in rows(db, schema_drift)} == {result.run_id}
++
++
++def test_missing_optional_columns_are_drift_too(db, settings, clock, tmp_path):
++    pipeline = Pipeline(db, settings, clock, sources=with_policy("products", DriftPolicy.WARN))
++    path = write_csv(
++        tmp_path / "products.csv",
++        PRODUCTS.required_columns,
++        [product_row()],
++        delimiter=",",
++    )
++
++    result = pipeline.run("products", path)
++
++    assert result.counts.loaded == 1
++    assert drift_rows(db) == [("category", "missing"), ("active", "missing")]
++
++
++def test_ignore_records_nothing(db, settings, clock, tmp_path):
++    pipeline = Pipeline(db, settings, clock, sources=with_policy("products", DriftPolicy.IGNORE))
++    path = write_csv(
++        tmp_path / "products.csv",
++        (*PRODUCT_HEADER, "colour"),
++        [{**product_row(), "colour": "blue"}],
++        delimiter=",",
++    )
++
++    result = pipeline.run("products", path)
++
++    assert result.counts.loaded == 1
++    assert drift_rows(db) == []
++
++
++def test_fail_records_the_drift_with_the_failed_run_and_loads_nothing(cli, db, tmp_path):
++    path = write_csv(
++        tmp_path / "products.csv",
++        (*PRODUCT_HEADER, "colour"),
++        [{**product_row(), "colour": "blue"}],
++        delimiter=",",
++    )
++
++    cli("run", "products", path)
++
++    (run,) = rows(db, runs)
++    assert run["status"] == "failed"
++    assert run["error"] == "products: undeclared columns: colour"
++    assert count(db, products) == 0
++    assert drift_rows(db) == [("colour", "undeclared")]
++
++
++def test_runs_show_lists_the_drift_and_sources_show_the_policy(cli, db, tmp_path):
++    cli("run", "customers", write_customers(tmp_path, [customer_obj()]))
++    path = write_csv(
++        tmp_path / "orders.csv",
++        (*ORDER_HEADER, "channel"),
++        [{**order_row(), "channel": "app"}],
++        delimiter=";",
++    )
++    cli("run", "orders", path)
++
++    shown = cli("runs", "show", "2")
++    detail = cli("runs", "show", "2", "--json")
++
++    assert "schema drift" in shown.stdout
++    assert "channel  undeclared" in shown.stdout
++    assert detail.exit_code == 0, detail.output
++    assert '"schema_drift":[{"column":"channel","kind":"undeclared"}]' in detail.stdout.replace(
++        " ", ""
++    ).replace("\n", "")
++    assert "drift policy     fail" in cli("sources", "show", "products").stdout

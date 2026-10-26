@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/cucumber/cucumber-jvm",
+  "intro_pr": 3213,
+  "intro_merged_at": "2026-07-21T15:34:56Z",
+  "fix_pr": 3248,
+  "fix_merged_at": "2026-09-24T15:59:38Z",
+  "license": "MIT",
+  "base_commit": "5cf4673893503a78710b3f46e942dca9a28091bb",
+  "intro_commit": "d30a3671d346d14bdb0c3553b5ecf203797ee47e",
+  "fix_commit": "9bb0dfef86a160b875527c9c7d114ec92f7e8eef",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

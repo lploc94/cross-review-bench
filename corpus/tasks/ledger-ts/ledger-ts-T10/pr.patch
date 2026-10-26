@@ -1,0 +1,630 @@
+diff --git a/README.md b/README.md
+index 5f08d14..2084d50 100644
+--- a/README.md
++++ b/README.md
+@@ -43,6 +43,12 @@ characters). A retry with the same key and body returns the original response wi
+ Keys are claimed in the transfer's own transaction, so a request that fails can be retried with
+ the same key. Keys are scoped by tenant.
+ 
++**Daily transfer limits.** An API key may carry a daily limit in one currency
++(`npm run api-keys -- limit`). `POST /transfers` with that key in that currency answers 422
++`limit_exceeded` when the key's transfers of the day plus the new amount would go over it; the
++error's details give the `limit`, what was `used`, the `remaining` amount and `resets_at`. The
++day runs from 00:00 UTC to 00:00 UTC. Replayed requests and hold captures do not count.
++
+ **Holds.** A hold reserves part of an account's available funds for up to seven days. It can be
+ captured in full into another account while `now < expires_at`, or voided at any time while
+ active; voiding is also how the funds of an expired, uncaptured hold are released.
+@@ -103,7 +109,7 @@ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ | 403 | `forbidden` |
+ | 404 | `not_found` |
+ | 409 | `conflict`, `idempotency_conflict`, `invalid_hold_state` |
+-| 422 | `insufficient_funds`, `currency_mismatch`, `account_closed` |
++| 422 | `insufficient_funds`, `currency_mismatch`, `account_closed`, `limit_exceeded` |
+ | 429 | `rate_limited` |
+ | 500 | `internal_error` |
+ 
+@@ -170,7 +176,8 @@ batch, then closes its connections.
+ 
+ Operational scripts:
+ 
+-- `npm run api-keys -- issue|list|revoke --tenant <id> …` manages API keys.
++- `npm run api-keys -- issue|list|revoke|limit --tenant <id> …` manages API keys and their daily
++  transfer limits.
+ - `npm run verify-ledger [-- --tenant <id>]` checks that transfers balance and that balances and
+   held amounts match the entries and holds; it exits 1 and prints the problems when they do not.
+ - `npm run show-transfer -- <transfer id>` prints any tenant's transfer with its entries and
+diff --git a/migrations/0009_api_key_transfer_limits.sql b/migrations/0009_api_key_transfer_limits.sql
+new file mode 100644
+index 0000000..a9b75c9
+--- /dev/null
++++ b/migrations/0009_api_key_transfer_limits.sql
+@@ -0,0 +1,12 @@
++-- An API key may cap the amount it sends per UTC day in one currency. Transfers record the key
++-- that posted them, so a key's usage for the day is the sum of its transfers since midnight UTC.
++ALTER TABLE api_keys
++    ADD COLUMN daily_transfer_limit_minor    bigint CHECK (daily_transfer_limit_minor > 0),
++    ADD COLUMN daily_transfer_limit_currency text REFERENCES currencies (code),
++    ADD CONSTRAINT api_keys_daily_transfer_limit_check
++        CHECK ((daily_transfer_limit_minor IS NULL) = (daily_transfer_limit_currency IS NULL));
++
++ALTER TABLE transfers ADD COLUMN api_key_id uuid REFERENCES api_keys (id);
++
++CREATE INDEX transfers_api_key_created_idx ON transfers (api_key_id, currency, created_at)
++    WHERE api_key_id IS NOT NULL;
+diff --git a/src/api/routes/transfers.ts b/src/api/routes/transfers.ts
+index 2b220dd..e2db4f6 100644
+--- a/src/api/routes/transfers.ts
++++ b/src/api/routes/transfers.ts
+@@ -18,7 +18,7 @@ export const transferRoutes: FastifyPluginAsync<RouteOptions> = async (app, { se
+    * original response (and `Idempotent-Replayed: true`); the same key with another body is 409.
+    */
+   app.post("/transfers", { preHandler: requireScope("transfers:write") }, async (request, reply) => {
+-    const { tenantId } = authOf(request);
++    const { tenantId, apiKeyId } = authOf(request);
+     const idempotencyKey = parse(
+       idempotencyKeySchema,
+       request.headers["idempotency-key"],
+@@ -27,6 +27,7 @@ export const transferRoutes: FastifyPluginAsync<RouteOptions> = async (app, { se
+     const body = parse(createTransferBodySchema, request.body, "body");
+     const { response, replayed } = await services.transfers.createTransfer({
+       tenantId,
++      apiKeyId,
+       idempotencyKey,
+       input: {
+         fromAccountId: body.from_account_id,
+diff --git a/src/domain/apiKey.ts b/src/domain/apiKey.ts
+index 0748b33..b821215 100644
+--- a/src/domain/apiKey.ts
++++ b/src/domain/apiKey.ts
+@@ -1,4 +1,5 @@
+ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
++import type { DailyTransferLimit } from "./transferLimit.js";
+ 
+ /**
+  * API keys look like `lk_<prefix>_<secret>`: an 8-character lowercase prefix that identifies the
+@@ -71,4 +72,5 @@ export interface ApiKeyRecord {
+   readonly scopes: readonly string[];
+   readonly createdAt: Date;
+   readonly revokedAt: Date | null;
++  readonly dailyTransferLimit: DailyTransferLimit | null;
+ }
+diff --git a/src/domain/errors.ts b/src/domain/errors.ts
+index 3df20bb..761c328 100644
+--- a/src/domain/errors.ts
++++ b/src/domain/errors.ts
+@@ -88,6 +88,29 @@ export class AccountClosedError extends DomainError {
+   }
+ }
+ 
++export class LimitExceededError extends DomainError {
++  readonly code = "limit_exceeded";
++  readonly httpStatus = 422;
++
++  constructor(details: {
++    limit: bigint;
++    currency: string;
++    used: bigint;
++    requested: bigint;
++    resetsAt: Date;
++  }) {
++    const remaining = details.limit > details.used ? details.limit - details.used : 0n;
++    super(`transfer exceeds this API key's daily limit of ${details.limit} ${details.currency}`, {
++      limit: details.limit.toString(),
++      currency: details.currency,
++      used: details.used.toString(),
++      remaining: remaining.toString(),
++      requested: details.requested.toString(),
++      resets_at: details.resetsAt.toISOString(),
++    });
++  }
++}
++
+ export class HoldStateError extends DomainError {
+   readonly code = "invalid_hold_state";
+   readonly httpStatus = 409;
+diff --git a/src/domain/transferLimit.ts b/src/domain/transferLimit.ts
+new file mode 100644
+index 0000000..7818586
+--- /dev/null
++++ b/src/domain/transferLimit.ts
+@@ -0,0 +1,23 @@
++import type { CurrencyCode } from "./currency.js";
++
++/** The most an API key may send per UTC day in one currency, in minor units. */
++export interface DailyTransferLimit {
++  readonly amountMinor: bigint;
++  readonly currency: CurrencyCode;
++}
++
++export interface LimitWindow {
++  /** Inclusive. */
++  readonly start: Date;
++  /** Exclusive: the moment the allowance resets. */
++  readonly end: Date;
++}
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++/** The day `now` falls in, from 00:00 UTC to the next 00:00 UTC. */
++export function dailyWindow(now: Date): LimitWindow {
++  const start = new Date(now.getTime());
++  start.setHours(0, 0, 0, 0);
++  return { start, end: new Date(start.getTime() + DAY_MS) };
++}
+diff --git a/src/repositories/apiKeys.ts b/src/repositories/apiKeys.ts
+index 2aa0f71..cdcdcb1 100644
+--- a/src/repositories/apiKeys.ts
++++ b/src/repositories/apiKeys.ts
+@@ -1,6 +1,8 @@
+ import type { Queryable } from "../db/pool.js";
+ import type { ApiKeyRecord } from "../domain/apiKey.js";
+-import { firstRow, requireRow } from "./mapping.js";
++import { toCurrencyCode } from "../domain/currency.js";
++import type { DailyTransferLimit } from "../domain/transferLimit.js";
++import { firstRow, requireRow, toBigInt } from "./mapping.js";
+ 
+ interface ApiKeyRow {
+   id: string;
+@@ -11,9 +13,22 @@ interface ApiKeyRow {
+   scopes: string[];
+   created_at: Date;
+   revoked_at: Date | null;
++  daily_transfer_limit_minor: string | null;
++  daily_transfer_limit_currency: string | null;
+ }
+ 
+-const COLUMNS = "id, tenant_id, name, prefix, secret_hash, scopes, created_at, revoked_at";
++const COLUMNS =
++  "id, tenant_id, name, prefix, secret_hash, scopes, created_at, revoked_at, daily_transfer_limit_minor, daily_transfer_limit_currency";
++
++function mapLimit(row: ApiKeyRow): DailyTransferLimit | null {
++  if (row.daily_transfer_limit_minor === null || row.daily_transfer_limit_currency === null) {
++    return null;
++  }
++  return {
++    amountMinor: toBigInt(row.daily_transfer_limit_minor),
++    currency: toCurrencyCode(row.daily_transfer_limit_currency),
++  };
++}
+ 
+ function mapApiKey(row: ApiKeyRow): ApiKeyRecord {
+   return {
+@@ -25,6 +40,7 @@ function mapApiKey(row: ApiKeyRow): ApiKeyRecord {
+     scopes: row.scopes,
+     createdAt: row.created_at,
+     revokedAt: row.revoked_at,
++    dailyTransferLimit: mapLimit(row),
+   };
+ }
+ 
+@@ -83,3 +99,41 @@ export async function revokeApiKey(
+   const row = firstRow(result.rows);
+   return row ? mapApiKey(row) : null;
+ }
++
++/** Set or (with null) remove a key's daily transfer limit. */
++export async function setDailyTransferLimit(
++  db: Queryable,
++  tenantId: string,
++  id: string,
++  limit: DailyTransferLimit | null,
++): Promise<ApiKeyRecord | null> {
++  const result = await db.query<ApiKeyRow>(
++    `UPDATE api_keys
++     SET daily_transfer_limit_minor = $3, daily_transfer_limit_currency = $4
++     WHERE tenant_id = $1 AND id = $2
++     RETURNING ${COLUMNS}`,
++    [tenantId, id, limit?.amountMinor ?? null, limit?.currency ?? null],
++  );
++  const row = firstRow(result.rows);
++  return row ? mapApiKey(row) : null;
++}
++
++/**
++ * Lock a key's row for the rest of the transaction when it has a daily limit in `currency`, and
++ * return that limit; null (and no lock) for keys without one.
++ */
++export async function lockDailyTransferLimit(
++  db: Queryable,
++  tenantId: string,
++  id: string,
++  currency: string,
++): Promise<DailyTransferLimit | null> {
++  const result = await db.query<ApiKeyRow>(
++    `SELECT ${COLUMNS} FROM api_keys
++     WHERE tenant_id = $1 AND id = $2 AND daily_transfer_limit_currency = $3
++     FOR UPDATE`,
++    [tenantId, id, currency],
++  );
++  const row = firstRow(result.rows);
++  return row ? mapLimit(row) : null;
++}
+diff --git a/src/repositories/transfers.ts b/src/repositories/transfers.ts
+index 30be05a..0f602f2 100644
+--- a/src/repositories/transfers.ts
++++ b/src/repositories/transfers.ts
+@@ -44,13 +44,15 @@ export interface NewTransfer {
+   readonly description: string | null;
+   readonly metadata: Metadata;
+   readonly createdAt: Date;
++  /** The API key that posted the transfer through `POST /transfers`; null for hold captures. */
++  readonly apiKeyId: string | null;
+ }
+ 
+ export async function insertTransfer(db: Queryable, transfer: NewTransfer): Promise<Transfer> {
+   const result = await db.query<TransferRow>(
+     `INSERT INTO transfers
+-       (tenant_id, from_account_id, to_account_id, amount_minor, currency, description, metadata, created_at)
+-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
++       (tenant_id, from_account_id, to_account_id, amount_minor, currency, description, metadata, created_at, api_key_id)
++     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+      RETURNING ${COLUMNS}`,
+     [
+       transfer.tenantId,
+@@ -61,6 +63,7 @@ export async function insertTransfer(db: Queryable, transfer: NewTransfer): Prom
+       transfer.description,
+       JSON.stringify(transfer.metadata),
+       transfer.createdAt,
++      transfer.apiKeyId,
+     ],
+   );
+   return mapTransfer(requireRow(result.rows, "insertTransfer"));
+@@ -126,3 +129,20 @@ export async function listTransfers(
+   );
+   return result.rows.map(mapTransfer);
+ }
++
++/** What an API key sent in `currency` with `start <= created_at < end`. */
++export async function sumSentByApiKey(
++  db: Queryable,
++  tenantId: string,
++  apiKeyId: string,
++  currency: CurrencyCode,
++  window: { start: Date; end: Date },
++): Promise<bigint> {
++  const result = await db.query<{ total: string }>(
++    `SELECT COALESCE(sum(amount_minor), 0)::text AS total FROM transfers
++     WHERE tenant_id = $1 AND api_key_id = $2 AND currency = $3
++       AND created_at >= $4 AND created_at < $5`,
++    [tenantId, apiKeyId, currency, window.start, window.end],
++  );
++  return toBigInt(requireRow(result.rows, "sumSentByApiKey").total);
++}
+diff --git a/src/scripts/apiKeys.ts b/src/scripts/apiKeys.ts
+index a6c16cc..b6225fa 100644
+--- a/src/scripts/apiKeys.ts
++++ b/src/scripts/apiKeys.ts
+@@ -1,4 +1,7 @@
+ import { parseArgs } from "node:util";
++import type { ApiKeyRecord } from "../domain/apiKey.js";
++import { isCurrencyCode } from "../domain/currency.js";
++import { parseMinor } from "../domain/money.js";
+ import { SCOPES } from "../domain/scopes.js";
+ import { systemClock } from "../infra/clock.js";
+ import * as apiKeys from "../repositories/apiKeys.js";
+@@ -9,6 +12,7 @@ const USAGE = `usage:
+   npm run api-keys -- issue  --tenant <tenant id> --name <key name> [--scopes <a,b,…>]
+   npm run api-keys -- list   --tenant <tenant id>
+   npm run api-keys -- revoke --tenant <tenant id> --id <key id>
++  npm run api-keys -- limit  --tenant <tenant id> --id <key id> (--amount <minor units> --currency <code> | --clear)
+ 
+ Scopes: ${SCOPES.join(", ")} (issue defaults to all of them). An issued token is printed once.`;
+ 
+@@ -16,6 +20,11 @@ function print(value: unknown): void {
+   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+ }
+ 
++function limitJson(key: ApiKeyRecord): { amount: string; currency: string } | null {
++  const limit = key.dailyTransferLimit;
++  return limit ? { amount: limit.amountMinor.toString(), currency: limit.currency } : null;
++}
++
+ await runScript(USAGE, async ({ pool }) => {
+   let parsed;
+   try {
+@@ -26,6 +35,9 @@ await runScript(USAGE, async ({ pool }) => {
+         name: { type: "string" },
+         scopes: { type: "string" },
+         id: { type: "string" },
++        amount: { type: "string" },
++        currency: { type: "string" },
++        clear: { type: "boolean" },
+       },
+     });
+   } catch (err) {
+@@ -56,6 +68,7 @@ await runScript(USAGE, async ({ pool }) => {
+           scopes: key.scopes,
+           created_at: key.createdAt.toISOString(),
+           revoked_at: key.revokedAt?.toISOString() ?? null,
++          daily_transfer_limit: limitJson(key),
+         })),
+       );
+       return;
+@@ -66,6 +79,19 @@ await runScript(USAGE, async ({ pool }) => {
+       print({ id: key.id, revoked_at: key.revokedAt?.toISOString() ?? null });
+       return;
+     }
++    case "limit": {
++      if (!values.id) throw new UsageError("--id is required");
++      let limit = null;
++      if (!values.clear) {
++        const { amount, currency } = values;
++        if (!amount || !currency) throw new UsageError("--amount and --currency, or --clear");
++        if (!isCurrencyCode(currency)) throw new UsageError(`unsupported currency ${currency}`);
++        limit = { amountMinor: parseMinor(amount), currency };
++      }
++      const key = await service.setDailyTransferLimit(values.tenant, values.id, limit);
++      print({ id: key.id, daily_transfer_limit: limitJson(key) });
++      return;
++    }
+     default:
+       throw new UsageError(command ? `unknown command ${command}` : "a command is required");
+   }
+diff --git a/src/services/apiKeyService.ts b/src/services/apiKeyService.ts
+index ac28f41..0227266 100644
+--- a/src/services/apiKeyService.ts
++++ b/src/services/apiKeyService.ts
+@@ -8,6 +8,7 @@ import {
+ } from "../domain/apiKey.js";
+ import { NotFoundError, ValidationError } from "../domain/errors.js";
+ import { partitionScopes } from "../domain/scopes.js";
++import type { DailyTransferLimit } from "../domain/transferLimit.js";
+ import type { Clock } from "../infra/clock.js";
+ import * as apiKeys from "../repositories/apiKeys.js";
+ import * as tenants from "../repositories/tenants.js";
+@@ -77,6 +78,20 @@ export class ApiKeyService {
+     }
+   }
+ 
++  /** Cap what the key may send per UTC day in one currency; null removes the cap. */
++  async setDailyTransferLimit(
++    tenantId: string,
++    id: string,
++    limit: DailyTransferLimit | null,
++  ): Promise<ApiKeyRecord> {
++    if (limit && limit.amountMinor <= 0n) {
++      throw new ValidationError("a daily transfer limit must be positive");
++    }
++    const key = await apiKeys.setDailyTransferLimit(this.pool, tenantId, id, limit);
++    if (!key) throw NotFoundError.resource("api key", id);
++    return key;
++  }
++
+   async revokeKey(tenantId: string, id: string): Promise<ApiKeyRecord> {
+     const key = await apiKeys.revokeApiKey(this.pool, tenantId, id, this.clock.now());
+     if (!key) throw NotFoundError.resource("api key", id);
+diff --git a/src/services/ledgerPosting.ts b/src/services/ledgerPosting.ts
+index 6a81bae..b641c69 100644
+--- a/src/services/ledgerPosting.ts
++++ b/src/services/ledgerPosting.ts
+@@ -21,6 +21,8 @@ export interface PostingInput {
+   readonly description: string | null;
+   readonly metadata: Metadata;
+   readonly now: Date;
++  /** The API key posting the transfer, recorded for its daily limit; omitted for hold captures. */
++  readonly apiKeyId?: string | null;
+ }
+ 
+ export interface PostingResult {
+@@ -60,6 +62,7 @@ export async function postTransfer(db: Queryable, input: PostingInput): Promise<
+     description: input.description,
+     metadata: input.metadata,
+     createdAt: now,
++    apiKeyId: input.apiKeyId ?? null,
+   });
+   const debited = await accounts.applyBalanceChange(db, tenantId, from.id, {
+     balanceDelta: -amountMinor,
+diff --git a/src/services/transferService.ts b/src/services/transferService.ts
+index f4bdf2f..d1fca46 100644
+--- a/src/services/transferService.ts
++++ b/src/services/transferService.ts
+@@ -1,11 +1,13 @@
+-import type { Pool } from "../db/pool.js";
++import type { Pool, PoolClient } from "../db/pool.js";
+ import { withTransaction } from "../db/tx.js";
+-import { NotFoundError } from "../domain/errors.js";
++import { LimitExceededError, NotFoundError } from "../domain/errors.js";
+ import type { JsonValue } from "../domain/json.js";
+ import { toPage, type OffsetPage, type Page } from "../domain/pagination.js";
+ import type { Entry, Transfer, TransferInput } from "../domain/transfer.js";
++import { dailyWindow } from "../domain/transferLimit.js";
+ import type { Clock } from "../infra/clock.js";
+ import * as accounts from "../repositories/accounts.js";
++import * as apiKeys from "../repositories/apiKeys.js";
+ import * as entries from "../repositories/entries.js";
+ import * as transfers from "../repositories/transfers.js";
+ import type { TransferFilter } from "../repositories/transfers.js";
+@@ -14,6 +16,8 @@ import { postTransfer, type PostingResult } from "./ledgerPosting.js";
+ 
+ export interface CreateTransferRequest {
+   readonly tenantId: string;
++  /** The API key making the request; its daily transfer limit, if any, applies. */
++  readonly apiKeyId: string;
+   readonly idempotencyKey: string;
+   readonly input: TransferInput;
+   /** Renders the HTTP body stored with the idempotency key and replayed on retries. */
+@@ -49,7 +53,8 @@ export class TransferService {
+   /**
+    * Post a transfer exactly once per idempotency key. Both accounts are locked in ascending id
+    * order before anything is checked, so concurrent transfers between the same accounts are
+-   * serialized and every balance check sees the latest committed balance.
++   * serialized and every balance check sees the latest committed balance. A replayed request is
++   * not checked against the daily limit again: it posts nothing.
+    */
+   async createTransfer(request: CreateTransferRequest): Promise<IdempotentResult> {
+     const { tenantId, input } = request;
+@@ -61,6 +66,7 @@ export class TransferService {
+     };
+     return withTransaction(this.pool, (client) =>
+       runIdempotent(client, scope, now, async () => {
++        await this.checkDailyLimit(client, request, now);
+         const locked = await accounts.lockAccounts(client, tenantId, [
+           input.fromAccountId,
+           input.toAccountId,
+@@ -79,12 +85,39 @@ export class TransferService {
+           description: input.description ?? null,
+           metadata: input.metadata ?? {},
+           now,
++          apiKeyId: request.apiKeyId,
+         });
+         return { status: 201, body: request.present(result) };
+       }),
+     );
+   }
+ 
++  /**
++   * Refuse a transfer that would take its API key past the key's daily limit in the transfer's
++   * currency. The key row is locked first, so concurrent transfers of one key are counted one
++   * after the other and cannot overshoot the limit together.
++   */
++  private async checkDailyLimit(
++    client: PoolClient,
++    request: CreateTransferRequest,
++    now: Date,
++  ): Promise<void> {
++    const { tenantId, apiKeyId, input } = request;
++    const limit = await apiKeys.lockDailyTransferLimit(client, tenantId, apiKeyId, input.currency);
++    if (!limit) return;
++    const window = dailyWindow(now);
++    const used = await transfers.sumSentByApiKey(client, tenantId, apiKeyId, limit.currency, window);
++    if (used + input.amountMinor > limit.amountMinor) {
++      throw new LimitExceededError({
++        limit: limit.amountMinor,
++        currency: limit.currency,
++        used,
++        requested: input.amountMinor,
++        resetsAt: window.end,
++      });
++    }
++  }
++
+   async getTransfer(tenantId: string, id: string): Promise<TransferWithEntries> {
+     const transfer = await transfers.findTransfer(this.pool, tenantId, id);
+     if (!transfer) throw NotFoundError.resource("transfer", id);
+diff --git a/test/api/transferLimits.test.ts b/test/api/transferLimits.test.ts
+new file mode 100644
+index 0000000..753948a
+--- /dev/null
++++ b/test/api/transferLimits.test.ts
+@@ -0,0 +1,120 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import type { CurrencyCode } from "../../src/domain/currency.js";
++import { ApiKeyService } from "../../src/services/apiKeyService.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  fundedWallet,
++  issueKey,
++  openAccount,
++  transferRequest,
++  type AccountBody,
++  type ErrorResponse,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++describe("daily transfer limits", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++  let limited: TestTenant;
++  let wallet: AccountBody;
++  let merchant: AccountBody;
++
++  beforeAll(async () => {
++    t = await buildTestApp();
++  });
++
++  afterAll(async () => {
++    await t.close();
++  });
++
++  beforeEach(async () => {
++    tenant = await createTenant(t.pool, t.clock);
++    wallet = await fundedWallet(t.app, tenant, "100000");
++    merchant = await openAccount(t.app, tenant);
++    limited = await issueKey(t.pool, t.clock, tenant.tenantId, ["transfers:write"]);
++  });
++
++  async function limitKey(key: TestTenant, amount: bigint, currency: CurrencyCode = "USD") {
++    await new ApiKeyService({ pool: t.pool, clock: t.clock }).setDailyTransferLimit(
++      key.tenantId,
++      key.apiKeyId,
++      { amountMinor: amount, currency },
++    );
++  }
++
++  function send(key: TestTenant, amount: string, from = wallet, to = merchant) {
++    return transferRequest(t.app, key, {
++      from_account_id: from.id,
++      to_account_id: to.id,
++      amount,
++      currency: from.currency,
++    });
++  }
++
++  it("refuses a transfer that would exceed the key's limit and reports what is left", async () => {
++    await limitKey(limited, 1000n);
++    expect((await send(limited, "600")).statusCode).toBe(201);
++
++    const refused = await send(limited, "500");
++    expect(refused.statusCode).toBe(422);
++    const error = refused.json<ErrorResponse>().error;
++    expect(error.code).toBe("limit_exceeded");
++    expect(error.details).toMatchObject({
++      limit: "1000",
++      currency: "USD",
++      used: "600",
++      remaining: "400",
++      requested: "500",
++    });
++
++    expect((await send(limited, "400")).statusCode).toBe(201);
++    expect((await send(limited, "1")).statusCode).toBe(422);
++  });
++
++  it("counts only the key's own transfers in the limit's currency", async () => {
++    await limitKey(limited, 1000n);
++    const other = await issueKey(t.pool, t.clock, tenant.tenantId, ["transfers:write"]);
++    expect((await send(other, "5000")).statusCode).toBe(201);
++    expect((await send(limited, "1000")).statusCode).toBe(201);
++
++    const euros = await fundedWallet(t.app, tenant, "5000", "EUR");
++    const euroMerchant = await openAccount(t.app, tenant, { currency: "EUR" });
++    expect((await send(limited, "5000", euros, euroMerchant)).statusCode).toBe(201);
++  });
++
++  it("does not count a replayed request twice", async () => {
++    await limitKey(limited, 1000n);
++    const body = { from_account_id: wallet.id, to_account_id: merchant.id, amount: "700", currency: "USD" };
++    expect((await transferRequest(t.app, limited, body, "order-1")).statusCode).toBe(201);
++    const replay = await transferRequest(t.app, limited, body, "order-1");
++    expect(replay.statusCode).toBe(201);
++    expect(replay.headers["idempotent-replayed"]).toBe("true");
++    expect((await send(limited, "300")).statusCode).toBe(201);
++  });
++
++  it("gives a new allowance on the next day", async () => {
++    await limitKey(limited, 1000n);
++    expect((await send(limited, "1000")).statusCode).toBe(201);
++    expect((await send(limited, "1")).statusCode).toBe(422);
++
++    t.clock.set("2030-01-16T12:00:00.000Z");
++    expect((await send(limited, "1000")).statusCode).toBe(201);
++  });
++
++  it("lets concurrent transfers of one key spend the limit only once", async () => {
++    await limitKey(limited, 1000n);
++    const responses = await Promise.all(Array.from({ length: 5 }, () => send(limited, "400")));
++    expect(responses.map((r) => r.statusCode).sort()).toEqual([201, 201, 422, 422, 422]);
++  });
++
++  it("applies no limit once it is removed", async () => {
++    await limitKey(limited, 100n);
++    await new ApiKeyService({ pool: t.pool, clock: t.clock }).setDailyTransferLimit(
++      limited.tenantId,
++      limited.apiKeyId,
++      null,
++    );
++    expect((await send(limited, "5000")).statusCode).toBe(201);
++  });
++});

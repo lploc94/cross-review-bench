@@ -1,0 +1,40 @@
+diff --git a/src/services/holdService.ts b/src/services/holdService.ts
+index ded488e..4f32531 100644
+--- a/src/services/holdService.ts
++++ b/src/services/holdService.ts
+@@ -64,7 +64,7 @@ export class HoldService {
+       throw new ValidationError(`amount must be between 1 and ${MAX_AMOUNT_MINOR}`);
+     }
+     const now = this.clock.now();
+-    return withTransaction(this.pool, async (client) => {
++    const created = await withTransaction(this.pool, async (client) => {
+       const account = await accounts.lockAccount(client, tenantId, input.accountId);
+       if (!account) throw NotFoundError.resource("account", input.accountId);
+       assertOpen(account);
+@@ -87,6 +87,8 @@ export class HoldService {
+       await outbox.insertEvent(client, holdCreated(hold), now);
+       return hold;
+     });
++    await this.balances.invalidate(tenantId, [created.accountId]);
++    return created;
+   }
+ 
+   async getHold(tenantId: string, id: string): Promise<Hold> {
+@@ -157,7 +159,7 @@ export class HoldService {
+    */
+   async voidHold(tenantId: string, holdId: string): Promise<Hold> {
+     const now = this.clock.now();
+-    return withTransaction(this.pool, async (client) => {
++    const released = await withTransaction(this.pool, async (client) => {
+       const hold = await this.findOrThrow(client, tenantId, holdId);
+       const account = await accounts.lockAccount(client, tenantId, hold.accountId);
+       if (!account) throw NotFoundError.resource("account", hold.accountId);
+@@ -174,6 +176,8 @@ export class HoldService {
+       await outbox.insertEvent(client, holdVoided(voided), now);
+       return voided;
+     });
++    await this.balances.invalidate(tenantId, [released.accountId]);
++    return released;
+   }
+ 
+   private async findOrThrow(client: PoolClient, tenantId: string, id: string): Promise<Hold> {

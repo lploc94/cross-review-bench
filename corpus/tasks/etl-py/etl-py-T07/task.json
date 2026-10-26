@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T07",
+  "repo": "etl-py",
+  "kind": "buggy",
+  "title": "Schema drift policy",
+  "description": "Twice this quarter a source added or dropped a column without telling us: the shop export gained a `channel` column, and the catalogue job stopped writing `category` for a week. Undeclared columns were ignored silently and a missing optional column just became NULL everywhere, so nobody noticed until the reports looked odd. This makes header drift visible and lets a source refuse it.\n\n- `SourceSpec.drift_policy` (`DriftPolicy`: `ignore`, `warn`, `fail`; default `warn`). Drift is a CSV header column the source does not declare, or a declared optional column the header lacks (`find_drift` in `sources/base.py`). `products` is `fail` (the catalogue export comes from our own job, so a changed column is a deployment mistake); orders and customers are `warn`. JSON Lines files have no header and are not checked.\n- `CsvReader`/`open_reader` take an `on_header` callback, called with the checked header before the first row; the pipeline uses it to note the drift on the attempt and, under `fail`, to raise the new `SchemaDrift` (a kind of `SchemaMismatch`) before anything is staged.\n- Migration 0005 adds `etl.schema_drift(run_id, column_name, kind)`. Drift is saved with the run: in the load transaction when the run succeeds, with the failed run's record otherwise, so a refused file shows what changed. `etl runs show` lists it (`schema_drift` in `--json`), and `etl sources show` prints the policy.\n- README: the drift policy, and exit code 17 for `SchemaDrift` so schedulers can tell a changed export from a missing file or a bad row ratio.\n\nTests: `tests/pipeline/test_schema_drift.py` (drift detection, the declared policies, warn on an undeclared orders column, missing optional columns, ignore, fail recording the drift with the failed run and loading nothing, `runs show` and `sources show`).",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/etl/errors.py",
+      "lines": [97, 99],
+      "category": "api-contract",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "SchemaDrift is declared as a subclass of SchemaMismatch but gets no entry in EXIT_CODES. exit_code_for walks the class's MRO and stops at the first class in EXIT_CODES, so SchemaDrift exits with SchemaMismatch's 11 (\"required columns missing\") while the README, which the project treats as the exit-code interface, documents a new distinct code 17 for it. Schedulers that branch on exit codes cannot tell a drifted export from a file missing required columns, and anything keyed on 17 never fires.",
+      "trigger": "Any SchemaDrift reaching the CLI (e.g. a products file with an undeclared column once the run reports it): `etl run` exits 11, not the documented 17.",
+      "testable": true,
+      "hidden_tests": ["tests/hidden/test_drift_exit_code.py"],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_drift_exit_code.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Exit codes are resolved per class family by exit_code_for in src/etl/errors.py, and SchemaDrift is deliberately part of the SchemaMismatch family, just like UnknownSource, RunNotFound and SourceFileNotFound all share NotFound's 4; drift is a header that does not match the declaration, so sharing the schema-mismatch code is consistent and the README row is only describing the class.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/etl/pipeline/runner.py",
+      "lines": [137, 148],
+      "category": "error-handling",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "Pipeline.run catches SchemaDrift, records the failed run (with its drift rows) and then returns a RunResult instead of re-raising. Every caller treats a returned RunResult as success: api.runs.run_source reads the run record and the CLI prints it, so `etl run` on a file refused under the `fail` policy prints `run N: products failed` and exits 0. The error is swallowed at the one place that decides the process status: cron jobs, schedulers and scripts see success, the run_id is never set on the error, and the README's documented failure (exit code for SchemaDrift) never happens. Every other failure in Pipeline.run is re-raised after _record_failure.",
+      "trigger": "products file whose header has an extra column `colour`, or lacks the declared optional column `active` (policy fail): pipeline.run returns normally; `etl run products file.csv` exits 0.",
+      "testable": true,
+      "hidden_tests": ["tests/hidden/test_drift_fail_run.py"],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_drift_fail_run.py",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "Nothing is swallowed: the drifted run is recorded as failed with its error and its drift rows by _record_failure (src/etl/pipeline/runner.py), `etl runs list`/`etl status` show it as failed, and the run output printed by `etl run` says `failed` with the error line, so the operator sees exactly what happened.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

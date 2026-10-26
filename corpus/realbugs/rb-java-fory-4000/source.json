@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/apache/fory",
+  "intro_pr": 3955,
+  "intro_merged_at": "2026-08-21T04:22:34Z",
+  "fix_pr": 4000,
+  "fix_merged_at": "2026-08-30T16:23:34Z",
+  "license": "Apache-2.0",
+  "base_commit": "8728bd82535637aebc100cf47348fb3957347110",
+  "intro_commit": "a723392a5b27a542c92e1100ee8c7c9d0dd5b41b",
+  "fix_commit": "3f0d2a585da686b30d478d8bcb31c0f579c32161",
+  "fix_ported": false,
+  "snapshot_changes": [
+    ".gitattributes: removed `benchmarks export-ignore` and `integration_tests export-ignore`"
+  ]
+}

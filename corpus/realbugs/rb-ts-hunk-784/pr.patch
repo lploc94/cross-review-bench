@@ -1,0 +1,3332 @@
+diff --git a/.changeset/mighty-workers-highlight.md b/.changeset/mighty-workers-highlight.md
+new file mode 100644
+index 00000000..4720df13
+--- /dev/null
++++ b/.changeset/mighty-workers-highlight.md
+@@ -0,0 +1,5 @@
++---
++"hunkdiff": patch
++---
++
++Add an experimental `hunk --fast` mode that keeps eligible large syntax-highlighted diffs responsive with a Bun worker.
+diff --git a/README.md b/README.md
+index 99d0c874..bd8d8310 100644
+--- a/README.md
++++ b/README.md
+@@ -73,6 +73,7 @@ Hunk mirrors Git's diff-style commands, but opens the changeset in a review UI i
+ 
+ ```bash
+ hunk diff                      # review current repo changes, including untracked files
++hunk --fast                    # experimentally offload eligible large-diff highlighting
+ hunk diff --watch              # auto-reload as the working tree changes
+ hunk show                      # review the latest commit
+ hunk show HEAD~1               # review an earlier commit
+diff --git a/benchmarks/compact-highlight-payload.ts b/benchmarks/compact-highlight-payload.ts
+new file mode 100644
+index 00000000..00417831
+--- /dev/null
++++ b/benchmarks/compact-highlight-payload.ts
+@@ -0,0 +1,216 @@
++// Compare the worker's current raw-HAST response shape with the compact typed-array PoC.
++// This models response handling only: Pierre still generates the same HAST before the worker
++// normalizes it, and the terminal paint seam remains a later milestone.
++import { performance } from "node:perf_hooks";
++import { cleanLastNewline, parseDiffFromFile } from "@pierre/diffs";
++import type { DiffFile } from "../src/core/types";
++import {
++  buildSplitRows,
++  loadHighlightedDiff,
++  type HighlightedDiffCode,
++} from "../src/ui/diff/diffRows";
++import {
++  compactHighlightRunsForLine,
++  compactHighlightTransferList,
++  compactHighlightedDiffByteLength,
++  encodeCompactHighlightedDiff,
++  validateCompactHighlightedDiff,
++} from "../src/ui/diff/worker";
++import { resolveTheme } from "../src/ui/themes";
++
++const LINE_COUNT = Number(process.env.HUNK_COMPACT_HIGHLIGHT_LINES ?? 8_000);
++const SAMPLES = Number(process.env.HUNK_COMPACT_HIGHLIGHT_SAMPLES ?? 7);
++
++function median(values: number[]) {
++  const sorted = [...values].sort((left, right) => left - right);
++  return sorted[Math.floor(sorted.length / 2)]!;
++}
++
++function percentile(values: number[], percentileValue: number) {
++  const sorted = [...values].sort((left, right) => left - right);
++  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * percentileValue) - 1)]!;
++}
++
++function metric(name: string, value: number) {
++  console.log(`METRIC ${name}=${value.toFixed(2)}`);
++}
++
++/** Measure the largest interval delay while an operation runs on the terminal event loop. */
++function createStallProbe() {
++  let last = performance.now();
++  let worst = 0;
++  const timer = setInterval(() => {
++    const now = performance.now();
++    worst = Math.max(worst, now - last);
++    last = now;
++  }, 1);
++
++  return {
++    reset() {
++      last = performance.now();
++      worst = 0;
++    },
++    read() {
++      return worst;
++    },
++    stop() {
++      clearInterval(timer);
++    },
++  };
++}
++
++/** Build one added TypeScript file within Hunk's current 10k-line highlighting ceiling. */
++function createLargeDiffFile(lines: number): DiffFile {
++  const contents =
++    Array.from(
++      { length: lines },
++      (_, index) => `export const item${index} = { id: ${index}, label: \`item-${index}\` };`,
++    ).join("\n") + "\n";
++  const metadata = parseDiffFromFile(
++    { name: "compact.ts", contents: "", cacheKey: "compact-before" },
++    { name: "compact.ts", contents, cacheKey: "compact-after" },
++    { context: 3 },
++    true,
++  );
++
++  return {
++    id: "compact-benchmark",
++    path: "compact.ts",
++    patch: "",
++    language: "typescript",
++    stats: { additions: lines, deletions: 0 },
++    metadata,
++    agent: null,
++  };
++}
++
++/** Return the JSON byte size as a stable, inspectable proxy for raw HAST response volume. */
++function jsonByteLength(value: unknown) {
++  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
++}
++
++/** Return the raw source lengths used to validate compact UTF-16 ranges. */
++function compactLineLengths(file: DiffFile) {
++  return {
++    deletion: file.metadata.deletionLines.map((line) => cleanLastNewline(line).length),
++    addition: file.metadata.additionLines.map((line) => cleanLastNewline(line).length),
++  };
++}
++
++/** Decode every compact line to model the work a future paint resolver will perform. */
++function decodeAllCompactLines(payload: ReturnType<typeof encodeCompactHighlightedDiff>) {
++  for (const side of ["deletion", "addition"] as const) {
++    const lineCount = payload[side].lineOffsets.length - 1;
++    for (let lineIndex = 0; lineIndex < lineCount; lineIndex += 1) {
++      compactHighlightRunsForLine(payload, side, lineIndex);
++    }
++  }
++}
++
++/** Measure the production load plus first split-row materialization for one worker mode. */
++async function measureHighlightOperation({
++  file,
++  theme,
++  offloadLargeDiff,
++}: {
++  file: DiffFile;
++  theme: ReturnType<typeof resolveTheme>;
++  offloadLargeDiff: boolean;
++}) {
++  const wall: number[] = [];
++  const stalls: number[] = [];
++  const probe = createStallProbe();
++
++  try {
++    for (let sample = 0; sample < SAMPLES; sample += 1) {
++      await Bun.sleep(40);
++      probe.reset();
++      const started = performance.now();
++      const highlighted = await loadHighlightedDiff(
++        file,
++        theme,
++        offloadLargeDiff ? { offloadLargeDiff: true } : undefined,
++      );
++      buildSplitRows(file, highlighted, theme);
++      wall.push(performance.now() - started);
++      // Let the interval observe work that ended just before this await.
++      await Bun.sleep(25);
++      stalls.push(probe.read());
++    }
++  } finally {
++    probe.stop();
++  }
++
++  return {
++    wallMedian: median(wall),
++    wallP95: percentile(wall, 0.95),
++    stallMedian: median(stalls),
++    stallP95: percentile(stalls, 0.95),
++  };
++}
++
++const file = createLargeDiffFile(LINE_COUNT);
++const theme = resolveTheme("github-dark-default", null);
++const lineLengths = compactLineLengths(file);
++
++// Warm Shiki/Pierre and the reusable worker before timing response handling or operations.
++const warmResult = await loadHighlightedDiff(file, theme);
++await loadHighlightedDiff(file, theme, { offloadLargeDiff: true });
++const rawHastBytes = jsonByteLength(warmResult);
++const rawCloneMs: number[] = [];
++const compactEncodeMs: number[] = [];
++const compactTransferMs: number[] = [];
++const compactDecodeMs: number[] = [];
++const compactBytes: number[] = [];
++
++for (let sample = 0; sample < SAMPLES; sample += 1) {
++  const highlighted: HighlightedDiffCode =
++    sample === 0 ? warmResult : await loadHighlightedDiff(file, theme);
++
++  let started = performance.now();
++  structuredClone(highlighted);
++  rawCloneMs.push(performance.now() - started);
++
++  started = performance.now();
++  const compact = encodeCompactHighlightedDiff(highlighted, theme.appearance);
++  compactEncodeMs.push(performance.now() - started);
++  compactBytes.push(compactHighlightedDiffByteLength(compact));
++
++  started = performance.now();
++  const received = structuredClone(compact, { transfer: compactHighlightTransferList(compact) });
++  compactTransferMs.push(performance.now() - started);
++
++  validateCompactHighlightedDiff(received, lineLengths);
++  started = performance.now();
++  decodeAllCompactLines(received);
++  compactDecodeMs.push(performance.now() - started);
++}
++
++metric("lines", LINE_COUNT);
++metric("samples", SAMPLES);
++metric("raw_hast_json_bytes", rawHastBytes);
++metric("raw_hast_clone_ms_median", median(rawCloneMs));
++metric("raw_hast_clone_ms_p95", percentile(rawCloneMs, 0.95));
++metric("compact_payload_bytes_median", median(compactBytes));
++metric("compact_encode_ms_median", median(compactEncodeMs));
++metric("compact_encode_ms_p95", percentile(compactEncodeMs, 0.95));
++metric("compact_transfer_ms_median", median(compactTransferMs));
++metric("compact_transfer_ms_p95", percentile(compactTransferMs, 0.95));
++metric("compact_decode_all_ms_median", median(compactDecodeMs));
++metric("compact_decode_all_ms_p95", percentile(compactDecodeMs, 0.95));
++metric("compact_response_byte_ratio", median(compactBytes) / rawHastBytes);
++
++const inlineOperation = await measureHighlightOperation({ file, theme, offloadLargeDiff: false });
++const compactWorkerOperation = await measureHighlightOperation({
++  file,
++  theme,
++  offloadLargeDiff: true,
++});
++metric("inline_operation_wall_ms_median", inlineOperation.wallMedian);
++metric("inline_operation_wall_ms_p95", inlineOperation.wallP95);
++metric("inline_operation_stall_ms_median", inlineOperation.stallMedian);
++metric("inline_operation_stall_ms_p95", inlineOperation.stallP95);
++metric("compact_worker_operation_wall_ms_median", compactWorkerOperation.wallMedian);
++metric("compact_worker_operation_wall_ms_p95", compactWorkerOperation.wallP95);
++metric("compact_worker_operation_stall_ms_median", compactWorkerOperation.stallMedian);
++metric("compact_worker_operation_stall_ms_p95", compactWorkerOperation.stallP95);
+diff --git a/package.json b/package.json
+index 9741fac2..8245d983 100644
+--- a/package.json
++++ b/package.json
+@@ -94,6 +94,7 @@
+     "bench:changeset-parse": "bun run benchmarks/changeset-parse.ts",
+     "bench:render-layout": "bun run benchmarks/render-layout.ts",
+     "bench:highlight-prefetch": "bun run benchmarks/highlight-prefetch.ts",
++    "bench:highlight-compact-payload": "bun run benchmarks/compact-highlight-payload.ts",
+     "bench:large-stream": "bun run benchmarks/large-stream.ts",
+     "bench:interaction-latency": "bun run benchmarks/interaction-latency.ts",
+     "bench:non-ascii-stream": "bun run benchmarks/non-ascii-stream.ts",
+diff --git a/scripts/build-bin.ts b/scripts/build-bin.ts
+index 2d26ca7f..165df8be 100644
+--- a/scripts/build-bin.ts
++++ b/scripts/build-bin.ts
+@@ -19,6 +19,7 @@ const proc = Bun.spawnSync(
+     "--compile",
+     "--no-compile-autoload-bunfig",
+     path.join(repoRoot, "src", "main.tsx"),
++    path.join(repoRoot, "src", "highlightWorkerEntry.ts"),
+     "--outfile",
+     outfile,
+   ],
+diff --git a/src/core/cli.test.ts b/src/core/cli.test.ts
+index 6fe8b2e0..5cf2f56f 100644
+--- a/src/core/cli.test.ts
++++ b/src/core/cli.test.ts
+@@ -64,6 +64,7 @@ describe("parseCli", () => {
+     expect(parsed.text).toContain("auto-reload when the current diff input changes");
+     expect(parsed.text).toContain("--experimental");
+     expect(parsed.text).toContain("experimental STML");
++    expect(parsed.text).toContain("--fast");
+     expect(parsed.text).toContain("Git diff options:");
+     expect(parsed.text).toContain("Notes:");
+     expect(parsed.text).toContain(
+@@ -173,6 +174,91 @@ describe("parseCli", () => {
+     });
+   });
+ 
++  test("uses --fast alone as the shortest fast working-tree review", async () => {
++    expect(await parseCli(["bun", "hunk", "--fast"])).toMatchObject({
++      kind: "vcs",
++      staged: false,
++      options: { fast: true },
++    });
++  });
++
++  test("accepts --fast before or after a review command", async () => {
++    const prefixed = await parseCli(["bun", "hunk", "--fast", "diff"]);
++    const commandOption = await parseCli(["bun", "hunk", "diff", "--fast"]);
++
++    expect(prefixed).toMatchObject({ kind: "vcs", options: { fast: true } });
++    expect(commandOption).toMatchObject({ kind: "vcs", options: { fast: true } });
++  });
++
++  test("routes shorthand diff options through the diff parser", async () => {
++    expect(await parseCli(["bun", "hunk", "--fast", "--staged"])).toMatchObject({
++      kind: "vcs",
++      staged: true,
++      options: { fast: true },
++    });
++    expect(await parseCli(["bun", "hunk", "--fast", "--watch"])).toMatchObject({
++      kind: "vcs",
++      options: { fast: true, watch: true },
++    });
++    expect(await parseCli(["bun", "hunk", "--fast", "--theme", "nord"])).toMatchObject({
++      kind: "vcs",
++      options: { fast: true, theme: "nord" },
++    });
++  });
++
++  test("routes shorthand targets and direct file pairs through the diff parser", async () => {
++    expect(await parseCli(["bun", "hunk", "--fast", "HEAD"])).toMatchObject({
++      kind: "vcs",
++      range: "HEAD",
++      options: { fast: true },
++    });
++
++    const dir = createTempDir("hunk-fast-files-");
++    const left = join(dir, "before.ts");
++    const right = join(dir, "after.ts");
++    writeFileSync(left, "export const answer = 1;\n");
++    writeFileSync(right, "export const answer = 2;\n");
++
++    expect(await parseCli(["bun", "hunk", "--fast", left, right])).toMatchObject({
++      kind: "diff",
++      left,
++      right,
++      options: { fast: true },
++    });
++  });
++
++  test("keeps top-level help and version handling ahead of --fast shorthand", async () => {
++    const help = await parseCli(["bun", "hunk", "--fast", "--help"]);
++    const version = await parseCli(["bun", "hunk", "--fast", "--version"]);
++
++    expect(help).toMatchObject({ kind: "help" });
++    expect(version).toEqual({ kind: "help", text: `${resolveCliVersion()}\n` });
++  });
++
++  test("accepts leading --fast and --experimental in either order", async () => {
++    for (const flags of [
++      ["--fast", "--experimental"],
++      ["--experimental", "--fast"],
++    ]) {
++      expect(await parseCli(["bun", "hunk", ...flags, "show"])).toMatchObject({
++        kind: "show",
++        options: { experimental: true, fast: true },
++      });
++    }
++  });
++
++  test("keeps fast disabled by default and treats it as a pathspec after --", async () => {
++    const normal = await parseCli(["bun", "hunk", "diff"]);
++    const pathspec = await parseCli(["bun", "hunk", "diff", "--", "--fast"]);
++
++    expect(normal).toMatchObject({ kind: "vcs", options: { fast: undefined } });
++    expect(pathspec).toMatchObject({
++      kind: "vcs",
++      pathspecs: ["--fast"],
++      options: { fast: undefined },
++    });
++  });
++
+   test("parses transparent background toggles", async () => {
+     const transparent = await parseCli(["bun", "hunk", "diff", "--transparent-bg"]);
+     const opaque = await parseCli(["bun", "hunk", "diff", "--no-transparent-bg"]);
+@@ -1434,10 +1520,13 @@ describe("parseCli argument validation", () => {
+     ).rejects.toThrow("Specify either <session-id> or --repo <path>, not both.");
+   });
+ 
+-  test("rejects --experimental for non-review commands", async () => {
++  test("rejects prefixed review flags for non-review commands", async () => {
+     await expect(parseCli(["bun", "hunk", "--experimental", "session", "list"])).rejects.toThrow(
+       "must be used with a Hunk review command",
+     );
++    await expect(parseCli(["bun", "hunk", "--fast", "session", "list"])).rejects.toThrow(
++      "`--fast` must be used with a Hunk review command",
++    );
+   });
+ 
+   test("rejects unknown top-level, skill, daemon, stash, and comment subcommands", async () => {
+diff --git a/src/core/cli.ts b/src/core/cli.ts
+index ab16e1f7..4e6ee730 100644
+--- a/src/core/cli.ts
++++ b/src/core/cli.ts
+@@ -79,6 +79,10 @@ export const COMMON_REVIEW_OPTIONS = [
+   AUXILIARY_AGENT_OPTIONS.agentContext,
+   { flag: "--pager", description: "use pager-style chrome" },
+   AUXILIARY_AGENT_OPTIONS.experimental,
++  {
++    flag: "--fast",
++    description: "experimentally offload eligible large-diff highlighting",
++  },
+   { flag: "--line-numbers", description: "show line numbers" },
+   { flag: "--no-line-numbers", description: "hide line numbers" },
+   {
+@@ -319,6 +323,7 @@ function buildCommonOptions(
+     pager?: boolean;
+     watch?: boolean;
+     experimental?: boolean;
++    fast?: boolean;
+     transparentBackground?: boolean;
+     tabWidth?: number;
+     extension?: string[];
+@@ -333,9 +338,10 @@ function buildCommonOptions(
+     pager: options.pager ? true : undefined,
+     watch: options.watch ? true : undefined,
+     experimental:
+-      options.experimental || argv[2] === AUXILIARY_AGENT_OPTIONS.experimental.flag
++      options.experimental || hasPrefixedReviewFlag(argv, AUXILIARY_AGENT_OPTIONS.experimental.flag)
+         ? true
+         : undefined,
++    fast: options.fast || hasPrefixedReviewFlag(argv, "--fast") ? true : undefined,
+     excludeUntracked: resolveBooleanFlag(
+       argv,
+       AUXILIARY_AGENT_OPTIONS.excludeUntracked.flag,
+@@ -452,6 +458,7 @@ function renderCliHelp() {
+     "  -h, --help                              show help",
+     "  -v, --version                           show version",
+     "  --experimental                          enable experimental review features (currently STML)",
++    "  --fast                                  review working tree with experimental fast highlighting",
+     "",
+     "Common review options:",
+     "  --mode <mode>                           layout mode: auto, split, stack",
+@@ -1721,12 +1728,45 @@ async function parseStashCommand(tokens: string[], argv: string[]): Promise<Pars
+   };
+ }
+ 
++const REVIEW_COMMAND_NAMES = new Set(["diff", "show", "patch", "pager", "difftool", "stash"]);
++const TOP_LEVEL_COMMAND_NAMES = new Set([
++  ...REVIEW_COMMAND_NAMES,
++  "session",
++  "markup",
++  "skill",
++  "extension",
++  "ext",
++  "daemon",
++  "mcp",
++]);
++
++/** Return whether one review flag appears in the leading global-style flag run. */
++function hasPrefixedReviewFlag(argv: string[], flag: string) {
++  for (const arg of argv.slice(2)) {
++    if (arg !== "--fast" && arg !== AUXILIARY_AGENT_OPTIONS.experimental.flag) {
++      return false;
++    }
++    if (arg === flag) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ /** Parse CLI arguments into one normalized input shape for the app loader layer. */
+ export async function parseCli(argv: string[]): Promise<ParsedCliInput> {
+   const rawArgs = argv.slice(2);
+-  const prefixedExperimental = rawArgs[0] === AUXILIARY_AGENT_OPTIONS.experimental.flag;
+-  const args = prefixedExperimental ? rawArgs.slice(1) : rawArgs;
+-  const [commandName, ...rest] = args;
++  const prefixedReviewFlags: string[] = [];
++  while (
++    rawArgs[prefixedReviewFlags.length] === "--fast" ||
++    rawArgs[prefixedReviewFlags.length] === AUXILIARY_AGENT_OPTIONS.experimental.flag
++  ) {
++    prefixedReviewFlags.push(rawArgs[prefixedReviewFlags.length]!);
++  }
++  const prefixedFast = prefixedReviewFlags.includes("--fast");
++  const args = rawArgs.slice(prefixedReviewFlags.length);
++  const [explicitCommandName, ...rest] = args;
++  const commandName = explicitCommandName ?? (prefixedFast ? "diff" : undefined);
+ 
+   if (!commandName || commandName === "help" || commandName === "--help" || commandName === "-h") {
+     return { kind: "help", text: renderCliHelp() };
+@@ -1736,11 +1776,14 @@ export async function parseCli(argv: string[]): Promise<ParsedCliInput> {
+     return { kind: "help", text: renderCliVersion() };
+   }
+ 
+-  if (
+-    prefixedExperimental &&
+-    !["diff", "show", "patch", "pager", "difftool", "stash"].includes(commandName)
+-  ) {
+-    throw new Error("`--experimental` must be used with a Hunk review command.");
++  // `hunk --fast` is shorthand for `hunk diff --fast`, so options and targets following the
++  // launch flag belong to the diff parser unless they explicitly name another Hunk command.
++  if (prefixedFast && explicitCommandName && !TOP_LEVEL_COMMAND_NAMES.has(explicitCommandName)) {
++    return parseDiffCommand(args, argv);
++  }
++
++  if (prefixedReviewFlags.length > 0 && !REVIEW_COMMAND_NAMES.has(commandName)) {
++    throw new Error(`\`${prefixedReviewFlags[0]}\` must be used with a Hunk review command.`);
+   }
+ 
+   switch (commandName) {
+diff --git a/src/core/config.test.ts b/src/core/config.test.ts
+index e962b0b7..53736d4a 100644
+--- a/src/core/config.test.ts
++++ b/src/core/config.test.ts
+@@ -223,6 +223,27 @@ describe("config resolution", () => {
+     });
+   });
+ 
++  test("keeps fast highlighting launch-only instead of reading it from config", () => {
++    const home = createTempDir("hunk-config-fast-home-");
++    const repo = createTempDir("hunk-config-fast-repo-");
++    createRepo(repo);
++
++    mkdirSync(join(home, ".config", "hunk"), { recursive: true });
++    writeFileSync(join(home, ".config", "hunk", "config.toml"), "fast = true");
++
++    const configured = resolveConfiguredCliInput(createPatchPagerInput(), {
++      cwd: repo,
++      env: { HOME: home },
++    });
++    const launched = resolveConfiguredCliInput(createPatchPagerInput({ fast: true }), {
++      cwd: repo,
++      env: { HOME: home },
++    });
++
++    expect(configured.input.options.fast).toBe(false);
++    expect(launched.input.options.fast).toBe(true);
++  });
++
+   test("reads the current-line style from config and lets CLI flags outrank it", () => {
+     const home = createTempDir("hunk-config-home-");
+     const repo = createTempDir("hunk-config-repo-");
+diff --git a/src/core/config.ts b/src/core/config.ts
+index 892c88b7..850a560a 100644
+--- a/src/core/config.ts
++++ b/src/core/config.ts
+@@ -908,6 +908,7 @@ function mergeOptions(base: CommonOptions, overrides: CommonOptions): CommonOpti
+     pager: overrides.pager ?? base.pager,
+     watch: overrides.watch ?? base.watch,
+     experimental: overrides.experimental ?? base.experimental,
++    fast: overrides.fast ?? base.fast,
+     excludeUntracked: overrides.excludeUntracked ?? base.excludeUntracked,
+     lineNumbers: overrides.lineNumbers ?? base.lineNumbers,
+     tabWidth: overrides.tabWidth ?? base.tabWidth,
+@@ -1126,6 +1127,7 @@ export function resolveConfiguredCliInput(
+     pager: input.options.pager ?? false,
+     watch: input.options.watch ?? resolvedOptions.watch ?? false,
+     experimental: input.options.experimental ?? false,
++    fast: input.options.fast ?? false,
+     excludeUntracked: resolvedOptions.excludeUntracked ?? false,
+     theme: resolvedOptions.theme,
+     vcs: resolvedOptions.vcs ?? vcsCatalog.defaultAdapterId,
+diff --git a/src/core/types.ts b/src/core/types.ts
+index 3e806ba4..9e482a4d 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -94,6 +94,8 @@ export interface CommonOptions {
+   watch?: boolean;
+   /** Enable launch-scoped experimental review features. */
+   experimental?: boolean;
++  /** Offload eligible large-diff highlighting for this launch. */
++  fast?: boolean;
+   excludeUntracked?: boolean;
+   lineNumbers?: boolean;
+   tabWidth?: number;
+diff --git a/src/highlightWorkerClient.ts b/src/highlightWorkerClient.ts
+new file mode 100644
+index 00000000..5922da3a
+--- /dev/null
++++ b/src/highlightWorkerClient.ts
+@@ -0,0 +1,33 @@
++/** Resolve the worker URL once so capability checks and construction inspect the same path. */
++function highlightWorkerUrl() {
++  return new URL("./highlightWorkerEntry.js", import.meta.url);
++}
++
++/** Return whether this runtime can resolve Hunk's syntax worker entrypoint. */
++export function supportsHighlightWorkerOffload({
++  execPath = process.execPath,
++  platform = process.platform,
++}: {
++  execPath?: string;
++  platform?: NodeJS.Platform;
++} = {}) {
++  // Bun 1.3 cannot resolve embedded Worker entrypoints from Windows single-file executables.
++  // Source-mode Windows runs through bun.exe; compiled Hunk runs through its own executable.
++  const executableName = execPath.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
++  const runsThroughBun = executableName === "bun" || executableName === "bun.exe";
++  return platform !== "win32" || runsThroughBun;
++}
++
++/**
++ * Resolves the compiled syntax worker from Bun's executable entrypoint context.
++ *
++ * Keep this root-level shim beside `highlightWorkerEntry.ts`: Bun resolves the additional compiled
++ * worker entrypoint from here, while the worker queue and protocol stay under `ui/diff/worker`.
++ */
++export function createHighlightWorker() {
++  const workerUrl = highlightWorkerUrl();
++  if (!supportsHighlightWorkerOffload()) {
++    throw new Error("Syntax worker offload is unavailable in Bun's compiled Windows runtime.");
++  }
++  return new Worker(workerUrl);
++}
+diff --git a/src/highlightWorkerEntry.ts b/src/highlightWorkerEntry.ts
+new file mode 100644
+index 00000000..4955d772
+--- /dev/null
++++ b/src/highlightWorkerEntry.ts
+@@ -0,0 +1,2 @@
++/** Exposes the UI-local highlighting worker as a compiled Bun entrypoint. */
++import "./ui/diff/worker/highlightWorker";
+diff --git a/src/main.tsx b/src/main.tsx
+index fe25d5cf..069d08d4 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -6,6 +6,7 @@ import { prepareStartupPlan } from "./app/startup";
+ import { sanitizeTerminalText } from "./lib/terminalText";
+ import { serveSessionBrokerDaemon } from "./session/broker/brokerServer";
+ import { runSessionCommand } from "./session/agent/commands";
++import { disposeHighlightWorker } from "./ui/diff/worker";
+ 
+ async function main() {
+   const startupPlan = await prepareStartupPlan();
+@@ -99,10 +100,15 @@ async function main() {
+     throw new Error("Unreachable startup plan.");
+   }
+ 
+-  // OpenTUI stays behind the interactive plan so headless commands never
+-  // materialize its embedded native library.
+-  const { runInteractiveApp } = await import("./ui/runInteractiveApp");
+-  await runInteractiveApp(startupPlan);
++  // OpenTUI stays behind the interactive plan so headless commands never materialize its embedded
++  // native library. The highlighting client starts the compiled worker only when an opted-in,
++  // eligible large diff needs it, so normal sessions do not pay its startup cost.
++  try {
++    const { runInteractiveApp } = await import("./ui/runInteractiveApp");
++    await runInteractiveApp(startupPlan);
++  } finally {
++    disposeHighlightWorker();
++  }
+ }
+ 
+ await main().catch((error) => {
+diff --git a/src/ui/App.tsx b/src/ui/App.tsx
+index a6a92a2d..9f744b24 100644
+--- a/src/ui/App.tsx
++++ b/src/ui/App.tsx
+@@ -2363,6 +2363,7 @@ export function App({
+             expandedGapsByFileId={review.expandedGapsByFileId}
+             fileViews={fileViewLayouts}
+             files={filteredFiles}
++            offloadLargeDiff={bootstrap.input.options.fast === true}
+             lineHighlights={paintedLineHighlights}
+             pagerMode={pagerMode}
+             screenLeft={diffPaneScreenLeft}
+diff --git a/src/ui/AppHost.tsx b/src/ui/AppHost.tsx
+index b4fb27ee..b616a053 100644
+--- a/src/ui/AppHost.tsx
++++ b/src/ui/AppHost.tsx
+@@ -94,6 +94,7 @@ export function AppHost({
+   // Experimental capabilities are launch authority: remote/watch reloads may replace content,
+   // but opting in or out requires starting a new Hunk process.
+   const launchExperimental = initialBootstrap.input.options.experimental === true;
++  const launchFast = initialBootstrap.input.options.fast === true;
+   // Extension authority is launch authority for the same reason. A reload command
+   // names *content* to reopen — `hunk session reload <id> -- diff` — and is parsed
+   // fresh, so it carries none of the extension flags the session was launched
+@@ -242,6 +243,7 @@ export function AppHost({
+         options: {
+           ...nextInput.options,
+           experimental: launchExperimental,
++          fast: launchFast,
+           extensions: launchExtensionsEnabled,
+           extensionPaths: launchExtensionPaths,
+         },
+@@ -411,6 +413,7 @@ export function AppHost({
+       adoptPreparedExtensionReplacement,
+       hostClient,
+       launchExperimental,
++      launchFast,
+       launchExtensionsEnabled,
+       launchExtensionPaths,
+       ownProvisionalExtensionReplacement,
+diff --git a/src/ui/components/panes/DiffPane.tsx b/src/ui/components/panes/DiffPane.tsx
+index db3d5eb2..d02823da 100644
+--- a/src/ui/components/panes/DiffPane.tsx
++++ b/src/ui/components/panes/DiffPane.tsx
+@@ -219,6 +219,7 @@ export function DiffPane({
+   expandedGapsByFileId = EMPTY_EXPANDED_GAPS_BY_FILE_ID,
+   fileViews = EMPTY_FILE_VIEWS,
+   files,
++  offloadLargeDiff = false,
+   lineHighlights = EMPTY_LINE_HIGHLIGHTS,
+   headerLabelWidth,
+   headerStatsWidth,
+@@ -280,6 +281,8 @@ export function DiffPane({
+   /** Validated alternate layouts, keyed by file id; raw Pierre remains the fallback. */
+   fileViews?: ReadonlyMap<string, ResolvedFileViewLayout>;
+   files: DiffFile[];
++  /** Offload eligible large-diff highlighting for this launch. */
++  offloadLargeDiff?: boolean;
+   /** Validated extension line marks, keyed by file id. */
+   lineHighlights?: ReadonlyMap<string, readonly ValidatedLineHighlight[]>;
+   headerLabelWidth: number;
+@@ -1376,10 +1379,18 @@ export function DiffPane({
+ 
+       void prefetchHighlightedDiff({
+         file,
++        offloadLargeDiff,
+         theme,
+       });
+     }
+-  }, [files, highlightPrefetchFileIds, initialWrappedRenderWindowWarmed, theme, wrapLines]);
++  }, [
++    files,
++    highlightPrefetchFileIds,
++    initialWrappedRenderWindowWarmed,
++    offloadLargeDiff,
++    theme,
++    wrapLines,
++  ]);
+ 
+   // Keep the selected file/hunk derived from the visible viewport for actual scroll-driven
+   // movement, while leaving the initial mount and non-scroll relayouts alone.
+@@ -2357,6 +2368,7 @@ export function DiffPane({
+                         extensionLineHighlights={lineHighlights.get(file.id)}
+                         file={file}
+                         fileView={fileViewRenderPlans.get(file.id)?.fileView}
++                        offloadLargeDiff={offloadLargeDiff}
+                         headerLabelWidth={headerLabelWidth}
+                         headerStatsWidth={headerStatsWidth}
+                         layout={layout}
+diff --git a/src/ui/components/panes/DiffSection.tsx b/src/ui/components/panes/DiffSection.tsx
+index ee8645fb..9dad1f7a 100644
+--- a/src/ui/components/panes/DiffSection.tsx
++++ b/src/ui/components/panes/DiffSection.tsx
+@@ -24,6 +24,7 @@ interface DiffSectionProps {
+   extensionLineHighlights?: readonly ValidatedLineHighlight[];
+   file: DiffFile;
+   fileView?: ResolvedFileViewLayout;
++  offloadLargeDiff: boolean;
+   headerLabelWidth: number;
+   headerStatsWidth: number;
+   layout: Exclude<LayoutMode, "auto">;
+@@ -64,6 +65,7 @@ function DiffSectionComponent({
+   extensionLineHighlights,
+   file,
+   fileView,
++  offloadLargeDiff,
+   headerLabelWidth,
+   headerStatsWidth,
+   layout,
+@@ -161,6 +163,7 @@ function DiffSectionComponent({
+           extensionLineHighlights={extensionLineHighlights}
+           file={file}
+           layout={layout}
++          offloadLargeDiff={offloadLargeDiff}
+           showLineNumbers={showLineNumbers}
+           showHunkHeaders={showHunkHeaders}
+           sourceStatus={sourceStatus}
+@@ -203,6 +206,7 @@ export const DiffSection = memo(DiffSectionComponent, (previous, next) => {
+     previous.extensionLineHighlights === next.extensionLineHighlights &&
+     previous.file === next.file &&
+     previous.fileView === next.fileView &&
++    previous.offloadLargeDiff === next.offloadLargeDiff &&
+     previous.headerLabelWidth === next.headerLabelWidth &&
+     previous.headerStatsWidth === next.headerStatsWidth &&
+     previous.layout === next.layout &&
+diff --git a/src/ui/components/ui-components.test.tsx b/src/ui/components/ui-components.test.tsx
+index d9d6d01a..c175ea7d 100644
+--- a/src/ui/components/ui-components.test.tsx
++++ b/src/ui/components/ui-components.test.tsx
+@@ -239,6 +239,7 @@ function createDiffPaneProps(
+   return {
+     diffContentWidth: 72,
+     files,
++    offloadLargeDiff: false,
+     headerLabelWidth: 40,
+     headerStatsWidth: 16,
+     layout: "split" as const,
+diff --git a/src/ui/diff/DiffSectionBody.tsx b/src/ui/diff/DiffSectionBody.tsx
+index 8613fd58..2e36e98d 100644
+--- a/src/ui/diff/DiffSectionBody.tsx
++++ b/src/ui/diff/DiffSectionBody.tsx
+@@ -100,6 +100,7 @@ export function DiffSectionBody({
+   selectedHunkIndex,
+   sectionGeometry,
+   shouldLoadHighlight = true,
++  offloadLargeDiff = false,
+   scrollable = true,
+   visibleBodyBounds,
+ }: {
+@@ -131,6 +132,7 @@ export function DiffSectionBody({
+   selectedHunkIndex: number;
+   sectionGeometry?: DiffSectionGeometry;
+   shouldLoadHighlight?: boolean;
++  offloadLargeDiff?: boolean;
+   scrollable?: boolean;
+   visibleBodyBounds?: VisibleBodyBounds;
+ }) {
+@@ -205,6 +207,7 @@ export function DiffSectionBody({
+ 
+   const resolvedHighlighted = useHighlightedDiff({
+     file,
++    offloadLargeDiff,
+     theme,
+     shouldLoadHighlight,
+   });
+diff --git a/src/ui/diff/diffRows.test.ts b/src/ui/diff/diffRows.test.ts
+index b1d3f774..1c84c75b 100644
+--- a/src/ui/diff/diffRows.test.ts
++++ b/src/ui/diff/diffRows.test.ts
+@@ -5,8 +5,10 @@ import type { DiffFile } from "../../core/types";
+ import {
+   buildSplitRows,
+   buildStackRows,
++  HIGHLIGHT_WORKER_MIN_LINES,
+   highlightedDiffLineCount,
+   loadHighlightedDiff,
++  shouldOffloadHighlight,
+   loadHighlightedSourceLines,
+   shouldHighlightDiff,
+   spansForHighlightedSourceLine,
+@@ -20,6 +22,7 @@ import { measureTextWidth } from "../lib/text";
+ import { TRANSPARENT_BACKGROUND, resolveTheme } from "../themes";
+ import { createTestSourceFetcher } from "../../../test/helpers/diff-helpers";
+ import { createTestCustomThemes } from "../../../test/helpers/theme-helpers";
++import { registerHighlightWorker } from "./worker";
+ 
+ function createDiffFile(): DiffFile {
+   const metadata = parseDiffFromFile(
+@@ -121,6 +124,80 @@ function createElixirHeredocDiffFile(sourceFetcher?: DiffFile["sourceFetcher"]):
+   };
+ }
+ 
++/** Build a large changed TypeScript file that crosses the interactive worker threshold. */
++function createLargeDiffFile(): DiffFile {
++  const additions = Array.from(
++    { length: HIGHLIGHT_WORKER_MIN_LINES },
++    (_, index) => `export const generated${index} = ${index};`,
++  ).join("\n");
++  const metadata = parseDiffFromFile(
++    {
++      name: "large.ts",
++      contents: "export const changed = 1;\n",
++      cacheKey: "large-before",
++    },
++    {
++      name: "large.ts",
++      contents: `export const changed = 2;\n${additions}\n`,
++      cacheKey: "large-after",
++    },
++    { context: 3 },
++    true,
++  );
++
++  return {
++    id: "large",
++    path: "large.ts",
++    patch: "",
++    language: "typescript",
++    stats: { additions: HIGHLIGHT_WORKER_MIN_LINES + 1, deletions: 1 },
++    metadata,
++    agent: null,
++  };
++}
++
++/** Build a large partial source diff that must remap compact full-source ranges onto its patch. */
++function createLargeSourceBackedDiffFile(prefixLineCount = HIGHLIGHT_WORKER_MIN_LINES): DiffFile {
++  const prefix = Array.from(
++    { length: prefixLineCount },
++    (_, index) => `  value${index} = ${index}`,
++  ).join("\n");
++  const before = `${prefix}\n${ELIXIR_HEREDOC_BEFORE}`;
++  const after = before.replace("Line five.", "Line five, edited.");
++  const patch = createTwoFilesPatch("large.ex", "large.ex", before, after, "", "", { context: 3 });
++  const metadata = parsePatchFiles(patch, "large-source", true)[0]?.files[0];
++  if (!metadata) {
++    throw new Error("Expected large source-backed metadata");
++  }
++
++  return {
++    id: "large-source",
++    path: "large.ex",
++    patch,
++    language: "elixir",
++    stats: { additions: 1, deletions: 1 },
++    metadata,
++    agent: null,
++    sourceFetcher: createTestSourceFetcher((side) => (side === "old" ? before : after)),
++  };
++}
++
++/** Register a worker double that reports a startup failure as soon as it receives work. */
++function registerFailingHighlightWorkerForTest() {
++  const worker = {
++    onmessage: null as ((event: MessageEvent) => void) | null,
++    onerror: null as ((event: ErrorEvent) => void) | null,
++    postMessage() {
++      this.onerror?.({ message: "test worker failure" } as ErrorEvent);
++    },
++    terminate() {
++      return Promise.resolve(0);
++    },
++    unref() {},
++  };
++  registerHighlightWorker(worker as unknown as Worker);
++}
++
+ function createEmptyLineDiffFile(): DiffFile {
+   const metadata = parseDiffFromFile(
+     {
+@@ -215,6 +292,152 @@ describe("Pierre diff rows", () => {
+     expect(shouldHighlightDiff(createDiffFile())).toBe(true);
+   });
+ 
++  test("matches inline spans when a large bundled-theme diff uses the worker", async () => {
++    const file = createLargeDiffFile();
++    const theme = resolveTheme("github-dark-default", null);
++
++    expect(shouldOffloadHighlight(file.metadata, theme, { offloadLargeDiff: true })).toBe(true);
++
++    const [inline, offloaded] = await Promise.all([
++      loadHighlightedDiff(file, theme),
++      loadHighlightedDiff(file, theme, { offloadLargeDiff: true }),
++    ]);
++    const inlineRows = buildSplitRows(file, inline, theme);
++    const workerRows = buildSplitRows(file, offloaded, theme);
++
++    expect(offloaded.deletionLines).toEqual([]);
++    expect(offloaded.additionLines).toEqual([]);
++    expect(offloaded.compact?.payload.foregroundPalette.length).toBeGreaterThan(0);
++    expect(workerRows).toEqual(inlineRows);
++    const changedRow = workerRows.find(
++      (row) =>
++        row.type === "split-line" && row.left.kind === "deletion" && row.right.kind === "addition",
++    );
++    expect(
++      changedRow?.type === "split-line" && changedRow.right.spans.some((span) => span.bg),
++    ).toBe(true);
++  }, 30_000);
++
++  test("maps compact full-source worker ranges back onto a partial patch", async () => {
++    const file = createLargeSourceBackedDiffFile();
++    const theme = resolveTheme("github-dark-default", null);
++
++    const [inline, offloaded] = await Promise.all([
++      loadHighlightedDiff(file, theme),
++      loadHighlightedDiff(file, theme, { offloadLargeDiff: true }),
++    ]);
++
++    expect(offloaded.compact?.deletionLineMap).toHaveLength(file.metadata.deletionLines.length);
++    expect(offloaded.compact?.additionLineMap).toHaveLength(file.metadata.additionLines.length);
++    expect(buildStackRows(file, offloaded, theme)).toEqual(buildStackRows(file, inline, theme));
++  }, 30_000);
++
++  test("falls back to plain spans for an out-of-range compact source mapping", () => {
++    const file = createDiffFile();
++    const theme = resolveTheme("github-dark-default", null);
++    const emptySide = {
++      lineOffsets: Uint32Array.of(0, 0),
++      starts: new Uint32Array(),
++      ends: new Uint32Array(),
++      styleIds: new Uint16Array(),
++      flags: new Uint8Array(),
++    };
++    const highlighted = {
++      deletionLines: [],
++      additionLines: [],
++      compact: {
++        payload: {
++          version: 1 as const,
++          foregroundPalette: [],
++          deletion: emptySide,
++          addition: emptySide,
++        },
++        deletionLineMap: Array.from({ length: file.metadata.deletionLines.length }, () => 10_000),
++        additionLineMap: Array.from({ length: file.metadata.additionLines.length }, () => 10_000),
++      },
++    };
++
++    let rows: ReturnType<typeof buildSplitRows> = [];
++    expect(() => {
++      rows = buildSplitRows(file, highlighted, theme);
++    }).not.toThrow();
++    const changedRow = rows.find(
++      (row) =>
++        row.type === "split-line" && row.left.kind === "deletion" && row.right.kind === "addition",
++    );
++    expect(changedRow?.type).toBe("split-line");
++    expect(
++      changedRow?.type === "split-line" ? changedRow.left.spans.some((span) => span.fg) : true,
++    ).toBe(false);
++  });
++
++  test("matches inline context styling for a large patch-only diff", async () => {
++    const context = Array.from(
++      { length: HIGHLIGHT_WORKER_MIN_LINES },
++      (_, index) => `const gap${index} = ${index};`,
++    );
++    const before = [`const message = "closed";`, ...context, "const target = 1;", ""].join("\n");
++    const after = ["const message = `open", ...context, "const target = 2;`", ""].join("\n");
++    const patch = createTwoFilesPatch("state.ts", "state.ts", before, after, "", "", {
++      context: HIGHLIGHT_WORKER_MIN_LINES + 2,
++    });
++    const metadata = parsePatchFiles(patch, "large-patch-only-state", true)[0]?.files[0];
++    if (!metadata) {
++      throw new Error("Expected large patch-only grammar-state metadata");
++    }
++    const file: DiffFile = {
++      id: "large-patch-only-state",
++      path: "state.ts",
++      patch,
++      language: "typescript",
++      stats: { additions: 2, deletions: 2 },
++      metadata,
++      agent: null,
++    };
++    const theme = resolveTheme("github-dark-default", null);
++
++    const [inline, offloaded] = await Promise.all([
++      loadHighlightedDiff(file, theme),
++      loadHighlightedDiff(file, theme, { offloadLargeDiff: true }),
++    ]);
++
++    expect(offloaded.compact).toBeDefined();
++    expect(buildSplitRows(file, offloaded, theme)).toEqual(buildSplitRows(file, inline, theme));
++  }, 30_000);
++
++  test("falls back to patch highlighting when source-backed metadata exceeds the cap", async () => {
++    // A 6,000-line file produces 12,000 full-source side lines, although the visible patch has
++    // only one changed line. It should use the safe patch fragment rather than render plain rows.
++    const file = createLargeSourceBackedDiffFile(HIGHLIGHT_WORKER_MIN_LINES * 3);
++    const theme = resolveTheme("github-dark-default", null);
++    const highlighted = await loadHighlightedDiff(file, theme);
++    const rows = buildStackRows(file, highlighted, theme);
++    const functionRow = rows.find(
++      (row) =>
++        row.type === "stack-line" && row.cell.spans.some((span) => span.text.includes("def hello")),
++    );
++
++    expect(shouldHighlightDiff(file)).toBe(true);
++    expect(highlighted.deletionLines).toHaveLength(file.metadata.deletionLines.length);
++    expect(highlighted.additionLines).toHaveLength(file.metadata.additionLines.length);
++    expect(functionRow?.type).toBe("stack-line");
++    expect(functionRow?.type === "stack-line" ? functionRow.cell.spans[0]?.fg : undefined).toBe(
++      "#A5D6FF",
++    );
++  });
++
++  test("falls back to plain text when the large-diff worker fails", async () => {
++    registerFailingHighlightWorkerForTest();
++    const file = createLargeDiffFile();
++    const theme = resolveTheme("github-dark-default", null);
++
++    await expect(loadHighlightedDiff(file, theme, { offloadLargeDiff: true })).resolves.toEqual({
++      deletionLines: [],
++      additionLines: [],
++      retryable: true,
++    });
++  });
++
+   test("uses full source to keep partial Elixir hunks inside the correct heredoc state", async () => {
+     const sourceFetcher = createTestSourceFetcher((side) =>
+       side === "old" ? ELIXIR_HEREDOC_BEFORE : ELIXIR_HEREDOC_AFTER,
+diff --git a/src/ui/diff/diffRows.ts b/src/ui/diff/diffRows.ts
+index d670ad60..000d6794 100644
+--- a/src/ui/diff/diffRows.ts
++++ b/src/ui/diff/diffRows.ts
+@@ -28,6 +28,17 @@ import { measureTextWidth } from "../lib/text";
+ import { sanitizeTerminalLine } from "../../lib/terminalText";
+ import { TRANSPARENT_BACKGROUND, type AppTheme } from "../themes";
+ import { expandDiffTabs } from "./codeColumns";
++import {
++  aliasContextHighlightLines,
++  collectHastHighlightRuns,
++  compactHighlightRunsForLine,
++  highlightDiffInWorker,
++  supportsHighlightWorkerOffload,
++  validateCompactHighlightedDiff,
++  type CompactHighlightedDiff,
++  type CompactHighlightRun,
++  type HastNode,
++} from "./worker";
+ import {
+   createSourceBackedHighlightPlan,
+   remapSourceBackedHighlight,
+@@ -40,6 +51,13 @@ import {
+ 
+ type HighlightThemeInput = AppTheme | AppTheme["appearance"];
+ 
++export const HIGHLIGHT_WORKER_MIN_LINES = 2_000;
++
++export interface LoadHighlightedDiffOptions {
++  /** Allow the interactive TUI to move eligible large-file work into the Bun worker. */
++  offloadLargeDiff?: boolean;
++}
++
+ /** Return the light/dark mode for a theme object or legacy appearance argument. */
+ function highlightThemeAppearance(theme: HighlightThemeInput) {
+   return typeof theme === "string" ? theme : theme.appearance;
+@@ -61,23 +79,20 @@ type HighlightOptions = ReturnType<typeof getHighlighterOptions>;
+ const highlighterOptionsByKey = new Map<string, HighlightOptions>();
+ let queuedHighlightWork = Promise.resolve();
+ 
+-type HastNode = HastTextNode | HastElementNode;
+-
+-interface HastTextNode {
+-  type: "text";
+-  value: string;
+-}
+-
+-interface HastElementNode {
+-  type: "element";
+-  tagName: string;
+-  properties?: Record<string, unknown>;
+-  children?: HastNode[];
++export interface CompactHighlightedDiffCode {
++  payload: CompactHighlightedDiff;
++  /** Map visible patch-side indexes to full-source payload indexes when source context was used. */
++  deletionLineMap?: readonly number[];
++  additionLineMap?: readonly number[];
+ }
+ 
+ export interface HighlightedDiffCode {
+   deletionLines: Array<HastNode | undefined>;
+   additionLines: Array<HastNode | undefined>;
++  /** Holds the worker's compact result without reconstructing a HAST response tree. */
++  compact?: CompactHighlightedDiffCode;
++  /** Keeps a transient offload failure out of the shared cache so a later visit can retry it. */
++  retryable?: true;
+ }
+ 
+ export interface HighlightedSourceCode {
+@@ -162,41 +177,6 @@ function tabify(text: string, tabWidth: number, initialColumn = 0) {
+   return expandDiffTabs(sanitizeTerminalLine(text), tabWidth, initialColumn);
+ }
+ 
+-const EMPTY_STYLE_VALUES = new Map<string, string>();
+-// Pierre reuses the same tiny set of inline style strings across many token spans.
+-// Caching the parsed key/value pairs avoids reparsing identical `color:#...` snippets
+-// every time split/stack row builders revisit the same highlighted lines.
+-const parsedStyleValueCache = new Map<string, Map<string, string>>();
+-
+-/** Parse an inline CSS style string from Pierre's highlighted HAST output. */
+-function parseStyleValue(styleValue: unknown) {
+-  if (typeof styleValue !== "string") {
+-    return EMPTY_STYLE_VALUES;
+-  }
+-
+-  const cached = parsedStyleValueCache.get(styleValue);
+-  if (cached) {
+-    return cached;
+-  }
+-
+-  const styles = new Map<string, string>();
+-  for (const segment of styleValue.split(";")) {
+-    const separator = segment.indexOf(":");
+-    if (separator <= 0) {
+-      continue;
+-    }
+-
+-    const key = segment.slice(0, separator).trim();
+-    const value = segment.slice(separator + 1).trim();
+-    if (key && value) {
+-      styles.set(key, value);
+-    }
+-  }
+-
+-  parsedStyleValueCache.set(styleValue, styles);
+-  return styles;
+-}
+-
+ // The expensive part after highlighting is walking Pierre's HAST line tree and flattening it
+ // into terminal spans. The same highlighted line objects are reused when files remount or when
+ // we build both split and stack rows, so memoize flattened spans by line node + theme/background.
+@@ -321,42 +301,16 @@ function flattenHighlightedLine(
+ 
+   const spans: RenderSpan[] = [];
+   let codeColumn = 0;
+-  const colorVariable = theme.appearance === "light" ? "--diffs-token-light" : "--diffs-token-dark";
+-
+-  const visit = (current: HastNode | undefined, inherited: Pick<RenderSpan, "fg" | "bg">) => {
+-    if (!current) {
+-      return;
+-    }
+-
+-    if (current.type === "text") {
+-      // Pierre injects a "\n" placeholder into empty line nodes so they aren't childless.
+-      // Strip it the same way cleanDiffLine does for the unhighlighted path, or the literal
+-      // newline ends up in the span text and breaks terminal row rendering.
+-      const text = tabify(cleanLastNewline(current.value), tabWidth, codeColumn);
+-      mergeSpan(spans, {
+-        text,
+-        fg: inherited.fg,
+-        bg: inherited.bg,
+-      });
+-      codeColumn += measureTextWidth(text);
+-      return;
+-    }
+ 
+-    const properties = current.properties ?? {};
+-    const styles = parseStyleValue(properties.style);
+-    const nextStyle: Pick<RenderSpan, "fg" | "bg"> = {
+-      // The registered Shiki theme has already applied any user-authored scope colors.
+-      fg: styles.get(colorVariable) ?? styles.get("color") ?? inherited.fg,
+-      // Pierre marks inline word-diff emphasis spans with a data attribute rather than a separate row kind.
+-      bg: Object.hasOwn(properties, "data-diff-span") ? emphasisBg : inherited.bg,
+-    };
+-
+-    for (const child of current.children ?? []) {
+-      visit(child, nextStyle);
+-    }
+-  };
+-
+-  visit(node, {});
++  for (const run of collectHastHighlightRuns(node, theme.appearance)) {
++    const text = tabify(run.text, tabWidth, codeColumn);
++    mergeSpan(spans, {
++      text,
++      fg: run.fg,
++      bg: run.wordDiff ? emphasisBg : undefined,
++    });
++    codeColumn += measureTextWidth(text);
++  }
+ 
+   const nextCachedByTheme = cachedByTheme ?? new Map<string, RenderSpan[]>();
+   nextCachedByTheme.set(cacheKey, spans);
+@@ -367,6 +321,60 @@ function flattenHighlightedLine(
+   return spans;
+ }
+ 
++/** Flatten compact worker ranges against local text without rebuilding a HAST response tree. */
++function flattenCompactHighlightedLine(
++  rawLine: string | undefined,
++  runs: CompactHighlightRun[],
++  emphasisBg: string,
++  tabWidth: number,
++) {
++  const source = cleanLastNewline(rawLine ?? "");
++  const spans: RenderSpan[] = [];
++  let sourceColumn = 0;
++  let codeColumn = 0;
++
++  const appendText = (text: string, fg?: string, bg?: string) => {
++    const tabified = tabify(text, tabWidth, codeColumn);
++    mergeSpan(spans, { text: tabified, fg, bg });
++    codeColumn += measureTextWidth(tabified);
++  };
++
++  for (const run of runs) {
++    appendText(source.slice(sourceColumn, run.start));
++    appendText(source.slice(run.start, run.end), run.fg, run.wordDiff ? emphasisBg : undefined);
++    sourceColumn = run.end;
++  }
++  appendText(source.slice(sourceColumn));
++
++  return spans;
++}
++
++/** Resolve the compact worker runs for one visible patch-side line when present. */
++function compactRunsForHighlightedLine(
++  highlighted: HighlightedDiffCode | null,
++  side: "deletion" | "addition",
++  lineIndex: number,
++) {
++  const compact = highlighted?.compact;
++  if (!compact) {
++    return undefined;
++  }
++
++  const sourceLineMap = side === "deletion" ? compact.deletionLineMap : compact.additionLineMap;
++  const sourceIndex = sourceLineMap ? sourceLineMap[lineIndex] : lineIndex;
++  const lineCount = compact.payload[side].lineOffsets.length - 1;
++  if (
++    !Number.isInteger(sourceIndex) ||
++    sourceIndex === undefined ||
++    sourceIndex < 0 ||
++    sourceIndex >= lineCount
++  ) {
++    return undefined;
++  }
++
++  return compactHighlightRunsForLine(compact.payload, side, sourceIndex);
++}
++
+ /** Normalize one raw diff line before rendering. */
+ function cleanDiffLine(line: string | undefined, tabWidth: number) {
+   return tabify(cleanLastNewline(line ?? ""), tabWidth);
+@@ -381,6 +389,7 @@ function makeSplitCell(
+   theme: AppTheme,
+   tabWidth: number,
+   moveKind?: DiffLineMoveKind,
++  compactRuns?: CompactHighlightRun[],
+ ) {
+   if (kind === "empty") {
+     return {
+@@ -390,25 +399,30 @@ function makeSplitCell(
+     } satisfies SplitLineCell;
+   }
+ 
+-  // Startup renders often build rows before highlighted HAST exists, so keep that plain-text path cheap.
+-  // Once highlighted spans are available, avoid touching the raw source line unless flattening
+-  // produced nothing. That keeps newline stripping + tab expansion off the hot path.
++  // Startup renders often build rows before any highlight result exists, so keep that plain-text
++  // path cheap. HAST wins for inline work; worker responses decode compact ranges against raw text.
+   let spans: RenderSpan[];
+-  if (highlightedLine === undefined) {
+-    const fallbackText = cleanDiffLine(rawLine, tabWidth);
+-    spans = fallbackText.length > 0 ? [{ text: fallbackText }] : [];
+-  } else {
++  if (highlightedLine !== undefined) {
+     spans = flattenHighlightedLine(
+       highlightedLine,
+       theme,
+       wordDiffHighlightBg(kind, theme),
+       tabWidth,
+     );
++  } else if (compactRuns !== undefined) {
++    spans = flattenCompactHighlightedLine(
++      rawLine,
++      compactRuns,
++      wordDiffHighlightBg(kind, theme),
++      tabWidth,
++    );
++  } else {
++    spans = [];
++  }
+ 
+-    if (spans.length === 0) {
+-      const fallbackText = cleanDiffLine(rawLine, tabWidth);
+-      spans = fallbackText.length > 0 ? [{ text: fallbackText }] : [];
+-    }
++  if (spans.length === 0) {
++    const fallbackText = cleanDiffLine(rawLine, tabWidth);
++    spans = fallbackText.length > 0 ? [{ text: fallbackText }] : [];
+   }
+ 
+   return {
+@@ -430,25 +444,32 @@ function makeStackCell(
+   theme: AppTheme,
+   tabWidth: number,
+   moveKind?: DiffLineMoveKind,
++  compactRuns?: CompactHighlightRun[],
+ ) {
+-  // Same lazy-fallback strategy as split cells: only normalize the raw source line when we really
+-  // need the plain-text fallback, not when highlighted spans are already ready to reuse.
++  // Same lazy-fallback strategy as split cells: only normalize raw text when no HAST or compact
++  // syntax run is available, or the selected highlighter produced no spans.
+   let spans: RenderSpan[];
+-  if (highlightedLine === undefined) {
+-    const fallbackText = cleanDiffLine(rawLine, tabWidth);
+-    spans = fallbackText.length > 0 ? [{ text: fallbackText }] : [];
+-  } else {
++  if (highlightedLine !== undefined) {
+     spans = flattenHighlightedLine(
+       highlightedLine,
+       theme,
+       wordDiffHighlightBg(kind, theme),
+       tabWidth,
+     );
++  } else if (compactRuns !== undefined) {
++    spans = flattenCompactHighlightedLine(
++      rawLine,
++      compactRuns,
++      wordDiffHighlightBg(kind, theme),
++      tabWidth,
++    );
++  } else {
++    spans = [];
++  }
+ 
+-    if (spans.length === 0) {
+-      const fallbackText = cleanDiffLine(rawLine, tabWidth);
+-      spans = fallbackText.length > 0 ? [{ text: fallbackText }] : [];
+-    }
++  if (spans.length === 0) {
++    const fallbackText = cleanDiffLine(rawLine, tabWidth);
++    spans = fallbackText.length > 0 ? [{ text: fallbackText }] : [];
+   }
+ 
+   return {
+@@ -550,44 +571,6 @@ function sourceFileContents(file: DiffFile, text: string, language: string | und
+   return contents;
+ }
+ 
+-/**
+- * Pierre highlights unchanged context on both diff sides even though split/stack rendering later
+- * cares only about the styled code spans. Reuse one side's line node for both arrays so identical
+- * context flattens once and the existing WeakMap span cache can fan that result back out.
+- */
+-function aliasHighlightedContextLines(file: DiffFile, highlighted: HighlightedDiffCode) {
+-  for (const hunk of file.metadata.hunks) {
+-    let deletionLineIndex = hunk.deletionLineIndex;
+-    let additionLineIndex = hunk.additionLineIndex;
+-
+-    for (const content of hunk.hunkContent) {
+-      if (content.type === "context") {
+-        for (let offset = 0; offset < content.lines; offset += 1) {
+-          const sharedLine =
+-            highlighted.additionLines[additionLineIndex + offset] ??
+-            highlighted.deletionLines[deletionLineIndex + offset];
+-
+-          if (!sharedLine) {
+-            continue;
+-          }
+-
+-          highlighted.deletionLines[deletionLineIndex + offset] = sharedLine;
+-          highlighted.additionLines[additionLineIndex + offset] = sharedLine;
+-        }
+-
+-        deletionLineIndex += content.lines;
+-        additionLineIndex += content.lines;
+-        continue;
+-      }
+-
+-      deletionLineIndex += content.deletions;
+-      additionLineIndex += content.additions;
+-    }
+-  }
+-
+-  return highlighted;
+-}
+-
+ /** Load and validate authoritative source snapshots for one partial diff when available. */
+ async function loadSourceBackedHighlightPlan(file: DiffFile) {
+   if (!file.metadata.isPartial || !file.sourceFetcher || file.metadata.hunks.length === 0) {
+@@ -611,7 +594,7 @@ async function loadSourceBackedHighlightPlan(file: DiffFile) {
+ function finalizeHighlightedDiff(
+   file: DiffFile,
+   sourcePlan: SourceBackedHighlightPlan | null,
+-  highlighted: ReturnType<typeof renderDiffWithHighlighter>,
++  highlighted: { code: { deletionLines: unknown[]; additionLines: unknown[] } },
+ ): HighlightedDiffCode {
+   const code = {
+     deletionLines: highlighted.code.deletionLines as Array<HastNode | undefined>,
+@@ -622,7 +605,7 @@ function finalizeHighlightedDiff(
+   // those authoritative per-side nodes; aliasing remains safe only for patch-fragment highlighting.
+   return sourcePlan
+     ? remapSourceBackedHighlight(sourcePlan, code)
+-    : aliasHighlightedContextLines(file, code);
++    : aliasContextHighlightLines(file.metadata, code);
+ }
+ 
+ /** Render one metadata snapshot through an already prepared highlighter. */
+@@ -668,15 +651,73 @@ export function highlightedDiffLineCount(metadata: FileDiffMetadata) {
+   return (metadata.deletionLines?.length ?? 0) + (metadata.additionLines?.length ?? 0);
+ }
+ 
++/** Return whether one metadata snapshot is small enough that highlighting it is worth the work. */
++function shouldHighlightMetadata(metadata: FileDiffMetadata) {
++  return highlightedDiffLineCount(metadata) <= MAX_HIGHLIGHTED_DIFF_LINES;
++}
++
+ /** Return whether one file's diff is small enough that highlighting it is worth the work. */
+ export function shouldHighlightDiff(file: DiffFile) {
+-  return highlightedDiffLineCount(file.metadata) <= MAX_HIGHLIGHTED_DIFF_LINES;
++  return shouldHighlightMetadata(file.metadata);
++}
++
++/** Return whether this interactive diff can use the bundled-theme worker path. */
++export function shouldOffloadHighlight(
++  metadata: FileDiffMetadata,
++  theme: HighlightThemeInput,
++  options: LoadHighlightedDiffOptions,
++) {
++  return (
++    options.offloadLargeDiff === true &&
++    supportsHighlightWorkerOffload() &&
++    typeof theme !== "string" &&
++    Object.keys(theme.syntaxScopeOverrides ?? {}).length === 0 &&
++    shouldHighlightMetadata(metadata) &&
++    Math.max(metadata.deletionLines.length, metadata.additionLines.length) >=
++      HIGHLIGHT_WORKER_MIN_LINES
++  );
++}
++
++/** Return terminal-projected source lengths for compact UTF-16 range validation. */
++function compactHighlightLineLengths(metadata: FileDiffMetadata) {
++  return {
++    deletion: metadata.deletionLines.map((line) => cleanLastNewline(line).length),
++    addition: metadata.additionLines.map((line) => cleanLastNewline(line).length),
++  };
++}
++
++/** Highlight one eligible metadata snapshot off the terminal event loop. */
++async function loadWorkerHighlightedDiff(
++  file: DiffFile,
++  metadata: FileDiffMetadata,
++  theme: AppTheme,
++  sourcePlan: SourceBackedHighlightPlan | null,
++) {
++  const payload = await highlightDiffInWorker({
++    aliasContext: sourcePlan === null,
++    appearance: theme.appearance,
++    language: file.language ?? "text",
++    metadata,
++    theme: syntaxHighlightThemeName(theme),
++  });
++  validateCompactHighlightedDiff(payload, compactHighlightLineLengths(metadata));
++
++  return {
++    deletionLines: [],
++    additionLines: [],
++    compact: {
++      payload,
++      deletionLineMap: sourcePlan?.deletionLineMap,
++      additionLineMap: sourcePlan?.additionLineMap,
++    },
++  } satisfies HighlightedDiffCode;
+ }
+ 
+ /** Highlight a diff file and return just the rendered line trees the UI needs. */
+ export async function loadHighlightedDiff(
+   file: DiffFile,
+   theme: HighlightThemeInput = "dark",
++  options: LoadHighlightedDiffOptions = {},
+ ): Promise<HighlightedDiffCode> {
+   // Checked before the source read so an oversized file costs neither I/O nor queue time.
+   if (!shouldHighlightDiff(file)) {
+@@ -684,19 +725,28 @@ export async function loadHighlightedDiff(
+   }
+ 
+   const sourcePlan = await loadSourceBackedHighlightPlan(file);
++  // A source graft includes every line before the visible hunk. Keep its work bounded, but fall
++  // back to the already-eligible patch fragment instead of blanking a small review diff.
++  const highlightSourcePlan =
++    sourcePlan && shouldHighlightMetadata(sourcePlan.metadata) ? sourcePlan : null;
++  const metadata = highlightSourcePlan?.metadata ?? file.metadata;
++
++  if (typeof theme !== "string" && shouldOffloadHighlight(metadata, theme, options)) {
++    try {
++      return await loadWorkerHighlightedDiff(file, metadata, theme, highlightSourcePlan);
++    } catch {
++      // Do not repeat a multi-second highlight on the event loop after a worker failure. Render
++      // plain rows now, but leave a later file visit free to retry a recreated worker.
++      return { deletionLines: [], additionLines: [], retryable: true };
++    }
++  }
+ 
+   try {
+     const highlighter = await prepareHighlighter(file.language, theme);
+     try {
+-      return await renderHighlightedDiff(
+-        file,
+-        sourcePlan?.metadata ?? file.metadata,
+-        highlighter,
+-        theme,
+-        sourcePlan,
+-      );
++      return await renderHighlightedDiff(file, metadata, highlighter, theme, highlightSourcePlan);
+     } catch (error) {
+-      if (!sourcePlan) {
++      if (!highlightSourcePlan) {
+         throw error;
+       }
+ 
+@@ -821,6 +871,8 @@ export function buildSplitRows(
+               deletionLines[deletionLineIndex + offset],
+               theme,
+               tabWidth,
++              undefined,
++              compactRunsForHighlightedLine(highlighted, "deletion", deletionLineIndex + offset),
+             ),
+             right: makeSplitCell(
+               "context",
+@@ -829,6 +881,8 @@ export function buildSplitRows(
+               additionLines[additionLineIndex + offset],
+               theme,
+               tabWidth,
++              undefined,
++              compactRunsForHighlightedLine(highlighted, "addition", additionLineIndex + offset),
+             ),
+           });
+         }
+@@ -860,6 +914,7 @@ export function buildSplitRows(
+                 theme,
+                 tabWidth,
+                 file.lineMoveKinds?.deletionLines[deletionLineIndex + offset],
++                compactRunsForHighlightedLine(highlighted, "deletion", deletionLineIndex + offset),
+               )
+             : makeSplitCell("empty", undefined, undefined, undefined, theme, tabWidth),
+           right: hasAddition
+@@ -871,6 +926,7 @@ export function buildSplitRows(
+                 theme,
+                 tabWidth,
+                 file.lineMoveKinds?.additionLines[additionLineIndex + offset],
++                compactRunsForHighlightedLine(highlighted, "addition", additionLineIndex + offset),
+               )
+             : makeSplitCell("empty", undefined, undefined, undefined, theme, tabWidth),
+         });
+@@ -937,6 +993,8 @@ export function buildStackRows(
+               additionLines[additionLineIndex + offset],
+               theme,
+               tabWidth,
++              undefined,
++              compactRunsForHighlightedLine(highlighted, "addition", additionLineIndex + offset),
+             ),
+           });
+         }
+@@ -963,6 +1021,7 @@ export function buildStackRows(
+             theme,
+             tabWidth,
+             file.lineMoveKinds?.deletionLines[deletionLineIndex + offset],
++            compactRunsForHighlightedLine(highlighted, "deletion", deletionLineIndex + offset),
+           ),
+         });
+       }
+@@ -982,6 +1041,7 @@ export function buildStackRows(
+             theme,
+             tabWidth,
+             file.lineMoveKinds?.additionLines[additionLineIndex + offset],
++            compactRunsForHighlightedLine(highlighted, "addition", additionLineIndex + offset),
+           ),
+         });
+       }
+diff --git a/src/ui/diff/highlightedDiffCache.ts b/src/ui/diff/highlightedDiffCache.ts
+index 00b7176a..f52c297e 100644
+--- a/src/ui/diff/highlightedDiffCache.ts
++++ b/src/ui/diff/highlightedDiffCache.ts
+@@ -40,6 +40,15 @@ interface HighlightedDiffCacheEntry {
+ 
+ /** Count the highlighted lines one result retains, across both diff sides. */
+ function highlightedLineCount(value: HighlightedDiffCode) {
++  if (value.compact) {
++    return (
++      (value.compact.deletionLineMap?.length ??
++        value.compact.payload.deletion.lineOffsets.length - 1) +
++      (value.compact.additionLineMap?.length ??
++        value.compact.payload.addition.lineOffsets.length - 1)
++    );
++  }
++
+   return value.deletionLines.length + value.additionLines.length;
+ }
+ 
+diff --git a/src/ui/diff/useHighlightedDiff.test.ts b/src/ui/diff/useHighlightedDiff.test.ts
+index b690a7ef..041e0b49 100644
+--- a/src/ui/diff/useHighlightedDiff.test.ts
++++ b/src/ui/diff/useHighlightedDiff.test.ts
+@@ -1,9 +1,39 @@
+ import { describe, expect, test } from "bun:test";
+ import { createTestDiffFile, createTestSourceFetcher } from "../../../test/helpers/diff-helpers";
+ import { resolveTheme } from "../themes";
+-import { highlightedDiffCacheKey } from "./useHighlightedDiff";
++import { HIGHLIGHT_WORKER_MIN_LINES } from "./diffRows";
++import { prefetchHighlightedDiff, highlightedDiffCacheKey } from "./useHighlightedDiff";
++import { registerHighlightWorker } from "./worker";
+ 
+-describe("highlighted diff cache keys", () => {
++/** Build one file large enough to qualify for worker highlighting. */
++function createLargeHighlightTestFile(id: string) {
++  const lines = Array.from(
++    { length: HIGHLIGHT_WORKER_MIN_LINES },
++    (_, index) => `export const line${index} = ${index};`,
++  ).join("\n");
++  return createTestDiffFile({ after: `${lines}\n`, before: "", id });
++}
++
++/** Register a worker double that fails every request and reports how often a retry reaches it. */
++function registerFailingHighlightWorkerForTest() {
++  const state = { calls: 0 };
++  const worker = {
++    onmessage: null as ((event: MessageEvent) => void) | null,
++    onerror: null as ((event: ErrorEvent) => void) | null,
++    postMessage() {
++      state.calls += 1;
++      this.onerror?.({ message: "test worker failure" } as ErrorEvent);
++    },
++    terminate() {
++      return Promise.resolve(0);
++    },
++    unref() {},
++  };
++  registerHighlightWorker(worker as unknown as Worker);
++  return state;
++}
++
++describe("highlighted diff cache", () => {
+   test("invalidates source-backed partial highlights when an unversioned provider changes", () => {
+     const base = createTestDiffFile({ id: "cache", path: "cache.ts" });
+     const firstFetcher = createTestSourceFetcher(() => "first source\n");
+@@ -31,6 +61,43 @@ describe("highlighted diff cache keys", () => {
+     );
+   });
+ 
++  test("keeps inline highlighting as the default and offloads only when requested", async () => {
++    const theme = resolveTheme("github-dark-default", null);
++    const worker = registerFailingHighlightWorkerForTest();
++
++    const inline = await prefetchHighlightedDiff({
++      file: createLargeHighlightTestFile("default-inline-highlight"),
++      theme,
++    });
++    expect(inline.retryable).toBeUndefined();
++    expect(worker.calls).toBe(0);
++
++    const offloaded = await prefetchHighlightedDiff({
++      file: createLargeHighlightTestFile("fast-worker-highlight"),
++      offloadLargeDiff: true,
++      theme,
++    });
++    expect(offloaded.retryable).toBe(true);
++    expect(worker.calls).toBe(1);
++  });
++
++  test("does not cache retryable worker failures", async () => {
++    const file = createLargeHighlightTestFile("retryable-worker-failure");
++    const theme = resolveTheme("github-dark-default", null);
++    const firstWorker = registerFailingHighlightWorkerForTest();
++
++    const first = await prefetchHighlightedDiff({ file, offloadLargeDiff: true, theme });
++    expect(first.retryable).toBe(true);
++    expect(firstWorker.calls).toBe(1);
++
++    // Registering another recovered/recreated worker should receive a new request instead of a
++    // shared-cache hit for the first worker's plain-row fallback.
++    const secondWorker = registerFailingHighlightWorkerForTest();
++    const second = await prefetchHighlightedDiff({ file, offloadLargeDiff: true, theme });
++    expect(second.retryable).toBe(true);
++    expect(secondWorker.calls).toBe(1);
++  });
++
+   test("reuses source-backed highlights for equivalent versioned providers", () => {
+     const base = createTestDiffFile({ id: "cache", path: "cache.ts" });
+     const firstFetcher = Object.assign(
+diff --git a/src/ui/diff/useHighlightedDiff.ts b/src/ui/diff/useHighlightedDiff.ts
+index 1a9f66dc..fac87bdc 100644
+--- a/src/ui/diff/useHighlightedDiff.ts
++++ b/src/ui/diff/useHighlightedDiff.ts
+@@ -86,8 +86,12 @@ export function highlightedDiffCacheKey(theme: AppTheme, file: DiffFile) {
+   return `${theme.id}:${syntaxHighlightThemeName(theme)}:${file.id}:${patchFingerprint(file)}:${sourceFetcherFingerprint(file)}`;
+ }
+ 
+-/** Only commit a highlight result if the promise is still the active one for that key.
+- *  Prevents a superseded or late-resolving promise from overwriting a newer entry. */
++/**
++ * Commit one cacheable highlight result if its promise is still active for that key.
++ *
++ * A transient worker failure resolves to plain rows with `retryable`, which updates the current
++ * view but must not occupy the shared cache and prevent a later worker retry.
++ */
+ function commitHighlightResult(
+   cacheKey: string,
+   promise: Promise<HighlightedDiffCode>,
+@@ -98,7 +102,9 @@ function commitHighlightResult(
+   }
+ 
+   SHARED_HIGHLIGHT_PROMISES.delete(cacheKey);
+-  SHARED_HIGHLIGHTED_DIFF_CACHE.set(cacheKey, result);
++  if (!result.retryable) {
++    SHARED_HIGHLIGHTED_DIFF_CACHE.set(cacheKey, result);
++  }
+   return true;
+ }
+ 
+@@ -106,6 +112,7 @@ function commitHighlightResult(
+ function ensureHighlightedDiffLoaded(
+   file: DiffFile,
+   theme: AppTheme,
++  offloadLargeDiff: boolean,
+   cacheKey = highlightedDiffCacheKey(theme, file),
+ ) {
+   // Viewport prefetch calls this for every file in its halo on each scroll, so this read is also
+@@ -122,7 +129,7 @@ function ensureHighlightedDiffLoaded(
+   }
+ 
+   let pending: Promise<HighlightedDiffCode>;
+-  pending = loadHighlightedDiff(file, theme)
++  pending = loadHighlightedDiff(file, theme, { offloadLargeDiff })
+     .then((nextHighlighted) => {
+       commitHighlightResult(cacheKey, pending, nextHighlighted);
+       return nextHighlighted;
+@@ -141,8 +148,16 @@ function ensureHighlightedDiffLoaded(
+ }
+ 
+ /** Queue syntax highlighting for one file without mounting its diff rows first. */
+-export function prefetchHighlightedDiff({ file, theme }: { file: DiffFile; theme: AppTheme }) {
+-  return ensureHighlightedDiffLoaded(file, theme);
++export function prefetchHighlightedDiff({
++  file,
++  offloadLargeDiff = false,
++  theme,
++}: {
++  file: DiffFile;
++  offloadLargeDiff?: boolean;
++  theme: AppTheme;
++}) {
++  return ensureHighlightedDiffLoaded(file, theme, offloadLargeDiff);
+ }
+ 
+ /** Read the best already-available highlight result without starting async work during render. */
+@@ -171,10 +186,12 @@ function resolveHighlightedSnapshot({
+ /** Resolve highlighted diff content with shared caching and background prefetch support. */
+ export function useHighlightedDiff({
+   file,
++  offloadLargeDiff = false,
+   theme,
+   shouldLoadHighlight,
+ }: {
+   file: DiffFile | undefined;
++  offloadLargeDiff?: boolean;
+   theme: AppTheme;
+   shouldLoadHighlight?: boolean;
+ }) {
+@@ -209,19 +226,21 @@ export function useHighlightedDiff({
+     let cancelled = false;
+     setHighlighted(null);
+ 
+-    ensureHighlightedDiffLoaded(file, theme, appearanceCacheKey).then((nextHighlighted) => {
+-      if (cancelled) {
+-        return;
+-      }
++    ensureHighlightedDiffLoaded(file, theme, offloadLargeDiff, appearanceCacheKey).then(
++      (nextHighlighted) => {
++        if (cancelled) {
++          return;
++        }
+ 
+-      setHighlighted(nextHighlighted);
+-      setHighlightedCacheKey(appearanceCacheKey);
+-    });
++        setHighlighted(nextHighlighted);
++        setHighlightedCacheKey(appearanceCacheKey);
++      },
++    );
+ 
+     return () => {
+       cancelled = true;
+     };
+-  }, [appearanceCacheKey, file, highlightedCacheKey, shouldLoadHighlight]);
++  }, [appearanceCacheKey, file, highlightedCacheKey, offloadLargeDiff, shouldLoadHighlight]);
+ 
+   // Prefer cached highlights during render so revisiting a file can paint immediately.
+   return resolveHighlightedSnapshot({
+diff --git a/src/ui/diff/worker/highlightCompact.test.ts b/src/ui/diff/worker/highlightCompact.test.ts
+new file mode 100644
+index 00000000..21771f55
+--- /dev/null
++++ b/src/ui/diff/worker/highlightCompact.test.ts
+@@ -0,0 +1,240 @@
++import { describe, expect, test } from "bun:test";
++import { cleanLastNewline, parseDiffFromFile, parsePatchFiles } from "@pierre/diffs";
++import type { DiffFile } from "../../../core/types";
++import { loadHighlightedDiff, type HighlightedDiffCode } from "../diffRows";
++import {
++  COMPACT_HIGHLIGHT_FLAG_WORD_DIFF,
++  COMPACT_HIGHLIGHT_PROTOCOL_VERSION,
++  compactHighlightRunsForLine,
++  compactHighlightTransferList,
++  compactHighlightedDiffByteLength,
++  encodeCompactHighlightedDiff,
++  validateCompactHighlightedDiff,
++} from "./highlightCompact";
++import { collectHastHighlightRuns, type HastNode } from "./highlightHast";
++import { resolveTheme } from "../../themes";
++import { createTestSourceFetcher } from "../../../../test/helpers/diff-helpers";
++
++/** Build a regular changed file with tabs and word-diff emphasis. */
++function createDiffFile(): DiffFile {
++  const metadata = parseDiffFromFile(
++    {
++      name: "example.ts",
++      contents: "export const\tanswer = 41;\nexport const stable = true;\n",
++      cacheKey: "compact-before",
++    },
++    {
++      name: "example.ts",
++      contents:
++        "export const\tanswer = 42;\nexport const stable = true;\nexport const added = true;\n",
++      cacheKey: "compact-after",
++    },
++    { context: 3 },
++    true,
++  );
++
++  return {
++    id: "compact-example",
++    path: "example.ts",
++    patch: "",
++    language: "typescript",
++    stats: { additions: 2, deletions: 1 },
++    metadata,
++    agent: null,
++  };
++}
++
++const ELIXIR_BEFORE = `defmodule Repro do
++  @doc """
++  Line one.
++  Line two.
++  """
++  def hello do
++    :world
++  end
++end
++`;
++const ELIXIR_AFTER = ELIXIR_BEFORE.replace("Line two.", "Line two, edited.");
++const ELIXIR_PATCH = `diff --git a/repro.ex b/repro.ex
++--- a/repro.ex
+++++ b/repro.ex
++@@ -2,8 +2,8 @@
++   @doc """
++   Line one.
++-  Line two.
+++  Line two, edited.
++   """
++   def hello do
++     :world
++   end
++ end
++`;
++
++/** Build a partial source-backed diff whose two sides require independent lexical state. */
++function createSourceBackedDiff(): DiffFile {
++  const metadata = parsePatchFiles(ELIXIR_PATCH, "compact-source", true)[0]?.files[0];
++  if (!metadata) {
++    throw new Error("Expected partial Elixir metadata");
++  }
++
++  return {
++    id: "compact-source",
++    path: "repro.ex",
++    patch: ELIXIR_PATCH,
++    language: "elixir",
++    stats: { additions: 1, deletions: 1 },
++    metadata,
++    agent: null,
++    sourceFetcher: createTestSourceFetcher((side) =>
++      side === "old" ? ELIXIR_BEFORE : ELIXIR_AFTER,
++    ),
++  };
++}
++
++/** Build source lengths from the exact newline projection terminal rendering uses. */
++function lineLengths(lines: string[]) {
++  return lines.map((line) => cleanLastNewline(line).length);
++}
++
++/** Project HAST through the compact payload so assertions exercise no token-text response. */
++function expectedCompactRuns(
++  code: HighlightedDiffCode,
++  appearance: "dark" | "light",
++  side: "deletion" | "addition",
++) {
++  const lines = side === "deletion" ? code.deletionLines : code.additionLines;
++  const palette = new Map<string, number>();
++  for (const line of [...code.deletionLines, ...code.additionLines]) {
++    for (const run of collectHastHighlightRuns(line, appearance)) {
++      if (run.fg && !palette.has(run.fg)) {
++        palette.set(run.fg, palette.size + 1);
++      }
++    }
++  }
++
++  return lines.map((line) => {
++    let column = 0;
++    return collectHastHighlightRuns(line, appearance).flatMap((run) => {
++      const start = column;
++      column += run.text.length;
++      if (start === column) {
++        return [];
++      }
++      return [
++        {
++          start,
++          end: column,
++          fg: run.fg,
++          wordDiff: run.wordDiff,
++        },
++      ];
++    });
++  });
++}
++
++describe("compact worker highlight payload", () => {
++  test("preserves nested syntax inheritance and semantic word-diff emphasis without text", () => {
++    const nestedLine: HastNode = {
++      type: "element",
++      tagName: "span",
++      properties: { style: "color:#base" },
++      children: [
++        { type: "text", value: "const " },
++        {
++          type: "element",
++          tagName: "span",
++          properties: {
++            style: "--diffs-token-dark:#keyword;--diffs-token-light:#light-keyword",
++            "data-diff-span": "changed",
++          },
++          children: [{ type: "text", value: "answer" }],
++        },
++        { type: "text", value: "\n" },
++      ],
++    };
++    const code: HighlightedDiffCode = {
++      deletionLines: [nestedLine],
++      additionLines: [],
++    };
++
++    const payload = encodeCompactHighlightedDiff(code, "dark");
++    validateCompactHighlightedDiff(payload, { deletion: [12], addition: [] });
++
++    expect(payload.foregroundPalette).toEqual(["#base", "#keyword"]);
++    expect(compactHighlightRunsForLine(payload, "deletion", 0)).toEqual([
++      { start: 0, end: 6, fg: "#base", wordDiff: false },
++      { start: 6, end: 12, fg: "#keyword", wordDiff: true },
++    ]);
++    expect(payload.deletion.flags).toEqual(Uint8Array.from([0, COMPACT_HIGHLIGHT_FLAG_WORD_DIFF]));
++  });
++
++  test("round-trips actual Pierre output without HAST or token text", async () => {
++    const file = createDiffFile();
++    const theme = resolveTheme("github-dark-default", null);
++    const highlighted = await loadHighlightedDiff(file, theme);
++    const payload = encodeCompactHighlightedDiff(highlighted, theme.appearance);
++
++    validateCompactHighlightedDiff(payload, {
++      deletion: lineLengths(file.metadata.deletionLines),
++      addition: lineLengths(file.metadata.additionLines),
++    });
++    expect(payload.version).toBe(COMPACT_HIGHLIGHT_PROTOCOL_VERSION);
++    expect(JSON.stringify(payload)).not.toContain("export const");
++    expect(compactHighlightedDiffByteLength(payload)).toBeGreaterThan(0);
++
++    for (const side of ["deletion", "addition"] as const) {
++      const expected = expectedCompactRuns(highlighted, theme.appearance, side);
++      expect(expected).toHaveLength(
++        side === "deletion"
++          ? file.metadata.deletionLines.length
++          : file.metadata.additionLines.length,
++      );
++      expect(
++        expected.map((_, lineIndex) => compactHighlightRunsForLine(payload, side, lineIndex)),
++      ).toEqual(expected);
++    }
++  });
++
++  test("keeps source-backed old and new lines as independent compact sides", async () => {
++    const file = createSourceBackedDiff();
++    const theme = resolveTheme("github-dark-default", null);
++    const highlighted = await loadHighlightedDiff(file, theme);
++    const payload = encodeCompactHighlightedDiff(highlighted, theme.appearance);
++
++    validateCompactHighlightedDiff(payload, {
++      deletion: lineLengths(file.metadata.deletionLines),
++      addition: lineLengths(file.metadata.additionLines),
++    });
++    expect(payload.deletion.lineOffsets).not.toBe(payload.addition.lineOffsets);
++    for (const side of ["deletion", "addition"] as const) {
++      const expected = expectedCompactRuns(highlighted, theme.appearance, side);
++      expect(
++        expected.map((_, lineIndex) => compactHighlightRunsForLine(payload, side, lineIndex)),
++      ).toEqual(expected);
++    }
++  });
++
++  test("rejects malformed ranges and survives a transferable clone", () => {
++    const code: HighlightedDiffCode = {
++      deletionLines: [{ type: "text", value: "answer\n" }],
++      additionLines: [],
++    };
++    const payload = encodeCompactHighlightedDiff(code, "dark");
++    const cloned = structuredClone(payload, { transfer: compactHighlightTransferList(payload) });
++
++    validateCompactHighlightedDiff(cloned, { deletion: [6], addition: [] });
++    expect(cloned.deletion.starts).toEqual(Uint32Array.from([0]));
++    expect(payload.deletion.starts.byteLength).toBe(0);
++
++    cloned.deletion.starts[0] = 1;
++    expect(() => validateCompactHighlightedDiff(cloned, { deletion: [6], addition: [] })).toThrow(
++      "ranges are invalid",
++    );
++
++    cloned.deletion.starts[0] = 0;
++    cloned.deletion.ends[0] = 7;
++    expect(() => validateCompactHighlightedDiff(cloned, { deletion: [6], addition: [] })).toThrow(
++      "ranges are invalid",
++    );
++  });
++});
+diff --git a/src/ui/diff/worker/highlightCompact.ts b/src/ui/diff/worker/highlightCompact.ts
+new file mode 100644
+index 00000000..74e263c1
+--- /dev/null
++++ b/src/ui/diff/worker/highlightCompact.ts
+@@ -0,0 +1,319 @@
++import type { HighlightedDiffCode } from "../diffRows";
++import { collectHastHighlightRuns } from "./highlightHast";
++
++/** Identifies the typed-array layout used for worker highlight responses. */
++export const COMPACT_HIGHLIGHT_PROTOCOL_VERSION = 1;
++
++/** Marks one run whose background comes from the receiving row's word-diff policy. */
++export const COMPACT_HIGHLIGHT_FLAG_WORD_DIFF = 1;
++
++/** Holds all numeric syntax runs for one diff side. */
++export interface CompactHighlightSide {
++  /** Maps each line index to its half-open run range in the three run arrays. */
++  lineOffsets: Uint32Array;
++  /** UTF-16 source-column start for each run. */
++  starts: Uint32Array;
++  /** UTF-16 source-column end for each run. */
++  ends: Uint32Array;
++  /** One-based foreground color palette ID; zero means inherit the terminal default. */
++  styleIds: Uint16Array;
++  /** Bit flags such as `COMPACT_HIGHLIGHT_FLAG_WORD_DIFF`. */
++  flags: Uint8Array;
++}
++
++/** Carries a text-free, transferable projection of Pierre's highlighted diff output. */
++export interface CompactHighlightedDiff {
++  version: typeof COMPACT_HIGHLIGHT_PROTOCOL_VERSION;
++  /** Deduplicated resolved syntax foreground colors. */
++  foregroundPalette: string[];
++  deletion: CompactHighlightSide;
++  addition: CompactHighlightSide;
++}
++
++/** Exposes one decoded range without reconstructing a HAST node or text string. */
++export interface CompactHighlightRun {
++  start: number;
++  end: number;
++  fg?: string;
++  wordDiff: boolean;
++}
++
++interface MutableCompactHighlightSide {
++  lineOffsets: number[];
++  starts: number[];
++  ends: number[];
++  styleIds: number[];
++  flags: number[];
++}
++
++/** Build mutable side arrays before freezing them into transfer-friendly typed arrays. */
++function createMutableSide(): MutableCompactHighlightSide {
++  return {
++    lineOffsets: [0],
++    starts: [],
++    ends: [],
++    styleIds: [],
++    flags: [],
++  };
++}
++
++/** Assign one compact palette ID while preserving first-seen HAST traversal order. */
++function compactPaletteId(
++  foreground: string | undefined,
++  foregroundPalette: string[],
++  paletteIds: Map<string, number>,
++) {
++  if (!foreground) {
++    return 0;
++  }
++
++  const existingId = paletteIds.get(foreground);
++  if (existingId !== undefined) {
++    return existingId;
++  }
++  if (foregroundPalette.length === 0xffff) {
++    throw new Error("Compact syntax palette exceeded Uint16 style IDs.");
++  }
++
++  foregroundPalette.push(foreground);
++  const styleId = foregroundPalette.length;
++  paletteIds.set(foreground, styleId);
++  return styleId;
++}
++
++/** Encode one side's HAST lines in one traversal without retaining token text in the result. */
++function encodeSide({
++  lines,
++  appearance,
++  foregroundPalette,
++  paletteIds,
++}: {
++  lines: HighlightedDiffCode["deletionLines"];
++  appearance: "dark" | "light";
++  foregroundPalette: string[];
++  paletteIds: Map<string, number>;
++}) {
++  const side = createMutableSide();
++
++  for (const line of lines) {
++    let sourceColumn = 0;
++    for (const run of collectHastHighlightRuns(line, appearance)) {
++      const start = sourceColumn;
++      sourceColumn += run.text.length;
++      const end = sourceColumn;
++      if (end === start) {
++        continue;
++      }
++
++      const styleId = compactPaletteId(run.fg, foregroundPalette, paletteIds);
++
++      side.starts.push(start);
++      side.ends.push(end);
++      side.styleIds.push(styleId);
++      side.flags.push(run.wordDiff ? COMPACT_HIGHLIGHT_FLAG_WORD_DIFF : 0);
++    }
++    side.lineOffsets.push(side.starts.length);
++  }
++
++  return {
++    lineOffsets: Uint32Array.from(side.lineOffsets),
++    starts: Uint32Array.from(side.starts),
++    ends: Uint32Array.from(side.ends),
++    styleIds: Uint16Array.from(side.styleIds),
++    flags: Uint8Array.from(side.flags),
++  } satisfies CompactHighlightSide;
++}
++
++/**
++ * Converts Pierre HAST into a text-free worker response.
++ *
++ * The receiving terminal retains the original diff text and reconstructs terminal spans from the
++ * numeric ranges. Colors deliberately remain palette values while word-diff background stays a
++ * semantic flag so each row can apply its existing theme policy.
++ */
++export function encodeCompactHighlightedDiff(
++  code: HighlightedDiffCode,
++  appearance: "dark" | "light",
++): CompactHighlightedDiff {
++  const foregroundPalette: string[] = [];
++  const paletteIds = new Map<string, number>();
++
++  return {
++    version: COMPACT_HIGHLIGHT_PROTOCOL_VERSION,
++    foregroundPalette,
++    deletion: encodeSide({
++      lines: code.deletionLines,
++      appearance,
++      foregroundPalette,
++      paletteIds,
++    }),
++    addition: encodeSide({
++      lines: code.additionLines,
++      appearance,
++      foregroundPalette,
++      paletteIds,
++    }),
++  };
++}
++
++/** Return one side's typed-array buffers for a zero-copy worker response transfer. */
++function sideTransferList(side: CompactHighlightSide) {
++  return [
++    side.lineOffsets.buffer,
++    side.starts.buffer,
++    side.ends.buffer,
++    side.styleIds.buffer,
++    side.flags.buffer,
++  ];
++}
++
++/** Return the transferable buffers that contain every numeric compact response field. */
++export function compactHighlightTransferList(payload: CompactHighlightedDiff) {
++  return [...sideTransferList(payload.deletion), ...sideTransferList(payload.addition)];
++}
++
++/** Estimate the retained wire size, including the small cloned color palette. */
++export function compactHighlightedDiffByteLength(payload: CompactHighlightedDiff) {
++  const numericBytes = compactHighlightTransferList(payload).reduce(
++    (total, buffer) => total + buffer.byteLength,
++    0,
++  );
++  const paletteBytes = new TextEncoder().encode(
++    JSON.stringify(payload.foregroundPalette),
++  ).byteLength;
++  return numericBytes + paletteBytes;
++}
++
++/** Validate one compact side before it enters a cache or renderer. */
++function validateSide({
++  side,
++  paletteLength,
++  lineLengths,
++  name,
++}: {
++  side: CompactHighlightSide;
++  paletteLength: number;
++  lineLengths?: readonly number[];
++  name: string;
++}) {
++  if (
++    !(side.lineOffsets instanceof Uint32Array) ||
++    !(side.starts instanceof Uint32Array) ||
++    !(side.ends instanceof Uint32Array) ||
++    !(side.styleIds instanceof Uint16Array) ||
++    !(side.flags instanceof Uint8Array)
++  ) {
++    throw new Error(`Compact ${name} highlight fields must be typed arrays.`);
++  }
++
++  const runCount = side.starts.length;
++  if (
++    side.ends.length !== runCount ||
++    side.styleIds.length !== runCount ||
++    side.flags.length !== runCount ||
++    side.lineOffsets.length === 0
++  ) {
++    throw new Error(`Compact ${name} highlight run arrays disagree.`);
++  }
++  if (lineLengths && lineLengths.length !== side.lineOffsets.length - 1) {
++    throw new Error(`Compact ${name} highlight line count does not match its source.`);
++  }
++
++  let previousOffset = 0;
++  for (let lineIndex = 0; lineIndex < side.lineOffsets.length; lineIndex += 1) {
++    const offset = side.lineOffsets[lineIndex]!;
++    if (offset < previousOffset || offset > runCount) {
++      throw new Error(`Compact ${name} highlight offsets are invalid.`);
++    }
++    previousOffset = offset;
++  }
++  if (previousOffset !== runCount) {
++    throw new Error(`Compact ${name} highlight final offset does not reach its runs.`);
++  }
++
++  for (let lineIndex = 0; lineIndex < side.lineOffsets.length - 1; lineIndex += 1) {
++    const startOffset = side.lineOffsets[lineIndex]!;
++    const endOffset = side.lineOffsets[lineIndex + 1]!;
++    let previousEnd = 0;
++    const lineLength = lineLengths?.[lineIndex];
++
++    for (let runIndex = startOffset; runIndex < endOffset; runIndex += 1) {
++      const start = side.starts[runIndex]!;
++      const end = side.ends[runIndex]!;
++      const styleId = side.styleIds[runIndex]!;
++      const flags = side.flags[runIndex]!;
++      if (start !== previousEnd || end <= start || (lineLength !== undefined && end > lineLength)) {
++        throw new Error(`Compact ${name} highlight ranges are invalid at line ${lineIndex}.`);
++      }
++      if (styleId > paletteLength) {
++        throw new Error(`Compact ${name} highlight style ID is outside its palette.`);
++      }
++      if ((flags & ~COMPACT_HIGHLIGHT_FLAG_WORD_DIFF) !== 0) {
++        throw new Error(`Compact ${name} highlight contains unsupported flags.`);
++      }
++      previousEnd = end;
++    }
++
++    if (startOffset < endOffset && lineLength !== undefined && previousEnd !== lineLength) {
++      throw new Error(`Compact ${name} highlight ranges do not cover line ${lineIndex}.`);
++    }
++  }
++}
++
++/** Validate a received compact payload before it is cached or decoded. */
++export function validateCompactHighlightedDiff(
++  payload: CompactHighlightedDiff,
++  lineLengths?: {
++    deletion: readonly number[];
++    addition: readonly number[];
++  },
++) {
++  if (payload.version !== COMPACT_HIGHLIGHT_PROTOCOL_VERSION) {
++    throw new Error(`Unsupported compact highlight protocol version: ${String(payload.version)}`);
++  }
++  if (
++    !Array.isArray(payload.foregroundPalette) ||
++    payload.foregroundPalette.some((color) => typeof color !== "string" || color.length === 0)
++  ) {
++    throw new Error("Compact syntax palette contains an invalid color.");
++  }
++
++  validateSide({
++    side: payload.deletion,
++    paletteLength: payload.foregroundPalette.length,
++    lineLengths: lineLengths?.deletion,
++    name: "deletion",
++  });
++  validateSide({
++    side: payload.addition,
++    paletteLength: payload.foregroundPalette.length,
++    lineLengths: lineLengths?.addition,
++    name: "addition",
++  });
++}
++
++/** Read one compact line's styles without rebuilding HAST nodes or token text. */
++export function compactHighlightRunsForLine(
++  payload: CompactHighlightedDiff,
++  sideName: "deletion" | "addition",
++  lineIndex: number,
++): CompactHighlightRun[] {
++  const side = payload[sideName];
++  if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= side.lineOffsets.length - 1) {
++    throw new Error(`Compact ${sideName} highlight line index is outside its payload.`);
++  }
++
++  const startOffset = side.lineOffsets[lineIndex]!;
++  const endOffset = side.lineOffsets[lineIndex + 1]!;
++  const runs: CompactHighlightRun[] = [];
++  for (let runIndex = startOffset; runIndex < endOffset; runIndex += 1) {
++    const styleId = side.styleIds[runIndex]!;
++    runs.push({
++      start: side.starts[runIndex]!,
++      end: side.ends[runIndex]!,
++      fg: styleId === 0 ? undefined : payload.foregroundPalette[styleId - 1],
++      wordDiff: (side.flags[runIndex]! & COMPACT_HIGHLIGHT_FLAG_WORD_DIFF) !== 0,
++    });
++  }
++  return runs;
++}
+diff --git a/src/ui/diff/worker/highlightContext.ts b/src/ui/diff/worker/highlightContext.ts
+new file mode 100644
+index 00000000..0f8e282e
+--- /dev/null
++++ b/src/ui/diff/worker/highlightContext.ts
+@@ -0,0 +1,49 @@
++import type { FileDiffMetadata } from "@pierre/diffs";
++
++interface HighlightLineArrays<T> {
++  deletionLines: Array<T | undefined>;
++  additionLines: Array<T | undefined>;
++}
++
++/**
++ * Reuse addition-side patch context on both sides when no authoritative source plan exists.
++ *
++ * Patch fragments cannot prove the independent lexical states before a visible hunk. Sharing the
++ * addition-side result preserves the terminal's established rendering policy and lets HAST callers
++ * reuse one flattened span result for identical context.
++ */
++export function aliasContextHighlightLines<T>(
++  metadata: FileDiffMetadata,
++  highlighted: HighlightLineArrays<T>,
++) {
++  for (const hunk of metadata.hunks) {
++    let deletionLineIndex = hunk.deletionLineIndex;
++    let additionLineIndex = hunk.additionLineIndex;
++
++    for (const content of hunk.hunkContent) {
++      if (content.type === "context") {
++        for (let offset = 0; offset < content.lines; offset += 1) {
++          const sharedLine =
++            highlighted.additionLines[additionLineIndex + offset] ??
++            highlighted.deletionLines[deletionLineIndex + offset];
++
++          if (!sharedLine) {
++            continue;
++          }
++
++          highlighted.deletionLines[deletionLineIndex + offset] = sharedLine;
++          highlighted.additionLines[additionLineIndex + offset] = sharedLine;
++        }
++
++        deletionLineIndex += content.lines;
++        additionLineIndex += content.lines;
++        continue;
++      }
++
++      deletionLineIndex += content.deletions;
++      additionLineIndex += content.additions;
++    }
++  }
++
++  return highlighted;
++}
+diff --git a/src/ui/diff/worker/highlightHast.ts b/src/ui/diff/worker/highlightHast.ts
+new file mode 100644
+index 00000000..3bbb3999
+--- /dev/null
++++ b/src/ui/diff/worker/highlightHast.ts
+@@ -0,0 +1,119 @@
++import { cleanLastNewline } from "@pierre/diffs";
++
++/** Describes the HAST nodes Pierre returns for one syntax-highlighted line. */
++export type HastNode = HastTextNode | HastElementNode;
++
++interface HastTextNode {
++  type: "text";
++  value: string;
++}
++
++interface HastElementNode {
++  type: "element";
++  tagName: string;
++  properties?: Record<string, unknown>;
++  children?: HastNode[];
++}
++
++/** Preserves one terminal-relevant text run from Pierre's nested HAST. */
++export interface HastHighlightRun {
++  text: string;
++  fg?: string;
++  wordDiff: boolean;
++}
++
++const EMPTY_STYLE_VALUES = new Map<string, string>();
++const parsedStyleValueCache = new Map<string, Map<string, string>>();
++
++/** Parse one inline CSS style string from Pierre's highlighted HAST output. */
++function parseStyleValue(styleValue: unknown) {
++  if (typeof styleValue !== "string") {
++    return EMPTY_STYLE_VALUES;
++  }
++
++  const cached = parsedStyleValueCache.get(styleValue);
++  if (cached) {
++    return cached;
++  }
++
++  const styles = new Map<string, string>();
++  for (const segment of styleValue.split(";")) {
++    const separator = segment.indexOf(":");
++    if (separator <= 0) {
++      continue;
++    }
++
++    const key = segment.slice(0, separator).trim();
++    const value = segment.slice(separator + 1).trim();
++    if (key && value) {
++      styles.set(key, value);
++    }
++  }
++
++  parsedStyleValueCache.set(styleValue, styles);
++  return styles;
++}
++
++/** Append a run while preserving the flattened text/style projection. */
++function appendRun(target: HastHighlightRun[], next: HastHighlightRun) {
++  if (next.text.length === 0) {
++    return;
++  }
++
++  const previous = target[target.length - 1];
++  if (previous && previous.fg === next.fg && previous.wordDiff === next.wordDiff) {
++    previous.text += next.text;
++    return;
++  }
++
++  target.push(next);
++}
++
++/**
++ * Flattens one Pierre HAST line into terminal-relevant text runs.
++ *
++ * This keeps syntax foreground inheritance and word-diff decoration semantic. Terminal-specific
++ * background selection, text sanitization, tab expansion, and cell-width measurement remain local
++ * to the renderer.
++ */
++export function collectHastHighlightRuns(node: HastNode | undefined, appearance: "dark" | "light") {
++  if (!node) {
++    return [];
++  }
++
++  const runs: HastHighlightRun[] = [];
++  const colorVariable = appearance === "light" ? "--diffs-token-light" : "--diffs-token-dark";
++
++  const visit = (
++    current: HastNode | undefined,
++    inherited: Pick<HastHighlightRun, "fg" | "wordDiff">,
++  ) => {
++    if (!current) {
++      return;
++    }
++
++    if (current.type === "text") {
++      // Pierre adds a newline placeholder to empty line nodes. The renderer strips it before
++      // terminal layout, so compact ranges must use the same text projection.
++      appendRun(runs, {
++        text: cleanLastNewline(current.value),
++        fg: inherited.fg,
++        wordDiff: inherited.wordDiff,
++      });
++      return;
++    }
++
++    const styles = parseStyleValue(current.properties?.style);
++    const nextStyle: Pick<HastHighlightRun, "fg" | "wordDiff"> = {
++      fg: styles.get(colorVariable) ?? styles.get("color") ?? inherited.fg,
++      wordDiff: Object.hasOwn(current.properties ?? {}, "data-diff-span") || inherited.wordDiff,
++    };
++
++    for (const child of current.children ?? []) {
++      visit(child, nextStyle);
++    }
++  };
++
++  visit(node, { wordDiff: false });
++  return runs;
++}
+diff --git a/src/ui/diff/worker/highlightWorker.ts b/src/ui/diff/worker/highlightWorker.ts
+new file mode 100644
+index 00000000..4ee050aa
+--- /dev/null
++++ b/src/ui/diff/worker/highlightWorker.ts
+@@ -0,0 +1,101 @@
++/// <reference lib="webworker" />
++/**
++ * Highlights diff metadata away from the terminal event loop.
++ *
++ * This worker accepts only bundled Pierre themes. The main thread keeps custom-theme registration,
++ * source loading, result mapping, and every terminal rendering concern local.
++ */
++import {
++  getHighlighterOptions,
++  getSharedHighlighter,
++  renderDiffWithHighlighter,
++  type FileDiffMetadata,
++} from "@pierre/diffs";
++import { aliasContextHighlightLines } from "./highlightContext";
++import {
++  compactHighlightTransferList,
++  encodeCompactHighlightedDiff,
++  type CompactHighlightedDiff,
++} from "./highlightCompact";
++import type { HighlightedDiffCode } from "../diffRows";
++
++interface HighlightWorkerRequest {
++  version: 3;
++  id: number;
++  aliasContext: boolean;
++  metadata: FileDiffMetadata;
++  appearance: "dark" | "light";
++  language: string;
++  theme: string;
++}
++
++type HighlightWorkerResponse =
++  | {
++      version: 3;
++      id: number;
++      ok: true;
++      code: CompactHighlightedDiff;
++    }
++  | { version: 3; id: number; ok: false; message: string };
++
++/** Build the fixed Pierre render options shared with the terminal highlighter. */
++function workerRenderOptions(theme: string) {
++  return {
++    theme: theme as "pierre-dark",
++    useTokenTransformer: false,
++    tokenizeMaxLineLength: 1_000,
++    lineDiffType: "word-alt" as const,
++    maxLineDiffLength: 10_000,
++  };
++}
++
++/** Convert an unknown thrown value into a reply that survives structured clone. */
++function errorMessage(error: unknown) {
++  return error instanceof Error ? error.message : String(error);
++}
++
++declare const self: Worker;
++
++self.onmessage = async (event: MessageEvent<HighlightWorkerRequest>) => {
++  const { aliasContext, appearance, id, language, metadata, theme, version } = event.data;
++
++  if (version !== 3) {
++    const response: HighlightWorkerResponse = {
++      version: 3,
++      id,
++      ok: false,
++      message: `Unsupported highlight worker protocol version: ${String(version)}`,
++    };
++    self.postMessage(response);
++    return;
++  }
++
++  try {
++    const options = getHighlighterOptions(language, { theme: theme as never });
++    const highlighter = await getSharedHighlighter({
++      ...options,
++      preferredHighlighter: "shiki-wasm",
++    });
++    const result = renderDiffWithHighlighter(metadata, highlighter, workerRenderOptions(theme));
++    const highlighted = result.code as HighlightedDiffCode;
++    const code = encodeCompactHighlightedDiff(
++      aliasContext ? aliasContextHighlightLines(metadata, highlighted) : highlighted,
++      appearance,
++    );
++    const response: HighlightWorkerResponse = {
++      version: 3,
++      id,
++      ok: true,
++      code,
++    };
++    self.postMessage(response, compactHighlightTransferList(code));
++  } catch (error) {
++    const response: HighlightWorkerResponse = {
++      version: 3,
++      id,
++      ok: false,
++      message: errorMessage(error),
++    };
++    self.postMessage(response);
++  }
++};
+diff --git a/src/ui/diff/worker/highlightWorkerClient.test.ts b/src/ui/diff/worker/highlightWorkerClient.test.ts
+new file mode 100644
+index 00000000..46556a17
+--- /dev/null
++++ b/src/ui/diff/worker/highlightWorkerClient.test.ts
+@@ -0,0 +1,180 @@
++import { afterEach, describe, expect, test } from "bun:test";
++import { createTestDiffFile } from "../../../../test/helpers/diff-helpers";
++import { supportsHighlightWorkerOffload } from "../../../highlightWorkerClient";
++import type { CompactHighlightedDiff } from "./highlightCompact";
++import {
++  disposeHighlightWorker,
++  highlightDiffInWorker,
++  registerHighlightWorker,
++} from "./highlightWorkerClient";
++
++interface TestWorkerRequest {
++  version: 3;
++  id: number;
++  aliasContext: boolean;
++}
++
++/** Build the smallest valid compact worker response. */
++function emptyCompactResponse(): CompactHighlightedDiff {
++  const side = () => ({
++    lineOffsets: Uint32Array.of(0),
++    starts: new Uint32Array(),
++    ends: new Uint32Array(),
++    styleIds: new Uint16Array(),
++    flags: new Uint8Array(),
++  });
++
++  return {
++    version: 1,
++    foregroundPalette: [],
++    deletion: side(),
++    addition: side(),
++  };
++}
++
++/** Build a controllable Worker double for queue and lifecycle tests. */
++function createTestHighlightWorker({ throwOnPost }: { throwOnPost?: Error } = {}) {
++  const state = {
++    messages: [] as TestWorkerRequest[],
++    terminateCalls: 0,
++    unrefCalls: 0,
++  };
++  const worker = {
++    onmessage: null as ((event: MessageEvent) => void) | null,
++    onerror: null as ((event: ErrorEvent) => void) | null,
++    postMessage(message: TestWorkerRequest) {
++      if (throwOnPost) {
++        throw throwOnPost;
++      }
++      state.messages.push(message);
++    },
++    terminate() {
++      state.terminateCalls += 1;
++      return Promise.resolve(0);
++    },
++    unref() {
++      state.unrefCalls += 1;
++    },
++  };
++
++  return {
++    state,
++    worker: worker as unknown as Worker,
++    reply(data: unknown) {
++      worker.onmessage?.({ data } as MessageEvent);
++    },
++  };
++}
++
++/** Queue one representative request through the worker client. */
++function requestHighlight(aliasContext = false) {
++  return highlightDiffInWorker({
++    aliasContext,
++    appearance: "dark",
++    language: "typescript",
++    metadata: createTestDiffFile().metadata,
++    theme: "github-dark-default",
++  });
++}
++
++afterEach(() => {
++  disposeHighlightWorker();
++});
++
++describe("highlight worker client", () => {
++  test("disables offload only for Bun-compiled Windows entrypoints", () => {
++    expect(
++      supportsHighlightWorkerOffload({
++        platform: "win32",
++        execPath: "C:\\Program Files\\Hunk\\hunk.exe",
++      }),
++    ).toBe(false);
++    expect(
++      supportsHighlightWorkerOffload({
++        platform: "win32",
++        execPath: "C:\\Users\\dev\\.bun\\bin\\bun.exe",
++      }),
++    ).toBe(true);
++    expect(
++      supportsHighlightWorkerOffload({
++        platform: "linux",
++        execPath: "/opt/hunk/bin/hunk",
++      }),
++    ).toBe(true);
++  });
++
++  test("serializes requests, ignores stale replies, and propagates worker responses", async () => {
++    const control = createTestHighlightWorker();
++    registerHighlightWorker(control.worker);
++
++    const first = requestHighlight(true);
++    const second = requestHighlight();
++    expect(control.state.unrefCalls).toBe(1);
++    expect(control.state.messages).toHaveLength(1);
++    expect(control.state.messages[0]?.aliasContext).toBe(true);
++
++    control.reply({ version: 2, id: control.state.messages[0]?.id, ok: true });
++    await Promise.resolve();
++    expect(control.state.messages).toHaveLength(1);
++
++    control.reply({
++      version: 3,
++      id: control.state.messages[0]?.id,
++      ok: true,
++      code: emptyCompactResponse(),
++    });
++    await expect(first).resolves.toEqual(emptyCompactResponse());
++    expect(control.state.messages).toHaveLength(2);
++
++    control.reply({
++      version: 3,
++      id: control.state.messages[1]?.id,
++      ok: false,
++      message: "highlight rejected",
++    });
++    await expect(second).rejects.toThrow("highlight rejected");
++  });
++
++  test("rejects active and queued work when a replacement worker takes over", async () => {
++    const first = createTestHighlightWorker();
++    const replacement = createTestHighlightWorker();
++    registerHighlightWorker(first.worker);
++
++    const active = requestHighlight();
++    const queued = requestHighlight();
++    registerHighlightWorker(replacement.worker);
++
++    await expect(active).rejects.toThrow("replaced");
++    await expect(queued).rejects.toThrow("replaced");
++    expect(first.state.terminateCalls).toBe(1);
++    expect(replacement.state.unrefCalls).toBe(1);
++  });
++
++  test("fails all work when posting throws and permits a later worker", async () => {
++    const broken = createTestHighlightWorker({ throwOnPost: new Error("post failed") });
++    registerHighlightWorker(broken.worker);
++
++    await expect(requestHighlight()).rejects.toThrow("post failed");
++    expect(broken.state.terminateCalls).toBe(1);
++
++    const recovered = createTestHighlightWorker();
++    registerHighlightWorker(recovered.worker);
++    const pending = requestHighlight();
++    const request = recovered.state.messages[0]!;
++    recovered.reply({ version: 3, id: request.id, ok: true, code: emptyCompactResponse() });
++    await expect(pending).resolves.toEqual(emptyCompactResponse());
++  });
++
++  test("disposal terminates the worker and rejects active plus queued work", async () => {
++    const control = createTestHighlightWorker();
++    registerHighlightWorker(control.worker);
++    const active = requestHighlight();
++    const queued = requestHighlight();
++
++    disposeHighlightWorker();
++
++    await expect(active).rejects.toThrow("disposed");
++    await expect(queued).rejects.toThrow("disposed");
++    expect(control.state.terminateCalls).toBe(1);
++  });
++});
+diff --git a/src/ui/diff/worker/highlightWorkerClient.ts b/src/ui/diff/worker/highlightWorkerClient.ts
+new file mode 100644
+index 00000000..68f9b385
+--- /dev/null
++++ b/src/ui/diff/worker/highlightWorkerClient.ts
+@@ -0,0 +1,181 @@
++/**
++ * Brokers terminal syntax-highlighting jobs through Bun's compiled-entrypoint worker support.
++ *
++ * The first eligible request starts the worker through the root-level Bun resolver, then later
++ * requests share its serialized queue. UI callers consume the public worker-folder entrypoint.
++ */
++import type { FileDiffMetadata } from "@pierre/diffs";
++import { createHighlightWorker } from "../../../highlightWorkerClient";
++import type { CompactHighlightedDiff } from "./highlightCompact";
++
++export type WorkerHighlightedDiffCode = CompactHighlightedDiff;
++
++interface HighlightWorkerRequest {
++  version: 3;
++  id: number;
++  aliasContext: boolean;
++  metadata: FileDiffMetadata;
++  appearance: "dark" | "light";
++  language: string;
++  theme: string;
++}
++
++type HighlightWorkerResponse =
++  | { version: 3; id: number; ok: true; code: WorkerHighlightedDiffCode }
++  | { version: 3; id: number; ok: false; message: string };
++
++interface PendingHighlightRequest {
++  id: number;
++  aliasContext: boolean;
++  metadata: FileDiffMetadata;
++  appearance: "dark" | "light";
++  language: string;
++  theme: string;
++  resolve: (code: WorkerHighlightedDiffCode) => void;
++  reject: (error: Error) => void;
++}
++
++let worker: Worker | null = null;
++let activeRequest: PendingHighlightRequest | null = null;
++let nextRequestId = 1;
++const queuedRequests: PendingHighlightRequest[] = [];
++
++/** Attach the one message/error protocol every worker instance uses. */
++function useHighlightWorker(nextWorker: Worker) {
++  // Bun workers otherwise keep a static command or test process alive after its last request.
++  (nextWorker as Worker & { unref?: () => void }).unref?.();
++  nextWorker.onmessage = handleWorkerMessage;
++  nextWorker.onerror = handleWorkerError;
++  worker = nextWorker;
++  return nextWorker;
++}
++
++/** Register a caller-provided worker, such as a deterministic test double. */
++export function registerHighlightWorker(nextWorker: Worker) {
++  if (worker && worker !== nextWorker) {
++    resetWorker(new Error("The syntax highlighting worker was replaced."));
++  }
++  return useHighlightWorker(nextWorker);
++}
++
++/** Return one reusable worker without keeping short-lived Bun processes alive. */
++function getHighlightWorker() {
++  if (worker) {
++    return worker;
++  }
++
++  // Construction runs inside `runNextRequest`'s try/catch, so unavailable workers leave the
++  // visible diff plain rather than aborting the interactive application.
++  return useHighlightWorker(createHighlightWorker());
++}
++
++/** Resolve or reject the active job and advance the serialized message queue. */
++function settleActiveRequest(settle: (request: PendingHighlightRequest) => void) {
++  const request = activeRequest;
++  activeRequest = null;
++  if (request) {
++    settle(request);
++  }
++  runNextRequest();
++}
++
++/** Receive replies from the one worker and ignore no-longer-relevant messages. */
++function handleWorkerMessage(event: MessageEvent<HighlightWorkerResponse>) {
++  const response = event.data;
++  const request = activeRequest;
++  if (!request || response.version !== 3 || response.id !== request.id) {
++    return;
++  }
++
++  if (response.ok) {
++    settleActiveRequest((active) => active.resolve(response.code));
++    return;
++  }
++
++  settleActiveRequest((active) => active.reject(new Error(response.message)));
++}
++
++/** Drop a broken worker and fail every request rather than leaving stale work behind. */
++function resetWorker(error: Error) {
++  const currentWorker = worker;
++  worker = null;
++  if (currentWorker) {
++    void currentWorker.terminate();
++  }
++
++  const pending = [activeRequest, ...queuedRequests].filter(
++    (request): request is PendingHighlightRequest => request !== null,
++  );
++  activeRequest = null;
++  queuedRequests.length = 0;
++  for (const request of pending) {
++    request.reject(error);
++  }
++}
++
++/** Fail pending work when Bun reports a worker startup or runtime error. */
++function handleWorkerError(event: ErrorEvent) {
++  resetWorker(new Error(event.message || "The syntax highlighting worker failed."));
++}
++
++/** Post the next job only after the previous reply has been processed. */
++function runNextRequest() {
++  if (activeRequest || queuedRequests.length === 0) {
++    return;
++  }
++
++  const request = queuedRequests.shift();
++  if (!request) {
++    return;
++  }
++
++  activeRequest = request;
++  try {
++    const message: HighlightWorkerRequest = {
++      version: 3,
++      id: request.id,
++      aliasContext: request.aliasContext,
++      metadata: request.metadata,
++      appearance: request.appearance,
++      language: request.language,
++      theme: request.theme,
++    };
++    getHighlightWorker().postMessage(message);
++  } catch (error) {
++    resetWorker(error instanceof Error ? error : new Error(String(error)));
++  }
++}
++
++/** Highlight one diff in the Bun worker after earlier requests finish. */
++export function highlightDiffInWorker({
++  aliasContext,
++  appearance,
++  language,
++  metadata,
++  theme,
++}: {
++  aliasContext: boolean;
++  appearance: "dark" | "light";
++  language: string;
++  metadata: FileDiffMetadata;
++  theme: string;
++}) {
++  return new Promise<WorkerHighlightedDiffCode>((resolve, reject) => {
++    queuedRequests.push({
++      id: nextRequestId++,
++      aliasContext,
++      appearance,
++      language,
++      metadata,
++      theme,
++      resolve,
++      reject,
++    });
++    runNextRequest();
++  });
++}
++
++/** Terminate the shared worker when a controlled caller needs to release it. */
++export function disposeHighlightWorker() {
++  resetWorker(new Error("The syntax highlighting worker was disposed."));
++}
+diff --git a/src/ui/diff/worker/index.ts b/src/ui/diff/worker/index.ts
+new file mode 100644
+index 00000000..ed09af0d
+--- /dev/null
++++ b/src/ui/diff/worker/index.ts
+@@ -0,0 +1,22 @@
++/** Exposes the terminal diff worker subsystem without requiring callers to know its internals. */
++export {
++  createHighlightWorker,
++  supportsHighlightWorkerOffload,
++} from "../../../highlightWorkerClient";
++export {
++  disposeHighlightWorker,
++  highlightDiffInWorker,
++  registerHighlightWorker,
++  type WorkerHighlightedDiffCode,
++} from "./highlightWorkerClient";
++export {
++  compactHighlightRunsForLine,
++  compactHighlightTransferList,
++  compactHighlightedDiffByteLength,
++  encodeCompactHighlightedDiff,
++  validateCompactHighlightedDiff,
++  type CompactHighlightedDiff,
++  type CompactHighlightRun,
++} from "./highlightCompact";
++export { aliasContextHighlightLines } from "./highlightContext";
++export { collectHastHighlightRuns, type HastNode } from "./highlightHast";
+diff --git a/test/cli/compiled-headless-native-lib.test.ts b/test/cli/compiled-headless-native-lib.test.ts
+index 73ba1d0d..61c4cdef 100644
+--- a/test/cli/compiled-headless-native-lib.test.ts
++++ b/test/cli/compiled-headless-native-lib.test.ts
+@@ -19,35 +19,61 @@ const positiveControlExecutable = positiveControlBuildRoot
+       process.platform === "win32" ? "opentui-control.exe" : "opentui-control",
+     )
+   : undefined;
++const highlightWorkerControlExecutable = positiveControlBuildRoot
++  ? resolve(
++      positiveControlBuildRoot,
++      process.platform === "win32" ? "highlight-worker-control.exe" : "highlight-worker-control",
++    )
++  : undefined;
+ 
+ let rootsToClean: string[] = [];
+ 
+ beforeAll(() => {
+-  if (!positiveControlExecutable) {
++  if (!positiveControlExecutable || !highlightWorkerControlExecutable) {
+     return;
+   }
+ 
+-  const source = resolve(import.meta.dir, "fixtures", "compiled-opentui-positive-control.ts");
+-  const build = Bun.spawnSync(
+-    [
+-      process.execPath,
+-      "build",
+-      "--compile",
+-      "--no-compile-autoload-bunfig",
+-      source,
+-      "--outfile",
+-      positiveControlExecutable,
+-    ],
++  const controls = [
+     {
+-      stdin: "ignore",
+-      stdout: "pipe",
+-      stderr: "pipe",
++      name: "OpenTUI positive control",
++      entries: [resolve(import.meta.dir, "fixtures", "compiled-opentui-positive-control.ts")],
++      executable: positiveControlExecutable,
++      root: undefined,
+     },
+-  );
+-  if (build.exitCode !== 0) {
+-    throw new Error(
+-      `Failed to build the OpenTUI positive control: ${Buffer.from(build.stderr).toString("utf8")}`,
++    {
++      name: "highlight worker control",
++      entries: [
++        resolve(import.meta.dir, "fixtures", "compiled-highlight-worker-control.ts"),
++        resolve(import.meta.dir, "..", "..", "src", "highlightWorkerEntry.ts"),
++      ],
++      executable: highlightWorkerControlExecutable,
++      root: resolve(import.meta.dir, "..", "..", "src"),
++    },
++  ];
++
++  for (const control of controls) {
++    const build = Bun.spawnSync(
++      [
++        process.execPath,
++        "build",
++        "--compile",
++        "--no-compile-autoload-bunfig",
++        ...(control.root ? ["--root", control.root] : []),
++        ...control.entries,
++        "--outfile",
++        control.executable,
++      ],
++      {
++        stdin: "ignore",
++        stdout: "pipe",
++        stderr: "pipe",
++      },
+     );
++    if (build.exitCode !== 0) {
++      throw new Error(
++        `Failed to build the ${control.name}: ${Buffer.from(build.stderr).toString("utf8")}`,
++      );
++    }
+   }
+ });
+ 
+@@ -148,6 +174,24 @@ describe("compiled headless native-library loading", () => {
+     expect(nativeArtifacts(temp).length).toBeGreaterThan(0);
+   });
+ 
++  compiledTest("starts its embedded highlight worker entrypoint", () => {
++    const { env } = createTestEnvironment();
++    const proc = Bun.spawnSync([highlightWorkerControlExecutable!], {
++      env,
++      stdin: "ignore",
++      stdout: "pipe",
++      stderr: "pipe",
++    });
++
++    expect(Buffer.from(proc.stderr).toString("utf8")).toBe("");
++    expect(proc.exitCode).toBe(0);
++    expect(Buffer.from(proc.stdout).toString("utf8")).toContain(
++      process.platform === "win32"
++        ? "compiled highlight worker disabled"
++        : "compiled highlight worker ready",
++    );
++  });
++
+   compiledTest(
+     "does not extract OpenTUI for short-lived headless commands",
+     () => {
+diff --git a/test/cli/fixtures/compiled-highlight-worker-control.ts b/test/cli/fixtures/compiled-highlight-worker-control.ts
+new file mode 100644
+index 00000000..1525504c
+--- /dev/null
++++ b/test/cli/fixtures/compiled-highlight-worker-control.ts
+@@ -0,0 +1,40 @@
++import {
++  createHighlightWorker,
++  supportsHighlightWorkerOffload,
++} from "../../../src/highlightWorkerClient";
++
++if (!supportsHighlightWorkerOffload()) {
++  process.stdout.write("compiled highlight worker disabled\n");
++} else {
++  const worker = createHighlightWorker();
++  const timeout = setTimeout(() => {
++    process.stderr.write("Timed out waiting for the compiled highlight worker.\n");
++    void worker.terminate();
++    process.exit(1);
++  }, 5_000);
++
++  worker.onerror = (event) => {
++    clearTimeout(timeout);
++    process.stderr.write(`${event.message || "The compiled highlight worker failed."}\n`);
++    void worker.terminate();
++    process.exit(1);
++  };
++
++  worker.onmessage = (event: MessageEvent) => {
++    clearTimeout(timeout);
++    const response = event.data as { version?: unknown; id?: unknown; ok?: unknown };
++    if (response.version !== 3 || response.id !== 1 || response.ok !== false) {
++      process.stderr.write(
++        `Unexpected compiled highlight worker response: ${JSON.stringify(response)}\n`,
++      );
++      void worker.terminate();
++      process.exit(1);
++    }
++
++    process.stdout.write("compiled highlight worker ready\n");
++    void worker.terminate();
++  };
++
++  // The unsupported version asks the real worker protocol for its cheapest deterministic response.
++  worker.postMessage({ version: 0, id: 1 });
++}
+diff --git a/test/pty/highlighting.test.ts b/test/pty/highlighting.test.ts
+index ba2b5b90..1fcbc217 100644
+--- a/test/pty/highlighting.test.ts
++++ b/test/pty/highlighting.test.ts
+@@ -1,5 +1,8 @@
+ import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+-import { createPtyHarness } from "./harness";
++import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { createPtyHarness, sleep } from "./harness";
+ 
+ const harness = createPtyHarness();
+ 
+@@ -10,7 +13,54 @@ afterEach(() => {
+   harness.cleanup();
+ });
+ 
++/** Create a contiguous added TypeScript file large enough to use the highlight worker. */
++function createLargeHighlightTestFiles() {
++  const dir = mkdtempSync(join(tmpdir(), "hunk-highlight-worker-"));
++  const before = join(dir, "before.ts");
++  const after = join(dir, "after.ts");
++  const contents = Array.from(
++    { length: 8_000 },
++    (_, index) => `export const workerLine${index} = ${index};`,
++  ).join("\n");
++  writeFileSync(before, "");
++  writeFileSync(after, `${contents}\n`);
++  return { after, before, dir };
++}
++
+ describe("PTY syntax highlighting", () => {
++  test("keeps key input responsive while a large added file highlights", async () => {
++    const fixture = createLargeHighlightTestFiles();
++    const session = await harness.launchHunk({
++      args: ["diff", fixture.before, fixture.after, "--fast", "--mode", "stack"],
++      cwd: fixture.dir,
++      cols: 120,
++      rows: 24,
++    });
++
++    try {
++      await session.waitForText(/View\s+Navigate\s+Agent\s+Help/, { timeout: 15_000 });
++      // Effects schedule highlighting after the first plain-text paint. Give that queue a turn,
++      // then assert the PTY can still deliver navigation while the worker is busy.
++      await sleep(25);
++      const started = performance.now();
++      await session.press("down");
++      expect(performance.now() - started).toBeLessThan(500);
++
++      let colored = "";
++      for (let iteration = 0; iteration < 200; iteration += 1) {
++        await session.waitIdle({ timeout: 50 });
++        colored = await session.text({ immediate: true, only: { foreground: "#ff7b72" } });
++        if (colored.includes("export")) {
++          break;
++        }
++      }
++      expect(colored).toContain("export");
++    } finally {
++      session.close();
++      rmSync(fixture.dir, { recursive: true, force: true });
++    }
++  });
++
+   test("keeps code after a hidden Elixir heredoc opener out of the string token state", async () => {
+     const fixture = harness.createElixirHeredocRepoFixture();
+     const session = await harness.launchHunk({
+diff --git a/website/src/content/docs/docs/reference/cli.md b/website/src/content/docs/docs/reference/cli.md
+index c45b394e..87b21a25 100644
+--- a/website/src/content/docs/docs/reference/cli.md
++++ b/website/src/content/docs/docs/reference/cli.md
+@@ -24,6 +24,7 @@ This reference is generated from the command metadata used by Hunk itself. Run `
+ | `--agent-context <path>`    | JSON sidecar with agent rationale                               |
+ | `--pager`                   | use pager-style chrome                                          |
+ | `--experimental`            | enable experimental features (currently STML agent-note markup) |
++| `--fast`                    | experimentally offload eligible large-diff highlighting         |
+ | `--line-numbers`            | show line numbers                                               |
+ | `--no-line-numbers`         | hide line numbers                                               |
+ | `-x, --tab-width <columns>` | tab stop width: 1-16 Default: 4.                                |

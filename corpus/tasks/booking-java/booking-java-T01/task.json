@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T01",
+  "repo": "booking-java",
+  "kind": "buggy",
+  "title": "Promo codes with usage limits",
+  "description": "Marketing wants to run limited offers (\"20 % off for the first 50 bookings in May\") without staff re-pricing room types by hand. This adds promo codes per property.\n\n- Migration V2: table `promo_code` (code unique per property, either `percent` 1–100 or a fixed `amount`, `valid_from`/`valid_until`, `max_uses`, `uses`, `enabled`, with check constraints mirroring the rules, including `uses <= max_uses`), and a nullable `promo_code_id` on `hold` and `reservation`.\n- Admin API under `/api/v1/admin/properties/{code}/promo-codes`: create (`POST`), list (`GET`) and disable (`POST .../{promoCode}/disable`). Codes are stored upper-case, so they are case-insensitive. A fixed amount is in the property's currency and validated like other prices.\n- Quotes and holds accept an optional `promoCode` (in the stay part of the request). `PromoService.applicable` refuses unknown, disabled or out-of-date codes with 400; validity is checked against the booking day at the property (today in the property's zone), with `validFrom` and `validUntil` both inclusive. The discount is a new `PROMO` price line applied after every other rule (after the extra-guest fee) and never takes the total below zero.\n- A use is counted when the hold is confirmed (`PromoService.redeem` inside the confirmation's transaction, before the charge, so a refused confirmation charges nothing) and given back when the reservation is cancelled (`PromoService.giveBack` inside the cancellation's transaction). A code is never used more than `max_uses` times, also when confirmations and cancellations run concurrently; once it is used up, confirming answers 409 `promo-exhausted` and the hold stays active.\n- README: pricing order, promo code rules and the new admin routes.\n\nTests: `PromoCodeApiTest` covers the admin routes, validation and case-insensitive uniqueness, the `PROMO` line and the zero floor, unknown and out-of-date codes, and a use taken by a confirmation, refused when used up and given back by a cancellation.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/innkeep/booking/service/PromoService.java",
+      "lines": [114, 126],
+      "category": "concurrency",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "The use counter is maintained with read-modify-write on the managed entity: redeem loads the promo code, checks uses < maxUses and does uses++; giveBack loads it and does uses--. There is no row lock, no @Version and no conditional UPDATE, so Hibernate writes back whatever value its transaction computed from a stale read. A cancellation that gives a use back while a confirmation that took one is still open (the confirmation calls the payment gateway between its read and its commit) loses one of the two writes: the counter ends one too high (a use that is free is refused as promo-exhausted) or one too low, after which the code is used more than max_uses times. The CHECK (uses <= max_uses) does not catch it, since every written value is in range.",
+      "trigger": "Code with max_uses 2 and one confirmed reservation R1 using it (uses = 1). Confirm a second hold with the code; while that confirmation is inside its charge, cancel R1. The cancellation reads uses = 1 and commits 0, then the confirmation commits the 2 it computed: uses = 2 with only one reservation holding a use. In the other order (the cancellation reads before the confirmation commits and writes after) the counter ends at 0 with one active use, and two more confirmations succeed.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/innkeep/booking/service/PromoUseCountRaceTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=PromoUseCountRaceTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The counter cannot drift. Every confirmation loads its hold through HoldRepository.findLockedById (PESSIMISTIC_WRITE), so confirmations are serialized before redeem runs, and V2__promo_codes.sql adds CHECK (uses <= max_uses), so the database itself rejects any write that would take a code past its limit; the read-modify-write in PromoService is therefore safe.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/main/java/com/innkeep/booking/domain/PromoCode.java",
+      "lines": [116, 118],
+      "category": "boundary",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "PromoCode.isValidOn uses today.isBefore(validUntil), so the last valid day is refused: a code valid until 10 May returns 400 for a quote or hold made on 10 May at the property. The README and the description say validFrom and validUntil are both inclusive.",
+      "trigger": "Promo code valid 2027-05-01 to 2027-05-10; quote or hold with it on 2027-05-10 in the property's zone → 400 'not valid on 2027-05-10' instead of the discount.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/innkeep/booking/service/PromoValidityDaysTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=PromoValidityDaysTest",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "validUntil is an exclusive end on purpose, the convention the domain already uses for date ranges: DateRange (domain/DateRange.java) treats checkOut as exclusive and includesNight checks night.isBefore(checkOut), so a code 'until 10 May' ends at the start of 10 May exactly as a stay until 10 May has its last night on the 9th.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

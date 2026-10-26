@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/NandhaKishorM/laya",
+  "intro_pr": 605,
+  "intro_merged_at": "2026-09-27T19:29:03Z",
+  "fix_pr": 1224,
+  "fix_merged_at": "2026-10-15T10:46:00Z",
+  "license": "Apache-2.0",
+  "base_commit": "d28aef54f6a4e7d067f2c2913d46907024e895ae",
+  "intro_commit": "897aaf6904b967978f1620f47a2f4d727394e7d6",
+  "fix_commit": "a59953b5b4d80da42127cfaeeb619f7aa6a213c6",
+  "fix_ported": true,
+  "snapshot_changes": []
+}

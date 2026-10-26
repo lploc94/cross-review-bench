@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-go-ragflow-21119",
+  "repo": "rb-go-ragflow-21119",
+  "kind": "realbug",
+  "title": "fix(ingestion): scope extractor timeout to single LLM call",
+  "description": "## Summary\nThe Extractor wrapped its whole invoke (all chunks, all phases) in one fixed 600s budget, so any large-but-healthy document (e.g. 3000 chunks) inevitably failed with `context deadline exceeded` and lost the entire parse.\n\nThis PR moves the timeout to a per-LLM-call budget (default 180s, `EXTRACTOR_CHAT_TIMEOUT` override). The budget is a hung-call ceiling, not pacing, so per-model speed variance needs no tuning. A call that exceeds it skips its chunk instead of failing the document.\n\n## Related Issue\nNone.\n\n## Changes\n- `internal/ingestion/component/extractor.go`\n  - Remove the node-level `runtime.WithTimeout(600s)` in `Invoke`; phases run on the parent ctx (task cancellation still aborts).\n  - Add per-call budget in `callRaw` around `inv.Chat` (`extractorChatTimeout()`, env `EXTRACTOR_CHAT_TIMEOUT` seconds, default 180s).\n  - Pool jobs map a call-budget expiry to a per-chunk skip with warn (`resolveChunkCallError`); non-timeout errors keep fail-fast; parent cancel propagates.\n  - All-chunks-timed-out in a phase fails loudly (`checkAllChunksSkipped`) so a down model cannot silently produce empty extractions.\n- `internal/ingestion/component/extractor_call_timeout_test.go` (new): slow-chunk skip, all-hang failure, parent-cancel propagation, env parsing.\n\n## Test Plan\n- `bash build.sh --test ./internal/ingestion/component/` passes (includes 4 new tests, ~1s each for timeout cases).\n- `gofmt` clean.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/ingestion/component/extractor.go",
+      "lines": [
+        82,
+        83
+      ],
+      "category": "boundary",
+      "severity": "low",
+      "difficulty": "L1",
+      "summary": "extractorChatTimeout accepts any positive integer from EXTRACTOR_CHAT_TIMEOUT and multiplies it by time.Second without a range check, so a value above math.MaxInt64/1e9 seconds overflows into a negative duration instead of falling back to the 180-second default; every Extractor LLM call then times out immediately.",
+      "trigger": "EXTRACTOR_CHAT_TIMEOUT=9223372037 (one more than the largest representable number of seconds): extractorChatTimeout returns about -2562047h instead of 3m0s.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "internal/ingestion/component/extractor_call_timeout_test.go"
+      ],
+      "hidden_test_cmd": "CGO_ENABLED=0 GOFLAGS=-mod=mod GOPROXY=off go test -count=1 ./internal/ingestion/component/ -run '^TestExtractorChatTimeoutEnv$'"
+    }
+  ]
+}

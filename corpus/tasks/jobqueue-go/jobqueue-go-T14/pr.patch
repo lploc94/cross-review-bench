@@ -1,0 +1,421 @@
+diff --git a/README.md b/README.md
+index 7c29825..97dbd0c 100644
+--- a/README.md
++++ b/README.md
+@@ -90,7 +90,8 @@ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ | `SHUTDOWN_TIMEOUT` | `15s` | how long open HTTP requests may take to finish on shutdown |
+ | `WORKER_ID` | host-pid-random | lease owner prefix; must be unique per process |
+ | `WORKER_QUEUES` | `default` | comma-separated queues this instance works on |
+-| `WORKER_CONCURRENCY` | `4` | worker goroutines per queue; `0` runs the API only |
++| `WORKER_CONCURRENCY` | `4` | worker goroutines per queue without an override in `WORKER_QUEUE_CONCURRENCY`; `0` gives those queues none, so only the overridden queues get workers |
++| `WORKER_QUEUE_CONCURRENCY` | none | per-queue overrides of `WORKER_CONCURRENCY`, such as `emails=2,reports=1`: each queue at most once, one of `WORKER_QUEUES`, 1–256 goroutines |
+ | `WORKER_POLL_INTERVAL` | `1s` | how often an idle worker looks for jobs |
+ | `LEASE_DURATION` | `5m` | how long a leased job belongs to its worker |
+ | `JOB_TIMEOUT` | `1m` | default handler timeout; must be shorter than `LEASE_DURATION` |
+@@ -98,6 +99,11 @@ go run ./cmd/jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ | `REAP_INTERVAL` | `30s` | how often expired leases are recovered |
+ | `SCHEDULER_INTERVAL` | `10s` | how often due schedules are fired |
+ 
++A queue whose handlers are slow or hit a rate-limited service can run fewer goroutines than the
++rest: with `WORKER_QUEUES=default,emails,reports`, `WORKER_CONCURRENCY=8` and
++`WORKER_QUEUE_CONCURRENCY=reports=1`, reports run one at a time while the other queues get 8
++goroutines each. The gauge `jobqueue_workers{queue}` shows how many goroutines each queue got.
++
+ The service logs JSON lines to stdout and exits with status 2 on invalid configuration, listing
+ every problem.
+ 
+diff --git a/cmd/jobqueue/main.go b/cmd/jobqueue/main.go
+index 7ff6a35..e744064 100644
+--- a/cmd/jobqueue/main.go
++++ b/cmd/jobqueue/main.go
+@@ -148,15 +148,16 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 	handlers := worker.NewRegistry(cfg.JobTimeout)
+ 	builtin.Register(handlers, builtin.Options{Clock: clk, LeaseDuration: cfg.LeaseDuration})
+ 	workers, err := worker.NewPool(st, handlers, worker.Options{
+-		ID:            cfg.WorkerID,
+-		Queues:        cfg.WorkerQueues,
+-		Concurrency:   cfg.WorkerConcurrency,
+-		PollInterval:  cfg.WorkerPollInterval,
+-		LeaseDuration: cfg.LeaseDuration,
+-		Retry:         domain.FixedDelay{Delay: cfg.RetryDelay},
+-		Clock:         clk,
+-		Logger:        logger,
+-		Metrics:       reg,
++		ID:               cfg.WorkerID,
++		Queues:           cfg.WorkerQueues,
++		Concurrency:      cfg.WorkerConcurrency,
++		QueueConcurrency: cfg.WorkerQueueConcurrency,
++		PollInterval:     cfg.WorkerPollInterval,
++		LeaseDuration:    cfg.LeaseDuration,
++		Retry:            domain.FixedDelay{Delay: cfg.RetryDelay},
++		Clock:            clk,
++		Logger:           logger,
++		Metrics:          reg,
+ 	})
+ 	if err != nil {
+ 		return err
+diff --git a/internal/config/config.go b/internal/config/config.go
+index a11eebd..333c359 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -8,7 +8,9 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"maps"
+ 	"os"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -19,6 +21,9 @@ import (
+ // minTokenLength is the shortest admin token accepted; shorter tokens are too easy to guess.
+ const minTokenLength = 32
+ 
++// maxConcurrency bounds the worker goroutines of one queue.
++const maxConcurrency = 256
++
+ // Database is the database connection configuration, the only part `jobqueue migrate` needs.
+ type Database struct {
+ 	URL      string
+@@ -41,6 +46,10 @@ type Config struct {
+ 	JobTimeout         time.Duration // default handler timeout for types registered without one
+ 	RetryDelay         time.Duration
+ 
++	// WorkerQueueConcurrency overrides WorkerConcurrency for the queues it names; every key is
++	// one of WorkerQueues and every value is at least 1.
++	WorkerQueueConcurrency map[string]int
++
+ 	ReapInterval      time.Duration
+ 	SchedulerInterval time.Duration
+ }
+@@ -63,7 +72,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
+ 
+ 		WorkerID:           r.string("WORKER_ID", defaultWorkerID()),
+ 		WorkerQueues:       r.list("WORKER_QUEUES", []string{"default"}),
+-		WorkerConcurrency:  r.int("WORKER_CONCURRENCY", 4, 0, 256),
++		WorkerConcurrency:  r.int("WORKER_CONCURRENCY", 4, 0, maxConcurrency),
+ 		WorkerPollInterval: r.duration("WORKER_POLL_INTERVAL", time.Second),
+ 		LeaseDuration:      r.duration("LEASE_DURATION", 5*time.Minute),
+ 		JobTimeout:         r.duration("JOB_TIMEOUT", time.Minute),
+@@ -72,6 +81,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
+ 		ReapInterval:      r.duration("REAP_INTERVAL", 30*time.Second),
+ 		SchedulerInterval: r.duration("SCHEDULER_INTERVAL", 10*time.Second),
+ 	}
++	cfg.WorkerQueueConcurrency = r.queueConcurrency("WORKER_QUEUE_CONCURRENCY")
+ 	cfg.validate(&r)
+ 	if len(r.errs) > 0 {
+ 		return Config{}, fmt.Errorf("configuration: %w", errors.Join(r.errs...))
+@@ -105,6 +115,11 @@ func (c Config) validate(r *reader) {
+ 			r.fail("WORKER_QUEUES", "queue %q %s", q, err)
+ 		}
+ 	}
++	for _, q := range slices.Sorted(maps.Keys(c.WorkerQueueConcurrency)) {
++		if !slices.Contains(c.WorkerQueues, q) {
++			r.fail("WORKER_QUEUE_CONCURRENCY", "names queue %q, which is not in WORKER_QUEUES", q)
++		}
++	}
+ 	positive := []struct {
+ 		name string
+ 		d    time.Duration
+@@ -210,6 +225,45 @@ func (r *reader) list(name string, def []string) []string {
+ 	return out
+ }
+ 
++// queueConcurrency reads a comma-separated list of queue=n entries, such as
++// "emails=2,reports=1". Each queue may appear once and n must be between 1 and maxConcurrency.
++func (r *reader) queueConcurrency(name string) map[string]int {
++	v, ok := r.get(name)
++	if !ok {
++		return nil
++	}
++	out := make(map[string]int)
++	seen := make(map[string]bool)
++	for _, item := range strings.Split(v, ",") {
++		item = strings.TrimSpace(item)
++		if item == "" {
++			continue
++		}
++		queue, raw, ok := strings.Cut(item, "=")
++		queue, raw = strings.TrimSpace(queue), strings.TrimSpace(raw)
++		if !ok || queue == "" {
++			r.fail(name, "entry %q must look like queue=n", item)
++			continue
++		}
++		if seen[queue] {
++			r.fail(name, "queue %q is listed more than once", queue)
++			continue
++		}
++		seen[queue] = true
++		n, err := strconv.Atoi(raw)
++		switch {
++		case err != nil:
++			r.fail(name, "queue %q: %q is not an integer", queue, raw)
++			continue
++		case n < 1 || n > maxConcurrency:
++			r.fail(name, "queue %q: must be between 1 and %d, got %d", queue, maxConcurrency, n)
++			continue
++		}
++		out[queue] = n
++	}
++	return out
++}
++
+ func (r *reader) level(name string, def slog.Level) slog.Level {
+ 	v, ok := r.get(name)
+ 	if !ok {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index ad4dc14..d1f96b2 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -2,6 +2,7 @@ package config
+ 
+ import (
+ 	"log/slog"
++	"maps"
+ 	"slices"
+ 	"strings"
+ 	"testing"
+@@ -92,6 +93,51 @@ func TestLoadReportsEveryProblem(t *testing.T) {
+ 	}
+ }
+ 
++func TestLoadQueueConcurrency(t *testing.T) {
++	vars := base()
++	vars["WORKER_QUEUES"] = "default,emails,reports"
++	vars["WORKER_CONCURRENCY"] = "8"
++	vars["WORKER_QUEUE_CONCURRENCY"] = " emails=2, reports = 1 ,"
++	cfg, err := LoadFrom(env(vars))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := map[string]int{"emails": 2, "reports": 1}; !maps.Equal(cfg.WorkerQueueConcurrency, want) || cfg.WorkerConcurrency != 8 {
++		t.Errorf("concurrency = %d, overrides %v; want 8 and %v", cfg.WorkerConcurrency, cfg.WorkerQueueConcurrency, want)
++	}
++
++	cfg, err = LoadFrom(env(base()))
++	if err != nil || len(cfg.WorkerQueueConcurrency) != 0 {
++		t.Errorf("default overrides = %v, %v; want none", cfg.WorkerQueueConcurrency, err)
++	}
++}
++
++func TestQueueConcurrencyErrors(t *testing.T) {
++	cases := map[string]string{
++		"sms=1":               `names queue "sms", which is not in WORKER_QUEUES`,
++		"emails=0":            `queue "emails": must be between 1 and 256, got 0`,
++		"emails=-2":           `queue "emails": must be between 1 and 256, got -2`,
++		"emails=257":          `queue "emails": must be between 1 and 256, got 257`,
++		"emails=two":          `queue "emails": "two" is not an integer`,
++		"emails":              `entry "emails" must look like queue=n`,
++		"=3":                  `entry "=3" must look like queue=n`,
++		"emails=1,emails=2":   `queue "emails" is listed more than once`,
++		"emails=1, emails=1":  `queue "emails" is listed more than once`,
++		"emails=abc,emails=2": `queue "emails" is listed more than once`,
++	}
++	for value, want := range cases {
++		t.Run(value, func(t *testing.T) {
++			vars := base()
++			vars["WORKER_QUEUES"] = "default,emails"
++			vars["WORKER_QUEUE_CONCURRENCY"] = value
++			_, err := LoadFrom(env(vars))
++			if err == nil || !strings.Contains(err.Error(), "WORKER_QUEUE_CONCURRENCY "+want) {
++				t.Errorf("error = %v, want it to contain %q", err, want)
++			}
++		})
++	}
++}
++
+ func TestJobTimeoutMustBeShorterThanLease(t *testing.T) {
+ 	vars := base()
+ 	vars["LEASE_DURATION"] = "1m"
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index f7ebeed..930189c 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -8,7 +8,9 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"maps"
+ 	"runtime/debug"
++	"slices"
+ 	"sync"
+ 	"time"
+ 
+@@ -45,6 +47,10 @@ type Options struct {
+ 	// OnSettled, if set, is called after each job's outcome has been recorded (or failed to
+ 	// be), from the goroutine that ran the job.
+ 	OnSettled func(Outcome)
++
++	// QueueConcurrency overrides Concurrency for the queues it names. Every key must be one of
++	// Queues and every value at least 1.
++	QueueConcurrency map[string]int
+ }
+ 
+ // Outcome describes one finished attempt.
+@@ -65,8 +71,9 @@ type PanicError struct {
+ 
+ func (e *PanicError) Error() string { return fmt.Sprintf("panic: %v", e.Value) }
+ 
+-// Pool runs Concurrency goroutines per queue. Each repeatedly leases one job, runs its handler
+-// and records the outcome, sleeping PollInterval whenever its queue is empty.
++// Pool runs Concurrency goroutines per queue, or the queue's QueueConcurrency. Each repeatedly
++// leases one job, runs its handler and records the outcome, sleeping PollInterval whenever its
++// queue is empty.
+ type Pool struct {
+ 	store    Store
+ 	registry *Registry
+@@ -100,6 +107,16 @@ func NewPool(store Store, registry *Registry, opts Options) (*Pool, error) {
+ 			return nil, fmt.Errorf("worker: queue %q %w", q, err)
+ 		}
+ 	}
++	for _, q := range slices.Sorted(maps.Keys(opts.QueueConcurrency)) {
++		switch {
++		case !slices.Contains(opts.Queues, q):
++			return nil, fmt.Errorf("worker: concurrency given for queue %q, which the pool does not work on", q)
++		case opts.QueueConcurrency[q] < 1:
++			return nil, fmt.Errorf("worker: concurrency of queue %q must be positive", q)
++		}
++	}
++	// The pool keeps its own copy, so that the caller's map can change after NewPool.
++	opts.QueueConcurrency = maps.Clone(opts.QueueConcurrency)
+ 	if opts.Clock == nil {
+ 		opts.Clock = clock.Real{}
+ 	}
+@@ -134,18 +151,30 @@ func (p *Pool) Start(ctx context.Context) error {
+ 	}
+ 	p.started = true
+ 	p.ctx = ctx
++	perQueue := make(map[string]int, len(p.opts.Queues))
+ 	for _, queue := range p.opts.Queues {
+-		for i := range p.opts.Concurrency {
++		n := p.concurrency(queue)
++		perQueue[queue] = n
++		p.metrics.workers.Set(float64(n), queue)
++		for i := range n {
+ 			workerID := fmt.Sprintf("%s/%s/%d", p.opts.ID, queue, i)
+ 			p.wg.Add(1)
+ 			go p.work(queue, workerID)
+ 		}
+ 	}
+-	p.log.Info("worker pool started", "queues", p.opts.Queues, "concurrency", p.opts.Concurrency,
++	p.log.Info("worker pool started", "queues", p.opts.Queues, "concurrency", perQueue,
+ 		"types", p.registry.Types())
+ 	return nil
+ }
+ 
++// concurrency is the number of goroutines that work on queue.
++func (p *Pool) concurrency(queue string) int {
++	if n, ok := p.opts.QueueConcurrency[queue]; ok {
++		return n
++	}
++	return p.opts.Concurrency
++}
++
+ // Stop stops leasing new jobs and waits for the handlers that are running to return and for
+ // their outcomes to be recorded. Running handlers are not interrupted. Stop may be called more
+ // than once and before Start.
+@@ -352,6 +381,7 @@ type poolMetrics struct {
+ 	processed   *metrics.Counter
+ 	duration    *metrics.Histogram
+ 	busy        *metrics.Gauge
++	workers     *metrics.Gauge
+ 	leaseErrors *metrics.Counter
+ }
+ 
+@@ -363,6 +393,8 @@ func newPoolMetrics(reg *metrics.Registry) poolMetrics {
+ 			"Handler run time per attempt.", nil, "queue", "type"),
+ 		busy: reg.NewGauge("jobqueue_workers_busy",
+ 			"Worker goroutines currently running a handler.", "queue"),
++		workers: reg.NewGauge("jobqueue_workers",
++			"Worker goroutines started per queue.", "queue"),
+ 		leaseErrors: reg.NewCounter("jobqueue_lease_errors_total",
+ 			"Failed attempts to lease jobs.", "queue"),
+ 	}
+diff --git a/internal/worker/pool_test.go b/internal/worker/pool_test.go
+index 9cf0283..b61abdc 100644
+--- a/internal/worker/pool_test.go
++++ b/internal/worker/pool_test.go
+@@ -3,7 +3,10 @@ package worker_test
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"slices"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -376,6 +379,62 @@ func TestPoolRunsConcurrencyWorkersPerQueue(t *testing.T) {
+ 	}
+ }
+ 
++func TestPoolQueueConcurrencyOverridesDefault(t *testing.T) {
++	queues := []string{"a", "b", "c"}
++	want := map[string]int{"a": 1, "b": 3, "c": 2}
++	started := make(chan string, 10)
++	release := make(chan struct{})
++	var jobs []domain.Job
++	for _, q := range queues {
++		for range want[q] {
++			jobs = append(jobs, domain.Job{ID: int64(len(jobs) + 1), Queue: q, Type: "block"})
++		}
++	}
++	st := newFakeStore(jobs...)
++	h := newHarness(t, st, registry(map[string]worker.HandlerFunc{
++		"block": func(ctx context.Context, _ domain.Job) error {
++			started <- worker.WorkerID(ctx)
++			<-release
++			return nil
++		},
++	}), func(o *worker.Options) {
++		o.Queues = queues
++		o.Concurrency = 2
++		o.QueueConcurrency = map[string]int{"a": 1, "b": 3}
++	})
++	// Handlers are released before the pool is stopped, even when a Fatalf below ends the test.
++	var releaseOnce sync.Once
++	releaseHandlers := func() { releaseOnce.Do(func() { close(release) }) }
++	defer releaseHandlers()
++	h.start(t, context.Background())
++
++	var ids []string
++	for range len(jobs) {
++		select {
++		case id := <-started:
++			ids = append(ids, id)
++		case <-time.After(10 * time.Second):
++			t.Fatalf("only %v started within 10s", ids)
++		}
++	}
++	releaseHandlers()
++	slices.Sort(ids)
++	if got := strings.Join(ids, " "); got != "test/a/0 test/b/0 test/b/1 test/b/2 test/c/0 test/c/1" {
++		t.Errorf("workers that ran a job at once = %s", got)
++	}
++	for range len(jobs) {
++		h.next(t)
++	}
++
++	var buf strings.Builder
++	_ = h.metrics.WriteText(&buf)
++	for q, n := range want {
++		if line := fmt.Sprintf(`jobqueue_workers{queue="%s"} %d`, q, n); !strings.Contains(buf.String(), line) {
++			t.Errorf("metrics lack %s:\n%s", line, buf.String())
++		}
++	}
++}
++
+ func TestPoolStartTwice(t *testing.T) {
+ 	h := newHarness(t, newFakeStore(), registry(nil))
+ 	h.start(t, context.Background())
+@@ -397,6 +456,8 @@ func TestNewPoolValidatesOptions(t *testing.T) {
+ 		{"zero lease", func(o *worker.Options) { o.LeaseDuration = 0 }},
+ 		{"no retry policy", func(o *worker.Options) { o.Retry = nil }},
+ 		{"bad queue", func(o *worker.Options) { o.Queues = []string{"Not A Queue"} }},
++		{"override for another queue", func(o *worker.Options) { o.QueueConcurrency = map[string]int{"emails": 2} }},
++		{"zero override", func(o *worker.Options) { o.QueueConcurrency = map[string]int{"default": 0} }},
+ 	}
+ 	if _, err := worker.NewPool(newFakeStore(), registry(nil), valid); err != nil {
+ 		t.Fatalf("valid options rejected: %v", err)

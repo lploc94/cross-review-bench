@@ -1,0 +1,35 @@
+{
+  "name": "sync-ts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Offline-first document sync: a Postgres sync server and a SQLite client replica",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/client"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "typecheck": "tsc -b",
+    "lint": "eslint .",
+    "migrate": "npm run migrate -w @sync/server",
+    "admin": "npm run admin -w @sync/server --",
+    "start": "npm start -w @sync/server",
+    "cli": "npm run cli -w @sync/client --"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "eslint": "9.39.5",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.2",
+    "vitest": "5.0.5"
+  }
+}

@@ -1,0 +1,891 @@
+diff --git a/.env.example b/.env.example
+index 96602cf..bef2919 100644
+--- a/.env.example
++++ b/.env.example
+@@ -11,3 +11,5 @@ PULL_MAX_LIMIT=1000
+ PULL_DEFAULT_LIMIT=200
+ BODY_LIMIT_BYTES=33554432
+ SHUTDOWN_TIMEOUT_MS=10000
++EXPORT_MAX_CONCURRENT=2
++EXPORT_IDLE_TIMEOUT_MS=30000
+diff --git a/README.md b/README.md
+index 603ec06..ecbf3c5 100644
+--- a/README.md
++++ b/README.md
+@@ -87,6 +87,7 @@ version is answered 426 `protocol_mismatch` with the server's version. Every ans
+ | GET | `/v1/sync/status` | `{ "latestSeq", "cursor" }` |
+ | GET | `/v1/documents/:collection/:id` | the server's state of a document, with its field timestamps |
+ | GET | `/v1/me` | the calling device and its user |
++| GET | `/v1/export` | every document of the user as newline-delimited JSON (see Export) |
+ | GET | `/v1/devices` | the user's devices with their cursors |
+ | POST | `/v1/devices` | `{ "name" }` → 201 `{ "device", "token" }` |
+ 
+@@ -118,6 +119,17 @@ curl -s localhost:3000/v1/sync/push \
+        "hlc":"001894701600000:00000:laptop-1"}]}'
+ ```
+ 
++### Export
++
++`GET /v1/export` streams every document of the user as newline-delimited JSON: one line per
++document, shaped like `GET /v1/documents/:collection/:id` plus `"type": "document"`, ordered by
++collection and id (the `documents` primary key), then `{"type":"end","documents":<count>}`. An
++export without that last line is incomplete: the server cuts one off when it fails midway or
++when it could send its client nothing for `EXPORT_IDLE_TIMEOUT_MS`. Pages are read in one
++REPEATABLE READ transaction, so the export is the state at the time of the request, and only as
++fast as the client takes the lines. Each running export holds a database connection; beyond
++`EXPORT_MAX_CONCURRENT` the answer is 503 `unavailable`.
++
+ ## Layout
+ 
+ ```
+@@ -155,6 +167,8 @@ packages/*/test/            vitest suites; test/helpers have the app builders an
+ | `PULL_MAX_LIMIT`, `PULL_DEFAULT_LIMIT` | `1000`, `200` | events per pull page |
+ | `BODY_LIMIT_BYTES` | `33554432` | largest request body (a full push of the largest documents fits) |
+ | `SHUTDOWN_TIMEOUT_MS` | `10000` | graceful shutdown limit |
++| `EXPORT_MAX_CONCURRENT` | `2` | exports running at once, at most `DATABASE_POOL_MAX` − 1 |
++| `EXPORT_IDLE_TIMEOUT_MS` | `30000` | an export that could send its client nothing for this long is cut off |
+ 
+ The server refuses to start, listing every problem, when a variable is invalid. See
+ `.env.example`. The command-line client reads `SYNC_SERVER_URL`, `SYNC_TOKEN`, `SYNC_DB`
+@@ -184,8 +198,12 @@ npm run cli -- set notes groceries title=Groceries tags=home,weekly
+ npm run cli -- sync
+ npm run cli -- list notes
+ npm run cli -- status
++npm run cli -- export documents.ndjson     # the server's documents, one JSON per line
+ ```
+ 
++`export` writes `<file>.partial` and renames it to `<file>` once the server's `end` line has
++arrived and the count matches, so `<file>` only ever holds a complete export.
++
+ It exits 0 on success, 1 on a failure, 2 on a usage error and 75 on a failure worth retrying
+ later.
+ 
+diff --git a/packages/client/src/cli/commands.ts b/packages/client/src/cli/commands.ts
+index c188a96..cfe8d05 100644
+--- a/packages/client/src/cli/commands.ts
++++ b/packages/client/src/cli/commands.ts
+@@ -1,5 +1,6 @@
+ import {
+   COLLECTION_NAMES,
++  type ExportedDocument,
+   type MeResponse,
+   type RegisterDeviceResponse,
+   isCollectionName,
+@@ -9,6 +10,7 @@ import {
+ } from "@sync/shared";
+ import type { SyncClient } from "../sync/syncClient.js";
+ import { UsageError, type ParsedArgs } from "./args.js";
++import { exportToFile } from "./exportFile.js";
+ import { parseAssignments } from "./fieldValues.js";
+ 
+ /** What the commands can ask the server outside of a sync; null when no server is configured. */
+@@ -16,6 +18,7 @@ export interface ServerAccount {
+   status(): Promise<SyncStatusResponse>;
+   me(): Promise<MeResponse>;
+   registerDevice(name: string): Promise<RegisterDeviceResponse>;
++  exportDocuments(): AsyncIterable<ExportedDocument>;
+ }
+ 
+ export interface CommandContext {
+@@ -39,6 +42,7 @@ export const COMMANDS_USAGE = `commands:
+   status                                     pending changes and pull position
+   whoami                                     the user and device of the token
+   add-device <name>                          register another device; prints its token once
++  export <file>                              write the server's documents to a file, one JSON per line
+ collections: ${COLLECTION_NAMES.join(", ")}
+ values: text as is; true/false; integers; lists comma-separated (tags=a,b); null clears dueDate and noteId`;
+ 
+@@ -130,6 +134,13 @@ export async function runCommand(args: ParsedArgs, ctx: CommandContext): Promise
+       out(`token ${registered.token}`);
+       return 0;
+     }
++    case "export": {
++      expectArgs(args, 1);
++      if (first === undefined || first.trim() === "") throw new UsageError("an output file is required");
++      const count = await exportToFile(requireServer(ctx).exportDocuments(), first);
++      out(`exported ${count} documents to ${first}`);
++      return 0;
++    }
+     default:
+       throw new UsageError(args.command === null ? "a command is required" : `unknown command ${args.command}`);
+   }
+diff --git a/packages/client/src/cli/exportFile.ts b/packages/client/src/cli/exportFile.ts
+new file mode 100644
+index 0000000..4f76d4d
+--- /dev/null
++++ b/packages/client/src/cli/exportFile.ts
+@@ -0,0 +1,33 @@
++import { createWriteStream } from "node:fs";
++import { rename, rm } from "node:fs/promises";
++import { Readable } from "node:stream";
++import { pipeline } from "node:stream/promises";
++import { SyncError, type ExportedDocument } from "@sync/shared";
++
++/**
++ * Write an export to `file`, one document per line as the server sent it. The lines go to
++ * `<file>.partial`, which replaces `file` only once the export is complete, so an interrupted
++ * export never leaves a file that looks whole. Writing keeps pace with the disk: a slow disk
++ * slows the download instead of filling memory. Returns the number of documents.
++ */
++export async function exportToFile(documents: AsyncIterable<ExportedDocument>, file: string): Promise<number> {
++  const partial = `${file}.partial`;
++  let count = 0;
++  async function* lines(): AsyncGenerator<string> {
++    for await (const doc of documents) {
++      count += 1;
++      yield `${JSON.stringify(doc)}\n`;
++    }
++  }
++  try {
++    await pipeline(Readable.from(lines()), createWriteStream(partial));
++    await rename(partial, file);
++  } catch (err) {
++    await rm(partial, { force: true });
++    if (err instanceof SyncError) throw err;
++    throw new SyncError("export_failed", `cannot write ${file}: ${err instanceof Error ? err.message : String(err)}`, {
++      cause: err,
++    });
++  }
++  return count;
++}
+diff --git a/packages/client/src/transport/httpTransport.ts b/packages/client/src/transport/httpTransport.ts
+index 3853478..54a00f8 100644
+--- a/packages/client/src/transport/httpTransport.ts
++++ b/packages/client/src/transport/httpTransport.ts
+@@ -1,10 +1,15 @@
+-import { WireTransport, type WireRequest, type WireResponse } from "./wire.js";
++import { EXPORT_CONTENT_TYPE, exportLineSchema, type ExportedDocument } from "@sync/shared";
++import { InvalidResponseError, NetworkError } from "./errors.js";
++import { EXPORT_PATH, WireTransport, errorFromResponse, type WireRequest, type WireResponse } from "./wire.js";
+ 
+ export interface HttpTransportOptions {
+   /** The server's origin and optional path prefix, e.g. `https://sync.example.com/api`. */
+   readonly baseUrl: string;
+   readonly token: string;
+-  /** Longest wait for a whole answer, body included. */
++  /**
++   * Longest wait for a whole answer, body included. For `exportDocuments()` it bounds the wait for
++   * the answer and then for each part of the body, not the whole download.
++   */
+   readonly timeoutMs?: number;
+   /** The fetch implementation; the global one by default. */
+   readonly fetch?: typeof globalThis.fetch;
+@@ -12,6 +17,9 @@ export interface HttpTransportOptions {
+ 
+ export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+ 
++/** Longest line of an export the client buffers; a document line is far shorter. */
++const MAX_EXPORT_LINE_CHARS = 1_048_576;
++
+ /** The sync protocol over HTTP with fetch. */
+ export class HttpTransport extends WireTransport {
+   private readonly baseUrl: string;
+@@ -51,4 +59,85 @@ export class HttpTransport extends WireTransport {
+       body,
+     };
+   }
++
++  /**
++   * `GET /v1/export`: the user's documents, checked and yielded line by line as they arrive, so
++   * memory does not grow with the export. `timeoutMs` bounds the wait for the answer and for each
++   * part of its body, not the whole export. The export is complete only when the iteration ends
++   * normally: a body cut off in transfer is a NetworkError; one that ends without the server's
++   * `end` line, has a line that breaks the protocol or another count than it announces is an
++   * InvalidResponseError.
++   */
++  async *exportDocuments(): AsyncGenerator<ExportedDocument, void, undefined> {
++    const controller = new AbortController();
++    const timed = async <T>(what: string, step: () => Promise<T>): Promise<T> => {
++      const timer = setTimeout(() => controller.abort(new Error(`no answer for ${this.timeoutMs} ms`)), this.timeoutMs);
++      try {
++        return await step();
++      } catch (err) {
++        throw new NetworkError(`GET ${EXPORT_PATH} ${what}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
++      } finally {
++        clearTimeout(timer);
++      }
++    };
++    try {
++      const response = await timed("failed", () =>
++        this.fetchImpl(`${this.baseUrl}${EXPORT_PATH}`, {
++          method: "GET",
++          headers: this.requestHeaders({ accept: EXPORT_CONTENT_TYPE }),
++          signal: controller.signal,
++        }),
++      );
++      if (!response.ok) {
++        const body = await timed("failed", () => response.text());
++        throw errorFromResponse({ status: response.status, header: (name) => response.headers.get(name) ?? undefined, body });
++      }
++      if (!response.body) throw new InvalidResponseError("the export answer has no body");
++      const reader: ReadableStreamDefaultReader<Uint8Array> = response.body.getReader();
++      const decoder = new TextDecoder();
++      let pending = "";
++      let documents = 0;
++      let end: number | null = null;
++      for (;;) {
++        const chunk = await timed(`was cut off after ${documents} documents`, () => reader.read());
++        pending += chunk.done ? decoder.decode() : decoder.decode(chunk.value, { stream: true });
++        let start = 0;
++        for (let newline = pending.indexOf("\n"); newline >= 0; newline = pending.indexOf("\n", start)) {
++          const line = parseExportLine(pending.slice(start, newline));
++          start = newline + 1;
++          if (end !== null) throw new InvalidResponseError("the export continues after its end line");
++          if (line.type === "end") {
++            end = line.documents;
++          } else {
++            documents += 1;
++            yield line;
++          }
++        }
++        pending = pending.slice(start);
++        if (pending.length > MAX_EXPORT_LINE_CHARS) throw new InvalidResponseError("the export has a line that is too long");
++        if (chunk.done) break;
++      }
++      if (end === null || pending !== "") throw new InvalidResponseError(`the export stopped after ${documents} documents without its end line`);
++      if (end !== documents) {
++        throw new InvalidResponseError(`the export announced ${end} documents but sent ${documents}`);
++      }
++    } finally {
++      // Stops the download when the caller leaves the loop early or anything above failed.
++      controller.abort();
++    }
++  }
++}
++
++function parseExportLine(text: string) {
++  let json: unknown;
++  try {
++    json = JSON.parse(text);
++  } catch {
++    json = undefined;
++  }
++  const parsed = exportLineSchema.safeParse(json);
++  if (!parsed.success) {
++    throw new InvalidResponseError("the export has a line that does not follow the protocol", { cause: parsed.error });
++  }
++  return parsed.data;
+ }
+diff --git a/packages/client/src/transport/wire.ts b/packages/client/src/transport/wire.ts
+index 97c21af..65e3622 100644
+--- a/packages/client/src/transport/wire.ts
++++ b/packages/client/src/transport/wire.ts
+@@ -41,6 +41,7 @@ export const PULL_PATH = "/v1/sync/pull";
+ export const STATUS_PATH = "/v1/sync/status";
+ export const ME_PATH = "/v1/me";
+ export const DEVICES_PATH = "/v1/devices";
++export const EXPORT_PATH = "/v1/export";
+ 
+ /**
+  * The sync protocol over request/response exchanges: request encoding, authentication and
+@@ -96,15 +97,19 @@ export abstract class WireTransport implements SyncTransport {
+     return decode(response, registerDeviceResponseSchema);
+   }
+ 
+-  private async send(request: WireRequest): Promise<WireResponse> {
+-    const headers = {
+-      ...request.headers,
++  /** The headers of every request: `headers`, then the token and the protocol version. */
++  protected requestHeaders(headers: Readonly<Record<string, string>>): Record<string, string> {
++    return {
+       accept: "application/json",
++      ...headers,
+       authorization: `Bearer ${this.token}`,
+       [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+     };
++  }
++
++  private async send(request: WireRequest): Promise<WireResponse> {
+     try {
+-      return await this.exchange({ ...request, headers });
++      return await this.exchange({ ...request, headers: this.requestHeaders(request.headers) });
+     } catch (err) {
+       if (err instanceof SyncError) throw err;
+       throw new NetworkError(`${request.method} ${request.path.split("?")[0]} failed: ${describe(err)}`, {
+diff --git a/packages/client/test/e2e/export.test.ts b/packages/client/test/e2e/export.test.ts
+new file mode 100644
+index 0000000..a83e9e3
+--- /dev/null
++++ b/packages/client/test/e2e/export.test.ts
+@@ -0,0 +1,82 @@
++import { existsSync, readFileSync } from "node:fs";
++import type { AddressInfo } from "node:net";
++import { HttpError, HttpTransport, InvalidResponseError, NetworkError } from "@sync/client";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { exportToFile } from "../../src/cli/exportFile.js";
++import { main } from "../../src/cli/main.js";
++import { openClient } from "../helpers/clients.js";
++import { tempDbPath } from "../helpers/tempFiles.js";
++import { startTestServer, type TestAccount, type TestServer } from "../helpers/testServer.js";
++
++let server: TestServer;
++let ada: TestAccount;
++let baseUrl: string;
++
++beforeEach(async () => {
++  server = await startTestServer();
++  ada = await server.createUser("Ada");
++  await server.app.listen({ port: 0, host: "127.0.0.1" });
++  baseUrl = `http://127.0.0.1:${(server.app.server.address() as AddressInfo).port}`;
++});
++
++afterEach(async () => {
++  await server.close();
++});
++
++const DOC_HLC = "001894701600000:00000:laptop-1";
++
++function line(value: unknown): string {
++  return `${JSON.stringify(value)}\n`;
++}
++
++function doc(id: string) {
++  return { type: "document", collection: "notes", id, fields: { title: id }, fieldHlcs: { title: DOC_HLC }, updatedSeq: 1, updatedAt: "2026-10-19T08:00:00.000Z" };
++}
++
++/** A transport whose export answer is `parts`, then `ending` (a clean end or an error). */
++function transportAnswering(parts: string[], ending: Error | null = null): HttpTransport {
++  const body = new ReadableStream<Uint8Array>({
++    start(controller) {
++      for (const part of parts) controller.enqueue(new TextEncoder().encode(part));
++      if (ending) controller.error(ending);
++      else controller.close();
++    },
++  });
++  return new HttpTransport({ baseUrl: "http://sync.example.test", token: "sd_x", fetch: async () => new Response(body) });
++}
++
++describe("syncctl export", () => {
++  it("writes the user's documents to the file, one per line", async () => {
++    const laptop = openClient(server, ada);
++    laptop.client.set("tasks", "t1", { title: "Book train", priority: 2 });
++    laptop.client.set("notes", "n1", { title: "Trip", tags: ["travel"] });
++    laptop.client.set("notes", "n2", { title: "Packing" });
++    await laptop.client.sync();
++    await laptop.client.close();
++
++    const file = tempDbPath("export.ndjson");
++    const out: string[] = [];
++    const env = { SYNC_DB: tempDbPath(), SYNC_SERVER_URL: baseUrl, SYNC_TOKEN: ada.token };
++    const code = await main(["export", file], env, { out: (l) => out.push(l), err: (l) => out.push(l) });
++    expect({ code, out }).toEqual({ code: 0, out: [`exported 3 documents to ${file}`] });
++    const docs = readFileSync(file, "utf8").trimEnd().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
++    expect(docs.map((d) => `${String(d.collection)}/${String(d.id)}`)).toEqual(["notes/n1", "notes/n2", "tasks/t1"]);
++    expect(docs[0]).toMatchObject({ type: "document", fields: { title: "Trip", tags: ["travel"] } });
++    expect(existsSync(`${file}.partial`)).toBe(false);
++  });
++
++  it("reports a rejected token", async () => {
++    const transport = new HttpTransport({ baseUrl, token: `${ada.token}x` });
++    await expect(exportToFile(transport.exportDocuments(), tempDbPath("export.ndjson"))).rejects.toBeInstanceOf(HttpError);
++  });
++
++  it.each([
++    ["cut off in transfer", [line(doc("n1"))], new TypeError("terminated"), NetworkError],
++    ["without its end line", [line(doc("n1")), line(doc("n2"))], null, InvalidResponseError],
++    ["with another count than it sent", [line(doc("n1")), line({ type: "end", documents: 2 })], null, InvalidResponseError],
++  ])("leaves no file for an export %s", async (_case, parts, ending, error) => {
++    const file = tempDbPath("export.ndjson");
++    await expect(exportToFile(transportAnswering(parts, ending).exportDocuments(), file)).rejects.toBeInstanceOf(error);
++    expect(existsSync(file) || existsSync(`${file}.partial`)).toBe(false);
++  });
++});
+diff --git a/packages/server/src/api/routes/export.ts b/packages/server/src/api/routes/export.ts
+new file mode 100644
+index 0000000..a8ef034
+--- /dev/null
++++ b/packages/server/src/api/routes/export.ts
+@@ -0,0 +1,19 @@
++import { EXPORT_CONTENT_TYPE } from "@sync/shared";
++import type { FastifyInstance } from "fastify";
++import { authOf } from "../plugins/auth.js";
++import { serializeDocument } from "../serializers.js";
++import type { RouteOptions } from "./types.js";
++
++/** `/v1/export`: every document of the caller's user, streamed as newline-delimited JSON. */
++export async function exportRoutes(app: FastifyInstance, options: RouteOptions): Promise<void> {
++  const { documentExport } = options.services;
++
++  // No HEAD twin: it would read the whole export only to discard it.
++  app.get("/export", { exposeHeadRoute: false }, async (request, reply) => {
++    const stream = await documentExport.open(
++      authOf(request),
++      (doc) => ({ type: "document", ...serializeDocument(doc) }),
++    );
++    return reply.type(EXPORT_CONTENT_TYPE).header("cache-control", "no-store").send(stream);
++  });
++}
+diff --git a/packages/server/src/api/routes/index.ts b/packages/server/src/api/routes/index.ts
+index cd13e07..1f1cd65 100644
+--- a/packages/server/src/api/routes/index.ts
++++ b/packages/server/src/api/routes/index.ts
+@@ -3,6 +3,7 @@ import { authenticate } from "../plugins/auth.js";
+ import { requireProtocol } from "../plugins/protocol.js";
+ import { deviceRoutes } from "./devices.js";
+ import { documentRoutes } from "./documents.js";
++import { exportRoutes } from "./export.js";
+ import { healthRoutes } from "./health.js";
+ import { syncRoutes } from "./sync.js";
+ import type { RouteOptions } from "./types.js";
+@@ -28,6 +29,7 @@ export async function registerRoutes(app: FastifyInstance, options: RouteOptions
+         api.addHook("onRequest", authenticate(options.services.auth));
+         await api.register(documentRoutes, options);
+         await api.register(deviceRoutes, options);
++        await api.register(exportRoutes, options);
+       });
+     },
+     { prefix: "/v1" },
+diff --git a/packages/server/src/api/routes/types.ts b/packages/server/src/api/routes/types.ts
+index 1c94a6f..5e42958 100644
+--- a/packages/server/src/api/routes/types.ts
++++ b/packages/server/src/api/routes/types.ts
+@@ -2,6 +2,7 @@ import type { Pool } from "../../db/pool.js";
+ import type { AccountService } from "../../services/accountService.js";
+ import type { AuthService } from "../../services/authService.js";
+ import type { DocumentService } from "../../services/documentService.js";
++import type { ExportService } from "../../services/exportService.js";
+ import type { PullService } from "../../services/pullService.js";
+ import type { PushService } from "../../services/pushService.js";
+ 
+@@ -12,6 +13,7 @@ export interface RouteServices {
+   readonly push: PushService;
+   readonly pull: PullService;
+   readonly documents: DocumentService;
++  readonly documentExport: ExportService;
+ }
+ 
+ /** Limits the routes validate requests against (from the configuration). */
+diff --git a/packages/server/src/app.ts b/packages/server/src/app.ts
+index b41f475..dd247b8 100644
+--- a/packages/server/src/app.ts
++++ b/packages/server/src/app.ts
+@@ -10,6 +10,7 @@ import type { Logger } from "./infra/logger.js";
+ import { AccountService } from "./services/accountService.js";
+ import { AuthService } from "./services/authService.js";
+ import { DocumentService } from "./services/documentService.js";
++import { ExportService } from "./services/exportService.js";
+ import { PullService } from "./services/pullService.js";
+ import { PushService } from "./services/pushService.js";
+ 
+@@ -31,13 +32,18 @@ export function createServerHlc(deps: Pick<AppDeps, "clock" | "config">): Hlc {
+ }
+ 
+ export function buildServices(deps: AppDeps, hlc: Hlc = createServerHlc(deps)): RouteServices {
+-  const { pool, clock, logger } = deps;
++  const { pool, clock, logger, config } = deps;
+   return {
+     auth: new AuthService({ pool, clock }),
+     accounts: new AccountService({ pool, clock }),
+     push: new PushService({ pool, clock, hlc, logger: logger.child({ component: "push" }) }),
+     pull: new PullService({ pool, clock }),
+     documents: new DocumentService({ pool }),
++    documentExport: new ExportService({
++      pool,
++      maxConcurrent: config.exports.maxConcurrent,
++      idleTimeoutMs: config.exports.idleTimeoutMs,
++    }),
+   };
+ }
+ 
+diff --git a/packages/server/src/config/env.ts b/packages/server/src/config/env.ts
+index 42c1d8f..bae9780 100644
+--- a/packages/server/src/config/env.ts
++++ b/packages/server/src/config/env.ts
+@@ -38,6 +38,13 @@ const envShape = {
+   /** Largest request body; a full push batch of the largest documents fits in the default. */
+   BODY_LIMIT_BYTES: integer(32 * MIB, 1_024, 256 * MIB),
+   SHUTDOWN_TIMEOUT_MS: integer(10_000, 100, 300_000),
++  /**
++   * Exports streaming at once; each holds a database connection until it has read its last page,
++   * so never more than DATABASE_POOL_MAX - 1 (a pool of one connection refuses every export).
++   */
++  EXPORT_MAX_CONCURRENT: integer(2, 1, 100),
++  /** An export that could send its client nothing for this long (it stopped reading) is cut off. */
++  EXPORT_IDLE_TIMEOUT_MS: integer(30_000, 1_000, 600_000),
+ };
+ 
+ const envSchema = z.object(envShape).superRefine((env, ctx) => {
+@@ -60,6 +67,11 @@ export interface SyncSettings {
+   readonly pullDefaultLimit: number;
+ }
+ 
++export interface ExportSettings {
++  readonly maxConcurrent: number;
++  readonly idleTimeoutMs: number;
++}
++
+ export interface Config {
+   readonly nodeEnv: Env["NODE_ENV"];
+   readonly host: string;
+@@ -68,6 +80,7 @@ export interface Config {
+   readonly databaseUrl: string;
+   readonly databasePoolMax: number;
+   readonly sync: SyncSettings;
++  readonly exports: ExportSettings;
+   readonly bodyLimitBytes: number;
+   readonly shutdownTimeoutMs: number;
+ }
+@@ -113,6 +126,10 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
+       pullMaxLimit: env.PULL_MAX_LIMIT,
+       pullDefaultLimit: env.PULL_DEFAULT_LIMIT,
+     },
++    exports: {
++      maxConcurrent: Math.min(env.EXPORT_MAX_CONCURRENT, env.DATABASE_POOL_MAX - 1),
++      idleTimeoutMs: env.EXPORT_IDLE_TIMEOUT_MS,
++    },
+     bodyLimitBytes: env.BODY_LIMIT_BYTES,
+     shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS,
+   };
+diff --git a/packages/server/src/services/exportService.ts b/packages/server/src/services/exportService.ts
+new file mode 100644
+index 0000000..9c42181
+--- /dev/null
++++ b/packages/server/src/services/exportService.ts
+@@ -0,0 +1,117 @@
++import { Readable } from "node:stream";
++import type { Pool, PoolClient } from "../db/pool.js";
++import type { AuthContext } from "../domain/accounts.js";
++import { UnavailableError } from "../domain/errors.js";
++import { listDocumentsPage, type StoredDocument } from "../repositories/documents.js";
++
++/**
++ * Exports of a user's documents as newline-delimited JSON: one line per document in
++ * (collection, doc_id) order, then `{"type":"end","documents":<count>}`.
++ *
++ * An export reads the documents table page by page in one read-only REPEATABLE READ transaction,
++ * so it is one snapshot however long it streams, and reads a page only when the consumer has
++ * taken the previous one. Its connection stays checked out until the last page is read or the
++ * stream closes, so at most `maxConcurrent` exports run at once and one whose consumer takes
++ * nothing for `idleTimeoutMs` is cut off.
++ */
++export class ExportService {
++  private readonly pool: Pool;
++  private readonly pageSize: number;
++  private readonly maxConcurrent: number;
++  private readonly idleTimeoutMs: number;
++  private active = 0;
++
++  constructor(deps: { pool: Pool; maxConcurrent: number; idleTimeoutMs: number; pageSize?: number }) {
++    this.pool = deps.pool;
++    this.maxConcurrent = deps.maxConcurrent;
++    this.idleTimeoutMs = deps.idleTimeoutMs;
++    this.pageSize = deps.pageSize ?? 200;
++  }
++
++  /** Exports holding a connection now. */
++  get running(): number {
++    return this.active;
++  }
++
++  /**
++   * Start an export; `toLine` gives the JSON object written for a document. The first page is
++   * read before the stream is returned, so the snapshot is taken now, and too many exports or a
++   * database failure are an error answer rather than a response cut short.
++   */
++  async open(auth: AuthContext, toLine: (doc: StoredDocument) => object): Promise<Readable> {
++    if (this.active >= this.maxConcurrent) {
++      throw new UnavailableError(`at most ${this.maxConcurrent} exports run at once; try again later`);
++    }
++    this.active += 1;
++    let client: PoolClient | undefined;
++    let first: StoredDocument[];
++    const { pageSize, idleTimeoutMs } = this;
++    let broken: Error | undefined;
++    let streaming = false;
++    // While the connection is checked out the pool does not listen for its errors; one there (the
++    // session ended or the connection lost) comes to this listener instead of going unhandled. A
++    // query in flight also rejects with it; between pages it ends the stream.
++    const onConnectionError = (err: Error): void => {
++      broken = err;
++      if (streaming) stream.destroy(err);
++    };
++    try {
++      client = await this.pool.connect();
++      client.on("error", onConnectionError);
++      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
++      first = await listDocumentsPage(client, auth.userId, null, pageSize);
++    } catch (err) {
++      client?.removeListener("error", onConnectionError);
++      client?.release(asError(err));
++      this.active -= 1;
++      throw err;
++    }
++    const db = client;
++
++    let released = false;
++    // Runs after the last page and again when the stream closes; the first call releases.
++    const release = async (): Promise<void> => {
++      if (released) return;
++      released = true;
++      // The transaction only read, so ROLLBACK ends it as well as COMMIT would.
++      if (!broken) await db.query("ROLLBACK").catch((err: unknown) => (broken = asError(err)));
++      db.removeListener("error", onConnectionError);
++      db.release(broken);
++      this.active -= 1;
++    };
++
++    async function* lines(): AsyncGenerator<string> {
++      let page = first;
++      let documents = 0;
++      for (;;) {
++        for (const doc of page) {
++          yield `${JSON.stringify(toLine(doc))}\n`;
++          stall.refresh();
++        }
++        documents += page.length;
++        const last = page.at(-1);
++        if (!last || page.length < pageSize) break;
++        page = await listDocumentsPage(db, auth.userId, last, pageSize);
++      }
++      await release();
++      yield `${JSON.stringify({ type: "end", documents })}\n`;
++    }
++
++    const stream = Readable.from(lines(), { objectMode: false });
++    streaming = true;
++    const stall = setTimeout(() => {
++      stream.destroy(new Error(`export stalled: the client took nothing for ${idleTimeoutMs} ms`));
++    }, idleTimeoutMs);
++    // "close" comes once, after the generator has finished or been stopped (a query in flight
++    // completes first): the export ended, failed or its consumer went away.
++    stream.once("close", () => {
++      clearTimeout(stall);
++      void release();
++    });
++    return stream;
++  }
++}
++
++function asError(value: unknown): Error {
++  return value instanceof Error ? value : new Error(String(value));
++}
+diff --git a/packages/server/test/api/export.test.ts b/packages/server/test/api/export.test.ts
+new file mode 100644
+index 0000000..66aa363
+--- /dev/null
++++ b/packages/server/test/api/export.test.ts
+@@ -0,0 +1,166 @@
++import http from "node:http";
++import net, { type AddressInfo } from "node:net";
++import { exportLineSchema } from "@sync/shared";
++import pg from "pg";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { UnavailableError } from "../../src/domain/errors.js";
++import { ExportService } from "../../src/services/exportService.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { testDatabaseUrl } from "../helpers/env.js";
++import { createUser, hlc, mutation, push, type TestDevice } from "../helpers/fixtures.js";
++
++const database = new URL(testDatabaseUrl());
++let t: TestApp;
++let ada: TestDevice;
++
++beforeEach(async () => {
++  t = await buildTestApp();
++  ada = await createUser(t);
++});
++
++afterEach(async () => {
++  await t.close();
++});
++
++/** `count` notes written straight into the documents table: note-0001, note-0002, … */
++async function seedNotes(count: number, bodyLength: number): Promise<void> {
++  await t.pool.query(
++    `INSERT INTO documents (user_id, collection, doc_id, fields, field_hlcs, updated_seq, updated_at)
++     SELECT $1, 'notes', 'note-' || lpad(i::text, 4, '0'),
++            jsonb_build_object('title', 'Note ' || i, 'body', repeat('x', $3::int)),
++            jsonb_build_object('title', $4::text, 'body', $4::text), i, now()
++       FROM generate_series(1, $2::int) AS i`,
++    [ada.userId, count, bodyLength, hlc(t.clock.now() - 1_000)],
++  );
++}
++
++/** Connections of the test pool still checked out, after up to 5 s for them to come back. */
++async function checkedOut(): Promise<number> {
++  for (let i = 0; i < 100 && t.pool.totalCount > t.pool.idleCount; i++) {
++    await new Promise((resolve) => setTimeout(resolve, 50));
++  }
++  return t.pool.totalCount - t.pool.idleCount;
++}
++
++const toLine = (doc: { collection: string; docId: string; fields: object }) => ({ id: `${doc.collection}/${doc.docId}`, ...doc.fields });
++
++describe("GET /v1/export", () => {
++  it("streams the caller's documents by collection and id, then the count", async () => {
++    const bob = await createUser(t, "Bob");
++    const now = t.clock.now();
++    await push(t, ada, [
++      mutation({ collection: "tasks", docId: "t1", fields: { title: "Call", done: false }, hlc: hlc(now) }),
++      mutation({ docId: "n2", fields: { title: "Ideas" }, hlc: hlc(now) }),
++      mutation({ docId: "n1", fields: { title: "Groceries", tags: ["home"] }, hlc: hlc(now) }),
++    ]);
++    await push(t, bob, [mutation({ docId: "n3", fields: { title: "Bob's" }, hlc: hlc(now) })]);
++
++    const res = await t.app.inject({ method: "GET", url: "/v1/export", headers: { authorization: `Bearer ${ada.token}` } });
++    expect(res.statusCode).toBe(200);
++    expect(res.headers["content-type"]).toMatch(/^application\/x-ndjson/);
++    const lines = res.body.trimEnd().split("\n").map((line) => exportLineSchema.parse(JSON.parse(line)));
++    expect(lines.map((l) => (l.type === "document" ? `${l.collection}/${l.id}` : `end ${l.documents}`))).toEqual([
++      "notes/n1",
++      "notes/n2",
++      "tasks/t1",
++      "end 3",
++    ]);
++    expect(lines[0]).toMatchObject({ fields: { title: "Groceries", tags: ["home"] }, fieldHlcs: { title: hlc(now) } });
++    expect((await t.app.inject({ method: "GET", url: "/v1/export" })).statusCode).toBe(401);
++  });
++
++  it("releases the connection when the client goes away mid-export", async () => {
++    await seedNotes(3_000, 8_000);
++    await t.app.listen({ port: 0, host: "127.0.0.1" });
++    const { port } = t.app.server.address() as AddressInfo;
++    await new Promise<void>((resolve, reject) => {
++      const req = http.get({ port, path: "/v1/export", headers: { authorization: `Bearer ${ada.token}` } }, (res) => {
++        res.once("data", () => {
++          req.destroy();
++          resolve();
++        });
++      });
++      req.on("error", reject);
++      req.setTimeout(5_000, () => reject(new Error("no answer from the export")));
++    });
++    expect(await checkedOut()).toBe(0);
++  });
++});
++
++describe("ExportService", () => {
++  it("reads one snapshot, a page at a time as the consumer asks", async () => {
++    await seedNotes(400, 1_000);
++    const service = new ExportService({ pool: t.pool, maxConcurrent: 1, idleTimeoutMs: 10_000, pageSize: 50 });
++    const stream = await service.open(ada, toLine);
++    stream.setEncoding("utf8");
++    const reader = stream[Symbol.asyncIterator]();
++    let text = String((await reader.next()).value);
++
++    // Pushed while the last pages are still unread.
++    await push(t, ada, [
++      mutation({ docId: "note-0400", fields: { title: "Changed" }, hlc: hlc(t.clock.now()) }),
++      mutation({ docId: "note-9999", fields: { title: "New" }, hlc: hlc(t.clock.now()) }),
++    ]);
++    for (let next = await reader.next(); !next.done; next = await reader.next()) text += String(next.value);
++
++    const lines = text.trimEnd().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
++    expect(lines).toHaveLength(401);
++    expect(lines.at(-2)).toMatchObject({ id: "notes/note-0400", title: "Note 400" });
++    expect(lines.at(-1)).toEqual({ type: "end", documents: 400 });
++    expect(service.running).toBe(0);
++    expect(await checkedOut()).toBe(0);
++  });
++
++  it("fails to open, and nothing goes unhandled, when the connection drops during the first page", async () => {
++    // A TCP proxy in front of the database, so the connection can be cut as a network would cut it.
++    const sockets: net.Socket[] = [];
++    const proxy = net.createServer((socket) => {
++      const upstream = net.connect(Number(database.port), database.hostname);
++      socket.pipe(upstream).pipe(socket);
++      socket.on("error", () => undefined).on("close", () => upstream.destroy());
++      upstream.on("error", () => undefined).on("close", () => socket.destroy());
++      sockets.push(socket);
++    });
++    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
++    const proxied = new URL(database);
++    proxied.hostname = "127.0.0.1";
++    proxied.port = String((proxy.address() as AddressInfo).port);
++    const pool = new pg.Pool({ connectionString: proxied.toString(), max: 1 });
++    pool.on("error", () => undefined);
++    const service = new ExportService({ pool, maxConcurrent: 1, idleTimeoutMs: 10_000 });
++    const locker = await t.pool.connect();
++    try {
++      await locker.query("BEGIN");
++      await locker.query("LOCK TABLE documents IN ACCESS EXCLUSIVE MODE");
++      const opening = service.open(ada, toLine);
++      opening.catch(() => undefined);
++      // The first page waits for the lock; the connection is reset while it waits.
++      await expect
++        .poll(async () => {
++          const waiting = await t.pool.query(
++            "SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
++          );
++          return waiting.rowCount;
++        })
++        .toBe(1);
++      for (const socket of sockets) socket.resetAndDestroy();
++      await expect(opening).rejects.toThrow();
++    } finally {
++      await locker.query("ROLLBACK");
++      locker.release();
++      await pool.end();
++      await new Promise((resolve) => proxy.close(resolve));
++    }
++    expect(service.running).toBe(0);
++  });
++
++  it("refuses an export beyond maxConcurrent until one closes", async () => {
++    const service = new ExportService({ pool: t.pool, maxConcurrent: 1, idleTimeoutMs: 10_000 });
++    const first = await service.open(ada, toLine);
++    await expect(service.open(ada, toLine)).rejects.toBeInstanceOf(UnavailableError);
++    first.destroy();
++    await expect.poll(() => service.running).toBe(0);
++    (await service.open(ada, toLine)).destroy();
++    await expect.poll(() => service.running).toBe(0);
++  });
++});
+diff --git a/packages/server/test/config/env.test.ts b/packages/server/test/config/env.test.ts
+index 970d927..0db620f 100644
+--- a/packages/server/test/config/env.test.ts
++++ b/packages/server/test/config/env.test.ts
+@@ -15,6 +15,12 @@ describe("loadConfig", () => {
+       pullDefaultLimit: 200,
+     });
+     expect(config.bodyLimitBytes).toBe(32 * 1024 * 1024);
++    expect(config.exports).toEqual({ maxConcurrent: 2, idleTimeoutMs: 30_000 });
++  });
++
++  it("keeps a connection of the pool free of exports", () => {
++    expect(loadConfig({ ...BASE, DATABASE_POOL_MAX: "2", EXPORT_MAX_CONCURRENT: "4" }).exports.maxConcurrent).toBe(1);
++    expect(loadConfig({ ...BASE, DATABASE_POOL_MAX: "1" }).exports.maxConcurrent).toBe(0);
+   });
+ 
+   it("reads and converts every variable", () => {
+diff --git a/packages/shared/src/core/protocol.ts b/packages/shared/src/core/protocol.ts
+index a07635c..eb13338 100644
+--- a/packages/shared/src/core/protocol.ts
++++ b/packages/shared/src/core/protocol.ts
+@@ -103,6 +103,28 @@ export const registerDeviceResponseSchema = z.object({
+   token: z.string().min(1),
+ });
+ 
++/** `GET /v1/export` answers newline-delimited JSON: one line per document, then one `end` line. */
++export const EXPORT_CONTENT_TYPE = "application/x-ndjson";
++
++/** A document of the export: the server's materialised state, as `GET /v1/documents/…` shows it. */
++export const exportedDocumentSchema = z.object({
++  type: z.literal("document"),
++  collection: z.string().min(1),
++  id: docIdSchema,
++  fields: z.record(z.string(), z.json()),
++  fieldHlcs: z.record(z.string(), hlcSchema),
++  updatedSeq: seqSchema,
++  updatedAt: z.iso.datetime({ offset: true }),
++});
++
++/** The last line of a complete export, with the number of document lines before it. */
++export const exportEndSchema = z.object({
++  type: z.literal("end"),
++  documents: z.int().min(0),
++});
++
++export const exportLineSchema = z.discriminatedUnion("type", [exportedDocumentSchema, exportEndSchema]);
++
+ export const errorBodySchema = z.object({
+   error: z.object({
+     code: z.string(),
+@@ -121,6 +143,7 @@ export type SyncStatusResponse = z.output<typeof syncStatusResponseSchema>;
+ export type DeviceInfo = z.output<typeof deviceSchema>;
+ export type MeResponse = z.output<typeof meResponseSchema>;
+ export type RegisterDeviceResponse = z.output<typeof registerDeviceResponseSchema>;
++export type ExportedDocument = z.output<typeof exportedDocumentSchema>;
+ export type ErrorBody = z.output<typeof errorBodySchema>;
+ 
+ /**

@@ -1,0 +1,10 @@
+{
+  "language": "js",
+  "test_cmd": "node --test \"test/*.test.js\"",
+  "typecheck_cmd": null,
+  "lint_cmd": null,
+  "deps_cmd": null,
+  "warm_cmd": null,
+  "services": [],
+  "allow_words": []
+}

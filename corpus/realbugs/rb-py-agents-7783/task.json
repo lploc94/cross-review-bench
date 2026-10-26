@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-py-agents-7783",
+  "repo": "rb-py-agents-7783",
+  "kind": "realbug",
+  "title": "feat: expressive mode",
+  "description": "LLM-driven TTS prosody via provider-specific markup tags, end to end:\r\n\r\n- Provider-keyed markup pipeline in tts/_provider_format.py (LLM tag instructions, transcript stripping, normalize + convert to native syntax); base TTS.Markup delegates on _provider_key() so plugins override one method.\r\n- In-house per-provider input chunking: when expressiveness is on, sentences batch up to the provider send limit (Inworld 900, Cartesia 400) for continuous prosody; per-sentence otherwise. Defaults live in _provider_format.\r\n- ExpressiveContent captured on assistant messages and re-injected on later turns so the model sees its own expressive style.\r\n- Conversational / customer-service / healthcare presets, wired into the drive-thru, frontdesk, healthcare and survey examples.\r\n- Inference gateway + cartesia/elevenlabs/inworld plugin markup; assorted STT/telemetry/audio-recognition updates carried on the branch.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "livekit-agents/livekit/agents/utils/misc.py",
+      "lines": [
+        92,
+        101
+      ],
+      "category": "error-handling",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "safe_render promises that a placeholder with no value logs and renders empty, but its get_field fallback only catches KeyError/AttributeError/TypeError and substitutes an empty string: a positional placeholder ({} or {0}) raises IndexError from the empty args tuple, and a missing field with a format spec ({price:.2f}) hands \"\" to format_field, which raises ValueError, so rendering the instructions crashes instead of leaving the gap empty.",
+      "trigger": "Render Instructions(\"Hello {name}, total {}\") or Instructions(\"Hello {name}, price {price:.2f}\") with data={\"name\": \"Alex\"} (no value for the other placeholder).",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "tests/test_chat_ctx.py"
+      ],
+      "hidden_test_cmd": ".venv/bin/python -m pytest -q -p no:cacheprovider \"tests/test_chat_ctx.py::test_render_missing_placeholders_become_empty\""
+    }
+  ]
+}

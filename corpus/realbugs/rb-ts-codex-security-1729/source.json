@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/openai/codex-security",
+  "intro_pr": 1474,
+  "intro_merged_at": "2026-10-09T05:34:47Z",
+  "fix_pr": 1729,
+  "fix_merged_at": "2026-10-19T06:04:54Z",
+  "license": "Apache-2.0",
+  "base_commit": "97d27e4a058367b7e991ec0e49c8a35835b5ef22",
+  "intro_commit": "32ceaff7dbf8292cef053a36d7785fce65c5c5ff",
+  "fix_commit": "59cd2253b72c72e785a5121156bdbf38520fd25f",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

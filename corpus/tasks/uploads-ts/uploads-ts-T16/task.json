@@ -1,0 +1,25 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T16",
+  "repo": "uploads-ts",
+  "kind": "decoy",
+  "title": "Delete a folder",
+  "description": "Clearing out a folder today means listing it page by page and sending one DELETE per file. This adds a folder delete.\n\n- `DELETE /v1/files?prefix=reports/2025/` (scope `files:delete`) soft-deletes the tenant's live files under the prefix and answers 200 `{ prefix, deleted, bytes, more }`. The prefix must be a valid path followed by `/` (`normalizeFolderPrefix` in `src/domain/paths.ts`), so `reports/2025/` never matches `reports/2025-old/`; `%` and `_` are escaped for LIKE.\n- One request handles at most `LIST_MAX_LIMIT` files: `fileRepo.markDeletedUnderPrefix` picks the first ones in path order and marks them deleted in one UPDATE … RETURNING; the service releases the sum of the returned sizes in the same transaction and sets `more` when live files are still under the prefix. After the commit each object is removed through `FileCatalog.removeObjectOf`, exactly like a single delete (a failed removal is left to the cleanup job).\n- `UploadsClient.deleteFolder(prefix)` and `uploadctl delete-folder <prefix>` (one batch per call).\n- README: API table, response, configuration note for `LIST_MAX_LIMIT`.\n\nTests: `test/api/folderDelete.test.ts` (deleted files, released bytes and removed objects, batches with `more`, literal `%`/`_`, an empty folder, other tenants, invalid prefixes, scope) and a client test.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "src/repositories/fileRepo.ts",
+      "lines": [213, 222],
+      "looks_like": "A race with a concurrent single-file delete (or an overwrite, or a second folder delete): the batch is picked by a plain SELECT in the CTE without FOR UPDATE, and the service then releases the bytes of the deleted rows, so a file deleted concurrently by DELETE /v1/files/<path> seems able to have its bytes released twice, pushing the tenant's usage below what it stores.",
+      "why_correct": "The UPDATE re-checks `files.status <> 'deleted'` on every row it changes and takes the row lock. Under READ COMMITTED a row that a concurrent transaction is deleting is waited for and then re-evaluated on its new version (EvalPlanQual); a row that is already deleted no longer qualifies and is skipped, so it is not returned. FileService.deleteFolder releases only the sum of the sizes RETURNING gave back, inside the same transaction. The single-file path (FileService.deleteByPath) locks the row with findLiveFileByPath(... forUpdate) and changes it with fileRepo.markDeleted, which also requires `status <> 'deleted'` and returns null otherwise, and overwrites go through the same markDeleted in FileCatalog.register. So each row's bytes are released only by the one statement that actually moved it to deleted.",
+      "valid_rebuttal": "No SELECT … FOR UPDATE is needed: markDeletedUnderPrefix (src/repositories/fileRepo.ts) is a conditional UPDATE whose WHERE keeps `files.status <> 'deleted'`, and Postgres re-evaluates that condition on the latest row version after waiting for a concurrent writer's lock, so a file a concurrent delete got first is skipped and not returned. deleteFolder (src/services/fileService.ts) releases `rows.reduce(... row.size)` over the RETURNING rows only, in the same transaction. The competing writers — deleteByPath via fileRepo.markDeleted and FileCatalog.register's overwrite — use the same `status <> 'deleted'` condition and release only when markDeleted returned a row. Whichever statement reaches the row first deletes it and releases its bytes; the other matches nothing.",
+      "hidden_tests": ["test/hidden/folderDeleteRace.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/folderDeleteRace.test.ts"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

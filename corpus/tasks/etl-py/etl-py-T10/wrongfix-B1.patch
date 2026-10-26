@@ -1,0 +1,23 @@
+diff --git a/src/etl/load/orders.py b/src/etl/load/orders.py
+index 31b23d6..88dd4a6 100644
+--- a/src/etl/load/orders.py
++++ b/src/etl/load/orders.py
+@@ -200,7 +200,8 @@ def _add_placeholder_customers(
+ ) -> int:
+     """Create a current placeholder version for each customer of `headers` that has no current
+     version, and return how many were created."""
+-    since = literal(context.loaded_at, TZ)
++    # As old as the customer's orders, so a CRM row changed since then replaces it.
++    since = func.max(headers.c.updated_at)
+     known = exists().where(customers.c.customer_id == headers.c.customer_id, customers.c.is_current)
+     unknown = (
+         select(
+@@ -213,7 +214,7 @@ def _add_placeholder_customers(
+             true().label("is_placeholder"),
+         )
+         .where(not_(known))
+-        .distinct()
++        .group_by(headers.c.customer_id)
+     )
+     names = [column.name for column in unknown.selected_columns]
+     return count_written(

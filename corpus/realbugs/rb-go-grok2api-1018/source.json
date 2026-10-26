@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/chenyme/grok2api",
+  "intro_pr": 983,
+  "intro_merged_at": "2026-08-20T11:57:19Z",
+  "fix_pr": 1018,
+  "fix_merged_at": "2026-08-31T03:33:33Z",
+  "license": "MIT",
+  "base_commit": "be89e48db91d2c27d2ee6eaae2e880c3483a9810",
+  "intro_commit": "7d908f6633ce30a7e381d64ffe64967474dd9e09",
+  "fix_commit": "22587daac66896d5e1b4066216310c51ecf864c7",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

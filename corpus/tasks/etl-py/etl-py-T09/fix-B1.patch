@@ -1,0 +1,29 @@
+diff --git a/src/etl/quality/checks.py b/src/etl/quality/checks.py
+index 31e0efa..83c1afd 100644
+--- a/src/etl/quality/checks.py
++++ b/src/etl/quality/checks.py
+@@ -28,7 +28,7 @@ from sqlalchemy import (
+     select,
+ )
+ 
+-from etl.domain.timestamps import local_date
++from etl.domain.timestamps import day_bounds, local_date
+ from etl.infra.clock import Clock
+ 
+ 
+@@ -265,11 +265,13 @@ class DailyTotalAnomaly:
+         self, connection: Connection, first: date, last: date
+     ) -> dict[str, dict[date, Decimal]]:
+         """Per `by` value, the total of each local day in first..last that has rows."""
+-        local_day = cast(func.timezone(self.zone.key, self.table.c[self.timestamp]), Date)
++        start, end = day_bounds(first, last, self.zone)
++        moment = self.table.c[self.timestamp]
++        local_day = cast(func.timezone(self.zone.key, moment), Date)
+         group = self.table.c[self.by]
+         statement = (
+             select(group, local_day.label("day"), func.sum(self.table.c[self.amount]))
+-            .where(local_day.between(first, last))
++            .where(moment >= start, moment < end)
+             .group_by(group, local_day)
+         )
+         if self.where is not None:

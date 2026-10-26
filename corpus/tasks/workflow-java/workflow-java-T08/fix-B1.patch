@@ -1,0 +1,49 @@
+diff --git a/src/main/java/com/papertrail/workflow/service/ArchiveService.java b/src/main/java/com/papertrail/workflow/service/ArchiveService.java
+index 2d09fc4..8e88c97 100644
+--- a/src/main/java/com/papertrail/workflow/service/ArchiveService.java
++++ b/src/main/java/com/papertrail/workflow/service/ArchiveService.java
+@@ -7,6 +7,7 @@ import com.papertrail.workflow.domain.DocumentStatus;
+ import com.papertrail.workflow.persistence.DocumentRepository;
+ import java.time.Clock;
+ import java.time.Instant;
++import java.util.ArrayList;
+ import java.util.List;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -24,12 +25,9 @@ public class ArchiveService {
+ 
+   private static final Logger LOG = LoggerFactory.getLogger(ArchiveService.class);
+ 
+-  /** The statuses a review ends in. */
++  /** The statuses a review ends in at once; a rejection is final only after its window. */
+   private static final List<String> FINISHED =
+-      List.of(
+-          DocumentStatus.APPROVED.name(),
+-          DocumentStatus.WITHDRAWN.name(),
+-          DocumentStatus.REJECTED.name());
++      List.of(DocumentStatus.APPROVED.name(), DocumentStatus.WITHDRAWN.name());
+ 
+   private final DocumentRepository documents;
+   private final WorkflowConfig config;
+@@ -45,8 +43,19 @@ public class ArchiveService {
+   @Transactional
+   public int archiveFinished() {
+     WorkflowConfig.Retention retention = config.retention();
+-    Instant cutoff = clock.instant().minus(retention.finishedAfter());
+-    List<Document> due = documents.lockArchivable(FINISHED, cutoff, retention.batchSize());
++    Instant now = clock.instant();
++    Instant cutoff = now.minus(retention.finishedAfter());
++    Instant windowClosed = now.minus(retention.resubmitWindow());
++    Instant rejectedCutoff = cutoff.isBefore(windowClosed) ? cutoff : windowClosed;
++    List<Document> due =
++        new ArrayList<>(documents.lockArchivable(FINISHED, cutoff, retention.batchSize()));
++    if (due.size() < retention.batchSize()) {
++      due.addAll(
++          documents.lockArchivable(
++              List.of(DocumentStatus.REJECTED.name()),
++              rejectedCutoff,
++              retention.batchSize() - due.size()));
++    }
+     for (Document document : due) {
+       DocumentStateMachine.archive(document);
+     }

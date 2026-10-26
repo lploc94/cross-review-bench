@@ -1,0 +1,51 @@
+diff --git a/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java b/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java
+index d884bad..73be2f3 100644
+--- a/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java
++++ b/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java
+@@ -4,10 +4,22 @@ import com.innkeep.booking.domain.PromoCode;
+ import java.util.List;
+ import java.util.Optional;
+ import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
+ 
+ public interface PromoCodeRepository extends JpaRepository<PromoCode, Long> {
+ 
+   Optional<PromoCode> findByPropertyIdAndCode(long propertyId, String code);
+ 
+   List<PromoCode> findByPropertyIdOrderByCodeAsc(long propertyId);
++
++  /** Takes one use in a single conditional statement; 0 when none is left. */
++  @Modifying(flushAutomatically = true)
++  @Query("update PromoCode p set p.uses = p.uses + 1 where p.id = :id and p.uses < p.maxUses")
++  int takeUse(@Param("id") long id);
++
++  @Modifying(flushAutomatically = true)
++  @Query("update PromoCode p set p.uses = p.uses - 1 where p.id = :id and p.uses > 0")
++  int returnUse(@Param("id") long id);
+ }
+diff --git a/src/main/java/com/innkeep/booking/service/PromoService.java b/src/main/java/com/innkeep/booking/service/PromoService.java
+index 7ba7a95..edf17c4 100644
+--- a/src/main/java/com/innkeep/booking/service/PromoService.java
++++ b/src/main/java/com/innkeep/booking/service/PromoService.java
+@@ -113,16 +113,14 @@ public class PromoService {
+ 
+   /** Takes one use of the code for a confirmation, inside the confirmation's transaction. */
+   public void redeem(long promoCodeId) {
+-    PromoCode promo = byId(promoCodeId);
+-    if (!promo.hasUsesLeft()) {
+-      throw new PromoExhaustedException(promo.getCode());
++    if (promos.takeUse(promoCodeId) == 0) {
++      throw new PromoExhaustedException(byId(promoCodeId).getCode());
+     }
+-    promo.recordUse();
+   }
+ 
+   /** Gives the use of a cancelled reservation back, inside the cancellation's transaction. */
+   public void giveBack(long promoCodeId) {
+-    byId(promoCodeId).releaseUse();
++    promos.returnUse(promoCodeId);
+   }
+ 
+   private PromoCode byId(long promoCodeId) {

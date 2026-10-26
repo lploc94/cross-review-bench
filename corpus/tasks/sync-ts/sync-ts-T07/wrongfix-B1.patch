@@ -1,0 +1,20 @@
+diff --git a/packages/client/src/store/schema.ts b/packages/client/src/store/schema.ts
+index 7b22da0..20c9d02 100644
+--- a/packages/client/src/store/schema.ts
++++ b/packages/client/src/store/schema.ts
+@@ -95,9 +95,12 @@ export const CLIENT_MIGRATIONS: readonly SchemaMigration[] = [
+     // VACUUM, which gives the space of the dropped columns back, cannot run in a transaction.
+     transactional: false,
+     up: (db) => {
+-      db.exec(V2_FIELDS);
+-      copyFieldsToRows(db);
+-      db.exec("ALTER TABLE docs DROP COLUMN fields; ALTER TABLE docs DROP COLUMN field_hlcs;");
++      // All of the data steps or none of them: a row that cannot be moved leaves version 1 intact.
++      db.transaction(() => {
++        db.exec(V2_FIELDS);
++        copyFieldsToRows(db);
++        db.exec("ALTER TABLE docs DROP COLUMN fields; ALTER TABLE docs DROP COLUMN field_hlcs;");
++      }).immediate();
+       db.exec("VACUUM");
+     },
+   },

@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T05",
+  "repo": "jobqueue-go",
+  "kind": "buggy",
+  "title": "Bound the worker drain on shutdown",
+  "description": "On SIGTERM the service waits for every running handler with `Pool.Stop`, which has no deadline. Our orchestrator kills the container after its grace period, so a slow `http.post` or a long `sleep` job gets SIGKILLed mid-run: nothing records the attempt, and the job sits in `running` until its lease expires and the reaper hands it out again.\n\nThis adds `Pool.Shutdown(ctx)`:\n\n- It stops leasing and waits for the running handlers to return and for their outcomes to be recorded, like `Stop` did.\n- If `ctx` is done first, it cancels the contexts of the handlers that are still running, waits until each of them has returned and its outcome has been recorded, and returns `ctx`'s error. A cancelled attempt is recorded as a failed attempt (the handler sees `context.Canceled`), so the job is retried after `RETRY_DELAY` instead of waiting for the reaper.\n- Handlers now run under a context of their own, derived from the one given to `Start`, so cancelling them does not touch leasing or settling; outcomes are still recorded with `context.WithoutCancel` and `settleTimeout`.\n- `Stop()` is now `Shutdown(context.Background())`.\n- New setting `WORKER_DRAIN_TIMEOUT` (default `30s`, must be positive). `main` calls `Shutdown` with it after the HTTP server has shut down and before the database pool is closed, and logs a warning when jobs had to be cancelled.\n- README: lifecycle and configuration table.\n\nTests: `Shutdown` returning nil once the handlers are done, cancelling two running handlers after the deadline (both attempts recorded as retries with a live context), `Shutdown` before `Start`, and the new setting's default and validation.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/worker/pool.go",
+      "lines": [186, 190],
+      "category": "concurrency",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "When ctx is done, Shutdown cancels the handlers' contexts and returns at once instead of waiting for the worker goroutines (the drained channel) as its doc comment and the description promise. main then closes the database pool (deferred pool.Close in run) and the process exits while handlers are still returning, so their outcomes are never recorded: the cancelled jobs stay running until the reaper requeues them after the lease expires, and they are run again.",
+      "trigger": "Shutdown with a drain deadline that passes while a handler is running and that handler needs some time to return after its context is cancelled: Shutdown returns before Fail/OnSettled for that job.",
+      "testable": true,
+      "hidden_tests": ["internal/worker/drain_settle_test.go"],
+      "hidden_test_cmd": "go test -count=1 -run '^TestPoolShutdownWaitsForCancelledHandlerToSettle$' ./internal/worker/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Shutdown does not have to wait after cancelling: run records the outcome with context.WithoutCancel(p.ctx) and settleTimeout (internal/worker/pool.go), so every cancelled attempt is still settled in the store even after Shutdown has returned.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

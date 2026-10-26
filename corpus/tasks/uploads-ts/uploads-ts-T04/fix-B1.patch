@@ -1,0 +1,14 @@
+diff --git a/src/services/urlSigner.ts b/src/services/urlSigner.ts
+index d9db7ab..d87b553 100644
+--- a/src/services/urlSigner.ts
++++ b/src/services/urlSigner.ts
+@@ -45,8 +45,7 @@ export class UrlSigner {
+ 
+   /** Whether `signature` is the one signUpload gives for exactly this grant. */
+   verifyUpload(grant: UploadGrant, signature: string): boolean {
+-    const expected = this.signUpload(grant);
+-    return signature === expected;
++    return this.verify(uploadPayload(grant), signature);
+   }
+ }
+ 

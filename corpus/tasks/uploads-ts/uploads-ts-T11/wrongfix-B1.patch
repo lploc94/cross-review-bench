@@ -1,0 +1,14 @@
+diff --git a/src/services/fileCatalog.ts b/src/services/fileCatalog.ts
+index 7e95679..ea0faae 100644
+--- a/src/services/fileCatalog.ts
++++ b/src/services/fileCatalog.ts
+@@ -121,7 +121,8 @@ export class FileCatalog {
+         image: stored.content.image,
+         createdAt: now,
+       });
+-      return { file, replaced, deduplicated: twin !== null };
++      // Only report sharing within the tenant: another tenant must not learn that it has these bytes.
++      return { file, replaced, deduplicated: twin !== null && twin.tenantId === stored.tenantId };
+     } catch (err) {
+       // Another upload created a file at this path after the lookup above.
+       if (isUniqueViolation(err, LIVE_PATH_INDEX)) throw new PathConflictError(stored.path);

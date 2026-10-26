@@ -1,0 +1,11 @@
+diff --git a/src/pager.js b/src/pager.js
+index 960956b..9fcb350 100644
+--- a/src/pager.js
++++ b/src/pager.js
+@@ -10,5 +10,5 @@ export function paginate(items, page, size) {
+ /** Number of pages needed to show all `items`, `size` per page. */
+ export function pageCount(items, size) {
+   if (!Number.isInteger(size) || size <= 0) throw new RangeError("size must be a positive integer");
+-  return Math.floor(items.length / size);
++  return Math.ceil(items.length / size);
+ }

@@ -1,0 +1,668 @@
+diff --git a/README.md b/README.md
+index fe11f01..3d54e81 100644
+--- a/README.md
++++ b/README.md
+@@ -20,6 +20,13 @@ Flyway and PostgreSQL.
+   an approval approves the step, a rejection rejects it. `ALL_OF` needs every member to approve.
+   `QUORUM` needs a number of members to approve and rejects once that number can no longer be
+   reached. The remaining open tasks of a decided step are cancelled.
++- **Rejection reasons.** A definition may list rejection reasons, each a code (upper-case
++  letters, digits and underscores, up to 40) with a label, at most 20, set while it is a draft and
++  copied when it is revised. A rejection on a document whose definition lists reasons must name
++  one of the codes in `reason` (compared without case); a missing or unknown code is refused with
++  400 `invalid-reason`, and so is a `reason` on an approval or on a definition without reasons.
++  The code is kept on the task, shown with the task in the document's rounds, and written to the
++  decision's audit row.
+ - **Documents.** Statuses are `DRAFT`, `IN_REVIEW`, `APPROVED`, `REJECTED` and `WITHDRAWN`. The
+   owner submits a draft, withdraws a document under review, and resubmits a rejected one, which
+   starts a new round. Earlier rounds and their decisions stay on record.
+@@ -145,7 +152,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `GET /tasks/mine`, `GET /tasks/mine/count` | my open tasks, most urgent first, and how many |
+ | `GET /tasks/decided?cursor=&size=` | tasks I decided (approved or rejected), and only those |
+ | `GET /tasks/{id}` | one task (its assignee, or anyone who can see its document) |
+-| `POST /tasks/{id}/decision` | approve or reject, with an optional comment |
++| `POST /tasks/{id}/decision` | approve or reject, with an optional comment and, for a rejection, the `reason` code the definition requires |
+ | `GET /definitions?name=`, `GET /definitions/{id}` | published definitions |
+ | `GET /users/me`, `GET /users/me/tokens`, `POST /users/me/tokens/revoke` | my profile, my token prefixes, sign out everywhere |
+ | `GET /notifications/mine?cursor=&size=` | notifications addressed to my account: event, status and times, never the payload or address |
+@@ -164,6 +171,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `PUT`, `DELETE /admin/groups/{id}/members/{userId}` | membership |
+ | `POST /admin/definitions` (201), `GET /admin/definitions?name=`, `GET /admin/definitions/{id}` | create a draft, list every version, read one |
+ | `POST /admin/definitions/{id}/steps`, `PUT`, `DELETE /admin/definitions/{id}/steps/{stepId}` | add, replace and remove steps of a draft (409 once published) |
++| `PUT /admin/definitions/{id}/rejection-reasons` | replace a draft's rejection reasons, `{"reasons":[{"code":"MISSING_RECEIPTS","label":"..."}]}` (409 once published) |
+ | `DELETE /admin/definitions/{id}` | discard a draft (409 once published) |
+ | `POST /admin/definitions/{id}/publish` | publish a draft |
+ | `POST /admin/definitions/{id}/revise` (201) | start the next version of a published definition as a draft with the same steps |
+@@ -177,7 +185,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ 
+ Problems follow RFC 9457: `type` is `urn:workflow:problem:<slug>`, and a document the caller may not see is
+ reported as not found. The slugs a client can meet are `invalid-request`, `malformed-request`,
+-`validation-failed`, `not-found`, `no-such-route`, `forbidden`, `invalid-transition`, `conflict`,
++`validation-failed`, `invalid-reason`, `not-found`, `no-such-route`, `forbidden`, `invalid-transition`, `conflict`,
+ `concurrent-update`, `unauthorized`, `ambiguous-path`, `method-not-allowed`, `unsupported-media-type`,
+ `not-acceptable` and `unexpected`.
+ 
+diff --git a/src/main/java/com/papertrail/workflow/api/AdminController.java b/src/main/java/com/papertrail/workflow/api/AdminController.java
+index 59fd529..53b5247 100644
+--- a/src/main/java/com/papertrail/workflow/api/AdminController.java
++++ b/src/main/java/com/papertrail/workflow/api/AdminController.java
+@@ -4,12 +4,14 @@ import com.papertrail.workflow.api.dto.Requests.CreateDefinitionRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateGroupRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateStepRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateUserRequest;
++import com.papertrail.workflow.api.dto.Requests.RejectionReasonsRequest;
+ import com.papertrail.workflow.api.dto.Requests.UpdateUserRequest;
+ import com.papertrail.workflow.api.dto.Responses.CountResponse;
+ import com.papertrail.workflow.api.dto.Responses.IdResponse;
+ import com.papertrail.workflow.api.dto.Responses.JobRunResponse;
+ import com.papertrail.workflow.api.dto.Responses.TokenResponse;
+ import com.papertrail.workflow.domain.OutboxStatus;
++import com.papertrail.workflow.domain.RejectionReason;
+ import com.papertrail.workflow.integration.OutboxDispatchJob;
+ import com.papertrail.workflow.integration.OutboxDispatcher.DispatchResult;
+ import com.papertrail.workflow.integration.SlaEscalationJob;
+@@ -201,6 +203,18 @@ public class AdminController {
+     return definitions.view(id);
+   }
+ 
++  /** Replaces the reasons a rejection must name on a draft; an empty list removes them. */
++  @PutMapping("/definitions/{id}/rejection-reasons")
++  public DefinitionView replaceRejectionReasons(
++      @PathVariable long id, @Valid @RequestBody RejectionReasonsRequest request) {
++    List<RejectionReason> reasons =
++        request.reasons().stream()
++            .map(reason -> new RejectionReason(reason.code(), reason.label()))
++            .toList();
++    definitions.replaceRejectionReasons(id, reasons);
++    return definitions.view(id);
++  }
++
+   @PostMapping("/definitions/{id}/revise")
+   public ResponseEntity<IdResponse> revise(@PathVariable long id) {
+     long draft = definitions.revise(id);
+diff --git a/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java b/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java
+index 7e9360a..d3e5479 100644
+--- a/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java
++++ b/src/main/java/com/papertrail/workflow/api/ApiExceptionHandler.java
+@@ -2,6 +2,7 @@ package com.papertrail.workflow.api;
+ 
+ import com.papertrail.workflow.domain.ConflictException;
+ import com.papertrail.workflow.domain.ForbiddenException;
++import com.papertrail.workflow.domain.InvalidReasonException;
+ import com.papertrail.workflow.domain.InvalidTransitionException;
+ import com.papertrail.workflow.domain.NotFoundException;
+ import com.papertrail.workflow.domain.ValidationException;
+@@ -62,6 +63,11 @@ public class ApiExceptionHandler {
+     return problem(HttpStatus.CONFLICT, "conflict", "Conflict", e.getMessage());
+   }
+ 
++  @ExceptionHandler(InvalidReasonException.class)
++  public ProblemDetail invalidReason(InvalidReasonException e) {
++    return problem(HttpStatus.BAD_REQUEST, "invalid-reason", "Invalid reason", e.getMessage());
++  }
++
+   @ExceptionHandler(ValidationException.class)
+   public ProblemDetail invalid(ValidationException e) {
+     return problem(HttpStatus.BAD_REQUEST, "invalid-request", "Invalid request", e.getMessage());
+diff --git a/src/main/java/com/papertrail/workflow/api/TaskController.java b/src/main/java/com/papertrail/workflow/api/TaskController.java
+index a777b41..a75ce4d 100644
+--- a/src/main/java/com/papertrail/workflow/api/TaskController.java
++++ b/src/main/java/com/papertrail/workflow/api/TaskController.java
+@@ -56,6 +56,6 @@ public class TaskController {
+   @PostMapping("/{id}/decision")
+   public TaskView decide(@PathVariable long id, @Valid @RequestBody DecisionRequest request) {
+     Principal actor = current.require();
+-    return approvals.decide(actor, id, request.decision(), request.comment());
++    return approvals.decide(actor, id, request.decision(), request.comment(), request.reason());
+   }
+ }
+diff --git a/src/main/java/com/papertrail/workflow/api/dto/Requests.java b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+index 9bf7430..24b05cb 100644
+--- a/src/main/java/com/papertrail/workflow/api/dto/Requests.java
++++ b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+@@ -44,7 +44,16 @@ public final class Requests {
+   public record UpdateDocumentRequest(
+       @NotBlank @Size(max = 200) String title, @NotBlank @Size(max = 10_000) String body) {}
+ 
+-  public record DecisionRequest(@NotNull Decision decision, @Size(max = 1000) String comment) {}
++  public record DecisionRequest(
++      @NotNull Decision decision,
++      @Size(max = 1000) String comment,
++      @Size(max = 40) String reason) {}
++
++  public record RejectionReasonRequest(
++      @NotBlank @Size(max = 40) String code, @NotBlank @Size(max = 120) String label) {}
++
++  public record RejectionReasonsRequest(
++      @NotNull @Size(max = 20) List<@NotNull @Valid RejectionReasonRequest> reasons) {}
+ 
+   public record GrantPermissionRequest(@NotNull PermissionLevel level) {}
+ 
+diff --git a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+index a8a64ae..47c33bc 100644
+--- a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
++++ b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+@@ -66,6 +66,9 @@ public class ApprovalTask extends AbstractEntity<Long> {
+   @Column(name = "escalated_at")
+   private Instant escalatedAt;
+ 
++  @Column(name = "rejection_reason", length = 40)
++  private String rejectionReason;
++
+   @Version private Long version;
+ 
+   protected ApprovalTask() {}
+@@ -85,7 +88,8 @@ public class ApprovalTask extends AbstractEntity<Long> {
+     return status == TaskStatus.OPEN;
+   }
+ 
+-  public void decide(Decision decision, String comment, Instant now) {
++  /** Records the decision; {@code reason} is the code of a rejection reason, or null. */
++  public void decide(Decision decision, String comment, RejectionReason reason, Instant now) {
+     if (!isOpen()) {
+       throw new ConflictException("task " + id + " is " + status + ", not open");
+     }
+@@ -96,6 +100,7 @@ public class ApprovalTask extends AbstractEntity<Long> {
+     this.status = decision == Decision.APPROVE ? TaskStatus.APPROVED : TaskStatus.REJECTED;
+     this.decidedAt = now;
+     this.decisionComment = trimmed;
++    this.rejectionReason = reason == null ? null : reason.code();
+   }
+ 
+   /** Closes a task that is no longer needed because its step was decided without it. */
+@@ -149,4 +154,8 @@ public class ApprovalTask extends AbstractEntity<Long> {
+   public Instant getEscalatedAt() {
+     return escalatedAt;
+   }
++
++  public String getRejectionReason() {
++    return rejectionReason;
++  }
+ }
+diff --git a/src/main/java/com/papertrail/workflow/domain/InvalidReasonException.java b/src/main/java/com/papertrail/workflow/domain/InvalidReasonException.java
+new file mode 100644
+index 0000000..4d8aa3a
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/domain/InvalidReasonException.java
+@@ -0,0 +1,9 @@
++package com.papertrail.workflow.domain;
++
++/** A decision names a rejection reason it may not carry. */
++public class InvalidReasonException extends ValidationException {
++
++  public InvalidReasonException(String message) {
++    super(message);
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/domain/RejectionReason.java b/src/main/java/com/papertrail/workflow/domain/RejectionReason.java
+new file mode 100644
+index 0000000..50a3dfe
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/domain/RejectionReason.java
+@@ -0,0 +1,22 @@
++package com.papertrail.workflow.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Embeddable;
++import java.util.regex.Pattern;
++
++/** A reason a definition offers for rejecting its documents: a stable code and a label. */
++@Embeddable
++public record RejectionReason(
++    @Column(nullable = false, length = 40) String code,
++    @Column(nullable = false, length = 120) String label) {
++
++  private static final Pattern CODE = Pattern.compile("[A-Z][A-Z0-9_]{0,39}");
++
++  public RejectionReason {
++    if (code == null || !CODE.matcher(code).matches()) {
++      throw new ValidationException(
++          "a rejection reason code is 1 to 40 upper-case letters, digits or underscores");
++    }
++    label = AppUser.requireText(label, "label", 120);
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/domain/WorkflowDefinition.java b/src/main/java/com/papertrail/workflow/domain/WorkflowDefinition.java
+index 0d7527d..bf0acf5 100644
+--- a/src/main/java/com/papertrail/workflow/domain/WorkflowDefinition.java
++++ b/src/main/java/com/papertrail/workflow/domain/WorkflowDefinition.java
+@@ -1,19 +1,27 @@
+ package com.papertrail.workflow.domain;
+ 
+ import jakarta.persistence.CascadeType;
++import jakarta.persistence.CollectionTable;
+ import jakarta.persistence.Column;
++import jakarta.persistence.ElementCollection;
+ import jakarta.persistence.Entity;
+ import jakarta.persistence.GeneratedValue;
+ import jakarta.persistence.GenerationType;
+ import jakarta.persistence.Id;
++import jakarta.persistence.JoinColumn;
+ import jakarta.persistence.OneToMany;
+ import jakarta.persistence.OrderBy;
++import jakarta.persistence.OrderColumn;
+ import jakarta.persistence.Table;
+ import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.Comparator;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.OptionalInt;
++import java.util.Set;
++import org.hibernate.annotations.Fetch;
++import org.hibernate.annotations.FetchMode;
+ 
+ /**
+  * A versioned approval route. A draft takes steps; publishing freezes it, and each document keeps
+@@ -23,6 +31,8 @@ import java.util.OptionalInt;
+ @Table(name = "workflow_definition")
+ public class WorkflowDefinition extends AbstractEntity<Long> {
+ 
++  static final int MAX_REJECTION_REASONS = 20;
++
+   @Id
+   @GeneratedValue(strategy = GenerationType.IDENTITY)
+   private Long id;
+@@ -46,6 +56,14 @@ public class WorkflowDefinition extends AbstractEntity<Long> {
+   @OrderBy("stepOrder ASC, id ASC")
+   private List<StepDefinition> steps = new ArrayList<>();
+ 
++  @ElementCollection
++  @CollectionTable(
++      name = "definition_rejection_reason",
++      joinColumns = @JoinColumn(name = "definition_id"))
++  @OrderColumn(name = "position")
++  @Fetch(FetchMode.SUBSELECT)
++  private List<RejectionReason> rejectionReasons = new ArrayList<>();
++
+   protected WorkflowDefinition() {}
+ 
+   public WorkflowDefinition(String name, int version, Instant createdAt) {
+@@ -64,6 +82,26 @@ public class WorkflowDefinition extends AbstractEntity<Long> {
+     return step;
+   }
+ 
++  /**
++   * Replaces the reasons a rejection must name. An empty list lets rejections go without a reason,
++   * as before. Only a draft takes them; codes are unique within the definition.
++   */
++  public void replaceRejectionReasons(List<RejectionReason> reasons) {
++    requireDraft();
++    if (reasons.size() > MAX_REJECTION_REASONS) {
++      throw new ValidationException(
++          "a definition lists at most " + MAX_REJECTION_REASONS + " rejection reasons");
++    }
++    Set<String> codes = new HashSet<>();
++    for (RejectionReason reason : reasons) {
++      if (!codes.add(reason.code())) {
++        throw new ValidationException("rejection reason " + reason.code() + " is listed twice");
++      }
++    }
++    rejectionReasons.clear();
++    rejectionReasons.addAll(reasons);
++  }
++
+   /** Freezes the definition. It must have at least one step and must not be published yet. */
+   public void publish(Instant now) {
+     requireDraft();
+@@ -130,6 +168,10 @@ public class WorkflowDefinition extends AbstractEntity<Long> {
+     return steps.stream().sorted(Comparator.comparingInt(StepDefinition::getStepOrder)).toList();
+   }
+ 
++  public List<RejectionReason> getRejectionReasons() {
++    return List.copyOf(rejectionReasons);
++  }
++
+   /** Removes a step from a draft. Its assignments go with it. */
+   public void removeStep(long stepId) {
+     requireDraft();
+diff --git a/src/main/java/com/papertrail/workflow/service/ApprovalService.java b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+index f2243ed..6184a28 100644
+--- a/src/main/java/com/papertrail/workflow/service/ApprovalService.java
++++ b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+@@ -6,8 +6,10 @@ import com.papertrail.workflow.domain.BusinessCalendar;
+ import com.papertrail.workflow.domain.Decision;
+ import com.papertrail.workflow.domain.Document;
+ import com.papertrail.workflow.domain.DocumentStateMachine;
++import com.papertrail.workflow.domain.InvalidReasonException;
+ import com.papertrail.workflow.domain.NotFoundException;
+ import com.papertrail.workflow.domain.Principal;
++import com.papertrail.workflow.domain.RejectionReason;
+ import com.papertrail.workflow.domain.StepDefinition;
+ import com.papertrail.workflow.domain.StepKind;
+ import com.papertrail.workflow.domain.StepRules;
+@@ -17,7 +19,9 @@ import com.papertrail.workflow.service.Views.TaskView;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.util.Comparator;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.OptionalInt;
+ import org.springframework.stereotype.Service;
+@@ -52,6 +56,16 @@ public class ApprovalService {
+ 
+   @Transactional
+   public TaskView decide(Principal actor, long taskId, Decision decision, String comment) {
++    return decide(actor, taskId, decision, comment, null);
++  }
++
++  /**
++   * Records a decision. A rejection on a document whose definition lists rejection reasons names
++   * one of their codes; any other decision carries none.
++   */
++  @Transactional
++  public TaskView decide(
++      Principal actor, long taskId, Decision decision, String comment, String reasonCode) {
+     long documentId =
+         tasks
+             .findDocumentId(taskId)
+@@ -61,13 +75,15 @@ public class ApprovalService {
+         tasks.findById(taskId).orElseThrow(() -> new NotFoundException("task not found"));
+     Instant now = clock.instant();
+     DocumentStateMachine.requireDecidable(document, task, actor);
+-    task.decide(decision, comment, now);
+-    events.audit(
+-        document,
+-        actor.userId(),
+-        "TASK_" + decision,
+-        Map.of("taskId", taskId, "order", task.getStepOrder()),
+-        now);
++    RejectionReason reason = reasonFor(document, decision, reasonCode);
++    task.decide(decision, comment, reason, now);
++    Map<String, Object> details = new HashMap<>();
++    details.put("taskId", taskId);
++    details.put("order", task.getStepOrder());
++    if (reason != null) {
++      details.put("reason", reason.code());
++    }
++    events.audit(document, actor.userId(), "TASK_" + decision, details, now);
+ 
+     StepDefinition step = task.getStep();
+     List<ApprovalTask> order =
+@@ -153,6 +169,22 @@ public class ApprovalService {
+     events.audit(document, actor.userId(), "ADVANCED", Map.of("order", next.getAsInt()), now);
+   }
+ 
++  /** The definition's reason a rejection names, or null when the decision carries none. */
++  private static RejectionReason reasonFor(Document document, Decision decision, String code) {
++    List<RejectionReason> reasons = document.getDefinition().getRejectionReasons();
++    if (decision == Decision.APPROVE || reasons.isEmpty()) {
++      if (code != null) {
++        throw new InvalidReasonException("this decision does not take a rejection reason");
++      }
++      return null;
++    }
++    String wanted = code.strip().toUpperCase(Locale.ROOT);
++    return reasons.stream()
++        .filter(reason -> reason.code().equals(wanted))
++        .findFirst()
++        .orElseThrow(() -> new IllegalArgumentException("no rejection reason " + wanted));
++  }
++
+   /** A single step names its approver; a group step takes its active members, by id. */
+   private static List<AppUser> assigneesOf(StepDefinition step) {
+     if (step.getKind() == StepKind.SINGLE) {
+diff --git a/src/main/java/com/papertrail/workflow/service/DefinitionService.java b/src/main/java/com/papertrail/workflow/service/DefinitionService.java
+index d0289c2..5218006 100644
+--- a/src/main/java/com/papertrail/workflow/service/DefinitionService.java
++++ b/src/main/java/com/papertrail/workflow/service/DefinitionService.java
+@@ -3,6 +3,7 @@ package com.papertrail.workflow.service;
+ import com.papertrail.workflow.domain.AppUser;
+ import com.papertrail.workflow.domain.ConflictException;
+ import com.papertrail.workflow.domain.NotFoundException;
++import com.papertrail.workflow.domain.RejectionReason;
+ import com.papertrail.workflow.domain.StepDefinition;
+ import com.papertrail.workflow.domain.UserGroup;
+ import com.papertrail.workflow.domain.WorkflowDefinition;
+@@ -102,6 +103,12 @@ public class DefinitionService {
+     addStepTo(definition, step);
+   }
+ 
++  /** Replaces the rejection reasons of a draft; a published definition refuses it. */
++  @Transactional
++  public void replaceRejectionReasons(long definitionId, List<RejectionReason> reasons) {
++    get(definitionId).replaceRejectionReasons(reasons);
++  }
++
+   /** Removes a step from a draft. */
+   @Transactional
+   public void removeStep(long definitionId, long stepId) {
+@@ -130,6 +137,7 @@ public class DefinitionService {
+           step.getQuorum(),
+           (int) step.getSla().toMinutes());
+     }
++    draft.replaceRejectionReasons(published.getRejectionReasons());
+     return definitions.save(draft).getId();
+   }
+ 
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..0d24ac8 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -10,6 +10,7 @@ import com.papertrail.workflow.domain.DocumentStatus;
+ import com.papertrail.workflow.domain.OutboxEvent;
+ import com.papertrail.workflow.domain.OutboxStatus;
+ import com.papertrail.workflow.domain.PermissionLevel;
++import com.papertrail.workflow.domain.RejectionReason;
+ import com.papertrail.workflow.domain.StepDefinition;
+ import com.papertrail.workflow.domain.StepKind;
+ import com.papertrail.workflow.domain.TaskStatus;
+@@ -76,6 +77,7 @@ public final class Views {
+       Instant dueAt,
+       Instant decidedAt,
+       String decisionComment,
++      String rejectionReason,
+       Instant escalatedAt) {
+ 
+     public static TaskView of(ApprovalTask task) {
+@@ -97,6 +99,7 @@ public final class Views {
+           task.getDueAt(),
+           task.getDecidedAt(),
+           task.getDecisionComment(),
++          task.getRejectionReason(),
+           escalatedAt);
+     }
+   }
+@@ -162,7 +165,8 @@ public final class Views {
+       int version,
+       boolean published,
+       Instant publishedAt,
+-      List<StepView> steps) {
++      List<StepView> steps,
++      List<RejectionReason> rejectionReasons) {
+ 
+     public static DefinitionView of(WorkflowDefinition definition) {
+       return new DefinitionView(
+@@ -171,7 +175,8 @@ public final class Views {
+           definition.getVersion(),
+           definition.isPublished(),
+           definition.getPublishedAt(),
+-          definition.getSteps().stream().map(StepView::of).toList());
++          definition.getSteps().stream().map(StepView::of).toList(),
++          definition.getRejectionReasons());
+     }
+   }
+ 
+diff --git a/src/main/resources/db/migration/V3__rejection_reasons.sql b/src/main/resources/db/migration/V3__rejection_reasons.sql
+new file mode 100644
+index 0000000..d9dee8b
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__rejection_reasons.sql
+@@ -0,0 +1,12 @@
++-- The reasons a rejection on a definition's documents must name, in the order they are listed.
++CREATE TABLE definition_rejection_reason (
++    definition_id BIGINT       NOT NULL REFERENCES workflow_definition (id) ON DELETE CASCADE,
++    position      INTEGER      NOT NULL CHECK (position >= 0),
++    code          VARCHAR(40)  NOT NULL,
++    label         VARCHAR(120) NOT NULL,
++    PRIMARY KEY (definition_id, position),
++    -- Checked at commit, so a replaced list may move a code to another position.
++    UNIQUE (definition_id, code) DEFERRABLE INITIALLY DEFERRED
++);
++
++ALTER TABLE approval_task ADD COLUMN rejection_reason VARCHAR(40);
+diff --git a/src/test/java/com/papertrail/workflow/api/RejectionReasonApiTest.java b/src/test/java/com/papertrail/workflow/api/RejectionReasonApiTest.java
+new file mode 100644
+index 0000000..5f7dfaf
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/RejectionReasonApiTest.java
+@@ -0,0 +1,157 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.service.DefinitionService;
++import com.papertrail.workflow.service.DocumentService;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++class RejectionReasonApiTest extends IntegrationTestBase {
++
++  private static final String AUTH = "Authorization";
++  private static final String REASONS =
++      "{\"reasons\":[{\"code\":\"MISSING_RECEIPTS\",\"label\":\"Receipts are missing\"},"
++          + "{\"code\":\"OVER_BUDGET\",\"label\":\"Over the approved budget\"}]}";
++
++  @Autowired private DefinitionService definitions;
++  @Autowired private DocumentService documents;
++
++  private long owner;
++  private long approver;
++  private long definition;
++
++  @BeforeEach
++  void setUp() throws Exception {
++    owner = data.user("Ines Berg");
++    approver = data.user("Tomas Vale");
++    definition =
++        definitions.createDraft(
++            "Expenses", List.of(TestData.step(1, StepKind.SINGLE, approver, null, 0, 480)));
++  }
++
++  private ResultActions putReasons(long definitionId, String body) throws Exception {
++    return mvc.perform(
++        put("/api/v1/admin/definitions/" + definitionId + "/rejection-reasons")
++            .header(AUTH, ADMIN_AUTH)
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(body));
++  }
++
++  private long submittedDocument() {
++    long id = data.draft(data.principal(owner), "Expenses", "Travel claim");
++    documents.submit(data.principal(owner), id);
++    return id;
++  }
++
++  private ResultActions decide(long taskId, String body) throws Exception {
++    return mvc.perform(
++        post("/api/v1/tasks/" + taskId + "/decision")
++            .header(AUTH, data.bearer(approver))
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(body));
++  }
++
++  @Test
++  void aDraftTakesReasonsAndShowsThemInOrder() throws Exception {
++    putReasons(definition, REASONS)
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.rejectionReasons.length()").value(2))
++        .andExpect(jsonPath("$.rejectionReasons[0].code").value("MISSING_RECEIPTS"))
++        .andExpect(jsonPath("$.rejectionReasons[1].label").value("Over the approved budget"));
++
++    putReasons(definition, "{\"reasons\":[{\"code\":\"OVER_BUDGET\",\"label\":\"Too much\"}]}")
++        .andExpect(jsonPath("$.rejectionReasons.length()").value(1))
++        .andExpect(jsonPath("$.rejectionReasons[0].code").value("OVER_BUDGET"));
++  }
++
++  @Test
++  void reasonsAreCheckedAndFrozenOnPublish() throws Exception {
++    putReasons(
++            definition,
++            "{\"reasons\":[{\"code\":\"LATE\",\"label\":\"a\"},{\"code\":\"LATE\",\"label\":\"b\"}]}")
++        .andExpect(status().isBadRequest());
++    putReasons(definition, "{\"reasons\":[{\"code\":\"not upper\",\"label\":\"a\"}]}")
++        .andExpect(status().isBadRequest());
++    putReasons(definition, "{\"reasons\":[{\"code\":\"LATE\"}]}")
++        .andExpect(status().isBadRequest());
++
++    definitions.publish(definition);
++
++    putReasons(definition, REASONS)
++        .andExpect(status().isConflict())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:conflict"));
++  }
++
++  @Test
++  void aRejectionRecordsItsReasonOnTheTaskAndInTheAudit() throws Exception {
++    putReasons(definition, REASONS).andExpect(status().isOk());
++    definitions.publish(definition);
++    long id = submittedDocument();
++
++    decide(taskOf(id, approver), "{\"decision\":\"REJECT\",\"reason\":\"over_budget\"}")
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.status").value("REJECTED"))
++        .andExpect(jsonPath("$.rejectionReason").value("OVER_BUDGET"));
++
++    mvc.perform(get("/api/v1/documents/" + id + "/rounds").header(AUTH, data.bearer(owner)))
++        .andExpect(jsonPath("$[0].tasks[0].rejectionReason").value("OVER_BUDGET"));
++    String details =
++        jdbc.queryForObject(
++            "select details from audit_event where document_id = ? and action = 'TASK_REJECT'",
++            String.class,
++            id);
++    assertThat(details).contains("\"reason\":\"OVER_BUDGET\"");
++  }
++
++  @Test
++  void anApprovalTakesNoReason() throws Exception {
++    putReasons(definition, REASONS).andExpect(status().isOk());
++    definitions.publish(definition);
++    long id = submittedDocument();
++
++    decide(taskOf(id, approver), "{\"decision\":\"APPROVE\",\"reason\":\"OVER_BUDGET\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:invalid-reason"));
++    decide(taskOf(id, approver), "{\"decision\":\"APPROVE\"}")
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.rejectionReason").isEmpty());
++  }
++
++  @Test
++  void aDefinitionWithoutReasonsRejectsAsBefore() throws Exception {
++    definitions.publish(definition);
++    long id = submittedDocument();
++
++    decide(taskOf(id, approver), "{\"decision\":\"REJECT\",\"reason\":\"OVER_BUDGET\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:invalid-reason"));
++    decide(taskOf(id, approver), "{\"decision\":\"REJECT\",\"comment\":\"Not this quarter\"}")
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.status").value("REJECTED"));
++  }
++
++  @Test
++  void aRevisionKeepsTheReasons() throws Exception {
++    putReasons(definition, REASONS).andExpect(status().isOk());
++    definitions.publish(definition);
++
++    long revised = definitions.revise(definition);
++
++    assertThat(definitions.view(revised).rejectionReasons())
++        .extracting(reason -> reason.code())
++        .containsExactly("MISSING_RECEIPTS", "OVER_BUDGET");
++  }
++}

@@ -1,0 +1,13 @@
+diff --git a/docs/scripts/publish_versioned_docs.py b/docs/scripts/publish_versioned_docs.py
+index 0a709ba..48a4abf 100644
+--- a/docs/scripts/publish_versioned_docs.py
++++ b/docs/scripts/publish_versioned_docs.py
+@@ -20,6 +20,8 @@ HOST_CONFIG = (
+     json.dumps(
+         {
+             "framework": None,
++            "buildCommand": "true",
++            "outputDirectory": ".",
+             "trailingSlash": True,
+             "headers": [
+                 {

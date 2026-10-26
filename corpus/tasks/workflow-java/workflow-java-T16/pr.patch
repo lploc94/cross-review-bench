@@ -1,0 +1,729 @@
+diff --git a/README.md b/README.md
+index fe11f01..1d9392c 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,17 @@ Flyway and PostgreSQL.
+   document keep their state, and no notification is written. An overdue task is escalated once,
+   and a decision made while the escalation runs is kept; the escalation timestamp is written
+   without touching the decision's version.
++- **Out of office.** A user can set an out-of-office period (two dates, both included, as days in
++  the business zone) and a substitute, another active user. A task activated for them on a day in
++  that period is created for the substitute instead, and `onBehalfOfId` on the task names the
++  absent user. The substitute holds the task as its assignee: they decide it, it counts for the
++  step like the absent user's would, its notifications and escalation go to them, and through it
++  they see the document, as any approver does. The substitute need not be an approver of the
++  definition. The absent user keeps the task when the substitute is the document's owner, is
++  inactive, is out of office that day too, or already holds a task of the same step (a group step
++  never gives one person two tasks). A substitute's own substitute is never used: delegation does
++  not chain. Only the activation day counts: tasks created before the period stay with the
++  assignee, and tasks the substitute took stay with them after it ends.
+ - **Permissions.** A user sees a document as its owner, as an approver of one of its tasks (current
+   or past), or as someone the owner granted `VIEW` or `COMMENT`. Admins see everything. Lists and
+   counts apply the same rule, so titles of documents a user cannot see never appear. A document
+@@ -148,6 +159,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `POST /tasks/{id}/decision` | approve or reject, with an optional comment |
+ | `GET /definitions?name=`, `GET /definitions/{id}` | published definitions |
+ | `GET /users/me`, `GET /users/me/tokens`, `POST /users/me/tokens/revoke` | my profile, my token prefixes, sign out everywhere |
++| `PUT /users/me/out-of-office`, `DELETE /users/me/out-of-office` | set `{"from", "until", "substituteId"}` (ending today or later, at most 365 days long and ending within 365 days), or clear it; my profile shows it as `outOfOffice` |
+ | `GET /notifications/mine?cursor=&size=` | notifications addressed to my account: event, status and times, never the payload or address |
+ | `GET /calendar/working-hours`, `GET /calendar/due?from=&minutes=` | the business calendar, and the due time of a working-time allowance |
+ 
+diff --git a/src/main/java/com/papertrail/workflow/api/UserController.java b/src/main/java/com/papertrail/workflow/api/UserController.java
+index 7873cee..9600123 100644
+--- a/src/main/java/com/papertrail/workflow/api/UserController.java
++++ b/src/main/java/com/papertrail/workflow/api/UserController.java
+@@ -1,12 +1,17 @@
+ package com.papertrail.workflow.api;
+ 
++import com.papertrail.workflow.api.dto.Requests.OutOfOfficeRequest;
+ import com.papertrail.workflow.service.IdentityService;
+ import com.papertrail.workflow.service.Views.TokenView;
+ import com.papertrail.workflow.service.Views.UserView;
++import jakarta.validation.Valid;
+ import java.util.List;
+ import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.DeleteMapping;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RestController;
+ 
+@@ -30,6 +35,18 @@ public class UserController {
+     return identity.view(current.require().userId());
+   }
+ 
++  /** Sets the caller's out-of-office period; tasks activated in it go to the substitute. */
++  @PutMapping("/out-of-office")
++  public UserView goAway(@Valid @RequestBody OutOfOfficeRequest request) {
++    return identity.goAway(
++        current.require().userId(), request.from(), request.until(), request.substituteId());
++  }
++
++  @DeleteMapping("/out-of-office")
++  public UserView comeBack() {
++    return identity.comeBack(current.require().userId());
++  }
++
+   @GetMapping("/tokens")
+   public List<TokenView> tokens() {
+     return identity.tokensOf(current.require().userId());
+diff --git a/src/main/java/com/papertrail/workflow/api/dto/Requests.java b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+index 9bf7430..486b1c7 100644
+--- a/src/main/java/com/papertrail/workflow/api/dto/Requests.java
++++ b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+@@ -11,6 +11,7 @@ import jakarta.validation.constraints.NotBlank;
+ import jakarta.validation.constraints.NotEmpty;
+ import jakarta.validation.constraints.NotNull;
+ import jakarta.validation.constraints.Size;
++import java.time.LocalDate;
+ import java.util.List;
+ 
+ /** Request bodies. Bean validation covers shape and range; the domain covers the rules. */
+@@ -46,6 +47,9 @@ public final class Requests {
+ 
+   public record DecisionRequest(@NotNull Decision decision, @Size(max = 1000) String comment) {}
+ 
++  public record OutOfOfficeRequest(
++      @NotNull LocalDate from, @NotNull LocalDate until, @NotNull Long substituteId) {}
++
+   public record GrantPermissionRequest(@NotNull PermissionLevel level) {}
+ 
+   public record UpdateUserRequest(
+diff --git a/src/main/java/com/papertrail/workflow/domain/AppUser.java b/src/main/java/com/papertrail/workflow/domain/AppUser.java
+index a572b39..d982250 100644
+--- a/src/main/java/com/papertrail/workflow/domain/AppUser.java
++++ b/src/main/java/com/papertrail/workflow/domain/AppUser.java
+@@ -6,13 +6,24 @@ import jakarta.persistence.GeneratedValue;
+ import jakarta.persistence.GenerationType;
+ import jakarta.persistence.Id;
+ import jakarta.persistence.Table;
++import java.time.LocalDate;
++import java.time.temporal.ChronoUnit;
+ import java.util.Locale;
+-
+-/** A person who signs in with an API token and may own, review or approve documents. */
++import org.hibernate.annotations.DynamicUpdate;
++
++/**
++ * A person who signs in with an API token and may own, review or approve documents.
++ *
++ * <p>Partial updates: a change writes only the columns it touches, so an admin editing the profile
++ * and the user setting an out-of-office period at the same time do not overwrite each other.
++ */
++@DynamicUpdate
+ @Entity
+ @Table(name = "app_user")
+ public class AppUser extends AbstractEntity<Long> {
+ 
++  static final int MAX_AWAY_DAYS = 365;
++
+   @Id
+   @GeneratedValue(strategy = GenerationType.IDENTITY)
+   private Long id;
+@@ -29,6 +40,15 @@ public class AppUser extends AbstractEntity<Long> {
+   @Column(nullable = false)
+   private boolean admin;
+ 
++  @Column(name = "away_from")
++  private LocalDate awayFrom;
++
++  @Column(name = "away_until")
++  private LocalDate awayUntil;
++
++  @Column(name = "substitute_id")
++  private Long substituteId;
++
+   protected AppUser() {}
+ 
+   public AppUser(String displayName, String email, boolean admin) {
+@@ -79,6 +99,55 @@ public class AppUser extends AbstractEntity<Long> {
+     return admin;
+   }
+ 
++  public LocalDate getAwayFrom() {
++    return awayFrom;
++  }
++
++  public LocalDate getAwayUntil() {
++    return awayUntil;
++  }
++
++  public Long getSubstituteId() {
++    return substituteId;
++  }
++
++  /** Whether {@code day} is inside the user's out-of-office period, both ends included. */
++  public boolean isAwayOn(LocalDate day) {
++    return awayFrom != null && !day.isBefore(awayFrom) && !day.isAfter(awayUntil);
++  }
++
++  /**
++   * Sets the out-of-office period and the substitute. The period may have started already but not
++   * ended, lasts at most {@value #MAX_AWAY_DAYS} days and ends within as many days from today.
++   */
++  public void goAway(LocalDate from, LocalDate until, AppUser substitute, LocalDate today) {
++    if (until.isBefore(from)) {
++      throw new ValidationException("until must not be before from");
++    }
++    if (until.isBefore(today)) {
++      throw new ValidationException("the out-of-office period has already ended");
++    }
++    if (ChronoUnit.DAYS.between(from, until) >= MAX_AWAY_DAYS
++        || until.isAfter(today.plusDays(MAX_AWAY_DAYS))) {
++      throw new ValidationException(
++          "an out-of-office period lasts at most "
++              + MAX_AWAY_DAYS
++              + " days and ends within as many");
++    }
++    if (substitute.getId().equals(id) || !substitute.isActive()) {
++      throw new ValidationException("the substitute must be another active user");
++    }
++    this.awayFrom = from;
++    this.awayUntil = until;
++    this.substituteId = substitute.getId();
++  }
++
++  public void comeBack() {
++    this.awayFrom = null;
++    this.awayUntil = null;
++    this.substituteId = null;
++  }
++
+   public void activate() {
+     this.active = true;
+   }
+diff --git a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+index a8a64ae..8ab894f 100644
+--- a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
++++ b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+@@ -66,17 +66,32 @@ public class ApprovalTask extends AbstractEntity<Long> {
+   @Column(name = "escalated_at")
+   private Instant escalatedAt;
+ 
++  @Column(name = "on_behalf_of_id")
++  private Long onBehalfOfId;
++
+   @Version private Long version;
+ 
+   protected ApprovalTask() {}
+ 
+   public ApprovalTask(
+       Document document, int round, StepDefinition step, AppUser assignee, Instant dueAt) {
++    this(document, round, step, assignee, null, dueAt);
++  }
++
++  /** A task held by {@code assignee} for the absent user {@code onBehalfOfId}, or null. */
++  public ApprovalTask(
++      Document document,
++      int round,
++      StepDefinition step,
++      AppUser assignee,
++      Long onBehalfOfId,
++      Instant dueAt) {
+     this.document = document;
+     this.round = round;
+     this.stepOrder = step.getStepOrder();
+     this.step = step;
+     this.assignee = assignee;
++    this.onBehalfOfId = onBehalfOfId;
+     this.status = TaskStatus.OPEN;
+     this.dueAt = dueAt;
+   }
+@@ -146,6 +161,10 @@ public class ApprovalTask extends AbstractEntity<Long> {
+     return decisionComment;
+   }
+ 
++  public Long getOnBehalfOfId() {
++    return onBehalfOfId;
++  }
++
+   public Instant getEscalatedAt() {
+     return escalatedAt;
+   }
+diff --git a/src/main/java/com/papertrail/workflow/domain/BusinessCalendar.java b/src/main/java/com/papertrail/workflow/domain/BusinessCalendar.java
+index 46e4180..c2ae337 100644
+--- a/src/main/java/com/papertrail/workflow/domain/BusinessCalendar.java
++++ b/src/main/java/com/papertrail/workflow/domain/BusinessCalendar.java
+@@ -33,6 +33,11 @@ public final class BusinessCalendar {
+     this.end = end;
+   }
+ 
++  /** The calendar date at {@code moment} in the calendar's zone. */
++  public LocalDate dateAt(Instant moment) {
++    return moment.atZone(zone).toLocalDate();
++  }
++
+   /** The instant when {@code workingTime} of working hours has passed after {@code from}. */
+   public Instant dueAt(Instant from, Duration workingTime) {
+     if (workingTime.isNegative() || workingTime.isZero()) {
+diff --git a/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java b/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java
+index e78dbb5..ac37d1b 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java
++++ b/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java
+@@ -1,10 +1,14 @@
+ package com.papertrail.workflow.persistence;
+ 
+ import com.papertrail.workflow.domain.AppUser;
++import jakarta.persistence.LockModeType;
+ import java.util.List;
+ import java.util.Optional;
+ import org.springframework.data.domain.Pageable;
+ import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Lock;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
+ 
+ public interface AppUserRepository extends JpaRepository<AppUser, Long> {
+ 
+@@ -15,4 +19,8 @@ public interface AppUserRepository extends JpaRepository<AppUser, Long> {
+   long countByActive(boolean active);
+ 
+   Optional<AppUser> findByEmail(String email);
++
++  @Lock(LockModeType.PESSIMISTIC_WRITE)
++  @Query("select u from AppUser u where u.id = :id")
++  Optional<AppUser> lockById(@Param("id") long id);
+ }
+diff --git a/src/main/java/com/papertrail/workflow/service/ApprovalService.java b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+index f2243ed..a0953d4 100644
+--- a/src/main/java/com/papertrail/workflow/service/ApprovalService.java
++++ b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+@@ -12,14 +12,19 @@ import com.papertrail.workflow.domain.StepDefinition;
+ import com.papertrail.workflow.domain.StepKind;
+ import com.papertrail.workflow.domain.StepRules;
+ import com.papertrail.workflow.domain.TaskStatus;
++import com.papertrail.workflow.persistence.AppUserRepository;
+ import com.papertrail.workflow.persistence.ApprovalTaskRepository;
+ import com.papertrail.workflow.service.Views.TaskView;
+ import java.time.Clock;
+ import java.time.Instant;
++import java.time.LocalDate;
+ import java.util.Comparator;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.OptionalInt;
++import java.util.Set;
++import java.util.TreeMap;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+@@ -32,6 +37,7 @@ import org.springframework.transaction.annotation.Transactional;
+ public class ApprovalService {
+ 
+   private final ApprovalTaskRepository tasks;
++  private final AppUserRepository users;
+   private final DocumentAccess access;
+   private final EventLog events;
+   private final BusinessCalendar calendar;
+@@ -39,11 +45,13 @@ public class ApprovalService {
+ 
+   public ApprovalService(
+       ApprovalTaskRepository tasks,
++      AppUserRepository users,
+       DocumentAccess access,
+       EventLog events,
+       BusinessCalendar calendar,
+       Clock clock) {
+     this.tasks = tasks;
++    this.users = users;
+     this.access = access;
+     this.events = events;
+     this.calendar = calendar;
+@@ -111,25 +119,57 @@ public class ApprovalService {
+ 
+   /**
+    * Creates the open tasks for the document's current order and round, in the caller's transaction.
++   * An assignee who is out of office today has the task created for their substitute instead (see
++   * {@link #holderOf}).
+    */
+   public void activate(Document document, Instant now) {
++    LocalDate today = calendar.dateAt(now);
+     for (StepDefinition step : document.getDefinition().stepsAt(document.getCurrentOrder())) {
+       List<AppUser> assignees = assigneesOf(step);
+       StepRules.requireAssignable(step.getKind(), step.getQuorum(), assignees.size());
+       Instant due = calendar.dueAt(now, step.getSla());
++      Set<Long> holders = new HashSet<>();
++      assignees.forEach(assignee -> holders.add(assignee.getId()));
+       for (AppUser assignee : assignees) {
++        AppUser holder = holderOf(assignee, document, today, holders);
++        Long onBehalfOf = holder.getId().equals(assignee.getId()) ? null : assignee.getId();
+         ApprovalTask task =
+-            tasks.save(new ApprovalTask(document, document.getRound(), step, assignee, due));
+-        events.notify(
+-            "assigned:" + task.getId(),
+-            "TASK_ASSIGNED",
+-            assignee,
+-            Map.of("taskId", task.getId(), "documentId", document.getId(), "dueAt", due.toString()),
+-            now);
++            tasks.save(
++                new ApprovalTask(document, document.getRound(), step, holder, onBehalfOf, due));
++        Map<String, Object> payload = new TreeMap<>();
++        payload.put("taskId", task.getId());
++        payload.put("documentId", document.getId());
++        payload.put("dueAt", due.toString());
++        if (onBehalfOf != null) {
++          payload.put("onBehalfOf", onBehalfOf);
++        }
++        events.notify("assigned:" + task.getId(), "TASK_ASSIGNED", holder, payload, now);
+       }
+     }
+   }
+ 
++  /**
++   * Who takes an assignee's task: the assignee's substitute when the assignee is out of office
++   * today, and the substitute is active, is not out of office, is not the document's owner and does
++   * not already hold a task of this step; otherwise the assignee. A substitute's own substitute is
++   * never asked, so delegation does not chain.
++   */
++  private AppUser holderOf(
++      AppUser assignee, Document document, LocalDate today, Set<Long> holders) {
++    if (!assignee.isAwayOn(today)) {
++      return assignee;
++    }
++    AppUser substitute = users.findById(assignee.getSubstituteId()).orElse(null);
++    if (substitute == null
++        || !substitute.isActive()
++        || substitute.isAwayOn(today)
++        || document.isOwnedBy(substitute.getId())
++        || !holders.add(substitute.getId())) {
++      return assignee;
++    }
++    return substitute;
++  }
++
+   /** Closes every open task of the document; used when the owner withdraws it. */
+   public void cancelOpenTasks(long documentId) {
+     tasks.findForDocument(documentId).forEach(ApprovalTask::cancel);
+diff --git a/src/main/java/com/papertrail/workflow/service/IdentityService.java b/src/main/java/com/papertrail/workflow/service/IdentityService.java
+index 3b9efba..e117892 100644
+--- a/src/main/java/com/papertrail/workflow/service/IdentityService.java
++++ b/src/main/java/com/papertrail/workflow/service/IdentityService.java
+@@ -2,6 +2,7 @@ package com.papertrail.workflow.service;
+ 
+ import com.papertrail.workflow.domain.ApiToken;
+ import com.papertrail.workflow.domain.AppUser;
++import com.papertrail.workflow.domain.BusinessCalendar;
+ import com.papertrail.workflow.domain.ConflictException;
+ import com.papertrail.workflow.domain.NotFoundException;
+ import com.papertrail.workflow.domain.Principal;
+@@ -21,6 +22,7 @@ import java.security.NoSuchAlgorithmException;
+ import java.security.SecureRandom;
+ import java.time.Clock;
+ import java.time.Instant;
++import java.time.LocalDate;
+ import java.util.HexFormat;
+ import java.util.List;
+ import java.util.Optional;
+@@ -46,6 +48,7 @@ public class IdentityService {
+   private final UserGroupRepository groups;
+   private final ApiTokenRepository tokens;
+   private final StepDefinitionRepository steps;
++  private final BusinessCalendar calendar;
+   private final Clock clock;
+ 
+   public IdentityService(
+@@ -53,11 +56,13 @@ public class IdentityService {
+       UserGroupRepository groups,
+       ApiTokenRepository tokens,
+       StepDefinitionRepository steps,
++      BusinessCalendar calendar,
+       Clock clock) {
+     this.users = users;
+     this.groups = groups;
+     this.tokens = tokens;
+     this.steps = steps;
++    this.calendar = calendar;
+     this.clock = clock;
+   }
+ 
+@@ -123,6 +128,29 @@ public class IdentityService {
+     return UserView.of(user);
+   }
+ 
++  /**
++   * Sets the user's out-of-office period. Dates are days in the business zone; the substitute must
++   * be another active user. Tasks created before the period, or after it, are not affected.
++   */
++  @Transactional
++  public UserView goAway(long userId, LocalDate from, LocalDate until, long substituteId) {
++    AppUser user = lockUser(userId);
++    AppUser substitute =
++        users
++            .findById(substituteId)
++            .orElseThrow(
++                () -> new ValidationException("the substitute must be another active user"));
++    user.goAway(from, until, substitute, calendar.dateAt(clock.instant()));
++    return UserView.of(user);
++  }
++
++  @Transactional
++  public UserView comeBack(long userId) {
++    AppUser user = lockUser(userId);
++    user.comeBack();
++    return UserView.of(user);
++  }
++
+   /** Revokes every live token of a user, for a lost device or a suspected leak. */
+   @Transactional
+   public void revokeAllTokens(long userId) {
+@@ -250,6 +278,11 @@ public class IdentityService {
+     return users.findById(userId).orElseThrow(() -> new NotFoundException("user not found"));
+   }
+ 
++  /** The user row locked, so two period changes of one user apply one after the other. */
++  private AppUser lockUser(long userId) {
++    return users.lockById(userId).orElseThrow(() -> new NotFoundException("user not found"));
++  }
++
+   private UserGroup requireGroup(long groupId) {
+     return groups.findById(groupId).orElseThrow(() -> new NotFoundException("group not found"));
+   }
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..a012ea4 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -16,6 +16,7 @@ import com.papertrail.workflow.domain.TaskStatus;
+ import com.papertrail.workflow.domain.UserGroup;
+ import com.papertrail.workflow.domain.WorkflowDefinition;
+ import java.time.Instant;
++import java.time.LocalDate;
+ import java.time.LocalTime;
+ import java.util.Comparator;
+ import java.util.List;
+@@ -73,6 +74,7 @@ public final class Views {
+       TaskStatus status,
+       long assigneeId,
+       String assigneeName,
++      Long onBehalfOfId,
+       Instant dueAt,
+       Instant decidedAt,
+       String decisionComment,
+@@ -94,6 +96,7 @@ public final class Views {
+           task.getStatus(),
+           task.getAssignee().getId(),
+           task.getAssignee().getDisplayName(),
++          task.getOnBehalfOfId(),
+           task.getDueAt(),
+           task.getDecidedAt(),
+           task.getDecisionComment(),
+@@ -115,14 +118,33 @@ public final class Views {
+     }
+   }
+ 
+-  public record UserView(long id, String displayName, String email, boolean active, boolean admin) {
++  public record UserView(
++      long id,
++      String displayName,
++      String email,
++      boolean active,
++      boolean admin,
++      OutOfOfficeView outOfOffice) {
+ 
+     public static UserView of(AppUser user) {
++      OutOfOfficeView away =
++          user.getAwayFrom() == null
++              ? null
++              : new OutOfOfficeView(
++                  user.getAwayFrom(), user.getAwayUntil(), user.getSubstituteId());
+       return new UserView(
+-          user.getId(), user.getDisplayName(), user.getEmail(), user.isActive(), user.isAdmin());
++          user.getId(),
++          user.getDisplayName(),
++          user.getEmail(),
++          user.isActive(),
++          user.isAdmin(),
++          away);
+     }
+   }
+ 
++  /** An out-of-office period, both dates included, and the id of the user who stands in. */
++  public record OutOfOfficeView(LocalDate from, LocalDate until, long substituteId) {}
++
+   public record PermissionView(
+       long userId, String displayName, PermissionLevel level, Instant grantedAt) {
+ 
+diff --git a/src/main/resources/db/migration/V3__out_of_office.sql b/src/main/resources/db/migration/V3__out_of_office.sql
+new file mode 100644
+index 0000000..ab0826b
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__out_of_office.sql
+@@ -0,0 +1,15 @@
++-- An out-of-office period: inclusive dates in the business zone and the user who stands in.
++ALTER TABLE app_user
++    ADD COLUMN away_from     DATE,
++    ADD COLUMN away_until    DATE,
++    ADD COLUMN substitute_id BIGINT REFERENCES app_user (id),
++    ADD CONSTRAINT app_user_away CHECK (
++        (away_from IS NULL AND away_until IS NULL AND substitute_id IS NULL)
++        OR (away_from IS NOT NULL AND away_until IS NOT NULL AND away_until >= away_from
++            AND substitute_id IS NOT NULL AND substitute_id <> id)
++    );
++
++-- The absent assignee a task was created for, when a substitute holds it.
++ALTER TABLE approval_task
++    ADD COLUMN on_behalf_of_id BIGINT REFERENCES app_user (id),
++    ADD CONSTRAINT approval_task_on_behalf CHECK (on_behalf_of_id <> assignee_id);
+diff --git a/src/test/java/com/papertrail/workflow/api/OutOfOfficeApiTest.java b/src/test/java/com/papertrail/workflow/api/OutOfOfficeApiTest.java
+new file mode 100644
+index 0000000..5fdf1f5
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/OutOfOfficeApiTest.java
+@@ -0,0 +1,155 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.service.DocumentService;
++import com.papertrail.workflow.service.IdentityService;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.time.Duration;
++import java.time.Instant;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++/** The clock starts on Monday 3 May 2027, 11:00 in London. */
++class OutOfOfficeApiTest extends IntegrationTestBase {
++
++  private static final String AUTH = "Authorization";
++
++  @Autowired private DocumentService documents;
++  @Autowired private IdentityService identity;
++
++  private long owner;
++  private long alma;
++  private long bruno;
++
++  @BeforeEach
++  void setUp() {
++    owner = data.user("Ines Berg");
++    alma = data.user("Alma Reyes");
++    bruno = data.user("Bruno Kask");
++    data.publish("Expenses", TestData.step(1, StepKind.SINGLE, alma, null, 0, 480));
++  }
++
++  private ResultActions away(long userId, String from, String until, long substituteId)
++      throws Exception {
++    return mvc.perform(
++        put("/api/v1/users/me/out-of-office")
++            .header(AUTH, data.bearer(userId))
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(
++                "{\"from\":\"%s\",\"until\":\"%s\",\"substituteId\":%d}"
++                    .formatted(from, until, substituteId)));
++  }
++
++  private long submit(String definition) {
++    long document = data.draft(data.principal(owner), definition, "Travel claim");
++    documents.submit(data.principal(owner), document);
++    return document;
++  }
++
++  private Long assigneeOf(long document) {
++    return jdbc.queryForObject(
++        "select assignee_id from approval_task where document_id = ?", Long.class, document);
++  }
++
++  @Test
++  void theSubstituteTakesATaskActivatedDuringThePeriod() throws Exception {
++    away(alma, "2027-05-03", "2027-05-07", bruno)
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.outOfOffice.until").value("2027-05-07"))
++        .andExpect(jsonPath("$.outOfOffice.substituteId").value(bruno));
++
++    long document = submit("Expenses");
++    long task = taskOf(document, bruno);
++    mvc.perform(get("/api/v1/tasks/" + task).header(AUTH, data.bearer(bruno)))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.assigneeId").value(bruno))
++        .andExpect(jsonPath("$.onBehalfOfId").value(alma));
++    mvc.perform(get("/api/v1/documents/" + document).header(AUTH, data.bearer(alma)))
++        .andExpect(status().isNotFound());
++
++    mvc.perform(
++            post("/api/v1/tasks/" + task + "/decision")
++                .header(AUTH, data.bearer(bruno))
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("{\"decision\":\"APPROVE\"}"))
++        .andExpect(status().isOk());
++    assertThat(notifier.delivered()).isEmpty();
++    assertThat(
++            jdbc.queryForObject(
++                "select recipient_user_id from outbox_event where event_type = 'TASK_ASSIGNED'",
++                Long.class))
++        .isEqualTo(bruno);
++  }
++
++  @Test
++  void theDayIsTheBusinessZonesDay() throws Exception {
++    away(alma, "2027-05-04", "2027-05-04", bruno).andExpect(status().isOk());
++
++    clock.set(Instant.parse("2027-05-03T22:30:00Z")); // Monday 23:30 in London
++    long monday = submit("Expenses");
++    clock.set(Instant.parse("2027-05-03T23:30:00Z")); // Tuesday 00:30 in London
++    long tuesday = submit("Expenses");
++    clock.advance(Duration.ofDays(1)); // Wednesday
++    long wednesday = submit("Expenses");
++
++    assertThat(assigneeOf(monday)).isEqualTo(alma);
++    assertThat(assigneeOf(tuesday)).isEqualTo(bruno);
++    assertThat(assigneeOf(wednesday)).isEqualTo(alma);
++  }
++
++  @Test
++  void theAssigneeKeepsTheTaskWhenTheSubstituteCannotTakeIt() throws Exception {
++    long carla = data.user("Carla Moss");
++    away(alma, "2027-05-03", "2027-05-07", bruno).andExpect(status().isOk());
++    away(bruno, "2027-05-03", "2027-05-03", carla).andExpect(status().isOk());
++    assertThat(assigneeOf(submit("Expenses"))).isEqualTo(alma);
++
++    away(alma, "2027-05-03", "2027-05-07", carla).andExpect(status().isOk());
++    identity.updateUser(carla, null, null, false);
++    assertThat(assigneeOf(submit("Expenses"))).isEqualTo(alma);
++  }
++
++  @Test
++  void aGroupStepNeverGivesOnePersonTwoTasks() throws Exception {
++    long team = data.group("Finance", alma, bruno);
++    data.publish("Purchases", TestData.step(1, StepKind.ALL_OF, null, team, 0, 480));
++    away(alma, "2027-05-03", "2027-05-07", bruno).andExpect(status().isOk());
++
++    long document = submit("Purchases");
++
++    assertThat(
++            jdbc.queryForList(
++                "select assignee_id from approval_task where document_id = ? order by assignee_id",
++                Long.class,
++                document))
++        .containsExactly(alma, bruno);
++  }
++
++  @Test
++  void thePeriodIsValidatedAndCanBeCleared() throws Exception {
++    away(alma, "2027-05-07", "2027-05-03", bruno).andExpect(status().isBadRequest());
++    away(alma, "2027-04-26", "2027-04-30", bruno).andExpect(status().isBadRequest());
++    away(alma, "2027-05-03", "2028-05-03", bruno).andExpect(status().isBadRequest());
++    away(alma, "2027-05-03", "2027-05-07", alma).andExpect(status().isBadRequest());
++    away(alma, "2027-05-03", "2027-05-07", 9_999).andExpect(status().isBadRequest());
++    away(alma, "2027-05-03", "+1000000-01-01", bruno).andExpect(status().isBadRequest());
++
++    away(alma, "2027-04-26", "2027-05-03", bruno).andExpect(status().isOk());
++    mvc.perform(delete("/api/v1/users/me/out-of-office").header(AUTH, data.bearer(alma)))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.outOfOffice").doesNotExist());
++    assertThat(assigneeOf(submit("Expenses"))).isEqualTo(alma);
++  }
++}

@@ -1,0 +1,30 @@
+{
+  "schema": "crb-task/v1",
+  "id": "pager-js-T03",
+  "repo": "pager-js",
+  "kind": "decoy",
+  "title": "Add pageRange",
+  "description": "Add pageRange(items, page, size) returning the inclusive first and last index shown on a page, for the \"Showing 3-4 of 5\" label.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "src/pager.js",
+      "lines": [
+        12,
+        12
+      ],
+      "looks_like": "off-by-one on last",
+      "why_correct": "last is an inclusive index, so the exclusive end minus one is right",
+      "valid_rebuttal": "pageRange documents an inclusive range in its doc comment; Math.min(first + size, items.length) is the exclusive end, so subtracting one gives the last index on the page.",
+      "hidden_tests": [
+        "test/hidden/range.test.js"
+      ],
+      "hidden_test_cmd": "node --test test/hidden/range.test.js"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

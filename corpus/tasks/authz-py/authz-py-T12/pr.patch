@@ -1,0 +1,370 @@
+diff --git a/README.md b/README.md
+index 20ef4f0..fa92ad3 100644
+--- a/README.md
++++ b/README.md
+@@ -41,6 +41,14 @@ resolves the caller's membership; a caller who is not a member gets 404 for the
+ if it did not exist. Whoever creates an organisation becomes its first owner, and an organisation
+ always keeps at least one owner.
+ 
++An owner hands the organisation over with `POST /v1/orgs/{org_id}/transfer-ownership
++{"user_id": …, "stay_owner": false}`: the member named becomes an owner and the caller becomes an
++admin, or stays an owner with `"stay_owner": true`. Only a member whose own role is `owner` may
++transfer (holding `org:manage` through a role assignment is not enough); the new owner must
++already be a member, enabled, and not an owner yet. Both changes happen in one transaction under
++the organisation lock, role assignments are left alone, and the audit log gets a
++`member.role_changed` event per changed membership plus `org.ownership_transferred`.
++
+ **Roles and permissions.** Permissions are strings of the form `resource:action`:
+ 
+ | Permission | Grants |
+@@ -100,6 +108,7 @@ cursor.
+ | POST, GET | `/v1/orgs` | access token |
+ | GET | `/v1/orgs/{org_id}` | `org:read` |
+ | PATCH | `/v1/orgs/{org_id}` | `org:manage` |
++| POST | `/v1/orgs/{org_id}/transfer-ownership` | `owner` role |
+ | GET | `/v1/orgs/{org_id}/members`, `/members/{user_id}` | `members:read` |
+ | PATCH | `/v1/orgs/{org_id}/members/{user_id}` | `members:manage` |
+ | DELETE | `/v1/orgs/{org_id}/members/{user_id}` | membership (leaving) or `members:manage` |
+diff --git a/src/authz/api/routers/organizations.py b/src/authz/api/routers/organizations.py
+index 75c5173..8c68182 100644
+--- a/src/authz/api/routers/organizations.py
++++ b/src/authz/api/routers/organizations.py
+@@ -23,6 +23,8 @@ from authz.api.schemas.organizations import (
+     OrganizationDetailResponse,
+     OrganizationResponse,
+     OrganizationUpdate,
++    OwnershipTransferRequest,
++    OwnershipTransferResponse,
+ )
+ from authz.domain.permissions import Permission
+ from authz.domain.principal import Actor
+@@ -69,6 +71,17 @@ async def update_organization(
+     return OrganizationResponse.of(org)
+ 
+ 
++@router.post("/{org_id}/transfer-ownership", response_model=OwnershipTransferResponse)
++async def transfer_ownership(
++    body: OwnershipTransferRequest, auth: CanManageOrg, container: ContainerDep
++) -> OwnershipTransferResponse:
++    """Hand ownership to another member; the caller must be an owner."""
++    transfer = await container.members.transfer_ownership(
++        auth.principal, auth.org_id, body.user_id, stay_owner=body.stay_owner
++    )
++    return OwnershipTransferResponse.of(transfer)
++
++
+ @router.get("/{org_id}/members", response_model=PageResponse[MemberResponse])
+ async def list_members(
+     auth: CanReadMembers,
+diff --git a/src/authz/api/schemas/organizations.py b/src/authz/api/schemas/organizations.py
+index 78e0390..f41a89e 100644
+--- a/src/authz/api/schemas/organizations.py
++++ b/src/authz/api/schemas/organizations.py
+@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
+ from authz.api.schemas.common import RequestModel, ResponseModel
+ from authz.models import Organization, RoleAssignment
+ from authz.repositories.organizations import MemberRow, OrganizationWithRole
++from authz.services.members import OwnershipTransfer
+ from authz.services.roles import RoleView
+ 
+ 
+@@ -78,6 +79,23 @@ class MemberUpdate(RequestModel):
+     role_id: uuid.UUID
+ 
+ 
++class OwnershipTransferRequest(RequestModel):
++    user_id: uuid.UUID
++    stay_owner: bool = False
++
++
++class OwnershipTransferResponse(ResponseModel):
++    new_owner: MemberResponse
++    previous_owner: MemberResponse
++
++    @classmethod
++    def of(cls, transfer: OwnershipTransfer) -> OwnershipTransferResponse:
++        return cls(
++            new_owner=MemberResponse.of(transfer.new_owner),
++            previous_owner=MemberResponse.of(transfer.previous_owner),
++        )
++
++
+ class RoleCreate(RequestModel):
+     name: str = Field(min_length=1, max_length=50)
+     description: str = Field(default="", max_length=500)
+diff --git a/src/authz/services/audit.py b/src/authz/services/audit.py
+index f6ec05a..7298c12 100644
+--- a/src/authz/services/audit.py
++++ b/src/authz/services/audit.py
+@@ -21,6 +21,7 @@ from authz.repositories.audit import AuditRepository
+ class AuditAction(StrEnum):
+     ORG_CREATED = "org.created"
+     ORG_UPDATED = "org.updated"
++    OWNERSHIP_TRANSFERRED = "org.ownership_transferred"
+     MEMBER_ADDED = "member.added"
+     MEMBER_ROLE_CHANGED = "member.role_changed"
+     MEMBER_REMOVED = "member.removed"
+diff --git a/src/authz/services/members.py b/src/authz/services/members.py
+index 79c1203..e51df45 100644
+--- a/src/authz/services/members.py
++++ b/src/authz/services/members.py
+@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
+ from authz.domain.pagination import Cursor, Page, clamp_limit
+ from authz.domain.permissions import BuiltinRole, Permission
+ from authz.domain.principal import Actor, Principal, Resource
+-from authz.errors import ConflictError, NotFoundError
++from authz.errors import ConflictError, InvalidInputError, NotFoundError, PermissionDenied
+ from authz.infra.clock import Clock
+ from authz.infra.db import Database
+ from authz.models import Membership, Role, RoleAssignment
+@@ -34,6 +34,12 @@ class AssignmentRequest:
+     project_id: uuid.UUID | None = None
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class OwnershipTransfer:
++    new_owner: MemberRow
++    previous_owner: MemberRow
++
++
+ class MemberService:
+     def __init__(
+         self,
+@@ -116,6 +122,86 @@ class MemberService:
+             raise NotFoundError("member")
+         return row
+ 
++    async def transfer_ownership(
++        self,
++        principal: Principal,
++        org_id: uuid.UUID,
++        user_id: uuid.UUID,
++        *,
++        stay_owner: bool = False,
++    ) -> OwnershipTransfer:
++        """Make another member an owner and, unless `stay_owner`, demote the caller to admin.
++
++        Only a member whose membership role is `owner` may do this; holding `org:manage` through
++        a role assignment is not enough. Role assignments of both members are left as they are.
++        """
++        if user_id == principal.user_id:
++            raise InvalidInputError(
++                "you cannot transfer ownership to yourself", details={"field": "user_id"}
++            )
++        async with self._db.transaction() as session:
++            await self._lock_org(session, org_id)
++            memberships = MembershipRepository(session)
++            roles = RoleRepository(session)
++            owner_role = await roles.get_by_name(org_id, BuiltinRole.OWNER.value)
++            admin_role = await roles.get_by_name(org_id, BuiltinRole.ADMIN.value)
++            if owner_role is None or admin_role is None:
++                raise NotFoundError("role")
++            caller = await memberships.get(org_id, principal.user_id)
++            if caller is None or caller.role_id != owner_role.id:
++                raise PermissionDenied("only an owner can transfer ownership")
++            target = await memberships.get_member(org_id, user_id)
++            if target is None:
++                raise NotFoundError("member")
++            if target.user.disabled_at is not None:
++                raise ConflictError("ownership cannot go to a disabled account")
++            if target.membership.role_id == owner_role.id:
++                raise ConflictError("the member is already an owner")
++
++            now = self._clock.now()
++            actor = Actor.of(principal)
++            target_old_role_id = target.membership.role_id
++            await memberships.set_role(target.membership, owner_role.id, now)
++            await self._audit.record(
++                session,
++                actor,
++                org_id=org_id,
++                action=AuditAction.MEMBER_ROLE_CHANGED,
++                target_type="user",
++                target_id=user_id,
++                data={"from_role_id": target_old_role_id, "to_role_id": owner_role.id},
++            )
++            if not stay_owner:
++                await self._ensure_owner_remains(session, org_id, owner_role.id, admin_role)
++                await memberships.set_role(caller, admin_role.id, now)
++                await self._audit.record(
++                    session,
++                    actor,
++                    org_id=org_id,
++                    action=AuditAction.MEMBER_ROLE_CHANGED,
++                    target_type="user",
++                    target_id=principal.user_id,
++                    data={"from_role_id": owner_role.id, "to_role_id": admin_role.id},
++                )
++            await self._audit.record(
++                session,
++                actor,
++                org_id=org_id,
++                action=AuditAction.OWNERSHIP_TRANSFERRED,
++                target_type="user",
++                target_id=user_id,
++                data={
++                    "from_user_id": principal.user_id,
++                    "previous_role_id": target_old_role_id,
++                    "stayed_owner": stay_owner,
++                },
++            )
++            new_owner = await memberships.get_member(org_id, user_id)
++            previous_owner = await memberships.get_member(org_id, principal.user_id)
++        if new_owner is None or previous_owner is None:
++            raise NotFoundError("member")
++        return OwnershipTransfer(new_owner=new_owner, previous_owner=previous_owner)
++
+     async def remove(self, principal: Principal, org_id: uuid.UUID, user_id: uuid.UUID) -> None:
+         """Remove a member. Members may always leave; removing others needs members:manage."""
+         leaving = user_id == principal.user_id
+diff --git a/tests/api/test_ownership_transfer.py b/tests/api/test_ownership_transfer.py
+new file mode 100644
+index 0000000..0e89167
+--- /dev/null
++++ b/tests/api/test_ownership_transfer.py
+@@ -0,0 +1,145 @@
++from __future__ import annotations
++
++import uuid
++
++from tests.helpers.factories import add_member, disable_user, org_with_member, role_id, signed_in
++
++
++def transfer_url(org: dict[str, object]) -> str:
++    return f"/v1/orgs/{org['id']}/transfer-ownership"
++
++
++async def roles_of(client, org, viewer) -> dict[str, str]:
++    response = await client.get(f"/v1/orgs/{org['id']}/members", headers=viewer.headers)
++    assert response.status_code == 200
++    return {member["user_id"]: member["role"] for member in response.json()["data"]}
++
++
++async def test_owner_hands_over_and_becomes_admin(client, container):
++    org, owner, admin = await org_with_member(client, container, "admin")
++
++    response = await client.post(
++        transfer_url(org), json={"user_id": str(admin.id)}, headers=owner.headers
++    )
++
++    assert response.status_code == 200, response.text
++    body = response.json()
++    assert body["new_owner"]["user_id"] == str(admin.id)
++    assert body["new_owner"]["role"] == "owner"
++    assert body["previous_owner"]["user_id"] == str(owner.id)
++    assert body["previous_owner"]["role"] == "admin"
++    assert await roles_of(client, org, admin) == {str(owner.id): "admin", str(admin.id): "owner"}
++
++
++async def test_owner_can_stay_owner(client, container):
++    org, owner, member = await org_with_member(client, container, "member")
++
++    response = await client.post(
++        transfer_url(org),
++        json={"user_id": str(member.id), "stay_owner": True},
++        headers=owner.headers,
++    )
++
++    assert response.status_code == 200, response.text
++    assert response.json()["previous_owner"]["role"] == "owner"
++    assert await roles_of(client, org, owner) == {str(owner.id): "owner", str(member.id): "owner"}
++
++
++async def test_the_previous_owner_loses_owner_rights(client, container):
++    org, owner, admin = await org_with_member(client, container, "admin")
++    await client.post(transfer_url(org), json={"user_id": str(admin.id)}, headers=owner.headers)
++
++    again = await client.post(
++        transfer_url(org), json={"user_id": str(admin.id)}, headers=owner.headers
++    )
++    rename = await client.patch(
++        f"/v1/orgs/{org['id']}", json={"name": "Renamed"}, headers=owner.headers
++    )
++
++    assert again.status_code == 403
++    assert rename.status_code == 403
++
++
++async def test_admins_cannot_transfer(client, container):
++    org, owner, admin = await org_with_member(client, container, "admin")
++    member = await signed_in(client, container)
++    await add_member(container, org["id"], member, "member")
++
++    response = await client.post(
++        transfer_url(org), json={"user_id": str(member.id)}, headers=admin.headers
++    )
++
++    assert response.status_code == 403
++    assert await roles_of(client, org, admin) == {
++        str(owner.id): "owner",
++        str(admin.id): "admin",
++        str(member.id): "member",
++    }
++
++
++async def test_target_must_be_a_member(client, container):
++    org, owner, _ = await org_with_member(client, container, "admin")
++    outsider = await signed_in(client, container)
++
++    for user_id in (outsider.id, uuid.uuid4()):
++        response = await client.post(
++            transfer_url(org), json={"user_id": str(user_id)}, headers=owner.headers
++        )
++        assert response.status_code == 404
++        assert response.json()["error"]["details"]["resource"] == "member"
++
++
++async def test_refuses_self_existing_owners_and_disabled_accounts(client, container):
++    org, owner, co_owner = await org_with_member(client, container, "owner")
++    disabled = await signed_in(client, container)
++    await add_member(container, org["id"], disabled, "viewer")
++    await disable_user(container, disabled.id)
++
++    to_self = await client.post(
++        transfer_url(org), json={"user_id": str(owner.id)}, headers=owner.headers
++    )
++    to_owner = await client.post(
++        transfer_url(org), json={"user_id": str(co_owner.id)}, headers=owner.headers
++    )
++    to_disabled = await client.post(
++        transfer_url(org), json={"user_id": str(disabled.id)}, headers=owner.headers
++    )
++
++    assert to_self.status_code == 422
++    assert to_owner.status_code == 409
++    assert to_disabled.status_code == 409
++    assert (await roles_of(client, org, owner))[str(owner.id)] == "owner"
++
++
++async def test_unknown_fields_are_rejected(client, container):
++    org, owner, admin = await org_with_member(client, container, "admin")
++
++    response = await client.post(
++        transfer_url(org),
++        json={"user_id": str(admin.id), "keep_owner": True},
++        headers=owner.headers,
++    )
++
++    assert response.status_code == 422
++
++
++async def test_transfer_is_audited(client, container):
++    org, owner, viewer = await org_with_member(client, container, "viewer")
++    viewer_role = await role_id(container, org["id"], "viewer")
++
++    await client.post(transfer_url(org), json={"user_id": str(viewer.id)}, headers=owner.headers)
++    events = (
++        await client.get(f"/v1/orgs/{org['id']}/audit", headers=viewer.headers)
++    ).json()["data"]
++
++    transferred = [e for e in events if e["action"] == "org.ownership_transferred"]
++    changed = {e["target_id"] for e in events if e["action"] == "member.role_changed"}
++    assert len(transferred) == 1
++    assert transferred[0]["actor_id"] == str(owner.id)
++    assert transferred[0]["target_id"] == str(viewer.id)
++    assert transferred[0]["data"] == {
++        "from_user_id": str(owner.id),
++        "previous_role_id": str(viewer_role),
++        "stayed_owner": False,
++    }
++    assert changed == {str(owner.id), str(viewer.id)}

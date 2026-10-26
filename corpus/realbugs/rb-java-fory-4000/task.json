@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-java-fory-4000",
+  "repo": "rb-java-fory-4000",
+  "kind": "realbug",
+  "title": "feat: harden deserialization paths",
+  "description": "## What does this PR do?\r\n\r\nThis PR hardens untrusted deserialization across Fory runtimes and aligns shared metadata cache semantics with the wire protocol.\r\n\r\nKey changes:\r\n\r\n- make remote `TypeDef` and `TypeMeta` checked caches use the protocol top 52-bit hash as schema identity while keeping current-frame low bits only for bounded body skipping;\r\n- make large `MetaString` cache hits use the wire hash alone as identity, independent of the current body length;\r\n- route cached and shared metadata through the concrete owner selected on the validated miss, rejecting incompatible declared owners before cache, version, or root-table publication;\r\n- fix Python/Cython published-list mutation safety and strict/default reduce callable authorization;\r\n- bound Java metadata decompression and stream growth, tighten the disallowed-class list, and guard dynamic/generated field assignment;\r\n- fix Rust UTF-16 bounds handling and concrete metadata routing for static/grouped carriers;\r\n- enforce Swift nested decoder depth consistently across generated and compatible owners;\r\n- document trusted-input boundaries and the cache-hit validation model.\r\n\r\nThe wire format is unchanged. Cache hits do not reparse or revalidate metadata bodies; only cold misses perform body/hash/policy/limit validation and publish non-local checked metadata.\r\n\r\n## Performance\r\n\r\nCompared sequentially against a fresh `apache/main` worktree at `8728bd82535637aebc100cf47348fb3957347110`:\r\n\r\n- Java sample-list deserialize: paired median `+0.610%` throughput; MetaShare was faster.\r\n- Python/Cython sample-list deserialize: `-0.591%` and `-0.680%` latency.\r\n- Swift sample-list deserialize, 30-second pair: `+0.241%` latency.\r\n- Rust sample-list deserialize: `-0.468%` and `-3.060%` latency.\r\n- C++ sample-list deserialize, six balanced pairs: `-0.136%` median and `+0.059%` mean latency.\r\n\r\nAll retained affected hot paths are within the 1% regression gate.\r\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "java/fory-core/src/main/java/org/apache/fory/resolver/TypeResolver.java",
+      "lines": [
+        943,
+        952
+      ],
+      "category": "performance",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "When compatible-mode metadata matches an exact local schema, the resolver builds a fresh TypeInfo with createMetaSharedTypeInfo and never stores it in typeInfoByHeaderHash (here and in buildMetaSharedTypeInfo / buildCachedMetaSharedTypeInfo). Only the single depth-local cached hint can be reused, so alternating sibling struct types recreate their TypeInfo and compatible serializer on every read, resubmitting code generation each time.",
+      "trigger": "Deserializing, in compatible/meta-share mode, a stream that alternates two or more registered struct types whose remote TypeDef equals the local schema: each read of a type after another type was read builds a new TypeInfo instead of reusing the first one.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "java/fory-core/src/test/java/org/apache/fory/resolver/TypeDefHeaderHashTest.java"
+      ],
+      "hidden_test_cmd": "cd java && mvn -q -pl fory-core -am test -Dsurefire.failIfNoSpecifiedTests=false -Dtest=TypeDefHeaderHashTest"
+    }
+  ]
+}

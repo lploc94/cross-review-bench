@@ -1,0 +1,400 @@
+diff --git a/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/common/volume/DatanodeStorageMetrics.java b/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/common/volume/DatanodeStorageMetrics.java
+new file mode 100644
+index 0000000000..fc1edbee11
+--- /dev/null
++++ b/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/common/volume/DatanodeStorageMetrics.java
+@@ -0,0 +1,102 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.ozone.container.common.volume;
++
++import org.apache.hadoop.metrics2.MetricsCollector;
++import org.apache.hadoop.metrics2.MetricsInfo;
++import org.apache.hadoop.metrics2.MetricsRecordBuilder;
++import org.apache.hadoop.metrics2.MetricsSource;
++import org.apache.hadoop.metrics2.annotation.Metrics;
++import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
++import org.apache.hadoop.metrics2.lib.Interns;
++import org.apache.hadoop.metrics2.lib.MetricsRegistry;
++import org.apache.hadoop.ozone.OzoneConsts;
++import org.apache.hadoop.ozone.container.common.impl.StorageLocationReport;
++
++/**
++ * Node-level storage totals for a DataNode, aggregated over its HDDS data volumes only
++ * ({@code VolumeType.DATA_VOLUME}) via {@link MutableVolumeSet#getStorageReport()}.
++ * This is the same scope as the {@code storageReport} entries produced by
++ * {@code OzoneContainer.getNodeReport()}; meta and DB volumes are excluded.
++ * Registered as {@code Hadoop:service=HddsDatanode,name=DatanodeStorageMetrics}.
++ */
++@Metrics(about = "Ozone DataNode node-level storage totals",
++    context = OzoneConsts.OZONE)
++public final class DatanodeStorageMetrics implements MetricsSource {
++
++  public static final String SOURCE_NAME = DatanodeStorageMetrics.class.getSimpleName();
++
++  private static final MetricsInfo CAPACITY = Interns.info("OzoneCapacity",
++      "Total Ozone usable capacity across the DataNode's data volumes (bytes,"
++          + " post reserved-space adjustment)");
++  private static final MetricsInfo USED = Interns.info("OzoneUsed",
++      "Total Ozone used space across the DataNode's data volumes (bytes)");
++  private static final MetricsInfo USED_PERCENTAGE =
++      Interns.info("OzoneUsedPercentage",
++          "100 * OzoneUsed / OzoneCapacity across the DataNode's data volumes;"
++              + " 0 when OzoneCapacity is 0");
++
++  private final MetricsRegistry registry;
++  private final MutableVolumeSet volumeSet;
++
++  private DatanodeStorageMetrics(MutableVolumeSet volumeSet) {
++    this.volumeSet = volumeSet;
++    this.registry = new MetricsRegistry(SOURCE_NAME);
++  }
++
++  /**
++   * Creates a new {@code DatanodeStorageMetrics} instance and registers it
++   * with the default Metrics2 system.
++   */
++  public static DatanodeStorageMetrics create(MutableVolumeSet volumeSet) {
++    DatanodeStorageMetrics datanodeStorageMetrics = new DatanodeStorageMetrics(volumeSet);
++    DefaultMetricsSystem.instance().register(
++        SOURCE_NAME, "DataNode node-level storage totals", datanodeStorageMetrics);
++    return datanodeStorageMetrics;
++  }
++
++  /**
++   * Unregisters this source from the Metrics2 system.
++   */
++  public void unregister() {
++    DefaultMetricsSystem.instance().unregisterSource(SOURCE_NAME);
++  }
++
++  /**
++   * Metrics are computed on demand from the latest volume reports
++   * instead of maintaining cached counters.
++   */
++  @Override
++  public void getMetrics(MetricsCollector collector, boolean all) {
++    MetricsRecordBuilder builder = collector.addRecord(SOURCE_NAME);
++    registry.snapshot(builder, all);
++
++    long capacity = 0L;
++    long used = 0L;
++    for (StorageLocationReport report : volumeSet.getStorageReport()) {
++      capacity = Math.addExact(capacity, report.getCapacity());
++      used = Math.addExact(used, report.getScmUsed());
++    }
++    double usedPercentage = capacity > 0 ? (100.0 * used / capacity) : 0.0;
++
++    builder
++        .addGauge(CAPACITY, capacity)
++        .addGauge(USED, used)
++        .addGauge(USED_PERCENTAGE, usedPercentage);
++  }
++}
+diff --git a/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/ozoneimpl/OzoneContainer.java b/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/ozoneimpl/OzoneContainer.java
+index cd717d1e2b..08d5c18c1d 100644
+--- a/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/ozoneimpl/OzoneContainer.java
++++ b/hadoop-hdds/container-service/src/main/java/org/apache/hadoop/ozone/container/ozoneimpl/OzoneContainer.java
+@@ -92,6 +92,7 @@
+ import org.apache.hadoop.ozone.container.common.transport.server.ratis.XceiverServerRatis;
+ import org.apache.hadoop.ozone.container.common.utils.ContainerInspectorUtil;
+ import org.apache.hadoop.ozone.container.common.utils.HddsVolumeUtil;
++import org.apache.hadoop.ozone.container.common.volume.DatanodeStorageMetrics;
+ import org.apache.hadoop.ozone.container.common.volume.HddsVolume;
+ import org.apache.hadoop.ozone.container.common.volume.MutableVolumeSet;
+ import org.apache.hadoop.ozone.container.common.volume.StorageVolume;
+@@ -156,6 +157,7 @@ public class OzoneContainer {
+ 
+   private final ContainerMetrics metrics;
+   private WitnessedContainerMetadataStore witnessedContainerMetadataStore;
++  private final DatanodeStorageMetrics datanodeStorageMetrics;
+ 
+   enum InitializingStatus {
+     UNINITIALIZED, INITIALIZING, INITIALIZED
+@@ -330,6 +332,8 @@ public OzoneContainer(HddsDatanodeService hddsDatanodeService,
+       tlsClientConfig = null;
+     }
+ 
++    datanodeStorageMetrics = DatanodeStorageMetrics.create(volumeSet);
++
+     initializingStatus = new AtomicReference<>(InitializingStatus.UNINITIALIZED);
+   }
+ 
+@@ -633,6 +637,7 @@ public void stop() {
+     this.handlers.values().forEach(Handler::stop);
+     hddsDispatcher.shutdown();
+     volumeChecker.shutdownAndWait(0, TimeUnit.SECONDS);
++    datanodeStorageMetrics.unregister();
+     volumeSet.shutdown();
+     metaVolumeSet.shutdown();
+     if (dbVolumeSet != null) {
+diff --git a/hadoop-hdds/container-service/src/test/java/org/apache/hadoop/ozone/container/common/volume/TestDatanodeStorageMetrics.java b/hadoop-hdds/container-service/src/test/java/org/apache/hadoop/ozone/container/common/volume/TestDatanodeStorageMetrics.java
+new file mode 100644
+index 0000000000..d54a8b0f9e
+--- /dev/null
++++ b/hadoop-hdds/container-service/src/test/java/org/apache/hadoop/ozone/container/common/volume/TestDatanodeStorageMetrics.java
+@@ -0,0 +1,114 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.ozone.container.common.volume;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import org.apache.hadoop.metrics2.AbstractMetric;
++import org.apache.hadoop.metrics2.impl.MetricsCollectorImpl;
++import org.apache.hadoop.metrics2.impl.MetricsRecordImpl;
++import org.apache.hadoop.ozone.container.common.impl.StorageLocationReport;
++import org.junit.jupiter.api.Test;
++
++/**
++ * Unit tests for {@link DatanodeStorageMetrics}.
++ *
++ * <p>Tests verify:
++ * <ul>
++ *   <li>Correct aggregation of Capacity and Used across multiple volumes.</li>
++ *   <li>OzoneUsedPercentage arithmetic (100 * OzoneUsed / OzoneCapacity).</li>
++ *   <li>Zero-capacity guard: OzoneUsedPercentage returns 0 instead of NaN/divide-by-zero.</li>
++ * </ul>
++ */
++class TestDatanodeStorageMetrics {
++
++  @Test
++  void testAggregationAcrossTwoVolumes() {
++    // vol1: capacity=100, scmUsed=40  vol2: capacity=300, scmUsed=60
++    // expected: OzoneCapacity=400, OzoneUsed=100, OzoneUsedPercentage=25.0
++    StorageLocationReport vol1 = StorageLocationReport.newBuilder()
++        .setId("vol1").setCapacity(100L).setScmUsed(40L).setRemaining(60L)
++        .build();
++    StorageLocationReport vol2 = StorageLocationReport.newBuilder()
++        .setId("vol2").setCapacity(300L).setScmUsed(60L).setRemaining(240L)
++        .build();
++
++    MutableVolumeSet volumeSet = mock(MutableVolumeSet.class);
++    when(volumeSet.getStorageReport())
++        .thenReturn(new StorageLocationReport[]{vol1, vol2});
++
++    DatanodeStorageMetrics metrics = DatanodeStorageMetrics.create(volumeSet);
++    try {
++      MetricsCollectorImpl collector = new MetricsCollectorImpl();
++      metrics.getMetrics(collector, true);
++
++      assertThat(collector.getRecords()).hasSize(1);
++      MetricsRecordImpl rec = collector.getRecords().get(0);
++
++      // Record name determines the JMX name= segment — must match verbatim.
++      assertThat(rec.name()).isEqualTo(DatanodeStorageMetrics.SOURCE_NAME);
++
++      Iterable<AbstractMetric> all = rec.metrics();
++      assertThat(findLong(all, "OzoneCapacity")).isEqualTo(400L);
++      assertThat(findLong(all, "OzoneUsed")).isEqualTo(100L);
++      assertThat(findDouble(all, "OzoneUsedPercentage")).isEqualTo(25.0);
++    } finally {
++      metrics.unregister();
++    }
++  }
++
++  @Test
++  void testZeroCapacityReturnsZeroPercentage() {
++    // No volumes → capacity=0, used=0; OzoneUsedPercentage must be 0.0, not NaN.
++    MutableVolumeSet volumeSet = mock(MutableVolumeSet.class);
++    when(volumeSet.getStorageReport()).thenReturn(new StorageLocationReport[0]);
++
++    DatanodeStorageMetrics metrics = DatanodeStorageMetrics.create(volumeSet);
++    try {
++      MetricsCollectorImpl collector = new MetricsCollectorImpl();
++      metrics.getMetrics(collector, true);
++
++      Iterable<AbstractMetric> all = collector.getRecords().get(0).metrics();
++      assertThat(findLong(all, "OzoneCapacity")).isEqualTo(0L);
++      assertThat(findLong(all, "OzoneUsed")).isEqualTo(0L);
++      assertThat(findDouble(all, "OzoneUsedPercentage")).isEqualTo(0.0);
++    } finally {
++      metrics.unregister();
++    }
++  }
++
++  private static long findLong(Iterable<AbstractMetric> metrics, String name) {
++    for (AbstractMetric m : metrics) {
++      if (name.equals(m.name())) {
++        return m.value().longValue();
++      }
++    }
++    throw new AssertionError("Missing metric: " + name);
++  }
++
++  private static double findDouble(Iterable<AbstractMetric> metrics, String name) {
++    for (AbstractMetric m : metrics) {
++      if (name.equals(m.name())) {
++        return m.value().doubleValue();
++      }
++    }
++    throw new AssertionError("Missing metric: " + name);
++  }
++}
+diff --git a/hadoop-ozone/integration-test/src/test/java/org/apache/hadoop/ozone/dn/TestDatanodeStorageMetricsIntegration.java b/hadoop-ozone/integration-test/src/test/java/org/apache/hadoop/ozone/dn/TestDatanodeStorageMetricsIntegration.java
+new file mode 100644
+index 0000000000..076889a7e8
+--- /dev/null
++++ b/hadoop-ozone/integration-test/src/test/java/org/apache/hadoop/ozone/dn/TestDatanodeStorageMetricsIntegration.java
+@@ -0,0 +1,129 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.ozone.dn;
++
++import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_SCM_SAFEMODE_PIPELINE_CREATION;
++import static org.apache.hadoop.hdds.fs.SpaceUsageCheckFactory.Conf.configKeyForClassName;
++import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.ONE;
++import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_SCM_CONTAINER_SIZE;
++import static org.apache.ozone.test.MetricsAsserts.getDoubleGauge;
++import static org.apache.ozone.test.MetricsAsserts.getLongGauge;
++import static org.apache.ozone.test.MetricsAsserts.getMetrics;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.data.Offset.offset;
++
++import java.util.HashMap;
++import org.apache.hadoop.hdds.client.RatisReplicationConfig;
++import org.apache.hadoop.hdds.conf.OzoneConfiguration;
++import org.apache.hadoop.hdds.fs.DUFactory;
++import org.apache.hadoop.hdds.fs.SpaceUsageCheckFactory;
++import org.apache.hadoop.metrics2.MetricsRecordBuilder;
++import org.apache.hadoop.ozone.MiniOzoneCluster;
++import org.apache.hadoop.ozone.client.OzoneClient;
++import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
++import org.apache.hadoop.ozone.container.common.volume.DatanodeStorageMetrics;
++import org.apache.hadoop.ozone.container.common.volume.MutableVolumeSet;
++import org.apache.ozone.test.GenericTestUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.Timeout;
++
++/**
++ * Integration tests for {@link DatanodeStorageMetrics}.
++ *
++ * <p>Verifies that the live registered metrics source on a real DataNode
++ * reflects actual storage usage: capacity is positive, used space increases
++ * after writing data, and the percentage arithmetic holds.
++ */
++@Timeout(300)
++public class TestDatanodeStorageMetricsIntegration {
++
++  private MiniOzoneCluster cluster;
++
++  @BeforeEach
++  void startCluster() throws Exception {
++    OzoneConfiguration conf = new OzoneConfiguration();
++    conf.set(OZONE_SCM_CONTAINER_SIZE, "1GB");
++    conf.setBoolean(HDDS_SCM_SAFEMODE_PIPELINE_CREATION, false);
++    conf.setClass(configKeyForClassName(), DUFactory.class, SpaceUsageCheckFactory.class);
++    cluster = MiniOzoneCluster.newBuilder(conf)
++        .setNumDatanodes(1)
++        .build();
++    cluster.waitForClusterToBeReady();
++    cluster.waitForPipelineTobeReady(ONE, 30000);
++  }
++
++  @AfterEach
++  void stopCluster() {
++    if (cluster != null) {
++      cluster.shutdown();
++    }
++  }
++
++  @Test
++  void storageMetricsReflectWrittenData() throws Exception {
++    // Baseline before any write.
++    long baselineUsed = getLongGauge("OzoneUsed", storageMetrics());
++
++    // Write a key to generate real used space.
++    try (OzoneClient client = cluster.newClient()) {
++      client.getObjectStore().createVolume("vol");
++      client.getObjectStore().getVolume("vol").createBucket("bucket");
++      OzoneOutputStream key = client.getObjectStore().getVolume("vol")
++          .getBucket("bucket")
++          .createKey("key", 4096,
++              RatisReplicationConfig.getInstance(ONE), new HashMap<>());
++      key.write(new byte[4096]);
++      key.close();
++    }
++
++    // Force DU refresh so the in-memory usage cache reflects the write.
++    MutableVolumeSet volumeSet = cluster.getHddsDatanodes().get(0)
++        .getDatanodeStateMachine().getContainer().getVolumeSet();
++    volumeSet.getVolumesList().get(0).getVolumeUsage().refreshNow();
++
++    // Wait until OzoneUsed is reported as greater than the baseline.
++    GenericTestUtils.waitFor(
++        () -> getLongGauge("OzoneUsed", storageMetrics()) > baselineUsed,
++        500, 10_000);
++
++    // Read all three gauges from one storageMetrics() call so they come from
++    // the same getStorageReport() iteration and are mutually consistent.
++    MetricsRecordBuilder rb = storageMetrics();
++    long capacity = getLongGauge("OzoneCapacity", rb);
++    long used = getLongGauge("OzoneUsed", rb);
++    double usedPercentage = getDoubleGauge("OzoneUsedPercentage", rb);
++
++    assertThat(capacity).isGreaterThan(0L);
++    assertThat(used).isGreaterThan(baselineUsed);
++    assertThat(usedPercentage).isBetween(0.0, 100.0);
++
++    // Arithmetic invariant: usedPercentage == 100 * used / capacity.
++    assertThat(usedPercentage).isCloseTo(100.0 * used / capacity, offset(0.001));
++  }
++
++  /**
++   * Returns a fresh snapshot of the live {@link DatanodeStorageMetrics} source.
++   * Each call re-reads the underlying storage reports — do not mix values
++   * from different calls when checking invariants across gauges.
++   */
++  private static MetricsRecordBuilder storageMetrics() {
++    return getMetrics(DatanodeStorageMetrics.SOURCE_NAME);
++  }
++}

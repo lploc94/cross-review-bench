@@ -1,0 +1,599 @@
+diff --git a/.env.example b/.env.example
+index 3fc7578..8985a5b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -9,3 +9,5 @@ REPORTING_ZONE=Europe/Berlin
+ MAX_REJECT_RATIO=0.05
+ BATCH_SIZE=1000
+ MAX_FUTURE_SKEW_SECONDS=300
++# orders.daily_total.anomaly: a day's total this many times above or below the mean.
++ANOMALY_FACTOR=3
+diff --git a/README.md b/README.md
+index 2ae945d..8f11ef6 100644
+--- a/README.md
++++ b/README.md
+@@ -89,6 +89,14 @@ previous successful run. They run inside the load transaction; a failing `error`
+ the run and rolls the load back, a failing `warn` check is recorded. Results land in
+ `etl.check_results`, failed runs included. Check details name columns and counts, never values.
+ 
++`orders.daily_total.anomaly` (warn) compares yesterday's order total, per currency, with the
++mean daily total of the 28 days before it; days are calendar days in `REPORTING_ZONE`, and
++cancelled orders are left out, as in the daily sales report. A total more than
++`ANOMALY_FACTOR` times above or below the mean fails the check (a day without orders in a
++currency that had them counts as 0). The mean is taken over the days that had orders; a
++currency with fewer than 7 such days has no baseline yet and passes. Details give each
++currency outside the range with its total as a multiple of the mean.
++
+ **Reports.** Days are calendar days in `REPORTING_ZONE`, so an order placed at 23:30 UTC in
+ summer belongs to the next day in Berlin, and the day of a DST change has 23 or 25 hours.
+ 
+@@ -184,6 +192,7 @@ tests/                 pytest suites; tests/helpers has the clock, file builders
+ | `MAX_REJECT_RATIO` | `0.05` | 0–1; a run fails above it |
+ | `BATCH_SIZE` | `1000` | rows per staging insert and per reject write |
+ | `MAX_FUTURE_SKEW_SECONDS` | `300` | rows further in the future are rejected |
++| `ANOMALY_FACTOR` | `3` | above 1; see the `orders.daily_total.anomaly` check |
+ 
+ The command refuses to start, listing every problem, when a variable is missing or invalid.
+ See `.env.example`. Logs are JSON lines on stderr; values of keys such as `email`, `full_name`,
+diff --git a/src/etl/api/checks.py b/src/etl/api/checks.py
+index 2043817..9ce6558 100644
+--- a/src/etl/api/checks.py
++++ b/src/etl/api/checks.py
+@@ -18,11 +18,12 @@ from etl.store.check_results import SucceededRunHistory
+ 
+ 
+ def _declared(context: AppContext, source: str | None) -> Sequence[Check]:
++    declared = context.declared_checks()
+     if source is None:
+-        return list(context.checks)
++        return list(declared)
+     spec = get_source(source, context.sources)
+     tables = context.datasets[spec.dataset].loader.target_tables
+-    return checks_for(tables, context.checks)
++    return checks_for(tables, declared)
+ 
+ 
+ def list_checks(context: AppContext, source: str | None = None) -> list[CheckView]:
+diff --git a/src/etl/api/context.py b/src/etl/api/context.py
+index 3114520..60fe751 100644
+--- a/src/etl/api/context.py
++++ b/src/etl/api/context.py
+@@ -15,7 +15,7 @@ from etl.logging import configure_logging
+ from etl.pipeline.datasets import DATASETS, DatasetBinding
+ from etl.pipeline.runner import Pipeline
+ from etl.quality.checks import Check
+-from etl.quality.registry import CHECKS
++from etl.quality.registry import build_checks
+ from etl.sources.registry import SOURCES, Dataset, SourceSpec
+ 
+ 
+@@ -26,7 +26,8 @@ class AppContext:
+     clock: Clock
+     sources: Mapping[str, SourceSpec] = field(default_factory=lambda: SOURCES)
+     datasets: Mapping[Dataset, DatasetBinding[Any]] = field(default_factory=lambda: DATASETS)
+-    checks: Sequence[Check] = CHECKS
++    # None: the checks the settings declare (build_checks).
++    checks: Sequence[Check] | None = None
+     # Whether close() disposes of the engine (False when the caller shares its engine).
+     owns_engine: bool = True
+ 
+@@ -40,6 +41,11 @@ class AppContext:
+             checks=self.checks,
+         )
+ 
++    def declared_checks(self) -> Sequence[Check]:
++        if self.checks is not None:
++            return self.checks
++        return build_checks(self.settings, self.clock)
++
+     def close(self) -> None:
+         if self.owns_engine:
+             self.engine.dispose()
+diff --git a/src/etl/api/settings.py b/src/etl/api/settings.py
+index 424e52d..8a43211 100644
+--- a/src/etl/api/settings.py
++++ b/src/etl/api/settings.py
+@@ -18,4 +18,5 @@ def show_settings(context: AppContext) -> SettingsView:
+         max_reject_ratio=settings.max_reject_ratio,
+         batch_size=settings.batch_size,
+         max_future_skew_seconds=settings.max_future_skew_seconds,
++        anomaly_factor=settings.anomaly_factor,
+     )
+diff --git a/src/etl/config.py b/src/etl/config.py
+index 4c9b259..74ea49a 100644
+--- a/src/etl/config.py
++++ b/src/etl/config.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++from decimal import Decimal
+ from pathlib import Path
+ from typing import Literal
+ from urllib.parse import urlsplit
+@@ -38,6 +39,9 @@ class Settings(BaseSettings):
+     max_reject_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
+     batch_size: int = Field(default=1000, ge=1, le=50_000)
+     max_future_skew_seconds: int = Field(default=300, ge=0, le=86_400)
++    # A day's order total more than this many times above or below the recent daily mean is
++    # reported by the orders.daily_total.anomaly check.
++    anomaly_factor: Decimal = Field(default=Decimal(3), gt=1, le=1000)
+ 
+     @field_validator("database_url")
+     @classmethod
+diff --git a/src/etl/pipeline/runner.py b/src/etl/pipeline/runner.py
+index 5f697fe..9131517 100644
+--- a/src/etl/pipeline/runner.py
++++ b/src/etl/pipeline/runner.py
+@@ -41,7 +41,7 @@ from etl.pipeline.extract import ExtractCounts, extract
+ from etl.pipeline.sink import RejectSink
+ from etl.pipeline.window import IncrementalWindow
+ from etl.quality.checks import Check
+-from etl.quality.registry import CHECKS, checks_for
++from etl.quality.registry import build_checks, checks_for
+ from etl.quality.runner import CheckResult, blocking_failures, run_checks
+ from etl.sources.readers import open_reader
+ from etl.sources.registry import SOURCES, Dataset, SourceSpec, get_source
+@@ -92,14 +92,14 @@ class Pipeline:
+         *,
+         sources: Mapping[str, SourceSpec] = SOURCES,
+         datasets: Mapping[Dataset, DatasetBinding[Any]] = DATASETS,
+-        checks: Sequence[Check] = CHECKS,
++        checks: Sequence[Check] | None = None,
+     ) -> None:
+         self._engine = engine
+         self._settings = settings
+         self._clock = clock
+         self._sources = sources
+         self._datasets = datasets
+-        self._checks = checks
++        self._checks = checks if checks is not None else build_checks(settings, clock)
+ 
+     def run(self, source: str, path: Path) -> RunResult:
+         """Load `path` as a file of `source`. Raises an EtlError (with `run_id` set once the
+diff --git a/src/etl/quality/checks.py b/src/etl/quality/checks.py
+index d45c143..31e0efa 100644
+--- a/src/etl/quality/checks.py
++++ b/src/etl/quality/checks.py
+@@ -9,11 +9,27 @@ from __future__ import annotations
+ 
+ from collections.abc import Collection
+ from dataclasses import dataclass
++from datetime import date, timedelta
+ from decimal import Decimal
+ from enum import StrEnum
+ from typing import Protocol
++from zoneinfo import ZoneInfo
+ 
+-from sqlalchemy import ColumnElement, Connection, Table, and_, exists, func, not_, select
++from sqlalchemy import (
++    ColumnElement,
++    Connection,
++    Date,
++    Table,
++    and_,
++    cast,
++    exists,
++    func,
++    not_,
++    select,
++)
++
++from etl.domain.timestamps import local_date
++from etl.infra.clock import Clock
+ 
+ 
+ class Severity(StrEnum):
+@@ -211,3 +227,85 @@ class RowCountDelta:
+             observed=observed,
+             details=f"{_plural(current, 'row')}, {delta:.1%} change from {previous}",
+         )
++
++
++@dataclass(frozen=True, slots=True, eq=False)
++class DailyTotalAnomaly:
++    """The total of `amount` over the last complete local day stays within `factor` times the
++    mean daily total of the `history_days` days before it, per value of `by` (a currency).
++
++    Days are calendar days in `zone`, like the reports. Only days that have rows count as
++    history; with fewer than `min_history_days` of them there is no baseline yet.
++    """
++
++    table: Table
++    timestamp: str
++    amount: str
++    by: str
++    zone: ZoneInfo
++    factor: Decimal
++    clock: Clock
++    severity: Severity = Severity.WARN
++    where: ColumnElement[bool] | None = None
++    history_days: int = 28
++    min_history_days: int = 7
++
++    @property
++    def name(self) -> str:
++        return f"{self.table.name}.daily_total.anomaly"
++
++    @property
++    def description(self) -> str:
++        return (
++            f"yesterday's {self.amount} per {self.by} within {self.factor}x of the mean of "
++            f"the previous {self.history_days} days"
++        )
++
++    def _daily_totals(
++        self, connection: Connection, first: date, last: date
++    ) -> dict[str, dict[date, Decimal]]:
++        """Per `by` value, the total of each local day in first..last that has rows."""
++        local_day = cast(func.timezone(self.zone.key, self.table.c[self.timestamp]), Date)
++        group = self.table.c[self.by]
++        statement = (
++            select(group, local_day.label("day"), func.sum(self.table.c[self.amount]))
++            .where(local_day.between(first, last))
++            .group_by(group, local_day)
++        )
++        if self.where is not None:
++            statement = statement.where(self.where)
++        totals: dict[str, dict[date, Decimal]] = {}
++        for key, day, total in connection.execute(statement):
++            totals.setdefault(key, {})[day] = total
++        return totals
++
++    def evaluate(self, connection: Connection, history: CheckHistory) -> CheckOutcome:
++        day = local_date(self.clock.now(), self.zone) - timedelta(days=1)
++        first = day - timedelta(days=self.history_days)
++        totals = self._daily_totals(connection, first, day)
++
++        compared: list[str] = []
++        anomalies: list[str] = []
++        for key in sorted(totals):
++            by_day = totals[key]
++            total = by_day.pop(day, Decimal(0))
++            if len(by_day) < self.min_history_days:
++                continue
++            mean = sum(by_day.values(), Decimal(0)) / len(by_day)
++            if mean <= 0:
++                continue
++            compared.append(key)
++            if total > mean * self.factor or total * self.factor < mean:
++                anomalies.append(f"{key} {total / mean:.2f}x")
++
++        if not compared:
++            details = f"{day}: fewer than {self.min_history_days} days of history"
++        elif anomalies:
++            details = f"{day}: outside {self.factor}x of the mean: {', '.join(anomalies)}"
++        else:
++            details = f"{day}: {', '.join(compared)} within {self.factor}x of the mean"
++        return CheckOutcome(
++            passed=not anomalies,
++            observed=Decimal(len(anomalies)),
++            details=details,
++        )
+diff --git a/src/etl/quality/registry.py b/src/etl/quality/registry.py
+index 2cdb970..e2a6609 100644
+--- a/src/etl/quality/registry.py
++++ b/src/etl/quality/registry.py
+@@ -7,22 +7,28 @@ from decimal import Decimal
+ 
+ from sqlalchemy import Table
+ 
++from etl.config import Settings
+ from etl.domain.contact import COUNTRY_CODES
+ from etl.domain.money import CURRENCIES
+ from etl.domain.records import ORDER_STATUSES
++from etl.infra.clock import Clock
+ from etl.infra.tables import customers, order_lines, orders, products
+ from etl.quality.checks import (
+     AcceptedValues,
+     Check,
++    DailyTotalAnomaly,
+     NotNull,
+     Referential,
+     RowCountDelta,
+     Severity,
+     Unique,
+ )
++from etl.reports.daily_sales import EXCLUDED_STATUSES
+ 
+ DEFAULT_TOLERANCE = Decimal("0.5")
+ 
++# Checks that need no settings. build_checks adds those that depend on the settings and the
++# clock; a run and `etl checks` use what it returns.
+ CHECKS: tuple[Check, ...] = (
+     # products
+     Unique(products, ("product_id",)),
+@@ -44,6 +50,23 @@ CHECKS: tuple[Check, ...] = (
+ )
+ 
+ 
++def build_checks(settings: Settings, clock: Clock) -> tuple[Check, ...]:
++    """Every declared check: CHECKS and the checks configured by `settings`."""
++    return (
++        *CHECKS,
++        DailyTotalAnomaly(
++            orders,
++            timestamp="ordered_at",
++            amount="total_amount",
++            by="currency",
++            zone=settings.reporting_tz,
++            factor=settings.anomaly_factor,
++            clock=clock,
++            where=orders.c.status.not_in(EXCLUDED_STATUSES),
++        ),
++    )
++
++
+ def checks_for(tables: Iterable[Table], checks: Iterable[Check] = CHECKS) -> list[Check]:
+     """The checks on any of `tables`, in declaration order."""
+     wanted = set(tables)
+diff --git a/src/etl/schemas/views.py b/src/etl/schemas/views.py
+index c5592cf..caeb240 100644
+--- a/src/etl/schemas/views.py
++++ b/src/etl/schemas/views.py
+@@ -158,3 +158,4 @@ class SettingsView(View):
+     max_reject_ratio: float
+     batch_size: int
+     max_future_skew_seconds: int
++    anomaly_factor: Decimal
+diff --git a/tests/cli/test_checks_command.py b/tests/cli/test_checks_command.py
+index a93ca5b..4534fa4 100644
+--- a/tests/cli/test_checks_command.py
++++ b/tests/cli/test_checks_command.py
+@@ -16,6 +16,7 @@ def test_checks_list_shows_every_declared_check(cli, db):
+     assert result.exit_code == 0, result.output
+     for check in CHECKS:
+         assert check.name in result.stdout
++    assert "orders.daily_total.anomaly" in result.stdout
+     assert "never run" in result.stdout
+ 
+ 
+diff --git a/tests/quality/test_daily_total_anomaly.py b/tests/quality/test_daily_total_anomaly.py
+new file mode 100644
+index 0000000..47dfb15
+--- /dev/null
++++ b/tests/quality/test_daily_total_anomaly.py
+@@ -0,0 +1,187 @@
++"""The anomaly check on daily order totals: yesterday against the mean of the 28 days before."""
++
++from __future__ import annotations
++
++from datetime import UTC, date, datetime, time, timedelta
++from decimal import Decimal
++from zoneinfo import ZoneInfo
++
++import pytest
++from sqlalchemy import Connection, insert
++
++from etl.config import Settings
++from etl.infra.tables import check_results, orders, runs
++from etl.quality.checks import Check, Severity
++from etl.quality.registry import build_checks, checks_for, find_check
++from tests.helpers.clock import FrozenClock
++from tests.helpers.db import rows
++from tests.helpers.factories import customer_obj, order_row, write_customers, write_orders
++
++BERLIN = ZoneInfo("Europe/Berlin")
++# The default FrozenClock reads 2026-04-01 10:00 in Berlin: yesterday is 2026-03-31.
++YESTERDAY = date(2026, 3, 31)
++NAME = "orders.daily_total.anomaly"
++
++
++class NoHistory:
++    def previous_observed(self, check_name: str) -> Decimal | None:
++        return None
++
++
++def anomaly_check(settings: Settings, clock: FrozenClock) -> Check:
++    check = find_check(NAME, build_checks(settings, clock))
++    assert check is not None
++    return check
++
++
++def seed_run(connection: Connection) -> None:
++    connection.execute(
++        insert(runs).values(
++            id=1,
++            source="orders",
++            path="-",
++            status="running",
++            started_at=datetime(2026, 4, 1, tzinfo=UTC),
++        )
++    )
++
++
++def add_order(
++    connection: Connection,
++    order_id: str,
++    ordered_at: datetime,
++    total: str,
++    *,
++    currency: str = "EUR",
++    status: str = "paid",
++) -> None:
++    connection.execute(
++        insert(orders).values(
++            order_id=order_id,
++            customer_id="C-1",
++            status=status,
++            country="DE",
++            currency=currency,
++            total_amount=Decimal(total),
++            ordered_at=ordered_at,
++            updated_at=ordered_at,
++            loaded_at=ordered_at,
++            run_id=1,
++        )
++    )
++
++
++def at_noon(day: date) -> datetime:
++    return datetime.combine(day, time(12), tzinfo=BERLIN)
++
++
++def add_history(connection: Connection, days: int, total: str, *, currency: str = "EUR") -> None:
++    """One order of `total` at noon on each of the `days` days before yesterday."""
++    for back in range(1, days + 1):
++        day = YESTERDAY - timedelta(days=back)
++        add_order(connection, f"H-{currency}-{back}", at_noon(day), total, currency=currency)
++
++
++def evaluate(db, settings, clock, fill):
++    with db.begin() as connection:
++        seed_run(connection)
++        fill(connection)
++        outcome = anomaly_check(settings, clock).evaluate(connection, NoHistory())
++        connection.rollback()
++    return outcome
++
++
++def test_the_check_is_declared_for_orders_as_a_warning(settings, clock):
++    check = anomaly_check(settings, clock)
++
++    assert check.severity is Severity.WARN
++    assert NAME in [c.name for c in checks_for([orders], build_checks(settings, clock))]
++    assert "within 3x" in check.description
++
++
++def test_without_a_week_of_history_there_is_no_baseline(db, settings, clock):
++    def fill(connection):
++        add_history(connection, 6, "100.00")
++        add_order(connection, "Y-1", at_noon(YESTERDAY), "5000.00")
++
++    outcome = evaluate(db, settings, clock, fill)
++
++    assert outcome.passed
++    assert outcome.details == "2026-03-31: fewer than 7 days of history"
++
++
++@pytest.mark.parametrize(
++    ("total", "passed", "details"),
++    [
++        ("300.00", True, "2026-03-31: EUR within 3x of the mean"),
++        ("34.00", True, "2026-03-31: EUR within 3x of the mean"),
++        ("300.01", False, "2026-03-31: outside 3x of the mean: EUR 3.00x"),
++        ("25.00", False, "2026-03-31: outside 3x of the mean: EUR 0.25x"),
++    ],
++)
++def test_a_total_beyond_the_factor_fails(db, settings, clock, total, passed, details):
++    def fill(connection):
++        add_history(connection, 10, "100.00")
++        add_order(connection, "Y-1", at_noon(YESTERDAY), total)
++
++    outcome = evaluate(db, settings, clock, fill)
++
++    assert (outcome.passed, outcome.details) == (passed, details)
++    assert outcome.observed == Decimal(0 if passed else 1)
++
++
++def test_a_day_without_orders_fails(db, settings, clock):
++    outcome = evaluate(db, settings, clock, lambda connection: add_history(connection, 7, "80"))
++
++    assert not outcome.passed
++    assert outcome.details == "2026-03-31: outside 3x of the mean: EUR 0.00x"
++
++
++def test_currencies_are_compared_separately(db, settings, clock):
++    def fill(connection):
++        add_history(connection, 8, "100.00")
++        add_history(connection, 8, "400.00", currency="PLN")
++        add_order(connection, "Y-EUR", at_noon(YESTERDAY), "120.00")
++        add_order(connection, "Y-PLN", at_noon(YESTERDAY), "1500.00", currency="PLN")
++
++    outcome = evaluate(db, settings, clock, fill)
++
++    assert not outcome.passed
++    assert outcome.observed == Decimal(1)
++    assert outcome.details == "2026-03-31: outside 3x of the mean: PLN 3.75x"
++
++
++def test_days_are_local_days_and_cancelled_orders_do_not_count(db, settings, clock):
++    def fill(connection):
++        add_history(connection, 7, "100.00")
++        # 23:30 UTC on March 30 is already March 31 in Berlin, and 00:30 Berlin on April 1
++        # (22:30 UTC on March 31) is today: only the first counts as yesterday.
++        add_order(connection, "Y-1", datetime(2026, 3, 30, 23, 30, tzinfo=UTC), "150.00")
++        add_order(connection, "T-1", datetime(2026, 3, 31, 22, 30, tzinfo=UTC), "900.00")
++        add_order(connection, "Y-2", at_noon(YESTERDAY), "900.00", status="cancelled")
++
++    outcome = evaluate(db, settings, clock, fill)
++
++    assert outcome.passed
++    assert outcome.details == "2026-03-31: EUR within 3x of the mean"
++
++
++def test_the_factor_comes_from_the_settings(db, settings, clock):
++    lenient = settings.model_copy(update={"anomaly_factor": Decimal(5)})
++
++    def fill(connection):
++        add_history(connection, 7, "100.00")
++        add_order(connection, "Y-1", at_noon(YESTERDAY), "450.00")
++
++    assert not evaluate(db, settings, clock, fill).passed
++    assert evaluate(db, lenient, clock, fill).passed
++
++
++def test_an_orders_run_records_the_check(pipeline, db, tmp_path):
++    pipeline.run("customers", write_customers(tmp_path, [customer_obj()]))
++
++    result = pipeline.run("orders", write_orders(tmp_path, [order_row()]))
++
++    recorded = {row["check_name"]: row for row in rows(db, check_results, run_id=result.run_id)}
++    assert recorded[NAME]["severity"] == "warn"
++    assert recorded[NAME]["passed"] is True
+diff --git a/tests/unit/test_config.py b/tests/unit/test_config.py
+index b5f37ab..cab5a60 100644
+--- a/tests/unit/test_config.py
++++ b/tests/unit/test_config.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from decimal import Decimal
++
+ import pytest
+ 
+ from etl.config import load_settings
+@@ -10,7 +12,14 @@ URL = "postgresql://etl:secret@db.internal:5432/warehouse"
+ 
+ @pytest.fixture(autouse=True)
+ def _clean_environment(monkeypatch):
+-    for name in ("DATABASE_URL", "REPORTING_ZONE", "MAX_REJECT_RATIO", "BATCH_SIZE", "REPORT_DIR"):
++    for name in (
++        "DATABASE_URL",
++        "REPORTING_ZONE",
++        "MAX_REJECT_RATIO",
++        "BATCH_SIZE",
++        "REPORT_DIR",
++        "ANOMALY_FACTOR",
++    ):
+         monkeypatch.delenv(name, raising=False)
+ 
+ 
+@@ -27,6 +36,7 @@ def test_settings_come_from_the_environment(monkeypatch, tmp_path):
+     assert settings.max_reject_ratio == 0.1
+     assert settings.report_dir == tmp_path
+     assert settings.batch_size == 1000
++    assert settings.anomaly_factor == Decimal(3)
+     assert "secret" not in repr(settings)
+ 
+ 
+@@ -59,3 +69,19 @@ def test_the_report_directory_must_not_be_a_file(monkeypatch, tmp_path):
+ 
+     with pytest.raises(ConfigError, match="not a directory"):
+         load_settings()
++
++
++@pytest.mark.parametrize("value", ["1", "0.5", "-2"])
++def test_the_anomaly_factor_must_exceed_one(monkeypatch, value):
++    monkeypatch.setenv("DATABASE_URL", URL)
++    monkeypatch.setenv("ANOMALY_FACTOR", value)
++
++    with pytest.raises(ConfigError, match="ANOMALY_FACTOR"):
++        load_settings()
++
++
++def test_the_anomaly_factor_may_be_a_decimal(monkeypatch):
++    monkeypatch.setenv("DATABASE_URL", URL)
++    monkeypatch.setenv("ANOMALY_FACTOR", "2.5")
++
++    assert load_settings().anomaly_factor == Decimal("2.5")

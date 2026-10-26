@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T13",
+  "repo": "gateway-go",
+  "kind": "clean",
+  "title": "Request size limits per route",
+  "description": "Some routes take uploads that must be smaller than the gateway-wide buffer. `BODY_BUFFER_LIMIT` bounds what the gateway holds in memory, but it says nothing about what a route should accept, and a route that only needs small JSON payloads should refuse anything bigger before it reaches an upstream.\n\n- Routes gain `max_request_bytes`. A declared `Content-Length` above it is answered with `413 body_too_large` right after the route matches, before authentication and before any upstream call.\n- A body of unknown length (chunked) is counted while it is forwarded. Once it passes the limit the attempt is aborted and the client gets `413 body_too_large`; this is not retried and does not count as an upstream failure for the circuit breaker.\n- The limit also bounds buffering for authentication and retries: the buffer uses the smaller of `max_request_bytes` and `BODY_BUFFER_LIMIT`, and a `413` on a buffered route names which limit applied.\n- When the upstream's response comes back before a chunked body has ended (an upstream that answers without reading the whole body), the body gets 50 ms, or the route's `timeout` when that is shorter, to end. An oversize body gets `413` in place of the response; otherwise the rest of the body is not forwarded, which ends the connection to the upstream, and the response is relayed, also to a client that has stopped sending, as far as the gateway had received it by then (an early answer is in practice a short error response; a longer one that is cut off ends with an aborted connection rather than looking complete). The client's connection is closed after the response. The limit decision is made on the bytes seen in that window. An upstream that does not answer gets `504` at the route's `timeout`, as before.\n- `config` validation rejects a negative value and names the route and field.\n- README: the request path and the routes file.\n\nTests: declared and chunked oversize bodies, a body exactly at the limit, a retried route whose body is cut off, the message naming the limit, an upstream that answers before an oversize chunked body is sent in full (413), an upstream that answers and closes while the client has sent part of a body and stalls (200 relayed by the gateway running as a real server), and the validation message.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["internal/proxy/max_request_bytes_check_test.go"],
+  "clean_hidden_test_cmd": "go test -count=1 -run '^TestRouteRequestLimitCheck$' ./internal/proxy/"
+}

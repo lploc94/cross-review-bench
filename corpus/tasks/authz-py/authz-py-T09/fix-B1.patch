@@ -1,0 +1,31 @@
+diff --git a/src/authz/services/members.py b/src/authz/services/members.py
+index ab0facb..b128a4e 100644
+--- a/src/authz/services/members.py
++++ b/src/authz/services/members.py
+@@ -189,20 +189,21 @@ class MemberService:
+         items still apply. Items are written in key order, so two bulk requests over the same
+         members insert their rows in the same order and cannot deadlock on each other.
+         """
+-        outcomes: list[AssignmentOutcome] = []
++        outcomes: dict[int, AssignmentOutcome] = {}
++        ordered = sorted(enumerate(requests), key=lambda item: _lock_order(item[1]))
+         async with self._db.transaction() as session:
+             snapshot = await self._authz.snapshot(session, org_id, principal.user_id)
+-            for request in sorted(requests, key=_lock_order):
++            for index, request in ordered:
+                 try:
+                     async with session.begin_nested():
+                         assignment = await self._add_assignment(
+                             session, principal, org_id, request, snapshot
+                         )
+                 except DomainError as error:
+-                    outcomes.append(AssignmentOutcome(request, error=error))
++                    outcomes[index] = AssignmentOutcome(request, error=error)
+                 else:
+-                    outcomes.append(AssignmentOutcome(request, assignment=assignment))
+-        return outcomes
++                    outcomes[index] = AssignmentOutcome(request, assignment=assignment)
++        return [outcomes[index] for index in range(len(requests))]
+ 
+     async def _add_assignment(
+         self,

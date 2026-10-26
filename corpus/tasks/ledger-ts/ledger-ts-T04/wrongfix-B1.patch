@@ -1,0 +1,16 @@
+diff --git a/src/services/statementService.ts b/src/services/statementService.ts
+index 5a98154..5fd8b09 100644
+--- a/src/services/statementService.ts
++++ b/src/services/statementService.ts
+@@ -59,7 +59,10 @@ export class StatementService {
+           );
+         }
+         const movement = entriesTotal(rows);
+-        const openingBalance = account.balanceMinor - movement;
++        const first = rows[0];
++        const openingBalance = first
++          ? first.balanceAfter - first.amountMinor
++          : account.balanceMinor;
+         return {
+           account,
+           period,

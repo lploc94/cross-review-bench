@@ -1,0 +1,18 @@
+diff --git a/packages/server/src/services/pushService.ts b/packages/server/src/services/pushService.ts
+index 6884b6a..f61f354 100644
+--- a/packages/server/src/services/pushService.ts
++++ b/packages/server/src/services/pushService.ts
+@@ -162,9 +162,11 @@ export class PushService {
+     const refused = new Map<MutationPayload, PushRejection>();
+     const unseen = mutations.filter((m) => !recorded.has(m.mutationId));
+     unseen.forEach((mutation, index) => {
++      // Positions in the request: count the recorded mutations that were skipped.
++      const position = index + (mutations.length - unseen.length);
+       const reject = (issues: readonly FieldIssue[], summary?: string) => {
+-        const err = new InvalidMutationError(index, mutation.mutationId, issues, summary);
+-        refused.set(mutation, { index, code: err.code, message: err.message, issues: [...issues] });
++        const err = new InvalidMutationError(position, mutation.mutationId, issues, summary);
++        refused.set(mutation, { index: position, code: err.code, message: err.message, issues: [...issues] });
+       };
+       if (seen.has(mutation.mutationId)) {
+         reject(

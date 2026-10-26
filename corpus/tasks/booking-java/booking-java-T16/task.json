@@ -1,0 +1,45 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T16",
+  "repo": "booking-java",
+  "kind": "decoy",
+  "title": "Hold groups: several room types for one stay",
+  "description": "Front desk keeps getting requests for one stay in several room types (two doubles and a suite for a family, for example), which today means separate holds that can half succeed. This adds hold groups.\n\n- `POST /api/v1/properties/{code}/hold-groups` takes `checkIn`, `checkOut`, `items` (`[{roomType, rooms, guests}]`, each room type once) and `guest`, and answers 201 with `Location: /api/v1/hold-groups/{id}`. `GET /api/v1/hold-groups/{id}`, `POST .../release` and `POST .../confirm` follow; confirm answers 201 with one reservation per room type.\n- A group is one ordinary hold per room type (each with its own quote and price lines) sharing a new nullable `hold.group_id` (migration V2, with a partial unique index on `(group_id, room_type_id)`) and the same time limit. Hold responses and the admin hold list show `groupId`.\n- `HoldService.createGroup` resolves the room types and takes the rooms in room type id order and then night order, whatever order the request lists the items in; the group response lists the holds in that order.\n- Inventory is taken with the existing conditional `holdRooms` update. If any night of any item is short, the request is a 409 `insufficient-availability` and nothing is held.\n- Confirm locks the group's hold rows and only those (`HoldRepository.findLockedGroup`, in room type id order), so other guests' holds and releases on the same property go on while the group is being charged. It checks every hold as single confirm does (an expired or already started stay names the hold that failed), charges the group's total once with key `charge-group-<groupId>`, then confirms each hold into its own reservation with a CHARGE ledger entry for that hold's total and the shared gateway reference. As with single holds, a hold quoted at zero gets no ledger entry and a group quoted at zero is not charged. Single confirm is refactored to share the same `book` step.\n- Release and expiry handle all holds of a group: `releaseGroup` locks them within `booking.lock-timeout`; the sweep and the admin expire override, given any hold of a group, expire the whole group (the sweep's count is the number of holds expired). Releasing or confirming one hold of a group through `/api/v1/holds/{id}` is a 409.\n- Limits: at least one item, `max-rooms-per-booking` applies to the group's total rooms.\n\nTests: `HoldGroupTest` (order and shared id/expiry, short room type holds nothing, duplicate room type refused, single charge and ledger on confirm, room types quoted at zero, a group confirmation paused in its charge locks no property or room type row and a new hold for the same room type goes through, member-only release/confirm refused and group release, sweep expires the group) and `HoldGroupApiTest`. README updated (concepts and API table).",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "src/main/java/com/innkeep/booking/service/HoldService.java",
+      "lines": [
+        177,
+        177
+      ],
+      "looks_like": "createGroup throws away the order the guest listed the room types in and re-sorts the items by internal room type id before taking any inventory, which looks like it changes the request's meaning (or makes the response order unrelated to the request) for no reason.",
+      "why_correct": "The order of items carries no meaning: each item becomes its own hold with its own quote, and all items must succeed or none, so the outcome is the same in any order. Sorting by room type id gives every group the same global lock order on inventory rows, (room type id, night ascending), which is also the order a single hold uses for its one room type. Without it, two groups listing the same room types in opposite orders take each other's first rows and deadlock (Postgres aborts one with 40P01, a 503). The response is documented to list holds in room type id order.",
+      "valid_rebuttal": "The README's Hold groups bullet and the HoldService class Javadoc state the rule: rooms are taken in room type id order and then night order whatever the request lists, so groups and single holds never take inventory rows in opposite orders. Each item is priced and held independently (PricingEngine.quote per room type, one Hold per item) and the transaction makes the group all-or-nothing, so the order changes nothing but the locking order. HoldGroupTest.aGroupHoldsEveryRoomTypeInRoomTypeOrderWithItsOwnQuote shows the documented order.",
+      "hidden_tests": [
+        "src/test/java/com/innkeep/booking/service/GroupHoldOrderCheckTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=GroupHoldOrderCheckTest#twoGroupsListingTheirRoomTypesInOppositeOrderBothComplete"
+    },
+    {
+      "id": "D2",
+      "file": "src/main/java/com/innkeep/booking/service/HoldService.java",
+      "lines": [
+        194,
+        198
+      ],
+      "looks_like": "When a night of a later item is short, createGroup throws InsufficientAvailabilityException straight away without giving back the rooms holdRooms already moved into held for the earlier items (and earlier nights), which looks like leaked inventory for every partially taken group.",
+      "why_correct": "The whole loop runs inside tx.execute (Spring's TransactionTemplate), and the exception is a RuntimeException, so the template rolls the transaction back: every holdRooms UPDATE and every hold INSERT of the group is undone by the database. That is exactly how the existing single-hold create handles a short night after earlier nights were taken. Nothing is committed until all items succeed.",
+      "valid_rebuttal": "createGroup returns tx.execute(...) around the whole loop; TransactionTemplate rolls back on any RuntimeException, and InsufficientAvailabilityException is one (it extends ConflictException, a BookingException, which extends RuntimeException). The single-hold HoldService.create relies on the same rollback for its nights, and HoldServiceTest.aStayShortOnOneNightTakesNothingOnAnyNight shows it. HoldGroupTest.aShortRoomTypeHoldsNothingForTheOthers checks that no room of any item is held after the failure.",
+      "hidden_tests": [
+        "src/test/java/com/innkeep/booking/service/GroupHoldOrderCheckTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=GroupHoldOrderCheckTest#whenTheSecondRoomTypeIsShortNothingIsTakenForTheFirst"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

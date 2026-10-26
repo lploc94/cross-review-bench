@@ -1,0 +1,574 @@
+diff --git a/README.md b/README.md
+index fe7e007..25f2db4 100644
+--- a/README.md
++++ b/README.md
+@@ -61,6 +61,14 @@ clean.
+ and `"`/`\` replaced by `_`), `X-Content-Type-Options: nosniff`, `Cache-Control: private`, and the
+ file's sha256 as a strong `ETag`; a matching `If-None-Match` answers 304.
+ 
++**Range requests.** Downloads (by path, by id and through signed links) answer
++`Accept-Ranges: bytes` and honour a single `Range: bytes=…` header: `first-last`, `first-` and the
++suffix form `-length` (the last `length` bytes). The answer is 206 with
++`Content-Range: bytes <first>-<last>/<size>` and the length of that part; a range that starts at or
++after the end of the file is 416 `range_not_satisfiable` with `Content-Range: bytes */<size>`.
++Several ranges, a malformed header, or an `If-Range` that is not the file's current `ETag` get the
++whole file (200). An empty file is always sent whole.
++
+ **Signed links.** `POST /v1/files/by-id/:id/signed-url` with `{"expiresIn": <seconds>}` (1 to
+ `SIGNED_URL_MAX_TTL_S`) returns `{"url": "/v1/public/<id>?exp=<unix seconds>&sig=<hex>",
+ "expiresAt": "<ISO 8601>"}`. Anyone holding the link can download the file without an API key
+@@ -93,12 +101,12 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | GET | `/v1/files?limit=&after=` | `files:read` | 200 |
+ | PUT | `/v1/files/<path>[?overwrite=true]` | `files:write` | 201, or 200 when it replaced a file |
+ | POST | `/v1/files[?overwrite=true]` (multipart) | `files:write` | 201, or 200 when it replaced a file |
+-| GET | `/v1/files/<path>` | `files:read` | 200 (304 on a matching `If-None-Match`) |
++| GET | `/v1/files/<path>` | `files:read` | 200 (206 for a `Range`, 304 on a matching `If-None-Match`) |
+ | DELETE | `/v1/files/<path>` | `files:delete` | 204 |
+-| GET | `/v1/files/by-id/:id` | `files:read` | 200 (304) |
++| GET | `/v1/files/by-id/:id` | `files:read` | 200 (206, 304) |
+ | GET | `/v1/files/by-id/:id/meta` | `files:read` | 200 |
+ | POST | `/v1/files/by-id/:id/signed-url` | `files:read` | 200 |
+-| GET | `/v1/public/:id?exp=&sig=` | none (signed) | 200 (304) |
++| GET | `/v1/public/:id?exp=&sig=` | none (signed) | 200 (206, 304) |
+ | POST | `/v1/uploads[?overwrite=true]` | `uploads:write` | 201 with `Location` |
+ | PATCH | `/v1/uploads/:id` | `uploads:write` | 204 |
+ | HEAD | `/v1/uploads/:id` | `uploads:write` | 200 |
+diff --git a/src/api/plugins/errorHandler.ts b/src/api/plugins/errorHandler.ts
+index 4ab41b5..d0ed342 100644
+--- a/src/api/plugins/errorHandler.ts
++++ b/src/api/plugins/errorHandler.ts
+@@ -2,6 +2,7 @@ import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from
+ import { ZodError } from "zod";
+ import {
+   DomainError,
++  RangeNotSatisfiableError,
+   StorageError,
+   UploadOffsetMismatchError,
+   type ErrorDetails,
+@@ -55,6 +56,9 @@ export function errorHandler(
+     if (err instanceof UploadOffsetMismatchError) {
+       reply.header("upload-offset", String(err.offset));
+     }
++    if (err instanceof RangeNotSatisfiableError) {
++      reply.header("content-range", `bytes */${err.size}`);
++    }
+     if (err instanceof StorageError) {
+       request.log.error({ err }, "storage failure");
+       return reply.code(err.httpStatus).send(body(err.code, "the storage backend failed", err.details));
+diff --git a/src/api/range.ts b/src/api/range.ts
+new file mode 100644
+index 0000000..7f0753b
+--- /dev/null
++++ b/src/api/range.ts
+@@ -0,0 +1,47 @@
++import type { ByteRange } from "../storage/driver.js";
++
++/** What a download answers to its `Range` header. */
++export type RangeRequest =
++  | { readonly kind: "full" }
++  | { readonly kind: "partial"; readonly range: ByteRange }
++  | { readonly kind: "unsatisfiable" };
++
++const FULL: RangeRequest = { kind: "full" };
++const UNSATISFIABLE: RangeRequest = { kind: "unsatisfiable" };
++
++/** One range of the `bytes` unit; the unit name is case-insensitive. */
++const SINGLE_BYTE_RANGE = /^bytes=(\d*)-(\d*)$/i;
++
++/**
++ * The part of a `size`-byte file that a `Range` header asks for (RFC 9110 §14.2). A single range
++ * is served: `first-last`, `first-` (to the end of the file) and the suffix form `-length` (the
++ * last `length` bytes); a `last` past the end of the file is cut to the end. The range returned
++ * has an inclusive `end`, as in the header itself and in `Content-Range`.
++ *
++ * A missing or malformed header, another unit, a list of several ranges or a `last` before
++ * `first` is ignored, and the whole file is sent, as the RFC allows. A range that starts at or
++ * after the end of the file is unsatisfiable (416). An empty file is always sent whole.
++ */
++export function parseRange(header: string | undefined, size: number): RangeRequest {
++  if (header === undefined || size === 0) return FULL;
++  const match = SINGLE_BYTE_RANGE.exec(header.trim());
++  if (!match) return FULL;
++  const first = match[1] ?? "";
++  const last = match[2] ?? "";
++  if (first === "" && last === "") return FULL;
++  const start = first === "" ? 0 : Number(first);
++  const end = last === "" ? size - 1 : Math.min(Number(last), size - 1);
++  if (last !== "" && Number(last) < start) return FULL;
++  if (start >= size) return UNSATISFIABLE;
++  return { kind: "partial", range: { start, end } };
++}
++
++/**
++ * Whether a `Range` header may be honoured under `If-Range` (RFC 9110 §13.1.5): always without
++ * the header, otherwise only when it names the file's current entity tag. The comparison is
++ * strong, so a weak tag never matches; a date never matches either, since downloads carry no
++ * `Last-Modified`.
++ */
++export function ifRangeHolds(header: string | undefined, etag: string): boolean {
++  return header === undefined || header.trim() === etag;
++}
+diff --git a/src/api/routes/sendFile.ts b/src/api/routes/sendFile.ts
+index d08b326..aab8553 100644
+--- a/src/api/routes/sendFile.ts
++++ b/src/api/routes/sendFile.ts
+@@ -1,12 +1,17 @@
+ import type { FastifyReply, FastifyRequest } from "fastify";
++import { RangeNotSatisfiableError } from "../../domain/errors.js";
+ import { etagOf, ifNoneMatchHits, type FileRecord } from "../../domain/file.js";
+ import type { FileService } from "../../services/fileService.js";
+ import { contentDisposition } from "../contentDisposition.js";
++import { ifRangeHolds, parseRange, type RangeRequest } from "../range.js";
+ 
+ /**
+  * Answer with a file's bytes: its stored (sniffed) type, length and sha256 entity tag, always as
+  * an attachment that browsers must not sniff. A matching If-None-Match answers 304 without
+  * touching storage. Files that are not available (pending scan, quarantined) are 409.
++ *
++ * A single `Range` is answered with 206 and only those bytes (unless an `If-Range` names another
++ * entity tag); a range outside the file is 416, with a `Content-Range` that gives the file's size.
+  */
+ export async function sendFile(
+   request: FastifyRequest,
+@@ -19,14 +24,32 @@ export async function sendFile(
+   reply
+     .header("etag", etag)
+     .header("cache-control", "private")
++    .header("accept-ranges", "bytes")
+     .header("x-content-type-options", "nosniff");
+   if (ifNoneMatchHits(request.headers["if-none-match"], etag)) {
+     return reply.code(304).send();
+   }
+-  const stream = await files.openContent(file);
+-  return reply
++  const { range, "if-range": ifRange } = request.headers;
++  // A repeated Range or If-Range header gets the whole file.
++  const requested: RangeRequest =
++    typeof range === "string" && !Array.isArray(ifRange) && ifRangeHolds(ifRange, etag)
++      ? parseRange(range, file.size)
++      : { kind: "full" };
++  if (requested.kind === "unsatisfiable") {
++    throw new RangeNotSatisfiableError(file.id, file.size);
++  }
++  reply
+     .header("content-type", file.contentType)
+-    .header("content-length", String(file.size))
+-    .header("content-disposition", contentDisposition(file.originalName))
+-    .send(stream);
++    .header("content-disposition", contentDisposition(file.originalName));
++  if (requested.kind === "partial") {
++    const { start, end } = requested.range;
++    const stream = await files.openContent(file, requested.range);
++    return reply
++      .code(206)
++      .header("content-range", `bytes ${start}-${end}/${file.size}`)
++      .header("content-length", String(end - start))
++      .send(stream);
++  }
++  const stream = await files.openContent(file);
++  return reply.header("content-length", String(file.size)).send(stream);
+ }
+diff --git a/src/domain/errors.ts b/src/domain/errors.ts
+index a96c1c5..8465fe6 100644
+--- a/src/domain/errors.ts
++++ b/src/domain/errors.ts
+@@ -154,6 +154,18 @@ export class UploadOffsetMismatchError extends DomainError {
+   }
+ }
+ 
++/** A download's `Range` starts at or after the end of the file. */
++export class RangeNotSatisfiableError extends DomainError {
++  readonly code = "range_not_satisfiable";
++  readonly httpStatus = 416;
++  readonly size: number;
++
++  constructor(fileId: string, size: number) {
++    super(`the requested range is outside file ${fileId} (${size} bytes)`, { fileId, size });
++    this.size = size;
++  }
++}
++
+ /**
+  * The storage backend failed. `storageCode` is the backend's own code (an S3 error code such as
+  * `NoSuchKey`, or the same names for the local driver) when there is one.
+diff --git a/src/services/fileService.ts b/src/services/fileService.ts
+index 02088ef..f4137b2 100644
+--- a/src/services/fileService.ts
++++ b/src/services/fileService.ts
+@@ -15,7 +15,7 @@ import type { Clock } from "../infra/clock.js";
+ import type { Logger } from "../infra/logger.js";
+ import * as files from "../repositories/fileRepo.js";
+ import * as tenants from "../repositories/tenantRepo.js";
+-import type { StorageDriver } from "../storage/driver.js";
++import type { ByteRange, StorageDriver } from "../storage/driver.js";
+ import type { FileCatalog } from "./fileCatalog.js";
+ import { downloadPayload, unixNow, type UrlSigner } from "./urlSigner.js";
+ 
+@@ -89,10 +89,13 @@ export class FileService {
+     return deleted;
+   }
+ 
+-  /** The file's bytes, for a download. Only available (scanned, clean) files are served. */
+-  async openContent(file: FileRecord): Promise<Readable> {
++  /**
++   * The file's bytes, or only the inclusive `range` of them, for a download. Only available
++   * (scanned, clean) files are served.
++   */
++  async openContent(file: FileRecord, range?: ByteRange): Promise<Readable> {
+     this.assertDownloadable(file);
+-    return this.deps.storage.get(file.storageKey);
++    return this.deps.storage.get(file.storageKey, range);
+   }
+ 
+   assertDownloadable(file: FileRecord): void {
+diff --git a/src/storage/driver.ts b/src/storage/driver.ts
+index b064282..c4a30e9 100644
+--- a/src/storage/driver.ts
++++ b/src/storage/driver.ts
+@@ -19,8 +19,12 @@ export interface StorageDriver {
+    */
+   put(key: string, stream: Readable, options: PutOptions): Promise<PutResult>;
+ 
+-  /** The object's bytes. Fails with a not-found StorageError when there is no object. */
+-  get(key: string): Promise<Readable>;
++  /**
++   * The object's bytes, or only those from `range.start` to `range.end` (both inclusive) when a
++   * range is given; the range must lie inside the object. Fails with a not-found StorageError
++   * when there is no object.
++   */
++  get(key: string, range?: ByteRange): Promise<Readable>;
+ 
+   /** The object's size, or null when there is no object. */
+   head(key: string): Promise<ObjectInfo | null>;
+@@ -53,6 +57,12 @@ export interface PutResult {
+   readonly bytes: number;
+ }
+ 
++/** Byte positions `start` to `end` of an object, both inclusive. */
++export interface ByteRange {
++  readonly start: number;
++  readonly end: number;
++}
++
+ export interface ObjectInfo {
+   readonly size: number;
+ }
+diff --git a/src/storage/localDriver.ts b/src/storage/localDriver.ts
+index b859b2d..856d34c 100644
+--- a/src/storage/localDriver.ts
++++ b/src/storage/localDriver.ts
+@@ -12,6 +12,7 @@ import {
+   assertPartIndex,
+   assertSessionId,
+   partName,
++  type ByteRange,
+   type ObjectInfo,
+   type PutOptions,
+   type PutResult,
+@@ -124,11 +125,14 @@ export class LocalStorageDriver implements StorageDriver {
+     }
+   }
+ 
+-  private async openForRead(file: string, key: string): Promise<Readable> {
++  private async openForRead(file: string, key: string, range?: ByteRange): Promise<Readable> {
+     try {
+       const handle = await open(file, "r");
+-      // autoClose: the descriptor is closed when the stream ends, fails or is destroyed.
+-      return handle.createReadStream({ autoClose: true });
++      // autoClose: the descriptor is closed when the stream ends, fails or is destroyed. `start`
++      // and `end` are both inclusive, like a ByteRange.
++      return handle.createReadStream(
++        range ? { autoClose: true, start: range.start, end: range.end } : { autoClose: true },
++      );
+     } catch (err) {
+       if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") {
+         throw StorageError.notFound(key);
+@@ -148,8 +152,8 @@ export class LocalStorageDriver implements StorageDriver {
+     return this.writeAtomically(target, stream, options.size);
+   }
+ 
+-  async get(key: string): Promise<Readable> {
+-    return this.openForRead(this.objectPath(key), key);
++  async get(key: string, range?: ByteRange): Promise<Readable> {
++    return this.openForRead(this.objectPath(key), key, range);
+   }
+ 
+   async head(key: string): Promise<ObjectInfo | null> {
+diff --git a/src/storage/s3Client.ts b/src/storage/s3Client.ts
+index 3db1041..8750dba 100644
+--- a/src/storage/s3Client.ts
++++ b/src/storage/s3Client.ts
+@@ -3,6 +3,7 @@ import { StorageError } from "../domain/errors.js";
+ import { discardResponse, readResponseText, responseStream } from "../infra/http.js";
+ import { systemClock, type Clock } from "../infra/clock.js";
+ import { childElement, childElements, childText, parseXml, type XmlElement } from "../infra/xml.js";
++import type { ByteRange } from "./driver.js";
+ import {
+   EMPTY_PAYLOAD_HASH,
+   encodeKeyPath,
+@@ -247,11 +248,22 @@ export class S3Client {
+     return { etag: response.headers.get("etag") };
+   }
+ 
+-  /** The object's bytes, streamed. */
+-  async getObject(key: string): Promise<Readable> {
+-    const headers = { "accept-encoding": "identity" };
++  /** The object's bytes, streamed; with a range, only `range.start` to `range.end` (inclusive). */
++  async getObject(key: string, range?: ByteRange): Promise<Readable> {
++    // fetch adds `Accept-Encoding: identity` on its own to a request with a Range header; setting
++    // it here as well would send the value twice, unlike what was signed.
++    const headers: Record<string, string> = range
++      ? { range: `bytes=${range.start}-${range.end}` }
++      : { "accept-encoding": "identity" };
+     const response = await this.send({ method: "GET", key, operation: "GetObject", headers });
+     if (!response.ok) throw await this.failure(response, "GetObject", key);
++    if (range && response.status !== 206) {
++      // A 200 would carry the whole object, not the bytes asked for.
++      await discardResponse(response);
++      throw new StorageError(`S3 GetObject ${key} ignored the requested range`, {
++        storageCode: "InvalidResponse",
++      });
++    }
+     return responseStream(response);
+   }
+ 
+diff --git a/src/storage/s3Driver.ts b/src/storage/s3Driver.ts
+index 8e444d0..61fd0c0 100644
+--- a/src/storage/s3Driver.ts
++++ b/src/storage/s3Driver.ts
+@@ -12,6 +12,7 @@ import {
+   assertPartIndex,
+   assertSessionId,
+   partName,
++  type ByteRange,
+   type ObjectInfo,
+   type PutOptions,
+   type PutResult,
+@@ -105,8 +106,8 @@ export class S3StorageDriver implements StorageDriver {
+     );
+   }
+ 
+-  get(key: string): Promise<Readable> {
+-    return this.client.getObject(key);
++  get(key: string, range?: ByteRange): Promise<Readable> {
++    return this.client.getObject(key, range);
+   }
+ 
+   async head(key: string): Promise<ObjectInfo | null> {
+diff --git a/test/api/downloads.test.ts b/test/api/downloads.test.ts
+index 4f42a83..c9f06e8 100644
+--- a/test/api/downloads.test.ts
++++ b/test/api/downloads.test.ts
+@@ -56,6 +56,7 @@ describe("downloads, signed links and deletion", () => {
+         "content-length": "11",
+         "content-disposition": 'attachment; filename="minutes _final_.txt"',
+         "x-content-type-options": "nosniff",
++        "accept-ranges": "bytes",
+         etag: `"${file.sha256}"`,
+       });
+     }
+diff --git a/test/api/range.test.ts b/test/api/range.test.ts
+new file mode 100644
+index 0000000..9797ddb
+--- /dev/null
++++ b/test/api/range.test.ts
+@@ -0,0 +1,65 @@
++import { describe, expect, it } from "vitest";
++import { ifRangeHolds, parseRange } from "../../src/api/range.js";
++
++describe("parseRange", () => {
++  it("reads a closed range with an inclusive end", () => {
++    expect(parseRange("bytes=0-9", 100)).toEqual({ kind: "partial", range: { start: 0, end: 9 } });
++    expect(parseRange("bytes=10-10", 100)).toEqual({ kind: "partial", range: { start: 10, end: 10 } });
++  });
++
++  it("reads an open range to the end of the file", () => {
++    expect(parseRange("bytes=90-", 100)).toEqual({ kind: "partial", range: { start: 90, end: 99 } });
++  });
++
++  it("cuts a last position past the end of the file", () => {
++    expect(parseRange("bytes=95-500", 100)).toEqual({ kind: "partial", range: { start: 95, end: 99 } });
++  });
++
++  it("serves a suffix longer than the file as the whole file", () => {
++    expect(parseRange("bytes=-200", 100)).toEqual({ kind: "partial", range: { start: 0, end: 99 } });
++  });
++
++  it("accepts the unit in any case and surrounding spaces", () => {
++    expect(parseRange(" Bytes=1-2 ", 100)).toEqual({ kind: "partial", range: { start: 1, end: 2 } });
++  });
++
++  it("is unsatisfiable when the range starts at or after the end", () => {
++    expect(parseRange("bytes=100-", 100)).toEqual({ kind: "unsatisfiable" });
++    expect(parseRange("bytes=150-200", 100)).toEqual({ kind: "unsatisfiable" });
++  });
++
++  it("ignores headers it does not serve", () => {
++    for (const header of [
++      undefined,
++      "",
++      "bytes=",
++      "bytes=-",
++      "bytes=5-3",
++      "bytes=0-1,5-6",
++      "items=0-9",
++      "bytes=a-b",
++      "bytes=1.5-2",
++    ]) {
++      expect(parseRange(header, 100), String(header)).toEqual({ kind: "full" });
++    }
++  });
++
++  it("always sends an empty file whole", () => {
++    expect(parseRange("bytes=0-0", 0)).toEqual({ kind: "full" });
++  });
++});
++
++describe("ifRangeHolds", () => {
++  const etag = '"abc"';
++
++  it("holds without the header and for the same strong tag", () => {
++    expect(ifRangeHolds(undefined, etag)).toBe(true);
++    expect(ifRangeHolds('"abc"', etag)).toBe(true);
++  });
++
++  it("fails for another tag, a weak tag or a date", () => {
++    expect(ifRangeHolds('"other"', etag)).toBe(false);
++    expect(ifRangeHolds('W/"abc"', etag)).toBe(false);
++    expect(ifRangeHolds("Tue, 15 Jan 2030 10:00:00 GMT", etag)).toBe(false);
++  });
++});
+diff --git a/test/api/rangeDownloads.test.ts b/test/api/rangeDownloads.test.ts
+new file mode 100644
+index 0000000..148811e
+--- /dev/null
++++ b/test/api/rangeDownloads.test.ts
+@@ -0,0 +1,107 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  expectStatus,
++  markAvailable,
++  storeFile,
++  type ErrorResponse,
++  type FileBody,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++/** 100 bytes, A to Z over and over, so every slice is recognisable. */
++const LETTERS = Array.from({ length: 100 }, (_, i) => String.fromCharCode(65 + (i % 26))).join("");
++
++describe("range requests on downloads", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++  let file: FileBody;
++
++  beforeEach(async () => {
++    t = await buildTestApp();
++    tenant = await createTenant(t.pool, t.clock);
++    file = await storeFile(t.app, tenant, "media/letters.txt", LETTERS);
++    await markAvailable(t.pool, file.id);
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  function download(range: string, extra: Record<string, string> = {}) {
++    return t.app.inject({
++      url: "/v1/files/media/letters.txt",
++      headers: { ...tenant.headers, range, ...extra },
++    });
++  }
++
++  it("answers 206 with the requested bytes and their Content-Range", async () => {
++    for (const url of ["/v1/files/media/letters.txt", `/v1/files/by-id/${file.id}`]) {
++      const response = await t.app.inject({ url, headers: { ...tenant.headers, range: "bytes=26-51" } });
++      expectStatus(response, 206);
++      expect(response.body).toBe(LETTERS.slice(26, 52));
++      expect(response.headers).toMatchObject({
++        "content-range": "bytes 26-51/100",
++        "accept-ranges": "bytes",
++        etag: `"${file.sha256}"`,
++        "content-disposition": 'attachment; filename="letters.txt"',
++      });
++    }
++  });
++
++  it("serves an open range to the end of the file", async () => {
++    const response = await download("bytes=95-");
++    expectStatus(response, 206);
++    expect(response.body).toBe("RSTUV");
++    expect(response.headers["content-range"]).toBe("bytes 95-99/100");
++  });
++
++  it("answers 416 with the file size when the range starts past the end", async () => {
++    const response = await download("bytes=100-");
++    expectStatus(response, 416);
++    expect(response.headers["content-range"]).toBe("bytes */100");
++    expect(response.json<ErrorResponse>().error.code).toBe("range_not_satisfiable");
++  });
++
++  it("sends the whole file for several ranges or a malformed header", async () => {
++    for (const range of ["bytes=0-1,5-6", "bytes=9-3", "lines=1-2"]) {
++      const response = await download(range);
++      expectStatus(response, 200);
++      expect(response.body).toBe(LETTERS);
++      expect(response.headers["content-length"]).toBe("100");
++    }
++  });
++
++  it("honours the range only while If-Range names the current ETag", async () => {
++    const current = await download("bytes=0-2", { "if-range": `"${file.sha256}"` });
++    expectStatus(current, 206);
++    expect(current.body).toBe("ABC");
++
++    const stale = await download("bytes=0-2", { "if-range": '"an-older-version"' });
++    expectStatus(stale, 200);
++    expect(stale.body).toBe(LETTERS);
++  });
++
++  it("serves ranges through signed links", async () => {
++    const signed = await t.app.inject({
++      method: "POST",
++      url: `/v1/files/by-id/${file.id}/signed-url`,
++      headers: tenant.headers,
++      payload: { expiresIn: 60 },
++    });
++    expectStatus(signed, 200);
++    const response = await t.app.inject({
++      url: signed.json<{ url: string }>().url,
++      headers: { range: "bytes=0-4" },
++    });
++    expectStatus(response, 206);
++    expect(response.body).toBe("ABCDE");
++    expect(response.headers["content-range"]).toBe("bytes 0-4/100");
++  });
++
++  it("still answers 304 to a matching If-None-Match", async () => {
++    const response = await download("bytes=0-4", { "if-none-match": `"${file.sha256}"` });
++    expectStatus(response, 304);
++  });
++});
+diff --git a/test/storage/contract.ts b/test/storage/contract.ts
+index 54be78c..f9c0470 100644
+--- a/test/storage/contract.ts
++++ b/test/storage/contract.ts
+@@ -43,6 +43,16 @@ export function storageContract(name: string, setUp: () => Promise<DriverFixture
+       await driver.delete(target);
+     });
+ 
++    it("reads a byte range of an object, both ends inclusive", async () => {
++      const target = key();
++      await driver.put(target, chunkedStream(["0123", "456789"]), { contentType: "text/plain" });
++      expect((await collect(await driver.get(target, { start: 2, end: 5 }))).toString()).toBe("2345");
++      expect((await collect(await driver.get(target, { start: 9, end: 9 }))).toString()).toBe("9");
++      expect((await collect(await driver.get(target, { start: 0, end: 9 }))).toString()).toBe(
++        "0123456789",
++      );
++    });
++
+     it("reports a missing object as a not-found StorageError", async () => {
+       const missing = key();
+       const error = await driver.get(missing).catch((err: unknown) => err);

@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T09",
+  "repo": "jobqueue-go",
+  "kind": "buggy",
+  "title": "Queue statistics in the API, jobctl and /metrics",
+  "description": "Operators have no quick way to see how much work is waiting: `GET /v1/jobs` pages through jobs one at a time and /metrics only has counters of what the workers did. This adds per-queue statistics.\n\n- `store.QueueStats` returns, for every queue that has jobs, the number of jobs in each state (every state present, zeros included) and the `run_at` of the oldest available job that is due; `QueueStatsOf` does the same for one queue (zero counts when it has no jobs).\n- `GET /v1/queues` lists them ordered by name and `GET /v1/queues/{queue}` returns one queue (an invalid name is 422 on `queue`). Each entry has `counts`, `total` and `oldest_available_age_seconds` (null when no available job is due).\n- New gauge `jobqueue_queue_jobs{queue,state}`. Its values live in the database, so the metrics registry gets collectors: `Registry.Collect(fn)` registers a function that `Handler` runs at the start of each scrape, with the request's context. The API server registers one that reads the statistics and sets the gauge; a failure is logged and the scrape still succeeds with the previous values.\n- `jobctl queues` prints one row per queue with the counts and how long the oldest due job has been waiting.\n\nTests: store statistics across states and queues, the two endpoints including a queue without jobs and an invalid name, the gauge after a scrape, collectors in the metrics package, the jobctl table. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/store/stats.go",
+      "lines": [53, 61],
+      "category": "performance",
+      "severity": "low",
+      "difficulty": "L3",
+      "summary": "The statistics are computed with a SELECT DISTINCT queue over the whole jobs table followed by one count(*) query per (queue, state) pair and one min(run_at) query per queue, all on separate round trips, and the collector registered with the metrics registry runs this on every /metrics scrape. Finished jobs (succeeded, failed, cancelled, dead) are never deleted, so each scrape costs 7·Q+1 queries whose scans grow with the job history; with frequent scrapes, many queues or millions of finished rows the scrape slows down and loads the database. One GROUP BY queue, state query (ideally cached between scrapes) gives the same numbers in a single pass.",
+      "trigger": "A deployment with many queues and millions of succeeded jobs, scraped by Prometheus every 15 s: every scrape issues 7·Q+1 queries that scan the whole history.",
+      "testable": false,
+      "hidden_tests": [],
+      "hidden_test_cmd": null,
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The counts are cheap: each count(*) filters on queue and state, and migrations/0001_create_jobs.sql indexes jobs by (queue, id) and (state, id), so Postgres answers them from the index without scanning the table, and a handful of queues means a handful of milliseconds per scrape.",
+      "justification": "The cost only shows with many queues and millions of finished rows under regular scraping; the statistics themselves are correct, so no deterministic test can tell the PR from the fix."
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

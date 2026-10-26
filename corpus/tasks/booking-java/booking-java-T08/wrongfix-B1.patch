@@ -1,0 +1,20 @@
+diff --git a/src/main/java/com/innkeep/booking/service/AllotmentService.java b/src/main/java/com/innkeep/booking/service/AllotmentService.java
+index c477aff..c9f318d 100644
+--- a/src/main/java/com/innkeep/booking/service/AllotmentService.java
++++ b/src/main/java/com/innkeep/booking/service/AllotmentService.java
+@@ -13,6 +13,7 @@ import com.innkeep.booking.persistence.InventoryRepository;
+ import com.innkeep.booking.persistence.KeptRooms;
+ import java.time.Clock;
+ import java.time.LocalDate;
++import java.time.ZoneId;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.regex.Pattern;
+@@ -139,6 +140,6 @@ public class AllotmentService {
+   }
+ 
+   private LocalDate today() {
+-    return LocalDate.now(clock);
++    return LocalDate.now(clock.withZone(ZoneId.systemDefault()));
+   }
+ }

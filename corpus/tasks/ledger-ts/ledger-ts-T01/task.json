@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T01",
+  "repo": "ledger-ts",
+  "kind": "buggy",
+  "title": "Add transfer reversals",
+  "description": "Adds `POST /transfers/:id/reverse` (scope `transfers:write`), which undoes a posted transfer by posting the same amount back from its destination to its source.\n\n- The reversal is an ordinary transfer posted through `postTransfer`, so the usual rules apply: both accounts open, same currency, and a wallet cannot go below zero (422 if the destination has already spent the funds).\n- Migration 0009 adds `transfers.reversal_of` (tenant-scoped foreign key to the original, partial index for the lookup). `reversal_of` is included in the transfer JSON and in event payloads.\n- A transfer can be reversed only once, and a reversal cannot itself be reversed; both answer 409 with the related transfer id in the details.\n- Besides the reversal's own `transfer.posted`, a new `transfer.reversed` event is written on the original transfer's aggregate, so webhook consumers following the original see it.\n- An optional `description` overrides the default \"Reversal of transfer <id>\". No Idempotency-Key is needed: retrying a reversal that went through gets the 409.\n\nTests: test/api/reversals.test.ts (balances and entries, description, single reversal, reversal of a reversal, insufficient funds, outbox events, scope and tenant isolation). README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/transferService.ts",
+      "lines": [108, 122],
+      "category": "concurrency",
+      "severity": "critical",
+      "difficulty": "L3",
+      "summary": "The already-reversed check reads reversal_of before any lock is taken, under READ COMMITTED, so two concurrent reversals of one transfer both pass it and both post: the money is moved back twice.",
+      "trigger": "Two concurrent POST /transfers/:id/reverse for the same transfer, with a destination that can pay the amount twice (a funded wallet or a system account).",
+      "testable": true,
+      "hidden_tests": ["test/hidden/reversalRace.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/reversalRace.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Two reversals of the same transfer cannot both go through: reverseTransfer locks both accounts with accounts.lockAccounts (SELECT … FOR UPDATE, ascending id order) before postTransfer runs, so the second reversal waits on the account rows until the first commits and then fails the reversal check with a 409.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

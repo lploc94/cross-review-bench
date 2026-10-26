@@ -1,0 +1,31 @@
+diff --git a/src/authz/services/api_keys.py b/src/authz/services/api_keys.py
+index c0499c5..5726072 100644
+--- a/src/authz/services/api_keys.py
++++ b/src/authz/services/api_keys.py
+@@ -12,7 +12,7 @@ from authz.errors import AuthenticationFailed, InvalidInputError, InvalidToken,
+ from authz.infra.clock import Clock
+ from authz.infra.db import Database
+ from authz.infra.hashing import PasswordHasher
+-from authz.infra.randomness import RandomSource
++from authz.infra.randomness import RandomSource, hash_token, tokens_equal
+ from authz.models import ApiKey
+ from authz.repositories.api_keys import ApiKeyRepository
+ from authz.repositories.roles import RoleRepository
+@@ -63,7 +63,7 @@ class ApiKeyService:
+         """Create a key with a role. The full key is returned here and never again."""
+         prefix = self._random.uuid().hex[:PREFIX_LENGTH]
+         secret = self._random.token()
+-        secret_hash = await self._hasher.hash(secret)
++        secret_hash = hash_token(secret)
+         async with self._db.transaction() as session:
+             role = await RoleRepository(session).get(org_id, role_id)
+             if role is None:
+@@ -126,7 +126,7 @@ class ApiKeyService:
+             candidates = await ApiKeyRepository(session).active_with_prefix(prefix)
+         key = None
+         for candidate in candidates:
+-            if await self._hasher.verify(candidate.secret_hash, secret):
++            if tokens_equal(candidate.secret_hash, hash_token(secret)):
+                 key = candidate
+                 break
+         if key is None:

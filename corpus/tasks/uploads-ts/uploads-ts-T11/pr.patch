@@ -1,0 +1,537 @@
+diff --git a/README.md b/README.md
+index fe7e007..48dd65a 100644
+--- a/README.md
++++ b/README.md
+@@ -47,6 +47,13 @@ behind. Replacing a file (`overwrite=true`) needs room for both files until the
+ recorded. Deleting a file, aborting a session and the expiry of a session release their bytes.
+ Lowering the quota below the current usage removes nothing; it only stops new uploads.
+ 
++**Deduplication.** When a new file's bytes (sha256 and size) are the same as those of a file that
++is already `available`, the new file is recorded with that file's storage object and the uploaded
++copy is removed, so identical content is stored once. This applies to PUT, multipart and
++completed resumable uploads; the returned file has `"deduplicated": true`. A deduplicated file is
++still scanned and still counts against the quota with its full size. Files that are not yet
++scanned, or quarantined, are never used as the source of a deduplicated file.
++
+ **Scanning.** A new file is `pending_scan` and cannot be downloaded (409 `file_not_available`)
+ until the scan worker has scanned it: a clean file becomes `available`, an infected one
+ `quarantined` and is never served. A scan that fails (scanner unreachable, unreadable object) is
+@@ -116,7 +123,8 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+   the part's file name becomes the file's `originalName`.
+ - Both answer 413 `payload_too_large` for more than `MAX_UPLOAD_BYTES`, announced or not.
+ - **Files** are returned as `{ id, path, size, sha256, contentType, declaredType, originalName,
+-  status, image: { width, height } | null, createdAt, updatedAt }`.
++  status, image: { width, height } | null, createdAt, updatedAt }`. Uploads (PUT, multipart, a
++  completed session) add `deduplicated`.
+ - **`GET /v1/files`** lists live files in byte order of their paths: `limit` 1 to
+   `LIST_MAX_LIMIT` (default 100, or `LIST_MAX_LIMIT` when lower), and `after` the `nextCursor` of
+   the previous page. It answers `{ "data": [...], "nextCursor": "<opaque>" | null }`.
+diff --git a/migrations/0004_file_deduplication.sql b/migrations/0004_file_deduplication.sql
+new file mode 100644
+index 0000000..2ebd833
+--- /dev/null
++++ b/migrations/0004_file_deduplication.sql
+@@ -0,0 +1,8 @@
++-- Files with identical bytes share one storage object: an upload whose sha256 and size match an
++-- available file is recorded with that file's storage key, and its own copy is removed. A storage
++-- key may therefore appear on several rows.
++DROP INDEX files_storage_key;
++CREATE INDEX files_storage_key ON files (storage_key);
++
++-- Finds the available file an upload can share its object with.
++CREATE INDEX files_available_sha256 ON files (sha256) WHERE status = 'available';
+diff --git a/src/api/routes/directUploads.ts b/src/api/routes/directUploads.ts
+index 0d18a69..fae8919 100644
+--- a/src/api/routes/directUploads.ts
++++ b/src/api/routes/directUploads.ts
+@@ -4,14 +4,15 @@ import { ValidationError } from "../../domain/errors.js";
+ import { authOf, requireScope } from "../plugins/auth.js";
+ import { acceptRawBodies, contentLengthOf, requestBodyStream } from "../requestBody.js";
+ import { overwriteQuerySchema, wildcardParamsSchema } from "../schemas/common.js";
+-import { serializeFile } from "../serializers.js";
++import { serializeUpload } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+ /**
+  * Single-request uploads: `PUT /files/<path>` with the raw bytes as the body, and
+  * `POST /files` as multipart/form-data with a `path` field followed by one file part.
+- * Both answer 201 for a new file and 200 when `overwrite=true` replaced one.
++ * Both answer 201 for a new file, and 200 when `overwrite=true` replaced one or when the bytes
++ * were already stored (see `serializeUpload`).
+  */
+ export const directUploadRoutes: FastifyPluginAsync<RouteOptions> = async (app, options) => {
+   await app.register(rawUploadRoutes, options);
+@@ -35,7 +36,8 @@ const rawUploadRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services
+       ...(size === undefined ? {} : { size }),
+       ...(contentType === undefined ? {} : { declaredType: contentType }),
+     });
+-    return reply.code(outcome.replaced ? 200 : 201).send(serializeFile(outcome.file));
++    const { status, body } = serializeUpload(outcome);
++    return reply.code(status).send(body);
+   });
+ };
+ 
+@@ -89,7 +91,8 @@ const multipartUploadRoutes: FastifyPluginAsync<RouteOptions> = async (app, { se
+         clientFileName: part.filename,
+         declaredType: part.mimetype,
+       });
+-      return reply.code(outcome.replaced ? 200 : 201).send(serializeFile(outcome.file));
++      const { status, body } = serializeUpload(outcome);
++      return reply.code(status).send(body);
+     }
+     throw new ValidationError("the form has no file part");
+   });
+diff --git a/src/api/routes/resumable.ts b/src/api/routes/resumable.ts
+index 711e87a..333e223 100644
+--- a/src/api/routes/resumable.ts
++++ b/src/api/routes/resumable.ts
+@@ -4,7 +4,7 @@ import { authOf, requireScope } from "../plugins/auth.js";
+ import { acceptRawBodies, contentLengthOf, requestBodyStream } from "../requestBody.js";
+ import { idParamsSchema, overwriteQuerySchema } from "../schemas/common.js";
+ import { createSessionBodySchema, uploadOffsetHeadersSchema } from "../schemas/uploads.js";
+-import { serializeFile, serializeSession } from "../serializers.js";
++import { serializeSession, serializeUpload } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+@@ -22,7 +22,7 @@ function progressHeaders(reply: FastifyReply, session: UploadSession): FastifyRe
+  *   POST   /uploads              {path, size, contentType?}  → 201 session (Location header)
+  *   PATCH  /uploads/:id          Upload-Offset + chunk bytes → 204, new Upload-Offset
+  *   HEAD   /uploads/:id                                      → 200, Upload-Offset
+- *   POST   /uploads/:id/complete                             → 201 file (200 if it replaced one)
++ *   POST   /uploads/:id/complete                             → 201 file (200: replaced/deduplicated)
+  *   DELETE /uploads/:id                                      → 204
+  */
+ export const resumableRoutes: FastifyPluginAsync<RouteOptions> = async (app, options) => {
+@@ -56,8 +56,8 @@ export const resumableRoutes: FastifyPluginAsync<RouteOptions> = async (app, opt
+   app.post("/uploads/:id/complete", write, async (request, reply) => {
+     const { tenantId } = authOf(request);
+     const { id } = parse(idParamsSchema, request.params, "params");
+-    const outcome = await services.resumable.complete(tenantId, id);
+-    return reply.code(outcome.replaced ? 200 : 201).send(serializeFile(outcome.file));
++    const { status, body } = serializeUpload(await services.resumable.complete(tenantId, id));
++    return reply.code(status).send(body);
+   });
+ 
+   app.delete("/uploads/:id", write, async (request, reply) => {
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index c862ab1..2ebe76f 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -1,6 +1,7 @@
+ import type { FileRecord } from "../domain/file.js";
+ import { availableBytes, type Tenant } from "../domain/tenant.js";
+ import type { UploadSession } from "../domain/uploadSession.js";
++import type { UploadOutcome } from "../services/uploadService.js";
+ 
+ export interface FileBody {
+   id: string;
+@@ -32,6 +33,23 @@ export function serializeFile(file: FileRecord): FileBody {
+   };
+ }
+ 
++/** A file as an upload returns it: whether it shares the object of an earlier, identical file. */
++export interface UploadBody extends FileBody {
++  deduplicated: boolean;
++}
++
++/**
++ * The answer to a finished upload (PUT, multipart or a completed session): 201 when the upload
++ * stored a new object for a new path, 200 when it replaced the file at the path or reused the
++ * object of an identical file.
++ */
++export function serializeUpload(outcome: UploadOutcome): { status: 200 | 201; body: UploadBody } {
++  return {
++    status: outcome.replaced || outcome.deduplicated ? 200 : 201,
++    body: { ...serializeFile(outcome.file), deduplicated: outcome.deduplicated },
++  };
++}
++
+ export function serializeSession(session: UploadSession) {
+   return {
+     id: session.id,
+diff --git a/src/repositories/fileRepo.ts b/src/repositories/fileRepo.ts
+index cf9a0cc..bc3aaeb 100644
+--- a/src/repositories/fileRepo.ts
++++ b/src/repositories/fileRepo.ts
+@@ -151,6 +151,27 @@ export async function findLiveFileBySignedId(
+   return row ? mapFile(row) : null;
+ }
+ 
++/**
++ * The oldest available file with these bytes on this storage driver, locked against deletion
++ * (FOR SHARE) until the caller's transaction ends, so its object outlives the lookup. A file that
++ * another transaction is deleting or replacing is skipped rather than waited for.
++ */
++export async function findAvailableBySha256(
++  db: Queryable,
++  content: { sha256: string; size: number; storageDriver: string },
++): Promise<FileRecord | null> {
++  const result = await db.query<FileRow>(
++    `SELECT ${COLUMNS} FROM files
++     WHERE sha256 = $1 AND size = $2 AND storage_driver = $3 AND status = 'available'
++     ORDER BY created_at, id
++     LIMIT 1
++     FOR SHARE SKIP LOCKED`,
++    [content.sha256, content.size, content.storageDriver],
++  );
++  const row = firstRow(result.rows);
++  return row ? mapFile(row) : null;
++}
++
+ /** Up to `limit` live files after `after` in (path, id) order. */
+ export async function listLiveFiles(
+   db: Queryable,
+diff --git a/src/services/fileCatalog.ts b/src/services/fileCatalog.ts
+index 933fe53..7e95679 100644
+--- a/src/services/fileCatalog.ts
++++ b/src/services/fileCatalog.ts
+@@ -41,6 +41,11 @@ export interface RegisteredFile {
+   readonly file: FileRecord;
+   /** The live file that was at the path before, now soft-deleted; its object is still stored. */
+   readonly replaced: FileRecord | null;
++  /**
++   * Whether the file was recorded with the storage object of an available file with the same
++   * bytes; the uploaded copy (`StoredFile.storageKey`) is then no longer needed.
++   */
++  readonly deduplicated: boolean;
+ }
+ 
+ /** Name of the partial unique index that keeps one live file per tenant and path. */
+@@ -48,8 +53,9 @@ const LIVE_PATH_INDEX = "files_tenant_path_live";
+ 
+ /**
+  * What every way of creating a file shares once its bytes are stored: inspecting the content,
+- * recording the row (replacing the file at the path when asked to), and removing storage objects
+- * after the rows that referenced them are gone.
++ * recording the row (replacing the file at the path when asked to, and sharing the object of an
++ * available file with the same bytes), and removing storage objects after the rows that
++ * referenced them are gone.
+  */
+ export class FileCatalog {
+   private readonly deps: CatalogDeps;
+@@ -78,7 +84,9 @@ export class FileCatalog {
+   /**
+    * Record a stored file inside the caller's transaction. A live file at the same path is a
+    * PathConflictError unless `overwrite` is set; then it is soft-deleted and its bytes released.
+-   * The new file's own bytes must already be reserved by the caller.
++   * When an available file already has the same bytes, the new row points at that file's object
++   * instead of the uploaded copy. The new file's own bytes must already be reserved by the caller:
++   * a deduplicated file counts against the quota like any other.
+    */
+   async register(client: PoolClient, stored: StoredFile): Promise<RegisteredFile> {
+     const now = this.deps.clock.now();
+@@ -93,6 +101,11 @@ export class FileCatalog {
+         await tenants.releaseBytes(client, stored.tenantId, replaced.size, this.deps.logger);
+       }
+     }
++    const twin = await files.findAvailableBySha256(client, {
++      sha256: stored.sha256,
++      size: stored.size,
++      storageDriver: this.deps.storage.name,
++    });
+     try {
+       const file = await files.insertFile(client, {
+         id: stored.id,
+@@ -104,11 +117,11 @@ export class FileCatalog {
+         declaredType: stored.declaredType,
+         originalName: stored.originalName,
+         storageDriver: this.deps.storage.name,
+-        storageKey: stored.storageKey,
++        storageKey: twin?.storageKey ?? stored.storageKey,
+         image: stored.content.image,
+         createdAt: now,
+       });
+-      return { file, replaced };
++      return { file, replaced, deduplicated: twin !== null };
+     } catch (err) {
+       // Another upload created a file at this path after the lookup above.
+       if (isUniqueViolation(err, LIVE_PATH_INDEX)) throw new PathConflictError(stored.path);
+@@ -116,6 +129,15 @@ export class FileCatalog {
+     }
+   }
+ 
++  /**
++   * Storage work for a registration whose transaction has committed: remove the object of the
++   * file it replaced, and the uploaded copy when the new file shares an existing object.
++   */
++  async afterCommit(registered: RegisteredFile, uploadedKey: string): Promise<void> {
++    if (registered.replaced) await this.removeObjectOf(registered.replaced);
++    if (registered.deduplicated) await this.discardObject(uploadedKey);
++  }
++
+   /**
+    * Remove the storage object of a file whose row is already soft-deleted and committed, and
+    * record that it is gone. A failure is logged and left for the cleanup job, never thrown: the
+@@ -134,14 +156,14 @@ export class FileCatalog {
+   }
+ 
+   /**
+-   * Remove an object no row refers to (a failed upload's bytes). Failures are logged: the object
+-   * is unreachable either way.
++   * Remove an object no row refers to (a failed upload's bytes, or the copy of a deduplicated
++   * one). Failures are logged: the object is unreachable either way.
+    */
+   async discardObject(storageKey: string): Promise<void> {
+     try {
+       await this.deps.storage.delete(storageKey);
+     } catch (err) {
+-      this.deps.logger.error({ err, storageKey }, "could not remove the object of a failed upload");
++      this.deps.logger.error({ err, storageKey }, "could not remove an object no file refers to");
+     }
+   }
+ }
+diff --git a/src/services/resumable.ts b/src/services/resumable.ts
+index d63970b..fb8f795 100644
+--- a/src/services/resumable.ts
++++ b/src/services/resumable.ts
+@@ -291,9 +291,16 @@ export class ResumableUploadService {
+       });
+       committed = true;
+       await this.discardStaging(sessionId);
+-      if (registered.replaced) await catalog.removeObjectOf(registered.replaced);
+-      this.deps.logger.info({ tenantId, sessionId, fileId, bytes }, "resumable upload completed");
+-      return { file: registered.file, replaced: registered.replaced !== null };
++      await catalog.afterCommit(registered, storageKey);
++      this.deps.logger.info(
++        { tenantId, sessionId, fileId, bytes, deduplicated: registered.deduplicated },
++        "resumable upload completed",
++      );
++      return {
++        file: registered.file,
++        replaced: registered.replaced !== null,
++        deduplicated: registered.deduplicated,
++      };
+     } finally {
+       if (!committed) await catalog.discardObject(storageKey);
+     }
+diff --git a/src/services/uploadService.ts b/src/services/uploadService.ts
+index d2d7e75..26b1196 100644
+--- a/src/services/uploadService.ts
++++ b/src/services/uploadService.ts
+@@ -32,6 +32,8 @@ export interface UploadOutcome {
+   readonly file: FileRecord;
+   /** Whether an existing file at the path was replaced. */
+   readonly replaced: boolean;
++  /** Whether the file shares the stored object of an earlier file with the same bytes. */
++  readonly deduplicated: boolean;
+ }
+ 
+ export interface UploadServiceDeps {
+@@ -126,12 +128,22 @@ export class UploadService {
+         }),
+       );
+       committed = true;
+-      if (registered.replaced) await catalog.removeObjectOf(registered.replaced);
++      await catalog.afterCommit(registered, storageKey);
+       logger.info(
+-        { tenantId: input.tenantId, fileId, bytes, replaced: registered.replaced !== null },
++        {
++          tenantId: input.tenantId,
++          fileId,
++          bytes,
++          replaced: registered.replaced !== null,
++          deduplicated: registered.deduplicated,
++        },
+         "file stored",
+       );
+-      return { file: registered.file, replaced: registered.replaced !== null };
++      return {
++        file: registered.file,
++        replaced: registered.replaced !== null,
++        deduplicated: registered.deduplicated,
++      };
+     } finally {
+       if (!committed) {
+         // The driver leaves no partial object when a write fails, but a write that succeeded
+diff --git a/test/api/deduplication.test.ts b/test/api/deduplication.test.ts
+new file mode 100644
+index 0000000..2329429
+--- /dev/null
++++ b/test/api/deduplication.test.ts
+@@ -0,0 +1,170 @@
++import { readdir } from "node:fs/promises";
++import path from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import type { UploadBody } from "../../src/api/serializers.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  expectStatus,
++  markAvailable,
++  multipartBody,
++  putFile,
++  storeFile,
++  tenantUsage,
++  type FileBody,
++  type SessionBody,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++describe("content deduplication", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeEach(async () => {
++    t = await buildTestApp({ env: { MAX_UPLOAD_BYTES: "8192" } });
++    tenant = await createTenant(t.pool, t.clock, { quotaBytes: 20_000 });
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  async function storedObjects(): Promise<string[]> {
++    const root = path.join(t.storageRoot ?? "", "objects", "t", tenant.tenantId);
++    return (await readdir(root).catch(() => [])).sort();
++  }
++
++  async function storageKeyOf(fileId: string): Promise<string | undefined> {
++    const result = await t.pool.query<{ storage_key: string }>(
++      "SELECT storage_key FROM files WHERE id = $1",
++      [fileId],
++    );
++    return result.rows[0]?.storage_key;
++  }
++
++  async function availableFile(filePath: string, body: string): Promise<FileBody> {
++    const file = await storeFile(t.app, tenant, filePath, body);
++    await markAvailable(t.pool, file.id);
++    return file;
++  }
++
++  it("records identical bytes against the object of an available file", async () => {
++    const first = await availableFile("reports/q1.csv", "region,total\nnorth,1200\n");
++    const response = await putFile(t.app, tenant, "archive/q1-copy.csv", "region,total\nnorth,1200\n");
++    expectStatus(response, 200);
++    const second = response.json<UploadBody>();
++    expect(second).toMatchObject({
++      path: "archive/q1-copy.csv",
++      sha256: first.sha256,
++      size: first.size,
++      status: "pending_scan",
++      deduplicated: true,
++    });
++    expect(second.id).not.toBe(first.id);
++    expect(await storageKeyOf(second.id)).toBe(await storageKeyOf(first.id));
++    expect(await storedObjects()).toEqual([first.id]);
++  });
++
++  it("still counts a deduplicated file against the quota", async () => {
++    const body = "identical content";
++    await availableFile("a.txt", body);
++    expectStatus(await putFile(t.app, tenant, "b.txt", body), 200);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(2 * Buffer.byteLength(body));
++  });
++
++  it("serves a deduplicated file once it is scanned", async () => {
++    await availableFile("minutes/2030-01.txt", "board minutes");
++    const copy = (await putFile(t.app, tenant, "minutes/latest.txt", "board minutes")).json<UploadBody>();
++    await markAvailable(t.pool, copy.id);
++    const download = await t.app.inject({ url: "/v1/files/minutes/latest.txt", headers: tenant.headers });
++    expectStatus(download, 200);
++    expect(download.body).toBe("board minutes");
++  });
++
++  it("keeps its own object while the earlier file is not scanned", async () => {
++    const first = await storeFile(t.app, tenant, "draft.txt", "unscanned words");
++    const response = await putFile(t.app, tenant, "draft-2.txt", "unscanned words");
++    expectStatus(response, 201);
++    const second = response.json<UploadBody>();
++    expect(second.deduplicated).toBe(false);
++    expect(await storedObjects()).toEqual([first.id, second.id].sort());
++  });
++
++  it("does not share the object of other bytes of the same size", async () => {
++    const first = await availableFile("one.txt", "aaaa");
++    const second = (await putFile(t.app, tenant, "two.txt", "bbbb")).json<UploadBody>();
++    expect(second.deduplicated).toBe(false);
++    expect(await storedObjects()).toEqual([first.id, second.id].sort());
++  });
++
++  it("deduplicates multipart uploads", async () => {
++    const first = await availableFile("logo.svg", "<svg/>");
++    const form = multipartBody([
++      { name: "path", value: "brand/logo.svg" },
++      { name: "file", filename: "logo.svg", contentType: "image/svg+xml", content: Buffer.from("<svg/>") },
++    ]);
++    const response = await t.app.inject({
++      method: "POST",
++      url: "/v1/files",
++      headers: { ...tenant.headers, "content-type": form.contentType },
++      payload: form.payload,
++    });
++    expectStatus(response, 200);
++    expect(response.json<UploadBody>()).toMatchObject({ originalName: "logo.svg", deduplicated: true });
++    expect(await storedObjects()).toEqual([first.id]);
++  });
++
++  it("deduplicates a completed resumable upload", async () => {
++    const body = Buffer.from("chunked but identical content");
++    const first = await availableFile("big/original.bin", body.toString());
++    const created = await t.app.inject({
++      method: "POST",
++      url: "/v1/uploads",
++      headers: tenant.headers,
++      payload: { path: "big/copy.bin", size: body.length },
++    });
++    expectStatus(created, 201);
++    const session = created.json<SessionBody>();
++    for (const [offset, chunk] of [
++      [0, body.subarray(0, 10)],
++      [10, body.subarray(10)],
++    ] as const) {
++      const patched = await t.app.inject({
++        method: "PATCH",
++        url: `/v1/uploads/${session.id}`,
++        headers: { ...tenant.headers, "upload-offset": String(offset), "content-type": "application/offset+octet-stream" },
++        payload: chunk,
++      });
++      expectStatus(patched, 204);
++    }
++    const completed = await t.app.inject({
++      method: "POST",
++      url: `/v1/uploads/${session.id}/complete`,
++      headers: tenant.headers,
++    });
++    expectStatus(completed, 200);
++    const file = completed.json<UploadBody>();
++    expect(file.deduplicated).toBe(true);
++    expect(await storageKeyOf(file.id)).toBe(await storageKeyOf(first.id));
++    expect(await storedObjects()).toEqual([first.id]);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(2 * body.length);
++  });
++
++  it("stores a new object when a file is overwritten with its own bytes", async () => {
++    await availableFile("notes.txt", "unchanged text");
++    const response = await putFile(t.app, tenant, "notes.txt", "unchanged text", { overwrite: true });
++    expectStatus(response, 200);
++    const replacement = response.json<UploadBody>();
++    expect(replacement.deduplicated).toBe(false);
++    expect(await storedObjects()).toEqual([replacement.id]);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(replacement.size);
++  });
++
++  it("releases the bytes of a deleted copy", async () => {
++    const first = await availableFile("a/report.txt", "same report");
++    expectStatus(await putFile(t.app, tenant, "b/report.txt", "same report"), 200);
++    const deleted = await t.app.inject({ method: "DELETE", url: "/v1/files/b/report.txt", headers: tenant.headers });
++    expectStatus(deleted, 204);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(first.size);
++  });
++});
+diff --git a/test/api/downloads.test.ts b/test/api/downloads.test.ts
+index 4f42a83..cce9a1d 100644
+--- a/test/api/downloads.test.ts
++++ b/test/api/downloads.test.ts
+@@ -75,7 +75,8 @@ describe("downloads, signed links and deletion", () => {
+     const file = await storeFile(t.app, tenant, "a.txt", "meta");
+     const response = await t.app.inject({ url: `/v1/files/by-id/${file.id}/meta`, headers: tenant.headers });
+     expectStatus(response, 200);
+-    expect(response.json<FileBody>()).toEqual(file);
++    // The upload's answer also says whether its bytes were deduplicated; the metadata does not.
++    expect({ ...response.json<FileBody>(), deduplicated: false }).toEqual(file);
+   });
+ 
+   it("answers 502 without backend details when the object is gone from storage", async () => {

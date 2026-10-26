@@ -1,0 +1,230 @@
+diff --git a/README.md b/README.md
+index 5f08d14..4e539a6 100644
+--- a/README.md
++++ b/README.md
+@@ -94,6 +94,11 @@ Lists use offset pagination (`limit` 1–100, default 25; `offset`) and answer
+ filter by creation time take `created_from` (inclusive) and `created_to` (exclusive), ISO 8601
+ timestamps with a time zone: `created_from <= created_at < created_to`.
+ 
++`GET /transfers` also filters by `account_id`, by `currency`, and by amount in minor units of that
++currency: `amount_min` (inclusive) and `amount_max` (exclusive), so
++`currency=USD&amount_min=1000&amount_max=5000` finds transfers from 10.00 up to 49.99 USD. Like
++every range in the API the amount range is half-open, and it needs `currency`.
++
+ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ 
+ | Status | Codes |
+diff --git a/migrations/0009_transfers_amount_index.sql b/migrations/0009_transfers_amount_index.sql
+new file mode 100644
+index 0000000..6f40fb1
+--- /dev/null
++++ b/migrations/0009_transfers_amount_index.sql
+@@ -0,0 +1,2 @@
++-- Transfer search by amount filters on one currency at a time (GET /transfers?currency=&amount_min=).
++CREATE INDEX transfers_tenant_currency_amount_idx ON transfers (tenant_id, currency, amount_minor);
+diff --git a/src/api/routes/transfers.ts b/src/api/routes/transfers.ts
+index 2b220dd..b633cca 100644
+--- a/src/api/routes/transfers.ts
++++ b/src/api/routes/transfers.ts
+@@ -53,6 +53,9 @@ export const transferRoutes: FastifyPluginAsync<RouteOptions> = async (app, { se
+         accountId: query.account_id,
+         createdFrom: query.created_from,
+         createdTo: query.created_to,
++        currency: query.currency,
++        amountMin: query.amount_min,
++        amountMax: query.amount_max,
+       },
+       { limit: query.limit, offset: query.offset },
+     );
+diff --git a/src/api/schemas/common.ts b/src/api/schemas/common.ts
+index df4acfc..c8d8518 100644
+--- a/src/api/schemas/common.ts
++++ b/src/api/schemas/common.ts
+@@ -51,6 +51,13 @@ const timestampSchema = z
+   .pipe(z.iso.datetime({ offset: true, error: "must be an ISO 8601 timestamp with a time zone" }))
+   .transform((value) => new Date(value));
+ 
++/*
++ * Range filters. Every range a list accepts is half-open: the lower bound (`*_from`, `*_min`) is
++ * inclusive and the upper bound (`*_to`, `*_max`) is exclusive, so consecutive ranges cover every
++ * value exactly once and a client can page through a domain by moving one bound. Either bound may
++ * be left out; when both are given the lower one must be below the upper one.
++ */
++
+ /**
+  * A half-open time range on created_at, shared by every list that filters by creation time:
+  *
+@@ -72,6 +79,27 @@ export const createdRangeSchema = z
+     { error: "created_from must be before created_to", path: ["created_to"] },
+   );
+ 
++/**
++ * A half-open range on an amount in minor units, like the creation range:
++ *
++ *   amount_min <= amount < amount_max
++ *
++ * so amount_min=1000&amount_max=5000 and amount_min=5000&amount_max=10000 split the amounts from
++ * 10.00 to 99.99 USD between them without overlap.
++ */
++export const amountRangeSchema = z
++  .object({
++    amount_min: amountSchema.optional(),
++    amount_max: amountSchema.optional(),
++  })
++  .refine(
++    (range) =>
++      range.amount_min === undefined ||
++      range.amount_max === undefined ||
++      range.amount_min < range.amount_max,
++    { error: "amount_min must be below amount_max", path: ["amount_max"] },
++  );
++
+ /** Free-form string labels attached to a transfer: up to 20 keys. */
+ export const metadataSchema = z
+   .record(
+diff --git a/src/api/schemas/transfers.ts b/src/api/schemas/transfers.ts
+index 21fcf88..eb82495 100644
+--- a/src/api/schemas/transfers.ts
++++ b/src/api/schemas/transfers.ts
+@@ -1,5 +1,6 @@
+ import { z } from "zod";
+ import {
++  amountRangeSchema,
+   amountSchema,
+   createdRangeSchema,
+   currencySchema,
+@@ -24,7 +25,17 @@ export const createTransferBodySchema = z
+ 
+ export type CreateTransferBody = z.infer<typeof createTransferBodySchema>;
+ 
+-export const listTransfersQuerySchema = z.intersection(
+-  paginationQuerySchema.extend({ account_id: idSchema.optional() }),
+-  createdRangeSchema,
+-);
++/**
++ * Amounts of different currencies are not comparable, so an amount range needs `currency`;
++ * `currency` alone lists the transfers of that currency.
++ */
++export const listTransfersQuerySchema = paginationQuerySchema
++  .extend({ account_id: idSchema.optional(), currency: currencySchema.optional() })
++  .and(createdRangeSchema)
++  .and(amountRangeSchema)
++  .refine(
++    (query) =>
++      query.currency !== undefined ||
++      (query.amount_min === undefined && query.amount_max === undefined),
++    { error: "amount_min and amount_max need a currency", path: ["currency"] },
++  );
+diff --git a/src/repositories/transfers.ts b/src/repositories/transfers.ts
+index 30be05a..4e3f706 100644
+--- a/src/repositories/transfers.ts
++++ b/src/repositories/transfers.ts
+@@ -93,6 +93,11 @@ export interface TransferFilter {
+   readonly createdFrom?: Date | undefined;
+   /** Exclusive upper bound on created_at. */
+   readonly createdTo?: Date | undefined;
++  readonly currency?: CurrencyCode | undefined;
++  /** Inclusive lower bound on amount_minor. */
++  readonly amountMin?: bigint | undefined;
++  /** Exclusive upper bound on amount_minor. */
++  readonly amountMax?: bigint | undefined;
+ }
+ 
+ /** Newest first; one row more than the page so the caller can tell whether another page exists. */
+@@ -116,6 +121,18 @@ export async function listTransfers(
+     params.push(filter.createdTo);
+     conditions.push(`created_at < $${params.length}`);
+   }
++  if (filter.currency !== undefined) {
++    params.push(filter.currency);
++    conditions.push(`currency = $${params.length}`);
++  }
++  if (filter.amountMin !== undefined) {
++    params.push(filter.amountMin);
++    conditions.push(`amount_minor >= $${params.length}`);
++  }
++  if (filter.amountMax !== undefined) {
++    params.push(filter.amountMax);
++    conditions.push(`amount_minor < $${params.length}`);
++  }
+   params.push(page.limit + 1, page.offset);
+   const result = await db.query<TransferRow>(
+     `SELECT ${COLUMNS} FROM transfers
+diff --git a/test/api/transfers.test.ts b/test/api/transfers.test.ts
+index 5bef87e..31fff7f 100644
+--- a/test/api/transfers.test.ts
++++ b/test/api/transfers.test.ts
+@@ -292,6 +292,73 @@ describe("transfers", () => {
+     }
+   });
+ 
++  describe("search by amount", () => {
++    async function ids(query: string): Promise<string[]> {
++      const response = await t.app.inject({ method: "GET", url: `/transfers?${query}`, headers: tenant.headers });
++      expect(response.statusCode, query).toBe(200);
++      return response.json<TransferPage>().data.map((x) => x.id);
++    }
++
++    async function postAmounts(amounts: string[], currency: "USD" | "EUR" = "USD"): Promise<TransferBody[]> {
++      const wallet = await fundedWallet(t.app, tenant, "100000", currency);
++      const merchant = await openAccount(t.app, tenant, { currency });
++      const posted: TransferBody[] = [];
++      for (const amount of amounts) {
++        t.clock.advanceSeconds(1);
++        posted.push(await transfer(t.app, tenant, wallet.id, merchant.id, amount, currency));
++      }
++      return posted;
++    }
++
++    it("includes amount_min and excludes amount_max", async () => {
++      const [a100, a250, a500, a999, a1000] = await postAmounts(["100", "250", "500", "999", "1000"]);
++      expect(await ids("currency=USD&amount_min=250&amount_max=1000")).toEqual([a999?.id, a500?.id, a250?.id]);
++      expect(await ids("currency=USD&amount_max=250")).toEqual([a100?.id]);
++      const atLeast1000 = await ids("currency=USD&amount_min=1000");
++      expect(atLeast1000).toContain(a1000?.id);
++      expect(atLeast1000).not.toContain(a999?.id);
++    });
++
++    it("only returns transfers of the requested currency", async () => {
++      const [usd] = await postAmounts(["700"]);
++      const [eur] = await postAmounts(["700"], "EUR");
++      expect(await ids("currency=EUR&amount_min=700&amount_max=701")).toEqual([eur?.id]);
++      expect(await ids("currency=USD&amount_min=700&amount_max=701")).toEqual([usd?.id]);
++    });
++
++    it("combines with the account and creation filters", async () => {
++      const wallet = await fundedWallet(t.app, tenant, "10000");
++      const a = await openAccount(t.app, tenant);
++      const b = await openAccount(t.app, tenant);
++      t.clock.set("2030-02-01T09:00:00.000Z");
++      await transfer(t.app, tenant, wallet.id, a.id, "300");
++      const toB = await transfer(t.app, tenant, wallet.id, b.id, "300");
++      t.clock.set("2030-02-02T09:00:00.000Z");
++      await transfer(t.app, tenant, wallet.id, b.id, "310");
++      expect(
++        await ids(
++          `account_id=${b.id}&currency=USD&amount_min=300&amount_max=400&created_to=2030-02-02T00:00:00Z`,
++        ),
++      ).toEqual([toB.id]);
++    });
++
++    it("rejects an amount range without a currency, and an empty or inverted one", async () => {
++      for (const query of [
++        "amount_min=100",
++        "amount_max=100",
++        "currency=USD&amount_min=500&amount_max=500",
++        "currency=USD&amount_min=500&amount_max=100",
++        "currency=USD&amount_min=0",
++        "currency=USD&amount_max=1.5",
++        "currency=usd&amount_min=1",
++      ]) {
++        const response = await t.app.inject({ method: "GET", url: `/transfers?${query}`, headers: tenant.headers });
++        expect(response.statusCode, query).toBe(400);
++        expect(response.json<ErrorResponse>().error.code, query).toBe("validation_error");
++      }
++    });
++  });
++
+   it("writes a transfer.posted event to the outbox", async () => {
+     const wallet = await fundedWallet(t.app, tenant, "1000");
+     const merchant = await openAccount(t.app, tenant);

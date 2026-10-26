@@ -1,0 +1,33 @@
+diff --git a/src/main/java/com/innkeep/booking/service/AllotmentService.java b/src/main/java/com/innkeep/booking/service/AllotmentService.java
+index c477aff..e464508 100644
+--- a/src/main/java/com/innkeep/booking/service/AllotmentService.java
++++ b/src/main/java/com/innkeep/booking/service/AllotmentService.java
+@@ -104,7 +104,7 @@ public class AllotmentService {
+    * allotment; the rest, like a public hold, must fit in the rooms no allotment keeps.
+    */
+   void holdNights(RoomType type, DateRange stay, int rooms, String channel) {
+-    LocalDate today = today();
++    LocalDate today = today(type.getProperty());
+     for (LocalDate night : stay.nightDates()) {
+       if (channel != null) {
+         allotments
+@@ -123,7 +123,8 @@ public class AllotmentService {
+    */
+   Map<Long, Map<LocalDate, Integer>> kept(Property property, LocalDate first, LocalDate last) {
+     var kept = new HashMap<Long, Map<LocalDate, Integer>>();
+-    for (KeptRooms row : allotments.keptForProperty(property.getCode(), first, last, today())) {
++    for (KeptRooms row :
++        allotments.keptForProperty(property.getCode(), first, last, today(property))) {
+       kept.computeIfAbsent(row.roomTypeId(), id -> new HashMap<>())
+           .put(row.night(), (int) row.rooms());
+     }
+@@ -138,7 +139,7 @@ public class AllotmentService {
+     }
+   }
+ 
+-  private LocalDate today() {
+-    return LocalDate.now(clock);
++  private LocalDate today(Property property) {
++    return LocalDate.ofInstant(clock.instant(), property.zone());
+   }
+ }

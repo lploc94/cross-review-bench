@@ -1,0 +1,21 @@
+diff --git a/src/authz/services/audit.py b/src/authz/services/audit.py
+index b3888d9..b739003 100644
+--- a/src/authz/services/audit.py
++++ b/src/authz/services/audit.py
+@@ -159,11 +159,12 @@ class AuditQueryService:
+                 org_id, limit=self._export_page_size, after=after, action=action
+             )
+             page = rows[: self._export_page_size]
++            actors = await users.get_many(
++                list({event.actor_id for event in page if event.actor_id is not None})
++            )
+             for event in page:
+-                email = None
+-                if event.actor_id is not None:
+-                    email = await users.email_of(event.actor_id)
+-                yield ExportedEvent(event=event, actor_email=email)
++                actor = actors.get(event.actor_id) if event.actor_id is not None else None
++                yield ExportedEvent(event=event, actor_email=actor.email if actor else None)
+             if len(rows) <= self._export_page_size:
+                 return
+             after = Cursor(created_at=page[-1].created_at, id=str(page[-1].id))

@@ -1,0 +1,66 @@
+diff --git a/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java b/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java
+index e120310..962cf88 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java
++++ b/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java
+@@ -57,6 +57,10 @@ public interface ApprovalTaskRepository extends JpaRepository<ApprovalTask, Long
+ 
+   long countByStatus(TaskStatus status);
+ 
++  /** Whether the user holds a task of this step and round in the given status. */
++  boolean existsByDocumentIdAndRoundAndStepIdAndAssigneeIdAndStatus(
++      long documentId, int round, long stepId, long assigneeId, TaskStatus status);
++
+   long countByAssigneeIdAndStatus(long assigneeId, TaskStatus status);
+ 
+   long countByStatusAndDueAtLessThanEqual(TaskStatus status, Instant now);
+diff --git a/src/main/java/com/papertrail/workflow/service/ApprovalService.java b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+index e146e00..6577f30 100644
+--- a/src/main/java/com/papertrail/workflow/service/ApprovalService.java
++++ b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+@@ -82,7 +82,7 @@ public class ApprovalService {
+             step.getKind(),
+             step.getQuorum(),
+             stepTasks.size(),
+-            count(stepTasks, TaskStatus.APPROVED),
++            approvers(stepTasks),
+             count(stepTasks, TaskStatus.REJECTED));
+     if (outcome == StepRules.Outcome.OPEN) {
+       return current(task);
+@@ -176,4 +176,14 @@ public class ApprovalService {
+   private static int count(List<ApprovalTask> tasks, TaskStatus status) {
+     return (int) tasks.stream().filter(task -> task.getStatus() == status).count();
+   }
++
++  /** Approvals by distinct people: one approver holding two tasks of a step counts once. */
++  private static int approvers(List<ApprovalTask> tasks) {
++    return (int)
++        tasks.stream()
++            .filter(task -> task.getStatus() == TaskStatus.APPROVED)
++            .map(task -> task.getAssignee().getId())
++            .distinct()
++            .count();
++  }
+ }
+diff --git a/src/main/java/com/papertrail/workflow/service/ReassignmentService.java b/src/main/java/com/papertrail/workflow/service/ReassignmentService.java
+index ef9577f..87dc500 100644
+--- a/src/main/java/com/papertrail/workflow/service/ReassignmentService.java
++++ b/src/main/java/com/papertrail/workflow/service/ReassignmentService.java
+@@ -7,6 +7,7 @@ import com.papertrail.workflow.domain.Document;
+ import com.papertrail.workflow.domain.DocumentStatus;
+ import com.papertrail.workflow.domain.ForbiddenException;
+ import com.papertrail.workflow.domain.NotFoundException;
++import com.papertrail.workflow.domain.TaskStatus;
+ import com.papertrail.workflow.domain.ValidationException;
+ import com.papertrail.workflow.persistence.AppUserRepository;
+ import com.papertrail.workflow.persistence.ApprovalTaskRepository;
+@@ -74,6 +75,10 @@ public class ReassignmentService {
+     if (previous.getId() == userId) {
+       throw new ConflictException("the task is already assigned to this user");
+     }
++    if (tasks.existsByDocumentIdAndRoundAndStepIdAndAssigneeIdAndStatus(
++        documentId, task.getRound(), task.getStep().getId(), userId, TaskStatus.OPEN)) {
++      throw new ConflictException("the user already has an open task in this step");
++    }
+ 
+     Instant now = clock.instant();
+     task.reassign();

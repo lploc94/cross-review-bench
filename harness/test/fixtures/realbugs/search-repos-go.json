@@ -1,0 +1,9 @@
+{
+  "total_count": 3,
+  "incomplete_results": false,
+  "items": [
+    { "full_name": "acme/tinyq", "stargazers_count": 4200, "license": { "spdx_id": "Apache-2.0" }, "archived": false, "size": 3100 },
+    { "full_name": "acme/viralcode", "stargazers_count": 9000, "license": { "spdx_id": "GPL-3.0" }, "archived": false, "size": 8000 },
+    { "full_name": "acme/brokenrepo", "stargazers_count": 1500, "license": { "spdx_id": "MIT" }, "archived": false, "size": 900 }
+  ]
+}

@@ -1,0 +1,16 @@
+diff --git a/internal/gateway/websocket_turn.go b/internal/gateway/websocket_turn.go
+index e3cd3c8..824e910 100644
+--- a/internal/gateway/websocket_turn.go
++++ b/internal/gateway/websocket_turn.go
+@@ -624,7 +624,10 @@ func (s *websocketConnection) runWebsocketAttempt(ctx context.Context, cancel co
+ 		}
+ 		observer.observeUsageEvent(observation)
+ 		if providerError {
+-			observer.observeError(body, "Upstream WebSocket request failed.")
++			observer.observeError(body, summarizeErrorBody(
++				recorder.redactor, body, "Upstream WebSocket request failed.",
++				resolvedErrorSummarySecretValues(input.APIKey, input.Group.HeaderRules, input.CredentialSecrets...)...,
++			))
+ 			body = recorder.redactor.Bytes(body, input.CredentialSecrets...)
+ 			var fields map[string]json.RawMessage
+ 			if json.Unmarshal(body, &fields) != nil || fields == nil {

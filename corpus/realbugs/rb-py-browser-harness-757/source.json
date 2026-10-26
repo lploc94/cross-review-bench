@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/browser-use/browser-harness",
+  "intro_pr": 532,
+  "intro_merged_at": "2026-07-17T05:02:34Z",
+  "fix_pr": 757,
+  "fix_merged_at": "2026-09-07T20:13:32Z",
+  "license": "MIT",
+  "base_commit": "67e3852d2fc33af46344e6fd7b3ac12930420a67",
+  "intro_commit": "6d0ac1634325b8b042a1431ba0bf3b75b4fbb460",
+  "fix_commit": "afbcc381b963040c19627d788e40c7e7663171ee",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

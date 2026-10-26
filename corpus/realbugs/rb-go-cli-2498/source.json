@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/larksuite/cli",
+  "intro_pr": 2218,
+  "intro_merged_at": "2026-08-07T10:41:34Z",
+  "fix_pr": 2498,
+  "fix_merged_at": "2026-08-25T10:33:36Z",
+  "license": "MIT",
+  "base_commit": "a6f3e635d440c6bb96776adffa7ec0a6c83ecd7b",
+  "intro_commit": "0f8259130389776db5517ae2bcfd4aef930a25b5",
+  "fix_commit": "faa2f8d3e017ea044ba265e5613d429181c275e3",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

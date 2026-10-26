@@ -1,0 +1,36 @@
+diff --git a/internal/store/stats.go b/internal/store/stats.go
+index ef28e58..e75d1f9 100644
+--- a/internal/store/stats.go
++++ b/internal/store/stats.go
+@@ -51,15 +51,25 @@ func (s *Store) QueueStats(ctx context.Context) ([]QueueStats, error) {
+ func (s *Store) QueueStatsOf(ctx context.Context, queue string) (QueueStats, error) {
+ 	st := QueueStats{Queue: queue, Counts: make(map[domain.State]int64, len(domain.States))}
+ 	for _, state := range domain.States {
++		st.Counts[state] = 0
++	}
++	rows, err := s.pool.Query(ctx, `SELECT state, count(*) FROM jobs WHERE queue = $1 GROUP BY state`, queue)
++	if err != nil {
++		return QueueStats{}, fmt.Errorf("count jobs of queue %q: %w", queue, err)
++	}
++	defer rows.Close()
++	for rows.Next() {
++		var state string
+ 		var n int64
+-		err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE queue = $1 AND state = $2`,
+-			queue, string(state)).Scan(&n)
+-		if err != nil {
+-			return QueueStats{}, fmt.Errorf("count %s jobs of queue %q: %w", state, queue, err)
++		if err := rows.Scan(&state, &n); err != nil {
++			return QueueStats{}, fmt.Errorf("count jobs of queue %q: %w", queue, err)
+ 		}
+-		st.Counts[state] = n
++		st.Counts[domain.State(state)] = n
++	}
++	if err := rows.Err(); err != nil {
++		return QueueStats{}, fmt.Errorf("count jobs of queue %q: %w", queue, err)
+ 	}
+-	err := s.pool.QueryRow(ctx, `SELECT min(run_at) FROM jobs WHERE queue = $1 AND state = 'available' AND run_at <= $2`,
++	err = s.pool.QueryRow(ctx, `SELECT min(run_at) FROM jobs WHERE queue = $1 AND state = 'available' AND run_at <= $2`,
+ 		queue, s.now()).Scan(&st.OldestAvailable)
+ 	if err != nil {
+ 		return QueueStats{}, fmt.Errorf("oldest available job of queue %q: %w", queue, err)

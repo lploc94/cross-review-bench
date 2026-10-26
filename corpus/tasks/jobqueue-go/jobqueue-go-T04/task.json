@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T04",
+  "repo": "jobqueue-go",
+  "kind": "buggy",
+  "title": "Renew the leases of running jobs automatically",
+  "description": "Today a handler that may outlive its lease has to call `worker.ExtendLease` itself, and the configuration refuses a `JOB_TIMEOUT` that is not shorter than `LEASE_DURATION`. Report generation jobs need well over five minutes, and raising the lease for everyone means a crashed worker's jobs sit for a long time before the reaper hands them out again. This change makes the pool renew leases on its own.\n\n- `Pool.run` starts a renewal loop next to every job it runs: every `LeaseDuration/3` it extends the job's lease by one `LeaseDuration` from now. The first renewal is timed from the lease, before the handler starts.\n- If a renewal comes back with `domain.ErrLeaseLost` (the reaper already gave the job to another worker), the handler's context is cancelled with that error as its cause, and the attempt's error says it stopped after losing the lease. Other renewal errors are logged and retried at the next interval.\n- New counter `jobqueue_lease_renewals_total{queue,result}` with `renewed`, `lost` and `error`.\n- Config: `JOB_TIMEOUT` may now be longer than `LEASE_DURATION`; instead `LEASE_DURATION` must be at least 3s, and `NewPool` refuses a lease under one second, so renewals are not fired in a tight loop.\n- `worker.ExtendLease` stays for handlers that want to check they still hold the lease before a step that must not run twice; doc comments and the README are updated.\n\nTests: renewals every 20s with a one-minute lease on the manual clock (fake store), the handler cancelled with the lost lease as cause, a long job against Postgres that the reaper leaves alone after four renewals, config validation. `TestPoolWithStoreRetriesThenDeadLetters` now waits for two clock waiters, since the attempt's renewal timer is registered on the manual clock as well.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/worker/pool.go",
+      "lines": [292, 298],
+      "category": "resource-leak",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "The renewal goroutine started for each job only stops when the pool's context is done; it never learns that its job finished. After the handler returns and the outcome is recorded, it keeps calling ExtendLease every LeaseDuration/3 for the life of the process (each call gets ErrLeaseLost, which it handles by cancelling the already-finished job context and continuing). main starts the pool with context.Background() and Stop only closes quit, so every processed job leaks a goroutine and a database round trip per interval; and when a retried job is leased again by the same worker, the loop left over from its earlier attempt renews the new attempt's lease as well. Worse, when recording the outcome fails (a brief database outage), the job is still running under this worker in the store, so every renewal succeeds and the loop keeps the lease alive for as long as the process runs: the reaper never hands the job out again.",
+      "trigger": "Run any job to completion, then let the clock pass several renewal intervals: ExtendLease keeps being called for the settled job and the renewLease goroutine never exits. Or let Complete fail once with a transient error: the job's lease keeps being renewed after the attempt has ended.",
+      "testable": true,
+      "hidden_tests": ["internal/worker/renewal_end_test.go"],
+      "hidden_test_cmd": "go test -count=1 -run '^TestPoolRenewalEndsWhen(JobSettles|SettleFails)$' ./internal/worker/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The renewal loop does not outlive the pool: it selects on p.ctx.Done(), and Stop shuts the pool down, so the goroutine exits when the pool's context is cancelled at Stop; between jobs the extra ExtendLease calls simply get ErrLeaseLost and are harmless.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

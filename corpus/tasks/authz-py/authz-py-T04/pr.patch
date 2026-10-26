@@ -1,0 +1,759 @@
+diff --git a/.env.example b/.env.example
+index dea4cd1..d992a9f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,6 +8,7 @@ LOG_LEVEL=info
+ ACCESS_TOKEN_TTL_SECONDS=900
+ REFRESH_TOKEN_TTL_SECONDS=2592000
+ SESSION_TTL_SECONDS=7776000
++MFA_TOKEN_TTL_SECONDS=300
+ LOGIN_RATE_LIMIT=10
+ LOGIN_RATE_WINDOW_SECONDS=300
+ REFRESH_RATE_LIMIT=60
+diff --git a/README.md b/README.md
+index 20ef4f0..3ddc2a1 100644
+--- a/README.md
++++ b/README.md
+@@ -27,6 +27,14 @@ two tokens:
+   and returns a new pair in the same session; a used, expired or unknown refresh token, or one
+   whose session was revoked or has expired, answers 401.
+ 
++**Two-factor authentication.** A user can add a TOTP authenticator app (RFC 6238: HMAC-SHA1,
++30-second steps, 6 digits). `POST /v1/me/totp {password}` returns a new base32 secret for the
++app; `POST /v1/me/totp/confirm {code}` turns it on once the app shows a valid code. From then on
++`POST /v1/auth/login` answers `{"mfa_required": true, "mfa_token", "expires_in"}` instead of
++tokens, and `POST /v1/auth/login/totp {mfa_token, code}` completes the login with the current
++code; codes of the step before or after are accepted for clock drift. An `mfa_token` lives
++`MFA_TOKEN_TTL_SECONDS` and is used once, whether the code was right or not.
++
+ `POST /v1/auth/logout` revokes the current session; `GET /v1/sessions` lists the caller's open
+ sessions and `DELETE /v1/sessions/{id}` revokes one of them. Login failures all look alike (same
+ status, body and, through a dummy argon2 verification for unknown addresses, similar timing), so
+@@ -91,9 +99,10 @@ cursor.
+ | Method | Path | Needs |
+ |---|---|---|
+ | GET | `/health` | none |
+-| POST | `/v1/auth/login`, `/v1/auth/refresh` | none |
++| POST | `/v1/auth/login`, `/v1/auth/login/totp`, `/v1/auth/refresh` | none |
+ | POST | `/v1/auth/logout` | access token |
+ | GET, PATCH | `/v1/me` | access token |
++| POST | `/v1/me/totp`, `/v1/me/totp/confirm` | access token |
+ | GET | `/v1/sessions` | access token |
+ | DELETE | `/v1/sessions/{session_id}` | access token (own sessions) |
+ | GET | `/v1/permissions` | access token |
+@@ -176,6 +185,7 @@ tests/                 pytest suites; tests/helpers has the clock, test doubles
+ | `ACCESS_TOKEN_TTL_SECONDS` | `900` | must be shorter than the refresh token TTL |
+ | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | 30 days, at most the session TTL |
+ | `SESSION_TTL_SECONDS` | `7776000` | 90 days; a session never outlives it |
++| `MFA_TOKEN_TTL_SECONDS` | `300` | time to enter the code after the password |
+ | `JWT_ISSUER`, `JWT_LEEWAY_SECONDS` | `authz`, `5` | |
+ | `ARGON2_TIME_COST`, `ARGON2_MEMORY_COST_KIB`, `ARGON2_PARALLELISM` | `3`, `65536`, `4` | |
+ | `LOGIN_RATE_LIMIT`, `LOGIN_RATE_WINDOW_SECONDS` | `10`, `300` | per email and IP |
+diff --git a/migrations/versions/0006_totp.py b/migrations/versions/0006_totp.py
+new file mode 100644
+index 0000000..a1bbcea
+--- /dev/null
++++ b/migrations/versions/0006_totp.py
+@@ -0,0 +1,29 @@
++"""two-factor authentication with TOTP
++
++Revision ID: 0006
++Revises: 0005
++Create Date: 2026-10-12 10:00:00+00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "0006"
++down_revision: str | None = "0005"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++TZ = sa.DateTime(timezone=True)
++
++
++def upgrade() -> None:
++    # The secret is set when enrolment starts; totp_enabled_at once a code confirms it.
++    op.add_column("users", sa.Column("totp_secret", sa.Text(), nullable=True))
++    op.add_column("users", sa.Column("totp_enabled_at", TZ, nullable=True))
++
++
++def downgrade() -> None:
++    op.drop_column("users", "totp_enabled_at")
++    op.drop_column("users", "totp_secret")
+diff --git a/src/authz/api/routers/account.py b/src/authz/api/routers/account.py
+index 860a161..a2ead9a 100644
+--- a/src/authz/api/routers/account.py
++++ b/src/authz/api/routers/account.py
+@@ -1,4 +1,4 @@
+-"""The caller's own account: profile and login sessions."""
++"""The caller's own account: profile, two-factor authentication and login sessions."""
+ 
+ from __future__ import annotations
+ 
+@@ -6,8 +6,16 @@ import uuid
+ 
+ from fastapi import APIRouter, Response, status
+ 
+-from authz.api.deps import ContainerDep, PrincipalDep
+-from authz.api.schemas.auth import ProfileUpdate, SessionResponse, UserResponse
++from authz.api.deps import ClientDep, ContainerDep, PrincipalDep
++from authz.api.routers.auth import NO_STORE
++from authz.api.schemas.auth import (
++    ProfileUpdate,
++    SessionResponse,
++    TotpConfirmRequest,
++    TotpEnrolmentResponse,
++    TotpEnrolRequest,
++    UserResponse,
++)
+ from authz.api.schemas.common import ListResponse
+ 
+ router = APIRouter(prefix="/v1", tags=["account"])
+@@ -26,6 +34,27 @@ async def update_me(
+     return UserResponse.of(user)
+ 
+ 
++@router.post("/me/totp", response_model=TotpEnrolmentResponse, status_code=status.HTTP_201_CREATED)
++async def start_totp_enrolment(
++    body: TotpEnrolRequest,
++    principal: PrincipalDep,
++    container: ContainerDep,
++    client: ClientDep,
++    response: Response,
++) -> TotpEnrolmentResponse:
++    secret = await container.auth.start_totp_enrolment(principal, body.password, client)
++    response.headers.update(NO_STORE)
++    return TotpEnrolmentResponse(secret=secret)
++
++
++@router.post("/me/totp/confirm", status_code=status.HTTP_204_NO_CONTENT)
++async def confirm_totp_enrolment(
++    body: TotpConfirmRequest, principal: PrincipalDep, container: ContainerDep
++) -> Response:
++    await container.auth.confirm_totp_enrolment(principal, body.code)
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
++
++
+ @router.get("/sessions", response_model=ListResponse[SessionResponse])
+ async def list_sessions(
+     principal: PrincipalDep, container: ContainerDep
+diff --git a/src/authz/api/routers/auth.py b/src/authz/api/routers/auth.py
+index 1054b0c..f60150d 100644
+--- a/src/authz/api/routers/auth.py
++++ b/src/authz/api/routers/auth.py
+@@ -7,21 +7,41 @@ from dataclasses import replace
+ from fastapi import APIRouter, Response, status
+ 
+ from authz.api.deps import ClientDep, ContainerDep, PrincipalDep
+-from authz.api.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
++from authz.api.schemas.auth import (
++    LoginRequest,
++    RefreshRequest,
++    SecondFactorResponse,
++    TokenResponse,
++    TotpLoginRequest,
++)
++from authz.services.auth import SecondFactorRequired
+ 
+ router = APIRouter(prefix="/v1", tags=["auth"])
+ 
+ NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+ 
+ 
+-@router.post("/auth/login", response_model=TokenResponse)
++@router.post("/auth/login", response_model=TokenResponse | SecondFactorResponse)
+ async def login(
+     body: LoginRequest, container: ContainerDep, client: ClientDep, response: Response
+-) -> TokenResponse:
+-    pair = await container.auth.login(
++) -> TokenResponse | SecondFactorResponse:
++    result = await container.auth.login(
+         body.email, body.password, replace(client, device_label=body.device_label)
+     )
+     response.headers.update(NO_STORE)
++    if isinstance(result, SecondFactorRequired):
++        return SecondFactorResponse.of(result)
++    return TokenResponse.of(result)
++
++
++@router.post("/auth/login/totp", response_model=TokenResponse)
++async def login_with_totp(
++    body: TotpLoginRequest, container: ContainerDep, client: ClientDep, response: Response
++) -> TokenResponse:
++    pair = await container.auth.login_with_totp(
++        body.mfa_token, body.code, replace(client, device_label=body.device_label)
++    )
++    response.headers.update(NO_STORE)
+     return TokenResponse.of(pair)
+ 
+ 
+diff --git a/src/authz/api/schemas/auth.py b/src/authz/api/schemas/auth.py
+index ab2fd1e..27c690c 100644
+--- a/src/authz/api/schemas/auth.py
++++ b/src/authz/api/schemas/auth.py
+@@ -8,8 +8,9 @@ from datetime import datetime
+ from pydantic import Field
+ 
+ from authz.api.schemas.common import RequestModel, ResponseModel
++from authz.domain import totp
+ from authz.models import User
+-from authz.services.auth import TokenPair
++from authz.services.auth import SecondFactorRequired, TokenPair
+ from authz.services.users import SessionView
+ 
+ 
+@@ -23,6 +24,20 @@ class RefreshRequest(RequestModel):
+     refresh_token: str = Field(min_length=1, max_length=512)
+ 
+ 
++class TotpLoginRequest(RequestModel):
++    mfa_token: str = Field(min_length=1, max_length=512)
++    code: str = Field(min_length=1, max_length=16)
++    device_label: str | None = Field(default=None, max_length=100)
++
++
++class TotpEnrolRequest(RequestModel):
++    password: str = Field(min_length=1, max_length=1024)
++
++
++class TotpConfirmRequest(RequestModel):
++    code: str = Field(min_length=1, max_length=16)
++
++
+ class TokenResponse(ResponseModel):
+     access_token: str
+     token_type: str = "bearer"  # noqa: S105 - the OAuth token type, not a secret
+@@ -42,6 +57,22 @@ class TokenResponse(ResponseModel):
+         )
+ 
+ 
++class SecondFactorResponse(ResponseModel):
++    mfa_required: bool = True
++    mfa_token: str
++    expires_in: int
++
++    @classmethod
++    def of(cls, required: SecondFactorRequired) -> SecondFactorResponse:
++        return cls(mfa_token=required.mfa_token, expires_in=required.expires_in)
++
++
++class TotpEnrolmentResponse(ResponseModel):
++    secret: str
++    digits: int = totp.DIGITS
++    period: int = totp.STEP_SECONDS
++
++
+ class UserResponse(ResponseModel):
+     id: uuid.UUID
+     email: str
+diff --git a/src/authz/config.py b/src/authz/config.py
+index 9ee6ede..d99a779 100644
+--- a/src/authz/config.py
++++ b/src/authz/config.py
+@@ -49,6 +49,7 @@ class Settings(BaseSettings):
+     access_token_ttl_seconds: int = Field(default=900, ge=30, le=86_400)
+     refresh_token_ttl_seconds: int = Field(default=30 * 86_400, ge=300, le=365 * 86_400)
+     session_ttl_seconds: int = Field(default=90 * 86_400, ge=300, le=365 * 86_400)
++    mfa_token_ttl_seconds: int = Field(default=300, ge=30, le=3_600)
+ 
+     argon2_time_cost: int = Field(default=3, ge=1, le=20)
+     argon2_memory_cost_kib: int = Field(default=65_536, ge=8, le=4_194_304)
+diff --git a/src/authz/container.py b/src/authz/container.py
+index db4b112..e60cde5 100644
+--- a/src/authz/container.py
++++ b/src/authz/container.py
+@@ -12,6 +12,7 @@ from authz.infra.clock import Clock, SystemClock
+ from authz.infra.db import Database
+ from authz.infra.hashing import HashParameters, PasswordHasher
+ from authz.infra.mailer import LogMailer, Mailer, SmtpMailer, SmtpOptions
++from authz.infra.pending_logins import PendingLoginStore
+ from authz.infra.randomness import RandomSource, SecureRandom
+ from authz.infra.rate_limiter import FixedWindowRateLimiter, RateLimiter, RateLimitRule
+ from authz.infra.redis import create_redis, ping
+@@ -114,6 +115,9 @@ def build_container(
+         hasher=hasher,
+         tokens=tokens,
+         limiter=limiter,
++        pending=PendingLoginStore(
++            redis, clock, random, timedelta(seconds=settings.mfa_token_ttl_seconds)
++        ),
+         policy=AuthPolicy(
+             refresh_token_ttl=timedelta(seconds=settings.refresh_token_ttl_seconds),
+             session_ttl=timedelta(seconds=settings.session_ttl_seconds),
+diff --git a/src/authz/domain/totp.py b/src/authz/domain/totp.py
+new file mode 100644
+index 0000000..2aeb3b4
+--- /dev/null
++++ b/src/authz/domain/totp.py
+@@ -0,0 +1,50 @@
++"""Time-based one-time passwords (RFC 6238) as authenticator apps implement them: HMAC-SHA1
++over 30-second steps since the epoch, truncated to six digits (RFC 4226 §5.3). Secrets are
++exchanged as unpadded base32, the form the apps expect."""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import hmac
++import struct
++from datetime import datetime
++
++STEP_SECONDS = 30
++DIGITS = 6
++SECRET_BYTES = 20
++# Codes of one step either side of the current one are accepted, for clocks that drift.
++ACCEPTED_DRIFT_STEPS = 1
++
++
++def encode_secret(raw: bytes) -> str:
++    return base64.b32encode(raw).decode("ascii").rstrip("=")
++
++
++def _decode_secret(secret: str) -> bytes:
++    padded = secret.upper() + "=" * (-len(secret) % 8)
++    return base64.b32decode(padded)
++
++
++def time_step(moment: datetime) -> int:
++    return int(moment.timestamp()) // STEP_SECONDS
++
++
++def code_at(secret: str, step: int) -> str:
++    """The code an authenticator shows during `step`."""
++    digest = hmac.new(_decode_secret(secret), struct.pack(">Q", step), hashlib.sha1).digest()
++    offset = digest[-1] & 0x0F
++    number = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
++    return str(number % 10**DIGITS).zfill(DIGITS)
++
++
++def matching_step(secret: str, code: str, now: datetime) -> int | None:
++    """The time step whose code equals `code` within the accepted drift, or None."""
++    code = code.strip()
++    if len(code) != DIGITS or not (code.isascii() and code.isdigit()):
++        return None
++    current = time_step(now)
++    for step in range(current - ACCEPTED_DRIFT_STEPS, current + ACCEPTED_DRIFT_STEPS + 1):
++        if hmac.compare_digest(code_at(secret, step), code):
++            return step
++    return None
+diff --git a/src/authz/infra/pending_logins.py b/src/authz/infra/pending_logins.py
+new file mode 100644
+index 0000000..28b6b5f
+--- /dev/null
++++ b/src/authz/infra/pending_logins.py
+@@ -0,0 +1,38 @@
++"""Logins that passed the password check and wait for a second factor, kept in Redis."""
++
++from __future__ import annotations
++
++import uuid
++from datetime import UTC, datetime, timedelta
++
++from redis.asyncio import Redis
++
++from authz.infra.clock import Clock, epoch_seconds
++from authz.infra.randomness import RandomSource, hash_token
++
++
++class PendingLoginStore:
++    """Each pending login is named by a random token, expires, and can be taken only once."""
++
++    def __init__(self, redis: Redis, clock: Clock, random: RandomSource, ttl: timedelta) -> None:
++        self._redis = redis
++        self._clock = clock
++        self._random = random
++        self.ttl_seconds = int(ttl.total_seconds())
++
++    async def open(self, user_id: uuid.UUID) -> str:
++        token = self._random.token()
++        expires_at = self._clock.now() + timedelta(seconds=self.ttl_seconds)
++        value = f"{user_id}|{epoch_seconds(expires_at)}"
++        await self._redis.set(f"authz:mfa:{hash_token(token)}", value, ex=self.ttl_seconds + 5)
++        return token
++
++    async def take(self, token: str) -> uuid.UUID | None:
++        """The user of a pending login that has not expired, removing it; None otherwise."""
++        value = await self._redis.getdel(f"authz:mfa:{hash_token(token)}")
++        if value is None:
++            return None
++        user_id, _, expires = str(value).partition("|")
++        if self._clock.now() >= datetime.fromtimestamp(int(expires), UTC):
++            return None
++        return uuid.UUID(user_id)
+diff --git a/src/authz/infra/randomness.py b/src/authz/infra/randomness.py
+index a4d7bbe..c6d32bf 100644
+--- a/src/authz/infra/randomness.py
++++ b/src/authz/infra/randomness.py
+@@ -16,6 +16,10 @@ class RandomSource(Protocol):
+         """A URL-safe random string carrying nbytes of entropy."""
+         ...
+ 
++    def token_bytes(self, nbytes: int) -> bytes:
++        """nbytes random bytes, for secrets that are not sent as text."""
++        ...
++
+     def uuid(self) -> uuid.UUID: ...
+ 
+ 
+@@ -23,6 +27,9 @@ class SecureRandom:
+     def token(self, nbytes: int = TOKEN_BYTES) -> str:
+         return secrets.token_urlsafe(nbytes)
+ 
++    def token_bytes(self, nbytes: int) -> bytes:
++        return secrets.token_bytes(nbytes)
++
+     def uuid(self) -> uuid.UUID:
+         return uuid.uuid4()
+ 
+diff --git a/src/authz/models/user.py b/src/authz/models/user.py
+index c16bf5c..03025fb 100644
+--- a/src/authz/models/user.py
++++ b/src/authz/models/user.py
+@@ -22,11 +22,17 @@ class User(Base):
+     created_at: Mapped[Timestamp]
+     updated_at: Mapped[Timestamp]
+     disabled_at: Mapped[OptionalTimestamp]
++    totp_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
++    totp_enabled_at: Mapped[OptionalTimestamp]
+ 
+     @property
+     def is_active(self) -> bool:
+         return self.disabled_at is None
+ 
++    @property
++    def totp_enabled(self) -> bool:
++        return self.totp_enabled_at is not None
++
+ 
+ class Session(Base):
+     """A login on one device. Refresh tokens rotate inside it; revoking it ends them all."""
+diff --git a/src/authz/repositories/users.py b/src/authz/repositories/users.py
+index b326e5b..ea8bc8d 100644
+--- a/src/authz/repositories/users.py
++++ b/src/authz/repositories/users.py
+@@ -17,8 +17,8 @@ class UserRepository:
+     def __init__(self, session: AsyncSession) -> None:
+         self._session = session
+ 
+-    async def get(self, user_id: uuid.UUID) -> User | None:
+-        return await self._session.get(User, user_id)
++    async def get(self, user_id: uuid.UUID, *, for_update: bool = False) -> User | None:
++        return await self._session.get(User, user_id, with_for_update=for_update)
+ 
+     async def get_by_email(self, email: str) -> User | None:
+         """Look a user up by an already normalised address."""
+@@ -67,3 +67,14 @@ class UserRepository:
+         user.display_name = display_name
+         user.updated_at = now
+         await self._session.flush()
++
++    async def start_totp_enrolment(self, user: User, secret: str, now: datetime) -> None:
++        user.totp_secret = secret
++        user.totp_enabled_at = None
++        user.updated_at = now
++        await self._session.flush()
++
++    async def enable_totp(self, user: User, now: datetime) -> None:
++        user.totp_enabled_at = now
++        user.updated_at = now
++        await self._session.flush()
+diff --git a/src/authz/services/auth.py b/src/authz/services/auth.py
+index 7161777..3220185 100644
+--- a/src/authz/services/auth.py
++++ b/src/authz/services/auth.py
+@@ -1,4 +1,4 @@
+-"""Login, token refresh and logout."""
++"""Login (with an optional second factor), token refresh and logout."""
+ 
+ from __future__ import annotations
+ 
+@@ -8,18 +8,22 @@ from datetime import datetime, timedelta
+ 
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from authz.domain import totp
+ from authz.domain.emails import normalize_email
+ from authz.domain.principal import Principal
+ from authz.errors import (
+     AuthenticationFailed,
++    ConflictError,
+     InvalidCredentials,
+     InvalidInputError,
+     InvalidToken,
++    NotFoundError,
+     RateLimited,
+ )
+ from authz.infra.clock import Clock
+ from authz.infra.db import Database
+ from authz.infra.hashing import MAX_PASSWORD_LENGTH, PasswordHasher
++from authz.infra.pending_logins import PendingLoginStore
+ from authz.infra.randomness import RandomSource, hash_token
+ from authz.infra.rate_limiter import RateLimiter, RateLimitRule
+ from authz.logging import get_logger
+@@ -57,6 +61,14 @@ class TokenPair:
+     user_id: uuid.UUID
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class SecondFactorRequired:
++    """The password was right; the login completes with a one-time code and this token."""
++
++    mfa_token: str
++    expires_in: int
++
++
+ class AuthService:
+     def __init__(
+         self,
+@@ -67,6 +79,7 @@ class AuthService:
+         hasher: PasswordHasher,
+         tokens: AccessTokenCodec,
+         limiter: RateLimiter,
++        pending: PendingLoginStore,
+         policy: AuthPolicy,
+     ) -> None:
+         self._db = db
+@@ -75,10 +88,14 @@ class AuthService:
+         self._hasher = hasher
+         self._tokens = tokens
+         self._limiter = limiter
++        self._pending = pending
+         self._policy = policy
+ 
+-    async def login(self, email: str, password: str, client: ClientInfo) -> TokenPair:
+-        """Exchange credentials for a new session. Every failure looks the same to the caller."""
++    async def login(
++        self, email: str, password: str, client: ClientInfo
++    ) -> TokenPair | SecondFactorRequired:
++        """Exchange credentials for a new session, or for a pending login when the user has
++        two-factor authentication on. Every failure looks the same to the caller."""
+         try:
+             address = normalize_email(email)
+         except InvalidInputError:
+@@ -112,10 +129,70 @@ class AuthService:
+                     user.id, new_hash, self._clock.now()
+                 )
+                 log.info("auth.password_rehashed", user_id=str(user.id))
++            if user.totp_enabled:
++                log.info("auth.second_factor_required", user_id=str(user.id))
++                mfa_token = await self._pending.open(user.id)
++                return SecondFactorRequired(mfa_token, self._pending.ttl_seconds)
++            pair = await self._open_session(session, user, client)
++        log.info("auth.login", user_id=str(pair.user_id), session_id=str(pair.session_id))
++        return pair
++
++    async def login_with_totp(self, mfa_token: str, code: str, client: ClientInfo) -> TokenPair:
++        """Complete a pending login with the code the user's authenticator shows."""
++        user_id = await self._pending.take(mfa_token)
++        if user_id is None:
++            raise InvalidToken()
++        await self._throttle(self._policy.login_rule, f"totp|{user_id}")
++        async with self._db.transaction() as session:
++            user = await UserRepository(session).get(user_id)
++            if user is None or user.disabled_at is not None:
++                raise InvalidToken()
++            if not user.totp_enabled or user.totp_secret is None:
++                raise InvalidToken()
++            if totp.matching_step(user.totp_secret, code, self._clock.now()) is None:
++                log.info("auth.login_failed", reason="bad_totp_code", user_id=str(user.id))
++                raise InvalidCredentials("the one-time code is incorrect")
+             pair = await self._open_session(session, user, client)
+         log.info("auth.login", user_id=str(pair.user_id), session_id=str(pair.session_id))
+         return pair
+ 
++    async def start_totp_enrolment(
++        self, principal: Principal, password: str, client: ClientInfo
++    ) -> str:
++        """A new secret for the caller's authenticator; it counts once a code confirms it."""
++        secret = totp.encode_secret(self._random.token_bytes(totp.SECRET_BYTES))
++        async with self._db.transaction() as session:
++            users = UserRepository(session)
++            user = await users.get(principal.user_id, for_update=True)
++            if user is None:
++                raise NotFoundError("user")
++            await self._throttle(self._policy.login_rule, f"{user.email}|{client.ip or '-'}")
++            if len(password) > MAX_PASSWORD_LENGTH or not await self._hasher.verify(
++                user.password_hash, password
++            ):
++                raise InvalidCredentials("the password is incorrect")
++            if user.totp_enabled:
++                raise ConflictError("two-factor authentication is already on")
++            await users.start_totp_enrolment(user, secret, self._clock.now())
++        log.info("auth.totp_enrolment_started", user_id=str(user.id))
++        return secret
++
++    async def confirm_totp_enrolment(self, principal: Principal, code: str) -> None:
++        """Turn two-factor authentication on once the authenticator shows a valid code."""
++        async with self._db.transaction() as session:
++            users = UserRepository(session)
++            user = await users.get(principal.user_id, for_update=True)
++            if user is None:
++                raise NotFoundError("user")
++            if user.totp_enabled:
++                raise ConflictError("two-factor authentication is already on")
++            if user.totp_secret is None:
++                raise ConflictError("no two-factor enrolment has been started")
++            if totp.matching_step(user.totp_secret, code, self._clock.now()) is None:
++                raise InvalidInputError("the code is incorrect", details={"field": "code"})
++            await users.enable_totp(user, self._clock.now())
++        log.info("auth.totp_enabled", user_id=str(principal.user_id))
++
+     async def _open_session(
+         self, session: AsyncSession, user: User, client: ClientInfo
+     ) -> TokenPair:
+diff --git a/tests/api/test_totp.py b/tests/api/test_totp.py
+new file mode 100644
+index 0000000..040e2f9
+--- /dev/null
++++ b/tests/api/test_totp.py
+@@ -0,0 +1,96 @@
++from __future__ import annotations
++
++from authz.domain import totp
++from tests.helpers.clock import FrozenClock
++from tests.helpers.factories import LoggedIn, login, signed_in
++
++
++def code(secret: str, clock: FrozenClock, steps: int = 0) -> str:
++    return totp.code_at(secret, totp.time_step(clock.now()) + steps)
++
++
++async def enrol(client, me: LoggedIn, clock: FrozenClock) -> str:
++    started = await client.post("/v1/me/totp", json={"password": me.password}, headers=me.headers)
++    assert started.status_code == 201, started.text
++    secret: str = started.json()["secret"]
++    confirmed = await client.post(
++        "/v1/me/totp/confirm", json={"code": code(secret, clock)}, headers=me.headers
++    )
++    assert confirmed.status_code == 204, confirmed.text
++    return secret
++
++
++async def second_step(client, me: LoggedIn, one_time_code: str, mfa_token: str | None = None):
++    if mfa_token is None:
++        mfa_token = (await login(client, me.email)).json()["mfa_token"]
++    return await client.post(
++        "/v1/auth/login/totp", json={"mfa_token": mfa_token, "code": one_time_code}
++    )
++
++
++async def test_enrolment_returns_a_secret_and_needs_the_password(client, container):
++    me = await signed_in(client, container)
++
++    wrong = await client.post("/v1/me/totp", json={"password": "not it"}, headers=me.headers)
++    response = await client.post("/v1/me/totp", json={"password": me.password}, headers=me.headers)
++
++    assert wrong.status_code == 401
++    assert response.status_code == 201
++    assert response.headers["cache-control"] == "no-store"
++    assert len(response.json()["secret"]) == 32
++    assert response.json()["period"] == 30
++
++
++async def test_login_completes_with_the_current_code(client, container, clock: FrozenClock):
++    me = await signed_in(client, container)
++    secret = await enrol(client, me, clock)
++    clock.advance(minutes=5)
++
++    first = await login(client, me.email)
++    second = await second_step(client, me, code(secret, clock), first.json()["mfa_token"])
++
++    assert first.status_code == 200
++    assert first.json()["mfa_required"] is True
++    assert first.json()["expires_in"] == container.settings.mfa_token_ttl_seconds
++    assert "access_token" not in first.json()
++    assert second.status_code == 200, second.text
++    me_again = await client.get(
++        "/v1/me", headers={"Authorization": f"Bearer {second.json()['access_token']}"}
++    )
++    assert me_again.status_code == 200
++    again = await client.post("/v1/me/totp", json={"password": me.password}, headers=me.headers)
++    assert again.status_code == 409
++
++
++async def test_a_wrong_code_spends_the_mfa_token(client, container, clock):
++    me = await signed_in(client, container)
++    secret = await enrol(client, me, clock)
++    clock.advance(minutes=5)
++    mfa_token = (await login(client, me.email)).json()["mfa_token"]
++
++    wrong = await second_step(client, me, code(secret, clock, 2), mfa_token)
++    retry = await second_step(client, me, code(secret, clock), mfa_token)
++
++    assert wrong.json()["error"]["code"] == "invalid_credentials"
++    assert retry.json()["error"]["code"] == "invalid_token"
++
++
++async def test_mfa_token_expires(client, container, clock: FrozenClock):
++    me = await signed_in(client, container)
++    secret = await enrol(client, me, clock)
++    mfa_token = (await login(client, me.email)).json()["mfa_token"]
++    clock.advance(seconds=container.settings.mfa_token_ttl_seconds)
++
++    response = await second_step(client, me, code(secret, clock), mfa_token)
++
++    assert response.status_code == 401
++    assert response.json()["error"]["code"] == "invalid_token"
++
++
++async def test_previous_step_is_accepted_but_not_older(client, container, clock):
++    me = await signed_in(client, container)
++    secret = await enrol(client, me, clock)
++    clock.advance(minutes=5)
++
++    assert (await second_step(client, me, code(secret, clock, -2))).status_code == 401
++    assert (await second_step(client, me, code(secret, clock, -1))).status_code == 200
+diff --git a/tests/helpers/doubles.py b/tests/helpers/doubles.py
+index 447b6a9..8b0a4ee 100644
+--- a/tests/helpers/doubles.py
++++ b/tests/helpers/doubles.py
+@@ -23,10 +23,13 @@ class SeededRandom:
+         return hashlib.sha256(f"{self._seed}:{self._counter}".encode()).digest()
+ 
+     def token(self, nbytes: int = 32) -> str:
++        return self.token_bytes(nbytes).hex()
++
++    def token_bytes(self, nbytes: int) -> bytes:
+         raw = b""
+         while len(raw) < nbytes:
+             raw += self._next()
+-        return raw[:nbytes].hex()
++        return raw[:nbytes]
+ 
+     def uuid(self) -> uuid.UUID:
+         return uuid.UUID(bytes=self._next()[:16], version=4)
+diff --git a/tests/unit/test_totp.py b/tests/unit/test_totp.py
+new file mode 100644
+index 0000000..5eb6c65
+--- /dev/null
++++ b/tests/unit/test_totp.py
+@@ -0,0 +1,25 @@
++from __future__ import annotations
++
++from datetime import UTC, datetime
++
++import pytest
++
++from authz.domain import totp
++
++# The SHA-1 secret of RFC 6238 Appendix B, "12345678901234567890", in base32.
++RFC_SECRET = totp.encode_secret(b"12345678901234567890")
++
++
++@pytest.mark.parametrize(
++    ("unix_time", "code"),
++    [(59, "287082"), (1111111109, "081804"), (1234567890, "005924"), (2000000000, "279037")],
++)
++def test_codes_match_the_rfc_test_vectors(unix_time, code):
++    moment = datetime.fromtimestamp(unix_time, UTC)
++
++    assert totp.code_at(RFC_SECRET, totp.time_step(moment)) == code
++
++
++@pytest.mark.parametrize("code", ["", "12345", "1234567", "12a456", "١٢٣٤٥٦"])
++def test_malformed_codes_never_match(code):
++    assert totp.matching_step(RFC_SECRET, code, datetime(2026, 3, 2, tzinfo=UTC)) is None

@@ -1,0 +1,710 @@
+diff --git a/README.md b/README.md
+index c9415f9..403519e 100644
+--- a/README.md
++++ b/README.md
+@@ -51,6 +51,12 @@ internal/testredis/ per-test Redis key spaces for tests
+    and replaced otherwise, and `X-Real-Ip`, `X-Forwarded-Port` and `Forwarded` from other peers
+    are dropped; `X-Request-Id` is propagated when well formed and generated if not. Request
+    trailers are forwarded under the same rules as the header, transforms included.
++   A route with `passive_health` ejects an upstream after `consecutive_failures` failures in a row
++   (connect, timeout or reset errors, and 5xx answers) for `ejection`; no more than
++   `max_ejected_percent` of its upstreams are ejected at once, and one always stays. A retry first
++   prefers a healthy upstream not ejected, tried ones included, and an untried one; only when none
++   is left does the attempt pick among all of the route's upstreams, ejected ones too, rather than
++   answering `503` (panic routing).
+ 6. Retries follow the route's `retry` policy, only for GET, HEAD, OPTIONS, PUT and DELETE unless
+    `non_idempotent` is set, and only when the body was buffered: bodies up to `BODY_BUFFER_LIMIT`
+    are held in memory, longer ones are streamed and sent once. Each retry waits an exponential
+@@ -103,7 +109,10 @@ Every response the gateway produces itself is JSON:
+ 
+ Only `id`, one of `path` or `path_prefix`, and `upstreams` are required; the values above for
+ `retry`, `circuit_breaker` and `health_check` are the defaults filled in when the object is present.
+-`auth` defaults to `none` and `timeout` to `30s`. Transforms run rename, then remove, then add; they
++`auth` defaults to `none` and `timeout` to `30s`. `passive_health`, when present, needs
++`consecutive_failures` (at least 1), `ejection` (a positive duration) and `max_ejected_percent`
++(1 to 100), for example `{"consecutive_failures": 5, "ejection": "30s", "max_ejected_percent": 50}`.
++Transforms run rename, then remove, then add; they
+ may not touch hop-by-hop fields, `Host`, `Content-Length`, `Trailer` or the headers the gateway
+ owns (`X-Request-Id`, `X-Forwarded-For`, `-Proto` and `-Host`, `X-Consumer-Id`).
+ 
+@@ -188,7 +197,7 @@ All `/admin/v1` endpoints require `Authorization: Bearer $ADMIN_TOKEN` and answe
+ | Method and path | |
+ |-----------------|-|
+ | `GET /admin/v1/health` | Redis and upstream health; `503` when Redis is down |
+-| `GET /admin/v1/routes`, `GET /admin/v1/routes/{id}` | live routes with upstream health and breaker state |
++| `GET /admin/v1/routes`, `GET /admin/v1/routes/{id}` | live routes with upstream health, passive ejection and breaker state |
+ | `POST /admin/v1/routes/reload` | reload the routes file; `422` with the problems when it is invalid |
+ | `POST /admin/v1/consumers` | `{"name": "billing", "enabled": true}` |
+ | `GET /admin/v1/consumers?offset=0&limit=100` | page of consumers |
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..d42c4ce 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -73,6 +73,7 @@ type Route struct {
+ 
+ 	RateLimit      *RateLimit      `json:"rate_limit,omitempty"`
+ 	Retry          *Retry          `json:"retry,omitempty"`
++	PassiveHealth  *PassiveHealth  `json:"passive_health,omitempty"`
+ 	CircuitBreaker *CircuitBreaker `json:"circuit_breaker,omitempty"`
+ 	HealthCheck    *HealthCheck    `json:"health_check,omitempty"`
+ 	Transforms     *Transforms     `json:"transforms,omitempty"`
+@@ -110,6 +111,15 @@ type CircuitBreaker struct {
+ 	HalfOpenProbes int      `json:"half_open_probes,omitempty"`
+ }
+ 
++// PassiveHealth ejects an upstream whose requests fail ConsecutiveFailures times in a row (connect
++// and timeout errors, resets, and 5xx answers) for Ejection. At most MaxEjectedPercent of the
++// route's upstreams are ejected at once, and at least one always stays.
++type PassiveHealth struct {
++	ConsecutiveFailures int      `json:"consecutive_failures"`
++	Ejection            Duration `json:"ejection"`
++	MaxEjectedPercent   int      `json:"max_ejected_percent"`
++}
++
+ // HealthCheck probes each upstream of the route.
+ type HealthCheck struct {
+ 	Path               string   `json:"path"`
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..1472ccb 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -128,6 +128,17 @@ func (r *Route) validate(p routeProblems) {
+ 	if r.Retry != nil {
+ 		r.Retry.validate(p)
+ 	}
++	if ph := r.PassiveHealth; ph != nil {
++		if ph.ConsecutiveFailures < 1 {
++			p.add("passive_health.consecutive_failures", "must be at least 1")
++		}
++		if ph.Ejection.D() <= 0 {
++			p.add("passive_health.ejection", "must be positive")
++		}
++		if ph.MaxEjectedPercent < 1 || ph.MaxEjectedPercent > 100 {
++			p.add("passive_health.max_ejected_percent", "must be between 1 and 100, got %d", ph.MaxEjectedPercent)
++		}
++	}
+ 	if r.CircuitBreaker != nil {
+ 		r.CircuitBreaker.validate(p)
+ 	}
+diff --git a/internal/core/balancer.go b/internal/core/balancer.go
+index 7b0bd03..80c39d4 100644
+--- a/internal/core/balancer.go
++++ b/internal/core/balancer.go
+@@ -14,12 +14,23 @@ type Upstream struct {
+ 	Weight  int
+ 	Breaker *Breaker // nil when the route has no circuit breaker
+ 	health  *Health
++	passive *Passive // nil when the route has no passive health checks
+ }
+ 
+ // Healthy reports whether active health checks consider the upstream healthy. Upstreams without
+ // health checks are always healthy.
+ func (u *Upstream) Healthy() bool { return u.health.Healthy() }
+ 
++// Ejected reports whether passive health checks have ejected the upstream.
++func (u *Upstream) Ejected() bool { return u.passive != nil && u.passive.Ejected(u.String()) }
++
++// Report records how a request admitted to the upstream ended, for passive health checks.
++func (u *Upstream) Report(o Outcome) {
++	if u.passive != nil {
++		u.passive.Report(u.String(), o)
++	}
++}
++
+ // String returns the upstream's URL.
+ func (u *Upstream) String() string { return u.URL.String() }
+ 
+@@ -52,11 +63,16 @@ func NewBalancer(upstreams []*Upstream) *Balancer {
+ // Next returns the next healthy upstream for which skip returns false, or nil when there is
+ // none. A nil skip skips nothing but unhealthy upstreams.
+ func (b *Balancer) Next(skip func(*Upstream) bool) *Upstream {
++	return b.next(skip, false)
++}
++
++// next is Next; with ignoreState set, unhealthy and ejected upstreams are candidates too.
++func (b *Balancer) next(skip func(*Upstream) bool, ignoreState bool) *Upstream {
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+ 	total, best := 0, -1
+ 	for i, u := range b.upstreams {
+-		if !u.Healthy() || (skip != nil && skip(u)) {
++		if (!ignoreState && (!u.Healthy() || u.Ejected())) || (skip != nil && skip(u)) {
+ 			continue
+ 		}
+ 		b.current[i] += u.Weight
+diff --git a/internal/core/passive.go b/internal/core/passive.go
+new file mode 100644
+index 0000000..e243708
+--- /dev/null
++++ b/internal/core/passive.go
+@@ -0,0 +1,161 @@
++package core
++
++import (
++	"sync"
++	"time"
++
++	"github.com/relaywork/gateway/internal/clock"
++	"github.com/relaywork/gateway/internal/config"
++)
++
++// PassivePolicy configures passive health checks of a route.
++type PassivePolicy struct {
++	ConsecutiveFailures int
++	Ejection            time.Duration
++	MaxEjectedPercent   int
++}
++
++func passivePolicy(c config.PassiveHealth) PassivePolicy {
++	return PassivePolicy{
++		ConsecutiveFailures: c.ConsecutiveFailures,
++		Ejection:            c.Ejection.D(),
++		MaxEjectedPercent:   c.MaxEjectedPercent,
++	}
++}
++
++// Passive records how the requests to a route's upstreams end and ejects the upstreams that fail
++// in a row. It is shared by all of the route's upstreams, and survives reloads that keep the
++// route's passive settings. It tracks only the upstreams of the live table: outcomes reported for
++// an upstream that a reload removed, by a request still on the old table, are ignored.
++type Passive struct {
++	policy PassivePolicy
++	clock  clock.Clock
++
++	mu       sync.Mutex
++	total    int                  // the route's upstreams
++	live     map[string]bool      // the route's upstreams, by URL; empty until setUpstreams
++	failures map[string]int       // consecutive failures, by upstream URL
++	ejected  map[string]time.Time // until when an upstream is ejected, by upstream URL
++}
++
++// NewPassive returns the passive health state of a route; setUpstreams gives it the upstreams.
++func NewPassive(p PassivePolicy, clk clock.Clock) *Passive {
++	return &Passive{
++		policy:   p,
++		clock:    clk,
++		live:     make(map[string]bool),
++		failures: make(map[string]int),
++		ejected:  make(map[string]time.Time),
++	}
++}
++
++// setUpstreams makes urls the route's upstreams. Failures and ejections of upstreams no longer in
++// the route are forgotten, so they do not use up the share. The share limit follows the new count:
++// when it dropped below the number of ejections, the ejections that end first are released until
++// the limit holds, which also keeps at least one upstream in rotation. Called once a table with the
++// route is in place.
++func (p *Passive) setUpstreams(urls []string) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	live := make(map[string]bool, len(urls))
++	for _, u := range urls {
++		live[u] = true
++	}
++	p.live = live
++	for u := range p.failures {
++		if !live[u] {
++			delete(p.failures, u)
++		}
++	}
++	for u := range p.ejected {
++		if !live[u] {
++			delete(p.ejected, u)
++		}
++	}
++	p.total = len(urls)
++
++	now := p.clock.Now()
++	for p.activeLocked(now) > p.limit() {
++		first, found := "", false
++		for u, until := range p.ejected {
++			if !found || until.Before(p.ejected[first]) || (until.Equal(p.ejected[first]) && u < first) {
++				first, found = u, true
++			}
++		}
++		if !found {
++			break
++		}
++		delete(p.ejected, first)
++	}
++}
++
++// limit is how many of the route's upstreams may be ejected at once: the configured share, and
++// never all of them.
++func (p *Passive) limit() int {
++	n := p.total * p.policy.MaxEjectedPercent / 100
++	if n >= p.total {
++		n = p.total - 1
++	}
++	return n
++}
++
++// Report records how a request admitted to the upstream at url ended. Success clears the
++// failures in a row; a failure counts, and reaching ConsecutiveFailures ejects the upstream while
++// the limit allows it. Ignored outcomes say nothing about the upstream, and neither do upstreams
++// the live table does not have.
++func (p *Passive) Report(url string, o Outcome) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if !p.live[url] {
++		return
++	}
++	switch o {
++	case Success:
++		delete(p.failures, url)
++	case Failure:
++		now := p.clock.Now()
++		if p.ejectedLocked(url, now) {
++			return
++		}
++		p.failures[url]++
++		if p.failures[url] < p.policy.ConsecutiveFailures {
++			return
++		}
++		if p.activeLocked(now) >= p.limit() {
++			return
++		}
++		delete(p.failures, url)
++		p.ejected[url] = now.Add(p.policy.Ejection)
++	}
++}
++
++// Ejected reports whether the upstream at url is ejected now.
++func (p *Passive) Ejected(url string) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.ejectedLocked(url, p.clock.Now())
++}
++
++// ejectedLocked reports whether url is ejected at now, forgetting an ejection that has ended.
++func (p *Passive) ejectedLocked(url string, now time.Time) bool {
++	until, ok := p.ejected[url]
++	if !ok {
++		return false
++	}
++	if now.Before(until) {
++		return true
++	}
++	delete(p.ejected, url)
++	return false
++}
++
++// activeLocked counts the upstreams ejected at now.
++func (p *Passive) activeLocked(now time.Time) int {
++	n := 0
++	for url := range p.ejected {
++		if p.ejectedLocked(url, now) {
++			n++
++		}
++	}
++	return n
++}
+diff --git a/internal/core/passive_health_test.go b/internal/core/passive_health_test.go
+new file mode 100644
+index 0000000..259e9a6
+--- /dev/null
++++ b/internal/core/passive_health_test.go
+@@ -0,0 +1,133 @@
++package core
++
++import (
++	"testing"
++	"time"
++)
++
++const passiveRoute = `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u1"},{"url":"http://u2"}],
++  "passive_health":{"consecutive_failures":2,"ejection":"30s","max_ejected_percent":50}}]}`
++
++func TestPassiveEjectsAfterConsecutiveFailuresOnly(t *testing.T) {
++	rt, clk := newRuntime(t, passiveRoute)
++	u1 := routeOf(t, rt, "a").Upstreams[0]
++
++	u1.Report(Failure)
++	u1.Report(Success) // a success clears the failures in a row
++	u1.Report(Failure)
++	if u1.Ejected() {
++		t.Fatal("ejected before two failures in a row")
++	}
++	u1.Report(Failure)
++	if !u1.Ejected() {
++		t.Fatal("not ejected after two failures in a row")
++	}
++	for range 4 {
++		if u := routeOf(t, rt, "a").Next(nil); u == nil || u.String() != "http://u2" {
++			t.Fatalf("picked %v while u1 is ejected", u)
++		}
++	}
++
++	clk.Advance(30 * time.Second)
++	if u1.Ejected() {
++		t.Fatal("still ejected when the ejection period ended")
++	}
++}
++
++func TestPassiveLimitKeepsAShareInRotation(t *testing.T) {
++	rt, _ := newRuntime(t, `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u1"},{"url":"http://u2"},{"url":"http://u3"}],
++	  "passive_health":{"consecutive_failures":1,"ejection":"30s","max_ejected_percent":50}}]}`)
++	ups := routeOf(t, rt, "a").Upstreams
++	ups[0].Report(Failure)
++	ups[1].Report(Failure)
++	if !ups[0].Ejected() || ups[1].Ejected() {
++		t.Fatal("with 50% of three upstreams, only the first failing one may be ejected")
++	}
++}
++
++func TestPassivePanicRoutingUsesEjectedUpstreams(t *testing.T) {
++	rt, _ := newRuntime(t, passiveRoute)
++	r := routeOf(t, rt, "a")
++	r.Upstreams[0].Report(Failure)
++	r.Upstreams[0].Report(Failure)
++	r.Upstreams[1].health.Set(false)
++	if u := r.NextAny(nil); u == nil {
++		t.Fatal("no upstream picked; every one is unhealthy or ejected, so all should be used")
++	}
++
++	rt2, _ := newRuntime(t, `{"routes":[{"id":"b","path":"/b","upstreams":[{"url":"http://u1"},{"url":"http://u2"}]}]}`)
++	b := routeOf(t, rt2, "b")
++	b.Upstreams[0].health.Set(false)
++	b.Upstreams[1].health.Set(false)
++	if u := b.NextAny(nil); u != nil {
++		t.Fatalf("route without passive health picked %v; want none", u)
++	}
++}
++
++// TestPassiveStateFollowsUpstreamChanges: a reload that keeps the passive settings keeps the
++// ejections of the upstreams still in the route, and frees the share of a removed upstream.
++func TestPassiveStateFollowsUpstreamChanges(t *testing.T) {
++	rt, _ := newRuntime(t, passiveRoute)
++	routeOf(t, rt, "a").Upstreams[0].Report(Failure)
++	routeOf(t, rt, "a").Upstreams[0].Report(Failure)
++	apply(t, rt, `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u1"},{"url":"http://u2"},{"url":"http://u3"}],
++	  "passive_health":{"consecutive_failures":2,"ejection":"30s","max_ejected_percent":50}}]}`)
++	ups := routeOf(t, rt, "a").Upstreams
++	if !ups[0].Ejected() {
++		t.Fatal("adding an upstream reset the ejection of u1")
++	}
++	ups[1].Report(Failure)
++	ups[1].Report(Failure)
++	if ups[1].Ejected() {
++		t.Fatal("three upstreams at 50% allow one ejection; a second one was let through")
++	}
++
++	// u1 leaves the route: its ejection goes with it, and u2 may now be ejected.
++	apply(t, rt, `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u2"},{"url":"http://u3"}],
++	  "passive_health":{"consecutive_failures":2,"ejection":"30s","max_ejected_percent":50}}]}`)
++	ups = routeOf(t, rt, "a").Upstreams
++	ups[0].Report(Failure)
++	ups[0].Report(Failure)
++	if !ups[0].Ejected() {
++		t.Fatal("the ejection of a removed upstream still uses up the share")
++	}
++}
++
++// TestPassiveShrinkingTheRouteReleasesExcessEjections: after a reload with fewer upstreams the
++// share is smaller, so the ejections that end first are released until it holds again, and one
++// upstream is always left in rotation.
++func TestPassiveShrinkingTheRouteReleasesExcessEjections(t *testing.T) {
++	rt, _ := newRuntime(t, `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u1"},{"url":"http://u2"},{"url":"http://u3"},{"url":"http://u4"}],
++	  "passive_health":{"consecutive_failures":1,"ejection":"30s","max_ejected_percent":50}}]}`)
++	ups := routeOf(t, rt, "a").Upstreams
++	ups[0].Report(Failure)
++	ups[1].Report(Failure)
++	if !ups[0].Ejected() || !ups[1].Ejected() {
++		t.Fatal("two of four upstreams at 50% should be ejected")
++	}
++
++	apply(t, rt, `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u1"},{"url":"http://u2"}],
++	  "passive_health":{"consecutive_failures":1,"ejection":"30s","max_ejected_percent":50}}]}`)
++	ups = routeOf(t, rt, "a").Upstreams
++	if ups[0].Ejected() || !ups[1].Ejected() {
++		t.Fatalf("ejected u1=%v u2=%v; want only u2, the later ejection, kept under the new limit of 1", ups[0].Ejected(), ups[1].Ejected())
++	}
++	if u := routeOf(t, rt, "a").Next(nil); u == nil || u.String() != "http://u1" {
++		t.Fatalf("Next picked %v; one upstream must stay in rotation", u)
++	}
++}
++
++// TestPassiveIgnoresReportsForRemovedUpstreams: a request still on the old table reports a failure
++// for an upstream the reload removed; it must not eject the upstream if it comes back.
++func TestPassiveIgnoresReportsForRemovedUpstreams(t *testing.T) {
++	rt, _ := newRuntime(t, passiveRoute)
++	old := routeOf(t, rt, "a")
++	apply(t, rt, `{"routes":[{"id":"a","path":"/a","upstreams":[{"url":"http://u1"}],
++	  "passive_health":{"consecutive_failures":2,"ejection":"30s","max_ejected_percent":50}}]}`)
++	old.Upstreams[1].Report(Failure)
++	old.Upstreams[1].Report(Failure)
++	apply(t, rt, passiveRoute)
++	if u := routeOf(t, rt, "a").Upstreams[1]; u.Ejected() {
++		t.Fatal("failures reported after u2 was removed ejected it when it came back")
++	}
++}
+diff --git a/internal/core/route.go b/internal/core/route.go
+index 9872989..46bc7e9 100644
+--- a/internal/core/route.go
++++ b/internal/core/route.go
+@@ -30,6 +30,7 @@ type Route struct {
+ 	Upstreams   []*Upstream
+ 
+ 	balancer *Balancer
++	passive  *Passive // nil without passive health checks
+ 	spec     config.Route
+ }
+ 
+@@ -86,9 +87,22 @@ func (r *Route) ForwardPath(u *url.URL) (path, rawPath string) {
+ 	return path, rawPath
+ }
+ 
+-// Next picks the upstream for the next attempt, see Balancer.Next.
++// Next picks the upstream for the next attempt, see Balancer.Next: a healthy upstream that is not
++// ejected and that skip does not exclude.
+ func (r *Route) Next(skip func(*Upstream) bool) *Upstream { return r.balancer.Next(skip) }
+ 
++// NextAny is the panic routing pick of a route with passive health checks: among the upstreams
++// skip does not exclude, it ignores health and ejection, so that a route whose upstreams are all
++// unhealthy or ejected still sends traffic rather than answering 503. It returns nil on routes
++// without passive health checks. The attempt loop calls it only after Next found nothing, tried
++// upstreams included.
++func (r *Route) NextAny(skip func(*Upstream) bool) *Upstream {
++	if r.spec.PassiveHealth == nil {
++		return nil
++	}
++	return r.balancer.next(skip, true)
++}
++
+ // HeaderTransform is a compiled config.HeaderTransform.
+ type HeaderTransform struct {
+ 	Rename [][2]string // from, to; in a stable order
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..eb017be 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -31,9 +31,10 @@ type Runtime struct {
+ 
+ 	table atomic.Pointer[Table]
+ 
+-	mu     sync.Mutex // serialises Apply and Close
+-	states map[stateKey]*upstreamState
+-	closed bool
++	mu       sync.Mutex // serialises Apply and Close
++	states   map[stateKey]*upstreamState
++	passives map[string]*Passive // by route id
++	closed   bool
+ }
+ 
+ // stateKey identifies an upstream of a route across reloads.
+@@ -101,7 +102,8 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
+ 			reloads:  reg.NewCounter("gateway_route_reloads_total", "Route table loads by result.", "result"),
+ 			lastLoad: reg.NewGauge("gateway_route_table_loaded_timestamp_seconds", "When the live route table was loaded, as a Unix time."),
+ 		},
+-		states: make(map[stateKey]*upstreamState),
++		states:   make(map[stateKey]*upstreamState),
++		passives: make(map[string]*Passive),
+ 	}
+ 	rt.table.Store(newTable(nil))
+ 	return rt, nil
+@@ -132,10 +134,11 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 	}
+ 
+ 	next := make(map[stateKey]*upstreamState)
++	nextPassives := make(map[string]*Passive)
+ 	var started []stateKey
+ 	built := make([]*Route, 0, len(routes.Routes))
+ 	for _, spec := range routes.Routes {
+-		r, err := rt.buildRoute(spec, next, &started)
++		r, err := rt.buildRoute(spec, next, nextPassives, &started)
+ 		if err != nil {
+ 			for _, key := range started {
+ 				next[key].stop()
+@@ -149,6 +152,17 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 		built = append(built, r)
+ 	}
+ 
++	// The routes are built, so the passive state can follow their upstreams now (not earlier, so
++	// that a failed Apply leaves it as it was).
++	for _, r := range built {
++		if r.passive != nil {
++			urls := make([]string, 0, len(r.Upstreams))
++			for _, u := range r.Upstreams {
++				urls = append(urls, u.String())
++			}
++			r.passive.setUpstreams(urls)
++		}
++	}
+ 	rt.table.Store(newTable(built))
+ 
+ 	for key, cur := range next {
+@@ -174,6 +188,7 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 		}
+ 	}
+ 	rt.states = next
++	rt.passives = nextPassives
+ 	rt.gauges.routes.Set(float64(len(built)))
+ 	rt.gauges.reloads.Inc("ok")
+ 	rt.gauges.lastLoad.Set(float64(rt.clock.Now().Unix()))
+@@ -183,7 +198,7 @@ func (rt *Runtime) Apply(routes *config.Routes) error {
+ 
+ // buildRoute compiles one route into next, reusing the state of upstreams it already had. New
+ // health checkers are started and their keys appended to started.
+-func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamState, started *[]stateKey) (*Route, error) {
++func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamState, nextPassives map[string]*Passive, started *[]stateKey) (*Route, error) {
+ 	path, prefix := spec.MatchPath()
+ 	r := &Route{
+ 		ID:          spec.ID,
+@@ -207,6 +222,8 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		r.Request = compileTransform(t.Request)
+ 		r.Response = compileTransform(t.Response)
+ 	}
++	passive := rt.passiveFor(spec, nextPassives)
++	r.passive = passive
+ 	for _, us := range spec.Upstreams {
+ 		u, err := url.Parse(us.URL)
+ 		if err != nil {
+@@ -229,12 +246,29 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 			Weight:  us.Weight,
+ 			Breaker: st.breaker,
+ 			health:  st.health,
++			passive: passive,
+ 		})
+ 	}
+ 	r.balancer = NewBalancer(r.Upstreams)
+ 	return r, nil
+ }
+ 
++// passiveFor returns the passive health state of the route spec, the one the last table built
++// when its settings are unchanged, a fresh one otherwise. It is recorded in nextPassives.
++func (rt *Runtime) passiveFor(spec config.Route, nextPassives map[string]*Passive) *Passive {
++	if spec.PassiveHealth == nil {
++		return nil
++	}
++	policy := passivePolicy(*spec.PassiveHealth)
++	if old := rt.passives[spec.ID]; old != nil && old.policy == policy {
++		nextPassives[spec.ID] = old
++		return old
++	}
++	p := NewPassive(policy, rt.clock)
++	nextPassives[spec.ID] = p
++	return p
++}
++
+ // upstreamState returns the state for key under spec: the current parts where their settings
+ // are unchanged, fresh parts otherwise. It never modifies the current state, so that a failed
+ // Apply leaves the live table untouched.
+@@ -320,6 +354,7 @@ type UpstreamStatus struct {
+ 	URL     string `json:"url"`
+ 	Weight  int    `json:"weight"`
+ 	Healthy bool   `json:"healthy"`
++	Ejected bool   `json:"ejected,omitempty"` // passive health checks have ejected it
+ 	Breaker string `json:"breaker,omitempty"`
+ }
+ 
+@@ -327,7 +362,7 @@ type UpstreamStatus struct {
+ func (r *Route) Status() []UpstreamStatus {
+ 	out := make([]UpstreamStatus, len(r.Upstreams))
+ 	for i, u := range r.Upstreams {
+-		out[i] = UpstreamStatus{URL: u.String(), Weight: u.Weight, Healthy: u.Healthy()}
++		out[i] = UpstreamStatus{URL: u.String(), Weight: u.Weight, Healthy: u.Healthy(), Ejected: u.Ejected()}
+ 		if u.Breaker != nil {
+ 			out[i].Breaker = u.Breaker.State().String()
+ 		}
+diff --git a/internal/proxy/forward.go b/internal/proxy/forward.go
+index 9a51c3f..e3c349f 100644
+--- a/internal/proxy/forward.go
++++ b/internal/proxy/forward.go
+@@ -103,6 +103,7 @@ func (h *Handler) forward(w *statusRecorder, ex *exchange, body *requestBody) {
+ 		ex.upstream, ex.attempts = u, n
+ 		last = h.attempt(ex, u, body)
+ 		ticket.Done(last.outcome())
++		u.Report(last.outcome())
+ 		if !last.retryable(route.Retry) {
+ 			break
+ 		}
+@@ -145,6 +146,19 @@ func (h *Handler) pick(route *core.Route, tried map[*core.Upstream]bool) (*core.
+ 			rejected[u] = true
+ 		}
+ 	}
++	// Panic routing: no healthy upstream that is not ejected is left, tried ones included, so the
++	// ejected ones are tried rather than answering 503.
++	for {
++		u := route.NextAny(func(u *core.Upstream) bool { return rejected[u] })
++		if u == nil {
++			break
++		}
++		ticket, err := u.Breaker.Allow()
++		if err == nil {
++			return u, ticket, nil
++		}
++		rejected[u] = true
++	}
+ 	if healthy {
+ 		return nil, core.Ticket{}, newError(http.StatusServiceUnavailable, codeCircuitOpen,
+ 			"the route's upstreams are failing; try again later")
+diff --git a/internal/proxy/passive_health_test.go b/internal/proxy/passive_health_test.go
+new file mode 100644
+index 0000000..53beb60
+--- /dev/null
++++ b/internal/proxy/passive_health_test.go
+@@ -0,0 +1,64 @@
++package proxy
++
++import (
++	"net/http"
++	"testing"
++
++	"github.com/relaywork/gateway/internal/core"
++)
++
++// TestFailingUpstreamIsEjectedByForwarding sends requests through the handler: the upstream that
++// answers 502 is tried until its consecutive failures eject it, and then sees no more traffic.
++func TestFailingUpstreamIsEjectedByForwarding(t *testing.T) {
++	calls := map[string]int{}
++	tr := &fakeTransport{respond: func(_ int, r *http.Request) (*http.Response, error) {
++		calls[r.URL.Host]++
++		if r.URL.Host == "a.test" {
++			return reply(r, http.StatusBadGateway, "down"), nil
++		}
++		return reply(r, http.StatusOK, "up"), nil
++	}}
++	f := newFixture(t, `{"routes":[{"id":"p","path_prefix":"/p",
++	  "upstreams":[{"url":"http://a.test"},{"url":"http://b.test"}],
++	  "passive_health":{"consecutive_failures":2,"ejection":"1m","max_ejected_percent":50}}]}`,
++		fixtureOptions{transport: tr})
++	for range 6 {
++		f.get("/p/x")
++	}
++	if calls["a.test"] != 2 {
++		t.Fatalf("a.test saw %d requests; want 2, then ejected", calls["a.test"])
++	}
++	if w := f.get("/p/x"); w.Code != http.StatusOK {
++		t.Fatalf("status %d while a.test is ejected; want 200", w.Code)
++	}
++}
++
++// TestRetryPrefersHealthyUpstreamOverEjected: on a retry the healthy upstream already tried is
++// used again before an ejected one is picked; panic routing only applies when nothing healthy is
++// left.
++func TestRetryPrefersHealthyUpstreamOverEjected(t *testing.T) {
++	calls := map[string]int{}
++	tr := &fakeTransport{respond: func(n int, r *http.Request) (*http.Response, error) {
++		calls[r.URL.Host]++
++		switch {
++		case r.URL.Host == "b.test":
++			return reply(r, http.StatusInternalServerError, "down"), nil
++		case calls["a.test"] == 1:
++			return reply(r, http.StatusBadGateway, "retry me"), nil
++		}
++		return reply(r, http.StatusOK, "up"), nil
++	}}
++	f := newFixture(t, `{"routes":[{"id":"p","path_prefix":"/p",
++	  "upstreams":[{"url":"http://a.test"},{"url":"http://b.test"}],
++	  "retry":{"attempts":3},
++	  "passive_health":{"consecutive_failures":2,"ejection":"1m","max_ejected_percent":50}}]}`,
++		fixtureOptions{transport: tr})
++	route, _ := f.rt.Table().Route("p")
++	b := route.Upstreams[1]
++	b.Report(core.Failure)
++	b.Report(core.Failure)
++	w := f.get("/p/x")
++	if w.Code != http.StatusOK || calls["b.test"] != 0 {
++		t.Fatalf("status %d, calls %v; want 200 from a.test and no call to the ejected b.test", w.Code, calls)
++	}
++}

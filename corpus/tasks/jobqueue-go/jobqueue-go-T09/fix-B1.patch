@@ -1,0 +1,105 @@
+diff --git a/internal/store/stats.go b/internal/store/stats.go
+index ef28e58..f46bb53 100644
+--- a/internal/store/stats.go
++++ b/internal/store/stats.go
+@@ -5,8 +5,6 @@ import (
+ 	"fmt"
+ 	"time"
+ 
+-	"github.com/jackc/pgx/v5"
+-
+ 	"github.com/relaywork/jobqueue/internal/domain"
+ )
+ 
+@@ -28,42 +26,63 @@ func (q QueueStats) Total() int64 {
+ 
+ // QueueStats returns the statistics of every queue that has jobs, ordered by queue name.
+ func (s *Store) QueueStats(ctx context.Context) ([]QueueStats, error) {
+-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT queue FROM jobs ORDER BY queue`)
+-	if err != nil {
+-		return nil, fmt.Errorf("list queues: %w", err)
+-	}
+-	queues, err := pgx.CollectRows(rows, pgx.RowTo[string])
++	return s.queueStats(ctx, "")
++}
++
++// QueueStatsOf returns the statistics of one queue. A queue without jobs has zero counts.
++func (s *Store) QueueStatsOf(ctx context.Context, queue string) (QueueStats, error) {
++	stats, err := s.queueStats(ctx, queue)
+ 	if err != nil {
+-		return nil, fmt.Errorf("list queues: %w", err)
++		return QueueStats{}, err
+ 	}
+-	out := make([]QueueStats, 0, len(queues))
+-	for _, q := range queues {
+-		st, err := s.QueueStatsOf(ctx, q)
+-		if err != nil {
+-			return nil, err
+-		}
+-		out = append(out, st)
++	if len(stats) == 0 {
++		return newQueueStats(queue), nil
+ 	}
+-	return out, nil
++	return stats[0], nil
+ }
+ 
+-// QueueStatsOf returns the statistics of one queue. A queue without jobs has zero counts.
+-func (s *Store) QueueStatsOf(ctx context.Context, queue string) (QueueStats, error) {
++func newQueueStats(queue string) QueueStats {
+ 	st := QueueStats{Queue: queue, Counts: make(map[domain.State]int64, len(domain.States))}
+ 	for _, state := range domain.States {
+-		var n int64
+-		err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE queue = $1 AND state = $2`,
+-			queue, string(state)).Scan(&n)
+-		if err != nil {
+-			return QueueStats{}, fmt.Errorf("count %s jobs of queue %q: %w", state, queue, err)
+-		}
+-		st.Counts[state] = n
++		st.Counts[state] = 0
+ 	}
+-	err := s.pool.QueryRow(ctx, `SELECT min(run_at) FROM jobs WHERE queue = $1 AND state = 'available' AND run_at <= $2`,
+-		queue, s.now()).Scan(&st.OldestAvailable)
++	return st
++}
++
++// queueStats counts the jobs of every queue, or only of queue when it is not empty, in one
++// statement and one pass over the table.
++func (s *Store) queueStats(ctx context.Context, queue string) ([]QueueStats, error) {
++	rows, err := s.pool.Query(ctx, `
++		SELECT queue, state, count(*), min(run_at) FILTER (WHERE state = 'available' AND run_at <= $2)
++		FROM jobs
++		WHERE $1 = '' OR queue = $1
++		GROUP BY queue, state
++		ORDER BY queue`, queue, s.now())
+ 	if err != nil {
+-		return QueueStats{}, fmt.Errorf("oldest available job of queue %q: %w", queue, err)
++		return nil, fmt.Errorf("queue statistics: %w", err)
++	}
++	defer rows.Close()
++	var out []QueueStats
++	for rows.Next() {
++		var (
++			q, state string
++			n        int64
++			oldest   *time.Time
++		)
++		if err := rows.Scan(&q, &state, &n, &oldest); err != nil {
++			return nil, fmt.Errorf("queue statistics: %w", err)
++		}
++		if len(out) == 0 || out[len(out)-1].Queue != q {
++			out = append(out, newQueueStats(q))
++		}
++		st := &out[len(out)-1]
++		st.Counts[domain.State(state)] = n
++		if oldest != nil {
++			st.OldestAvailable = utcPtr(oldest)
++		}
+ 	}
+-	st.OldestAvailable = utcPtr(st.OldestAvailable)
+-	return st, nil
++	if err := rows.Err(); err != nil {
++		return nil, fmt.Errorf("queue statistics: %w", err)
++	}
++	return out, nil
+ }

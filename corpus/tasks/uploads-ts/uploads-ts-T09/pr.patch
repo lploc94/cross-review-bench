@@ -1,0 +1,652 @@
+diff --git a/.env.example b/.env.example
+index 037fdb6..7197683 100644
+--- a/.env.example
++++ b/.env.example
+@@ -27,6 +27,8 @@ SCAN_BACKOFF_MAX_S=3600
+ SCAN_BATCH_SIZE=10
+ SCAN_POLL_INTERVAL_MS=2000
+ SCAN_CLAIM_LEASE_S=300
++WEBHOOK_TIMEOUT_MS=10000
++WEBHOOK_RETRY_DELAY_MS=5000
+ CLEANUP_INTERVAL_S=300
+ CLEANUP_BATCH_SIZE=100
+ DELETED_GRACE_S=86400
+diff --git a/README.md b/README.md
+index fe7e007..5b99d54 100644
+--- a/README.md
++++ b/README.md
+@@ -23,7 +23,7 @@ stored. Each key carries scopes, and each route requires exactly one of them:
+ | `files:delete` | delete files |
+ | `uploads:write` | resumable upload sessions |
+ | `tenant:read` | read the tenant's usage and quota |
+-| `tenant:admin` | change the quota |
++| `tenant:admin` | change the quota and the webhook |
+ 
+ **Paths.** A path is a name chosen by the tenant, such as `reports/2030/q1.pdf`. It is stored in
+ Unicode NFC, so composed and decomposed forms name the same file. Rejected: an empty path, a
+@@ -56,6 +56,14 @@ are POSTed to `SCANNER_URL`, which answers 200 with `{"result":"clean"}` or
+ `{"result":"infected"}`; anything else counts as a failed attempt. `SCANNER=noop` marks every file
+ clean.
+ 
++**Webhooks.** When a file of a tenant with a webhook (`PUT /v1/tenant/webhook`) passes its scan,
++the service POSTs `{ id, type: "file.available", createdAt, data: { file: { id, path, size,
++sha256, contentType, image } } }` to it with `Webhook-Id` (the event id, kept across retries) and
++`Webhook-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>" with the secret>`. A 2xx
++answer is a delivery; anything else, a network failure or no answer within `WEBHOOK_TIMEOUT_MS`
++is retried twice, after `WEBHOOK_RETRY_DELAY_MS` and twice that. Redirects are not followed.
++Events are not stored, so one whose three attempts fail is lost.
++
+ **Downloads.** A download answers the stored content type, `Content-Length`,
+ `Content-Disposition: attachment` with the original file name (characters outside printable ASCII
+ and `"`/`\` replaced by `_`), `X-Content-Type-Options: nosniff`, `Cache-Control: private`, and the
+@@ -106,6 +114,8 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | DELETE | `/v1/uploads/:id` | `uploads:write` | 204 |
+ | GET | `/v1/tenant` | `tenant:read` | 200 |
+ | PATCH | `/v1/tenant` | `tenant:admin` | 200 |
++| PUT | `/v1/tenant/webhook` | `tenant:admin` | 200 |
++| DELETE | `/v1/tenant/webhook` | `tenant:admin` | 204 |
+ 
+ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/week%201.txt`).
+ 
+@@ -128,6 +138,8 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+   `upload_session_state` with its state in `details.state`.
+ - **`PATCH /v1/tenant`** takes `{ "quotaBytes" }`. Tenants are returned as `{ id, name,
+   quotaBytes, usedBytes, availableBytes, createdAt }`.
++- **`PUT /v1/tenant/webhook`** takes `{ "url" }` (http or https, at most 2000 characters) and
++  answers `{ url, secret }`; the secret is shown only there and every PUT rotates it.
+ 
+ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ 
+@@ -160,7 +172,7 @@ migrations/          plain SQL, applied in order by src/db/migrate.ts
+ src/
+   api/               routes, plugins (auth, errors), zod schemas, serializers, request bodies
+   services/          use cases: uploads, resumable sessions, files and signed links, scanning,
+-                     cleanup, tenants and API keys
++                     webhooks, cleanup, tenants and API keys
+   domain/            paths, content sniffing, image dimensions, cursors, scopes, errors, entities
+   repositories/      one module per table: SQL and row mappers
+   db/                pool, transactions, migration runner
+@@ -201,6 +213,8 @@ test/                vitest suites; test/helpers has the app builder, fixtures a
+ | `SCAN_BATCH_SIZE` | `10` | files claimed per scan batch |
+ | `SCAN_POLL_INTERVAL_MS` | `2000` | idle wait between batches |
+ | `SCAN_CLAIM_LEASE_S` | `300` | how long a claimed file is left to its worker |
++| `WEBHOOK_TIMEOUT_MS` | `10000` | longest wait for a webhook receiver, per attempt |
++| `WEBHOOK_RETRY_DELAY_MS` | `5000` | pause before the first webhook retry, doubled for the second |
+ | `CLEANUP_INTERVAL_S` | `300` | wait between cleanup runs |
+ | `CLEANUP_BATCH_SIZE` | `100` | rows per cleanup batch |
+ | `DELETED_GRACE_S` | `86400` | wait before cleanup removes a deleted file's object |
+diff --git a/migrations/0004_tenant_webhooks.sql b/migrations/0004_tenant_webhooks.sql
+new file mode 100644
+index 0000000..1ac6e4e
+--- /dev/null
++++ b/migrations/0004_tenant_webhooks.sql
+@@ -0,0 +1,5 @@
++-- Where a tenant's file events are POSTed, and the secret that signs them: both or neither.
++ALTER TABLE tenants
++  ADD COLUMN webhook_url    text CHECK (webhook_url ~* '^https?://' AND length(webhook_url) <= 2000),
++  ADD COLUMN webhook_secret text,
++  ADD CONSTRAINT tenants_webhook_pair CHECK ((webhook_url IS NULL) = (webhook_secret IS NULL));
+diff --git a/src/api/routes/tenant.ts b/src/api/routes/tenant.ts
+index c237648..ba20fc9 100644
+--- a/src/api/routes/tenant.ts
++++ b/src/api/routes/tenant.ts
+@@ -1,11 +1,11 @@
+ import type { FastifyPluginAsync } from "fastify";
+ import { authOf, requireScope } from "../plugins/auth.js";
+-import { patchTenantBodySchema } from "../schemas/tenant.js";
++import { patchTenantBodySchema, putWebhookBodySchema } from "../schemas/tenant.js";
+ import { serializeTenant } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+-/** The caller's own tenant: usage, and the quota for keys with `tenant:admin`. */
++/** The caller's own tenant: usage, and the quota and webhook for keys with `tenant:admin`. */
+ export const tenantRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services }) => {
+   app.get("/tenant", { preHandler: requireScope("tenant:read") }, async (request) => {
+     const { tenantId } = authOf(request);
+@@ -17,4 +17,16 @@ export const tenantRoutes: FastifyPluginAsync<RouteOptions> = async (app, { serv
+     const body = parse(patchTenantBodySchema, request.body, "body");
+     return serializeTenant(await services.tenants.setQuota(tenantId, body.quotaBytes));
+   });
++
++  app.put("/tenant/webhook", { preHandler: requireScope("tenant:admin") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const body = parse(putWebhookBodySchema, request.body, "body");
++    return services.tenants.setWebhook(tenantId, body.url);
++  });
++
++  app.delete("/tenant/webhook", { preHandler: requireScope("tenant:admin") }, async (request, reply) => {
++    const { tenantId } = authOf(request);
++    await services.tenants.removeWebhook(tenantId);
++    return reply.code(204).send();
++  });
+ };
+diff --git a/src/api/schemas/tenant.ts b/src/api/schemas/tenant.ts
+index 6f66ee4..d7c0232 100644
+--- a/src/api/schemas/tenant.ts
++++ b/src/api/schemas/tenant.ts
+@@ -4,3 +4,13 @@ import { MAX_QUOTA_BYTES } from "../../domain/tenant.js";
+ export const patchTenantBodySchema = z.object({
+   quotaBytes: z.number().int().min(0).max(MAX_QUOTA_BYTES),
+ });
++
++export const putWebhookBodySchema = z.object({
++  url: z
++    .url({ protocol: /^https?$/, error: "must be an http:// or https:// URL" })
++    .max(2000)
++    .refine((url) => {
++      const parsed = URL.parse(url);
++      return parsed === null || (parsed.username === "" && parsed.password === "");
++    }, "must not contain a user name or password"),
++});
+diff --git a/src/app.ts b/src/app.ts
+index 1192ed2..b570d1c 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -16,6 +16,7 @@ import { ScanWorker } from "./services/scanWorker.js";
+ import { TenantService } from "./services/tenantService.js";
+ import { UploadService } from "./services/uploadService.js";
+ import { UrlSigner } from "./services/urlSigner.js";
++import { WebhookNotifier } from "./services/webhooks.js";
+ import type { StorageDriver } from "./storage/driver.js";
+ 
+ export interface AppDeps {
+@@ -110,6 +111,12 @@ export function createScanWorker(deps: AppDeps): ScanWorker {
+     logger: deps.logger.child({ component: "scan" }),
+     storage: deps.storage,
+     scanner: deps.scanner,
++    notifier: new WebhookNotifier({
++      pool: deps.pool,
++      clock: deps.clock,
++      logger: deps.logger.child({ component: "webhooks" }),
++      settings: deps.config.webhooks,
++    }),
+     settings: deps.config.scan,
+   });
+ }
+diff --git a/src/config/env.ts b/src/config/env.ts
+index a4948ff..8a22de1 100644
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -70,6 +70,9 @@ const envShape = {
+   SCAN_POLL_INTERVAL_MS: integer(2_000, 10, 600_000),
+   SCAN_CLAIM_LEASE_S: integer(300, 10, DAY_S),
+ 
++  WEBHOOK_TIMEOUT_MS: integer(10_000, 100, 120_000),
++  WEBHOOK_RETRY_DELAY_MS: integer(5_000, 0, 600_000),
++
+   CLEANUP_INTERVAL_S: integer(300, 1, DAY_S),
+   CLEANUP_BATCH_SIZE: integer(100, 1, 10_000),
+   DELETED_GRACE_S: integer(DAY_S, 0, 365 * DAY_S),
+@@ -154,6 +157,10 @@ export interface Config {
+     readonly pollIntervalMs: number;
+     readonly claimLeaseSeconds: number;
+   };
++  readonly webhooks: {
++    readonly timeoutMs: number;
++    readonly retryDelayMs: number;
++  };
+   readonly cleanup: {
+     readonly intervalSeconds: number;
+     readonly batchSize: number;
+@@ -241,6 +248,10 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
+       pollIntervalMs: env.SCAN_POLL_INTERVAL_MS,
+       claimLeaseSeconds: env.SCAN_CLAIM_LEASE_S,
+     },
++    webhooks: {
++      timeoutMs: env.WEBHOOK_TIMEOUT_MS,
++      retryDelayMs: env.WEBHOOK_RETRY_DELAY_MS,
++    },
+     cleanup: {
+       intervalSeconds: env.CLEANUP_INTERVAL_S,
+       batchSize: env.CLEANUP_BATCH_SIZE,
+diff --git a/src/domain/tenant.ts b/src/domain/tenant.ts
+index 2f46a92..71d0900 100644
+--- a/src/domain/tenant.ts
++++ b/src/domain/tenant.ts
+@@ -7,6 +7,12 @@ export interface Tenant {
+   readonly createdAt: Date;
+ }
+ 
++/** Where a tenant's file events are delivered, and the secret that signs them. */
++export interface TenantWebhook {
++  readonly url: string;
++  readonly secret: string;
++}
++
+ /** The largest quota the API accepts: byte counts must stay exact as JavaScript numbers. */
+ export const MAX_QUOTA_BYTES = Number.MAX_SAFE_INTEGER;
+ 
+diff --git a/src/repositories/tenantRepo.ts b/src/repositories/tenantRepo.ts
+index 2e61c5c..5268855 100644
+--- a/src/repositories/tenantRepo.ts
++++ b/src/repositories/tenantRepo.ts
+@@ -1,5 +1,5 @@
+ import type { Queryable } from "../db/pool.js";
+-import type { Tenant } from "../domain/tenant.js";
++import type { Tenant, TenantWebhook } from "../domain/tenant.js";
+ import type { Logger } from "../infra/logger.js";
+ import { firstRow, requireRow, toSafeInteger } from "./mapping.js";
+ 
+@@ -53,6 +53,24 @@ export async function updateQuota(
+   return row ? mapTenant(row) : null;
+ }
+ 
++/** Set the tenant's webhook, or remove it with null. False when there is no such tenant. */
++export async function updateWebhook(db: Queryable, id: string, webhook: TenantWebhook | null): Promise<boolean> {
++  const result = await db.query(
++    "UPDATE tenants SET webhook_url = $2, webhook_secret = $3 WHERE id = $1",
++    [id, webhook?.url ?? null, webhook?.secret ?? null],
++  );
++  return result.rowCount === 1;
++}
++
++/** The tenant's webhook with its secret, or null when it has none. */
++export async function findWebhook(db: Queryable, id: string): Promise<TenantWebhook | null> {
++  const result = await db.query<TenantWebhook>(
++    "SELECT webhook_url AS url, webhook_secret AS secret FROM tenants WHERE id = $1 AND webhook_url IS NOT NULL",
++    [id],
++  );
++  return firstRow(result.rows);
++}
++
+ /**
+  * Reserve `bytes` of the tenant's quota: one conditional UPDATE, so concurrent reservations can
+  * never together pass the quota. Returns false, changing nothing, when the bytes do not fit.
+diff --git a/src/services/scanWorker.ts b/src/services/scanWorker.ts
+index 423c6d3..07272f2 100644
+--- a/src/services/scanWorker.ts
++++ b/src/services/scanWorker.ts
+@@ -5,6 +5,7 @@ import type { Logger } from "../infra/logger.js";
+ import * as files from "../repositories/fileRepo.js";
+ import type { StorageDriver } from "../storage/driver.js";
+ import type { Scanner, ScanVerdict } from "./scanner.js";
++import type { FileEventNotifier } from "./webhooks.js";
+ 
+ export interface ScanSettings {
+   readonly maxAttempts: number;
+@@ -20,6 +21,7 @@ export interface ScanWorkerDeps {
+   readonly logger: Logger;
+   readonly storage: StorageDriver;
+   readonly scanner: Scanner;
++  readonly notifier: FileEventNotifier;
+   readonly settings: ScanSettings;
+ }
+ 
+@@ -94,12 +96,16 @@ export class ScanWorker {
+   private async scanFile(
+     file: FileRecord,
+   ): Promise<"available" | "quarantined" | "retried" | null> {
+-    const { pool, clock, logger, settings } = this.deps;
++    const { pool, clock, logger, notifier, settings } = this.deps;
+     const verdict = await this.verdictFor(file);
+     const now = clock.now();
+     switch (verdict) {
+-      case "clean":
+-        return (await files.recordScanVerdict(pool, file.id, "available", now)) ? "available" : null;
++      case "clean": {
++        if (!(await files.recordScanVerdict(pool, file.id, "available", now))) return null;
++        // Deliveries wait for slow receivers and pause between retries; the batch goes on.
++        void notifier.fileAvailable(file, now);
++        return "available";
++      }
+       case "infected": {
+         const recorded = await files.recordScanVerdict(pool, file.id, "quarantined", now);
+         if (recorded) logger.warn({ fileId: file.id, tenantId: file.tenantId }, "file quarantined: infected");
+diff --git a/src/services/tenantService.ts b/src/services/tenantService.ts
+index d832f56..a28024a 100644
+--- a/src/services/tenantService.ts
++++ b/src/services/tenantService.ts
+@@ -1,3 +1,4 @@
++import { randomBytes } from "node:crypto";
+ import type { Pool } from "../db/pool.js";
+ import { NotFoundError, ValidationError } from "../domain/errors.js";
+ import { MAX_QUOTA_BYTES, type Tenant } from "../domain/tenant.js";
+@@ -42,8 +43,24 @@ export class TenantService {
+     if (!tenant) throw NotFoundError.resource("tenant", id);
+     return tenant;
+   }
++
++  /**
++   * Point the tenant's webhook at `url` with a new signing secret, returned only here: setting
++   * the webhook again, even to the same URL, rotates the secret.
++   */
++  async setWebhook(id: string, url: string): Promise<{ url: string; secret: string }> {
++    const secret = `whsec_${randomBytes(WEBHOOK_SECRET_BYTES).toString("base64url")}`;
++    if (!(await tenants.updateWebhook(this.pool, id, { url, secret }))) throw NotFoundError.resource("tenant", id);
++    return { url, secret };
++  }
++
++  async removeWebhook(id: string): Promise<void> {
++    if (!(await tenants.updateWebhook(this.pool, id, null))) throw NotFoundError.resource("tenant", id);
++  }
+ }
+ 
++const WEBHOOK_SECRET_BYTES = 32;
++
+ function assertQuota(quotaBytes: number): void {
+   if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 0 || quotaBytes > MAX_QUOTA_BYTES) {
+     throw new ValidationError(`a quota is a whole number of bytes from 0 to ${MAX_QUOTA_BYTES}`);
+diff --git a/src/services/webhooks.ts b/src/services/webhooks.ts
+new file mode 100644
+index 0000000..96f2cfc
+--- /dev/null
++++ b/src/services/webhooks.ts
+@@ -0,0 +1,115 @@
++import { createHmac, randomUUID } from "node:crypto";
++import { setTimeout as sleep } from "node:timers/promises";
++import type { Pool } from "../db/pool.js";
++import type { FileRecord } from "../domain/file.js";
++import type { TenantWebhook } from "../domain/tenant.js";
++import type { Clock } from "../infra/clock.js";
++import { discardResponse } from "../infra/http.js";
++import type { Logger } from "../infra/logger.js";
++import * as tenants from "../repositories/tenantRepo.js";
++import { unixNow } from "./urlSigner.js";
++
++/** Deliveries of one event: the first attempt and two retries. */
++export const WEBHOOK_ATTEMPTS = 3;
++
++/** `timeoutMs` per attempt; `retryDelayMs` before the first retry, doubled before the next. */
++export interface WebhookSettings {
++  readonly timeoutMs: number;
++  readonly retryDelayMs: number;
++}
++
++/** Tells tenants what happened to their files. */
++export interface FileEventNotifier {
++  /** The file passed its scan and can be downloaded from `at` on. */
++  fileAvailable(file: FileRecord, at: Date): Promise<void>;
++}
++
++/** The JSON body of a `file.available` delivery. */
++export interface FileAvailableEvent {
++  readonly id: string;
++  readonly type: "file.available";
++  readonly createdAt: string;
++  readonly data: { readonly file: Pick<FileRecord, "id" | "path" | "size" | "sha256" | "contentType" | "image"> };
++}
++
++/** Every attempt to deliver an event failed; `lastStatus` is null when the last one got no answer. */
++export class WebhookDeliveryError extends Error {
++  constructor(
++    readonly eventId: string,
++    readonly lastStatus: number | null,
++    options?: { cause?: unknown },
++  ) {
++    super(`webhook event ${eventId} was not delivered after ${WEBHOOK_ATTEMPTS} attempts`, options);
++    this.name = "WebhookDeliveryError";
++  }
++}
++
++/**
++ * Delivers file events to the tenant's webhook, if it has one: a JSON POST signed with
++ * `Webhook-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, retried after an
++ * error status, a network failure or a timeout. Retries keep the event's `Webhook-Id`, so receivers
++ * can drop duplicates. Nothing is stored: when every attempt fails, `fileAvailable` rejects with a
++ * WebhookDeliveryError and the event is gone.
++ */
++export class WebhookNotifier implements FileEventNotifier {
++  private readonly deps: { pool: Pool; clock: Clock; logger: Logger; settings: WebhookSettings };
++
++  constructor(deps: { pool: Pool; clock: Clock; logger: Logger; settings: WebhookSettings }) {
++    this.deps = deps;
++  }
++
++  async fileAvailable(file: FileRecord, at: Date): Promise<void> {
++    const webhook = await tenants.findWebhook(this.deps.pool, file.tenantId);
++    if (!webhook) return;
++    const { id, path, size, sha256, contentType, image } = file;
++    const event: FileAvailableEvent = {
++      id: randomUUID(),
++      type: "file.available",
++      createdAt: at.toISOString(),
++      data: { file: { id, path, size, sha256, contentType, image } },
++    };
++    const body = JSON.stringify(event);
++    let lastStatus: number | null = null;
++    let lastError: unknown = undefined;
++    for (let attempt = 1; attempt <= WEBHOOK_ATTEMPTS; attempt++) {
++      if (attempt > 1) await sleep(this.deps.settings.retryDelayMs * 2 ** (attempt - 2));
++      const context = { tenantId: file.tenantId, fileId: file.id, eventId: event.id, attempt };
++      try {
++        lastStatus = await this.post(webhook, event.id, body);
++        lastError = undefined;
++        if (lastStatus >= 200 && lastStatus < 300) return;
++        this.deps.logger.warn({ ...context, status: lastStatus }, "webhook receiver answered with an error status");
++      } catch (err) {
++        lastStatus = null;
++        lastError = err;
++        this.deps.logger.warn({ ...context, err }, "webhook request failed");
++      }
++    }
++    throw new WebhookDeliveryError(event.id, lastStatus, { cause: lastError });
++  }
++
++  /** One attempt: the receiver's status, or a rejection when it could not be reached in time. */
++  private async post(webhook: TenantWebhook, eventId: string, body: string): Promise<number> {
++    const timestamp = unixNow(this.deps.clock);
++    const signature = createHmac("sha256", webhook.secret).update(`${timestamp}.${body}`, "utf8").digest("hex");
++    const controller = new AbortController();
++    const timer = setTimeout(() => controller.abort(), this.deps.settings.timeoutMs);
++    try {
++      const response = await fetch(webhook.url, {
++        method: "POST",
++        headers: {
++          "content-type": "application/json",
++          "webhook-id": eventId,
++          "webhook-signature": `t=${timestamp},v1=${signature}`,
++        },
++        body,
++        signal: controller.signal,
++        redirect: "error",
++      });
++      await discardResponse(response);
++      return response.status;
++    } finally {
++      clearTimeout(timer);
++    }
++  }
++}
+diff --git a/test/api/tenant.test.ts b/test/api/tenant.test.ts
+index c7a9508..c6383eb 100644
+--- a/test/api/tenant.test.ts
++++ b/test/api/tenant.test.ts
+@@ -63,4 +63,24 @@ describe("tenant usage and quota", () => {
+       );
+     }
+   });
++
++  it("sets, rotates and removes the webhook, for tenant:admin keys only", async () => {
++    const put = (url: unknown, headers = tenant.headers) =>
++      t.app.inject({ method: "PUT", url: "/v1/tenant/webhook", headers, payload: { url } });
++    const first = (await put("https://hooks.example.test/uploads")).json<{ url: string; secret: string }>();
++    expect(first.url).toBe("https://hooks.example.test/uploads");
++    expect(first.secret).toMatch(/^whsec_[\w-]{43}$/);
++    const second = (await put("HTTPS://hooks.example.test/uploads")).json<{ secret: string }>();
++    expect(second.secret).not.toBe(first.secret);
++
++    const reader = await issueKey(t.pool, t.clock, tenant.tenantId, ["tenant:read"]);
++    expectStatus(await put("https://hooks.example.test/other", reader.headers), 403);
++    for (const url of ["ftp://hooks.example.test/x", "hooks.example.test", "https://u:p@hooks.example.test/x", 42]) {
++      expectStatus(await put(url), 400);
++    }
++    expectStatus(await put(`https://hooks.example.test/${"a".repeat(2000)}`), 400);
++    expectStatus(await t.app.inject({ method: "DELETE", url: "/v1/tenant/webhook", headers: tenant.headers }), 204);
++    const stored = await t.pool.query("SELECT webhook_url, webhook_secret FROM tenants WHERE id = $1", [tenant.tenantId]);
++    expect(stored.rows).toEqual([{ webhook_url: null, webhook_secret: null }]);
++  });
+ });
+diff --git a/test/config/env.test.ts b/test/config/env.test.ts
+index 70f5354..595817d 100644
+--- a/test/config/env.test.ts
++++ b/test/config/env.test.ts
+@@ -14,6 +14,7 @@ describe("loadConfig", () => {
+     expect(config.uploads.maxUploadBytes).toBe(100 * 1024 * 1024);
+     expect(config.scanner.kind).toBe("noop");
+     expect(config.listMaxLimit).toBe(1000);
++    expect(config.webhooks).toEqual({ timeoutMs: 10_000, retryDelayMs: 5_000 });
+   });
+ 
+   it("lists every problem at once and treats blank values as unset", () => {
+diff --git a/test/helpers/webhookReceiver.ts b/test/helpers/webhookReceiver.ts
+new file mode 100644
+index 0000000..2b1d9e7
+--- /dev/null
++++ b/test/helpers/webhookReceiver.ts
+@@ -0,0 +1,48 @@
++import { createServer, type IncomingHttpHeaders } from "node:http";
++import type { AddressInfo } from "node:net";
++
++export interface ReceivedWebhook {
++  readonly headers: IncomingHttpHeaders;
++  readonly body: string;
++}
++
++/**
++ * An HTTP endpoint on 127.0.0.1 that records every request. Queued statuses answer one request
++ * each, then `defaultStatus`; with `silent` set, requests get no answer until the receiver closes.
++ */
++export class WebhookReceiver {
++  readonly received: ReceivedWebhook[] = [];
++  defaultStatus = 204;
++  silent = false;
++  private readonly statuses: number[] = [];
++  private readonly server = createServer((request, response) => {
++    const chunks: Buffer[] = [];
++    request.on("data", (chunk: Buffer) => chunks.push(chunk));
++    request.on("end", () => {
++      this.received.push({ headers: request.headers, body: Buffer.concat(chunks).toString("utf8") });
++      if (this.silent) return;
++      response.statusCode = this.statuses.shift() ?? this.defaultStatus;
++      response.end();
++    });
++  });
++
++  static async start(): Promise<WebhookReceiver> {
++    const receiver = new WebhookReceiver();
++    await new Promise<void>((resolve) => receiver.server.listen(0, "127.0.0.1", resolve));
++    return receiver;
++  }
++
++  get url(): string {
++    return `http://127.0.0.1:${(this.server.address() as AddressInfo).port}/hooks/uploads`;
++  }
++
++  respondWith(...statuses: number[]): this {
++    this.statuses.push(...statuses);
++    return this;
++  }
++
++  async close(): Promise<void> {
++    this.server.closeAllConnections();
++    await new Promise<void>((resolve) => this.server.close(() => resolve()));
++  }
++}
+diff --git a/test/services/webhooks.test.ts b/test/services/webhooks.test.ts
+new file mode 100644
+index 0000000..fcd474e
+--- /dev/null
++++ b/test/services/webhooks.test.ts
+@@ -0,0 +1,101 @@
++import { createHmac } from "node:crypto";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { createLogger } from "../../src/infra/logger.js";
++import { findLiveFileById } from "../../src/repositories/fileRepo.js";
++import { ScanWorker } from "../../src/services/scanWorker.js";
++import { WebhookDeliveryError, WebhookNotifier, type FileAvailableEvent } from "../../src/services/webhooks.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { createTenant, expectStatus, storeFile, type TestTenant } from "../helpers/fixtures.js";
++import { png } from "../helpers/images.js";
++import { WebhookReceiver } from "../helpers/webhookReceiver.js";
++
++describe("file.available webhooks", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++  let receiver: WebhookReceiver;
++  let secret: string;
++  let notifier: WebhookNotifier;
++  const logger = createLogger({ level: "silent" });
++
++  beforeEach(async () => {
++    t = await buildTestApp({ env: { WEBHOOK_RETRY_DELAY_MS: "0", WEBHOOK_TIMEOUT_MS: "200" } });
++    tenant = await createTenant(t.pool, t.clock);
++    receiver = await WebhookReceiver.start();
++    notifier = new WebhookNotifier({ pool: t.pool, clock: t.clock, logger, settings: t.config.webhooks });
++    const payload = { url: receiver.url };
++    const response = await t.app.inject({ method: "PUT", url: "/v1/tenant/webhook", headers: tenant.headers, payload });
++    expectStatus(response, 200);
++    secret = response.json<{ secret: string }>().secret;
++  });
++
++  afterEach(async () => {
++    await receiver.close();
++    await t.close();
++  });
++
++  /** Scan everything due, then wait for the deliveries the scan started. */
++  async function scanAndDeliver(): Promise<void> {
++    const deliveries: Promise<void>[] = [];
++    const worker = new ScanWorker({
++      pool: t.pool,
++      clock: t.clock,
++      logger,
++      storage: t.storage,
++      scanner: t.scanner,
++      settings: t.config.scan,
++      notifier: {
++        fileAvailable: (file, at) => {
++          const delivery = notifier.fileAvailable(file, at);
++          deliveries.push(delivery);
++          return delivery;
++        },
++      },
++    });
++    await worker.runOnce();
++    await Promise.all(deliveries);
++  }
++
++  async function record(path: string) {
++    const stored = await storeFile(t.app, tenant, path, "plain");
++    return (await findLiveFileById(t.pool, tenant.tenantId, stored.id))!;
++  }
++
++  it("posts a signed event for each clean file", async () => {
++    const file = await storeFile(t.app, tenant, "photos/harbour.png", png(64, 48));
++    t.clock.advanceSeconds(1);
++    await storeFile(t.app, tenant, "infected.txt", "bad");
++    t.scanner.next("clean", "infected");
++    await scanAndDeliver();
++
++    expect(receiver.received).toHaveLength(1);
++    const [delivery] = receiver.received;
++    const event = JSON.parse(delivery!.body) as FileAvailableEvent;
++    expect(event).toMatchObject({
++      type: "file.available",
++      createdAt: "2030-01-15T10:00:01.000Z",
++      data: { file: { id: file.id, path: "photos/harbour.png", sha256: file.sha256, image: { width: 64, height: 48 } } },
++    });
++    expect(delivery!.headers["webhook-id"]).toBe(event.id);
++    const t0 = Date.parse("2030-01-15T10:00:01.000Z") / 1000;
++    const signature = createHmac("sha256", secret).update(`${t0}.${delivery!.body}`).digest("hex");
++    expect(delivery!.headers["webhook-signature"]).toBe(`t=${t0},v1=${signature}`);
++  });
++
++  it("retries an error status with the same event id", async () => {
++    receiver.respondWith(500, 503);
++    await notifier.fileAvailable(await record("notes.txt"), t.clock.now());
++    expect(receiver.received).toHaveLength(3);
++    expect(new Set(receiver.received.map((d) => d.headers["webhook-id"])).size).toBe(1);
++  });
++
++  it("gives up after three failed attempts, timeouts included", async () => {
++    receiver.defaultStatus = 500;
++    const file = await record("notes.txt");
++    await expect(notifier.fileAvailable(file, t.clock.now())).rejects.toMatchObject({ lastStatus: 500 });
++    receiver.silent = true;
++    const failure = notifier.fileAvailable(file, t.clock.now());
++    await expect(failure).rejects.toBeInstanceOf(WebhookDeliveryError);
++    await expect(failure).rejects.toMatchObject({ lastStatus: null });
++    expect(receiver.received).toHaveLength(6);
++  });
++});

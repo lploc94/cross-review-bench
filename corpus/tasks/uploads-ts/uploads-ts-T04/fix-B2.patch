@@ -1,0 +1,31 @@
+diff --git a/src/services/presignedUploads.ts b/src/services/presignedUploads.ts
+index 156919e..1fe8ed8 100644
+--- a/src/services/presignedUploads.ts
++++ b/src/services/presignedUploads.ts
+@@ -63,7 +63,7 @@ export class PresignedUploadService {
+       if (declaredType === null) throw new ValidationError("contentType must be a media type");
+     }
+ 
+-    const expiresAt = this.deps.clock.now().getTime() + input.expiresIn * 1000;
++    const expiresAt = unixNow(this.deps.clock) + input.expiresIn;
+     const grant: UploadGrant = { tenantId: input.tenantId, path, size: input.size, expiresAt };
+     const query = new URLSearchParams({
+       tenant: grant.tenantId,
+@@ -75,7 +75,7 @@ export class PresignedUploadService {
+     return {
+       url: `/v1/public/uploads?${query.toString()}`,
+       headers: declaredType === null ? {} : { "content-type": declaredType },
+-      expiresAt: new Date(expiresAt),
++      expiresAt: new Date(expiresAt * 1000),
+     };
+   }
+ 
+@@ -106,7 +106,7 @@ export class PresignedUploadService {
+     const grant: UploadGrant = { tenantId: query.tenant, path: query.path, size: query.size, expiresAt: query.exp };
+     if (!this.deps.signer.verifyUpload(grant, query.sig)) throw new InvalidSignatureError();
+     if (grant.expiresAt <= unixNow(this.deps.clock)) {
+-      throw new SignedUrlExpiredError(new Date(grant.expiresAt));
++      throw new SignedUrlExpiredError(new Date(grant.expiresAt * 1000));
+     }
+     return grant;
+   }

@@ -1,0 +1,19 @@
+diff --git a/src/etl/pipeline/metrics.py b/src/etl/pipeline/metrics.py
+index dfdac00..edd7e65 100644
+--- a/src/etl/pipeline/metrics.py
++++ b/src/etl/pipeline/metrics.py
+@@ -55,7 +55,13 @@ def write_metrics(engine: Engine, path: Path) -> None:
+         descriptor, temporary = tempfile.mkstemp(
+             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+         )
+-        with engine.connect() as connection:
++        try:
++            connection = engine.connect()
++        except Exception:
++            # Nothing owns the descriptor yet: close it before giving up.
++            os.close(descriptor)
++            raise
++        with connection:
+             # Runs of different sources can finish together: one writer at a time, so a file
+             # rendered earlier never replaces one rendered later.
+             connection.execute(WRITER_LOCK, {"ns": LOCK_NAMESPACE, "key": lock_key("etl.metrics")})

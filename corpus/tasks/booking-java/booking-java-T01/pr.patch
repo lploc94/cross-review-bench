@@ -1,0 +1,1067 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..956ce77 100644
+--- a/README.md
++++ b/README.md
+@@ -28,8 +28,20 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   it, so the other due holds still expire; the skipped hold is found again by the next run.
+ - **Pricing.** The rules run in a fixed order, and the price lines are stored with the reservation so
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+-  Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+-  is rounded with HALF_EVEN to the currency's minor units.
++  Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee, then
++  a promo code's discount when the guest gave one. Money is rounded with HALF_EVEN to the currency's
++  minor units.
++- **Promo codes.** An admin creates codes per property (case-insensitive, unique per property): a
++  `percent` (1–100) of the stay or a fixed `amount` in the property's currency, valid from
++  `validFrom` to `validUntil` (property-local dates, both inclusive, compared with the day the
++  booking is made there) and for at most `maxUses` reservations. A quote or hold that names one
++  (`promoCode`) gets a `PROMO` line after every other rule; the discount never takes the total below
++  zero. Unknown, disabled or out-of-date codes are refused with 400; a hold keeps the discount it
++  was made with. A use is counted when the hold
++  is confirmed and given back when the reservation is cancelled. A code is never used more than
++  `maxUses` times, also when confirmations and cancellations run at the same moment: once none are
++  left, confirming is refused with 409 `promo-exhausted` and nothing is charged (the hold stays
++  active until it is released or expires).
+ - **Reservations.** Status moves `CONFIRMED` to `CHECKED_IN` (on or after the check-in date, before
+   check-out) to `COMPLETED`, or to `CANCELLED`. A cancellation made at or before the full-refund
+   deadline is refunded in full; later ones follow the property policy. Cancelling twice is a
+@@ -136,6 +148,7 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `GET /api/v1/admin/properties/{code}/revenue` | admin | charged, refunded and net money for a period |
+ | `POST /api/v1/admin/properties`, `PUT /api/v1/admin/properties/{code}`, `PUT .../policy` | admin | create a property, change its details or policy |
+ | `POST .../room-types`, `PUT .../room-types/{roomType}/rates` | admin | add a room type, change its rates |
++| `POST/GET .../promo-codes`, `POST .../promo-codes/{promoCode}/disable` | admin | promo codes of a property |
+ | `POST/GET/PUT/DELETE .../room-types/{roomType}/seasonal-rates[/{id}]` | admin | seasonal rates (same priority may not overlap) |
+ | `GET/PUT .../room-types/{roomType}/inventory`, `PUT .../inventory/range` | admin | inventory per night and for a range |
+ | `GET /api/v1/admin/holds`, `GET /api/v1/admin/holds/summary`, `POST /api/v1/admin/holds/{id}/expire` | admin | hold list, counts, manual expiry |
+diff --git a/src/main/java/com/innkeep/booking/api/AdminPromoCodeController.java b/src/main/java/com/innkeep/booking/api/AdminPromoCodeController.java
+new file mode 100644
+index 0000000..b8c34ad
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/AdminPromoCodeController.java
+@@ -0,0 +1,46 @@
++package com.innkeep.booking.api;
++
++import com.innkeep.booking.api.dto.PromoCodeRequest;
++import com.innkeep.booking.api.dto.PromoCodeResponse;
++import com.innkeep.booking.domain.PromoCode;
++import com.innkeep.booking.service.PromoService;
++import jakarta.validation.Valid;
++import java.net.URI;
++import java.util.List;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/** Admin routes for a property's promo codes: create, list, disable. */
++@RestController
++@RequestMapping("/api/v1/admin/properties/{code}/promo-codes")
++public class AdminPromoCodeController {
++
++  private final PromoService promos;
++
++  public AdminPromoCodeController(PromoService promos) {
++    this.promos = promos;
++  }
++
++  @PostMapping
++  public ResponseEntity<PromoCodeResponse> create(
++      @PathVariable String code, @Valid @RequestBody PromoCodeRequest request) {
++    PromoCode promo = promos.create(code, request.toDraft());
++    return ResponseEntity.created(URI.create("/api/v1/admin/properties/" + code + "/promo-codes"))
++        .body(PromoCodeResponse.from(promo));
++  }
++
++  @GetMapping
++  public List<PromoCodeResponse> list(@PathVariable String code) {
++    return promos.list(code).stream().map(PromoCodeResponse::from).toList();
++  }
++
++  @PostMapping("/{promoCode}/disable")
++  public PromoCodeResponse disable(@PathVariable String code, @PathVariable String promoCode) {
++    return PromoCodeResponse.from(promos.disable(code, promoCode));
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java b/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
+index 47c5d34..b017ae6 100644
+--- a/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
++++ b/src/main/java/com/innkeep/booking/api/ApiExceptionHandler.java
+@@ -5,6 +5,7 @@ import com.innkeep.booking.domain.HoldExpiredException;
+ import com.innkeep.booking.domain.InsufficientAvailabilityException;
+ import com.innkeep.booking.domain.NotFoundException;
+ import com.innkeep.booking.domain.PaymentFailedException;
++import com.innkeep.booking.domain.PromoExhaustedException;
+ import com.innkeep.booking.domain.ValidationException;
+ import jakarta.persistence.LockTimeoutException;
+ import jakarta.persistence.PessimisticLockException;
+@@ -123,6 +124,11 @@ public class ApiExceptionHandler {
+         HttpStatus.CONFLICT, "insufficient-availability", "Not enough rooms", e.getMessage());
+   }
+ 
++  @ExceptionHandler(PromoExhaustedException.class)
++  public ProblemDetail promoExhausted(PromoExhaustedException e) {
++    return problem(HttpStatus.CONFLICT, "promo-exhausted", "Promo code used up", e.getMessage());
++  }
++
+   @ExceptionHandler(ConflictException.class)
+   public ProblemDetail conflict(ConflictException e) {
+     return problem(HttpStatus.CONFLICT, "conflict", "Conflict", e.getMessage());
+diff --git a/src/main/java/com/innkeep/booking/api/HoldController.java b/src/main/java/com/innkeep/booking/api/HoldController.java
+index 7399d8c..1a1a364 100644
+--- a/src/main/java/com/innkeep/booking/api/HoldController.java
++++ b/src/main/java/com/innkeep/booking/api/HoldController.java
+@@ -40,7 +40,8 @@ public class HoldController {
+             stay,
+             request.stay().rooms(),
+             request.stay().guests(),
+-            guest);
++            guest,
++            request.stay().promoCode());
+     return ResponseEntity.created(URI.create("/api/v1/holds/" + hold.getId()))
+         .body(HoldResponse.from(hold));
+   }
+diff --git a/src/main/java/com/innkeep/booking/api/QuoteController.java b/src/main/java/com/innkeep/booking/api/QuoteController.java
+index 1fb7302..a4c0e93 100644
+--- a/src/main/java/com/innkeep/booking/api/QuoteController.java
++++ b/src/main/java/com/innkeep/booking/api/QuoteController.java
+@@ -25,6 +25,12 @@ public class QuoteController {
+   public QuoteResponse quote(@PathVariable String code, @Valid @RequestBody StayRequest request) {
+     var stay = new DateRange(request.checkIn(), request.checkOut());
+     return QuoteResponse.from(
+-        pricing.quote(code, request.roomType(), stay, request.rooms(), request.guests()));
++        pricing.quote(
++            code,
++            request.roomType(),
++            stay,
++            request.rooms(),
++            request.guests(),
++            request.promoCode()));
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/PromoCodeRequest.java b/src/main/java/com/innkeep/booking/api/dto/PromoCodeRequest.java
+new file mode 100644
+index 0000000..5cf1ead
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/PromoCodeRequest.java
+@@ -0,0 +1,21 @@
++package com.innkeep.booking.api.dto;
++
++import com.innkeep.booking.service.PromoCodeDraft;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import java.math.BigDecimal;
++import java.time.LocalDate;
++
++/** A new promo code: either {@code percent} or {@code amount}, never both. */
++public record PromoCodeRequest(
++    @NotBlank String code,
++    Integer percent,
++    BigDecimal amount,
++    @NotNull LocalDate validFrom,
++    @NotNull LocalDate validUntil,
++    int maxUses) {
++
++  public PromoCodeDraft toDraft() {
++    return new PromoCodeDraft(code, percent, amount, validFrom, validUntil, maxUses);
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/dto/PromoCodeResponse.java b/src/main/java/com/innkeep/booking/api/dto/PromoCodeResponse.java
+new file mode 100644
+index 0000000..5e23e07
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/PromoCodeResponse.java
+@@ -0,0 +1,28 @@
++package com.innkeep.booking.api.dto;
++
++import com.innkeep.booking.domain.PromoCode;
++import java.math.BigDecimal;
++import java.time.LocalDate;
++
++public record PromoCodeResponse(
++    String code,
++    Integer percent,
++    BigDecimal amount,
++    LocalDate validFrom,
++    LocalDate validUntil,
++    int maxUses,
++    int uses,
++    boolean enabled) {
++
++  public static PromoCodeResponse from(PromoCode promo) {
++    return new PromoCodeResponse(
++        promo.getCode(),
++        promo.getPercent(),
++        promo.getAmount(),
++        promo.getValidFrom(),
++        promo.getValidUntil(),
++        promo.getMaxUses(),
++        promo.getUses(),
++        promo.isEnabled());
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/dto/StayRequest.java b/src/main/java/com/innkeep/booking/api/dto/StayRequest.java
+index 2758fde..a295c74 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/StayRequest.java
++++ b/src/main/java/com/innkeep/booking/api/dto/StayRequest.java
+@@ -3,12 +3,17 @@ package com.innkeep.booking.api.dto;
+ import jakarta.validation.constraints.Min;
+ import jakarta.validation.constraints.NotBlank;
+ import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
+ import java.time.LocalDate;
+ 
+-/** What a guest asks for: a room type, a date range, the number of rooms and of guests. */
++/**
++ * What a guest asks for: a room type, a date range, the number of rooms and of guests, and
++ * optionally a promo code of the property.
++ */
+ public record StayRequest(
+     @NotBlank String roomType,
+     @NotNull LocalDate checkIn,
+     @NotNull LocalDate checkOut,
+     @Min(1) int rooms,
+-    @Min(1) int guests) {}
++    @Min(1) int guests,
++    @Size(max = 40) String promoCode) {}
+diff --git a/src/main/java/com/innkeep/booking/domain/Hold.java b/src/main/java/com/innkeep/booking/domain/Hold.java
+index 47d5216..fb62293 100644
+--- a/src/main/java/com/innkeep/booking/domain/Hold.java
++++ b/src/main/java/com/innkeep/booking/domain/Hold.java
+@@ -72,6 +72,9 @@ public class Hold extends AbstractEntity<UUID> {
+   @Column(name = "created_at", nullable = false)
+   private Instant createdAt;
+ 
++  @Column(name = "promo_code_id")
++  private Long promoCodeId;
++
+   @Version private Long version;
+ 
+   @ElementCollection(fetch = FetchType.LAZY)
+@@ -152,6 +155,15 @@ public class Hold extends AbstractEntity<UUID> {
+     return createdAt;
+   }
+ 
++  /** The promo code the quote used, or null. */
++  public Long getPromoCodeId() {
++    return promoCodeId;
++  }
++
++  public void usePromoCode(long promoCodeId) {
++    this.promoCodeId = promoCodeId;
++  }
++
+   public List<PriceLine> getPriceLines() {
+     return List.copyOf(priceLines);
+   }
+diff --git a/src/main/java/com/innkeep/booking/domain/PriceKind.java b/src/main/java/com/innkeep/booking/domain/PriceKind.java
+index 7b22bb5..c7e5f76 100644
+--- a/src/main/java/com/innkeep/booking/domain/PriceKind.java
++++ b/src/main/java/com/innkeep/booking/domain/PriceKind.java
+@@ -4,5 +4,6 @@ package com.innkeep.booking.domain;
+ public enum PriceKind {
+   NIGHTLY_RATE,
+   LENGTH_OF_STAY_DISCOUNT,
+-  EXTRA_GUEST_FEE
++  EXTRA_GUEST_FEE,
++  PROMO
+ }
+diff --git a/src/main/java/com/innkeep/booking/domain/PromoCode.java b/src/main/java/com/innkeep/booking/domain/PromoCode.java
+new file mode 100644
+index 0000000..08afaed
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/PromoCode.java
+@@ -0,0 +1,163 @@
++package com.innkeep.booking.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.FetchType;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.JoinColumn;
++import jakarta.persistence.ManyToOne;
++import jakarta.persistence.Table;
++import java.math.BigDecimal;
++import java.time.LocalDate;
++import java.util.ArrayList;
++import org.hibernate.annotations.DynamicUpdate;
++
++/**
++ * A discount code of one property: a percentage of the stay or a fixed amount in the property's
++ * currency, valid for bookings made from {@code validFrom} to {@code validUntil} (property-local
++ * dates) and for at most {@code maxUses} confirmed reservations.
++ */
++@Entity
++@DynamicUpdate
++@Table(name = "promo_code")
++public class PromoCode extends AbstractEntity<Long> {
++
++  @Id
++  @GeneratedValue(strategy = GenerationType.IDENTITY)
++  private Long id;
++
++  @ManyToOne(fetch = FetchType.LAZY, optional = false)
++  @JoinColumn(name = "property_id", nullable = false)
++  private Property property;
++
++  @Column(nullable = false, length = 40)
++  private String code;
++
++  private Integer percent;
++
++  @Column(precision = 12, scale = 2)
++  private BigDecimal amount;
++
++  @Column(name = "valid_from", nullable = false)
++  private LocalDate validFrom;
++
++  @Column(name = "valid_until", nullable = false)
++  private LocalDate validUntil;
++
++  @Column(name = "max_uses", nullable = false)
++  private int maxUses;
++
++  @Column(nullable = false)
++  private int uses;
++
++  @Column(nullable = false)
++  private boolean enabled;
++
++  protected PromoCode() {}
++
++  public PromoCode(
++      Property property,
++      String code,
++      Integer percent,
++      BigDecimal amount,
++      LocalDate validFrom,
++      LocalDate validUntil,
++      int maxUses) {
++    this.property = property;
++    this.code = code;
++    this.percent = percent;
++    this.amount = amount;
++    this.validFrom = validFrom;
++    this.validUntil = validUntil;
++    this.maxUses = maxUses;
++    this.enabled = true;
++  }
++
++  @Override
++  public Long getId() {
++    return id;
++  }
++
++  public String getCode() {
++    return code;
++  }
++
++  public Integer getPercent() {
++    return percent;
++  }
++
++  public BigDecimal getAmount() {
++    return amount;
++  }
++
++  public LocalDate getValidFrom() {
++    return validFrom;
++  }
++
++  public LocalDate getValidUntil() {
++    return validUntil;
++  }
++
++  public int getMaxUses() {
++    return maxUses;
++  }
++
++  public int getUses() {
++    return uses;
++  }
++
++  public boolean isEnabled() {
++    return enabled;
++  }
++
++  /** Whether a booking made on {@code today}, the property's local date, may use the code. */
++  public boolean isValidOn(LocalDate today) {
++    return !today.isBefore(validFrom) && today.isBefore(validUntil);
++  }
++
++  public boolean hasUsesLeft() {
++    return uses < maxUses;
++  }
++
++  public void recordUse() {
++    this.uses++;
++  }
++
++  public void releaseUse() {
++    if (uses > 0) {
++      this.uses--;
++    }
++  }
++
++  public void disable() {
++    this.enabled = false;
++  }
++
++  /**
++   * The quote with one more line, the promo discount, after every other rule. The discount is the
++   * percentage of the total, or the fixed amount, and never more than the total.
++   */
++  public Quote applyTo(Quote quote) {
++    Money total = quote.total();
++    Money discount = percent != null ? total.percent(percent) : Money.of(amount, total.currency());
++    if (discount.amount().compareTo(total.amount()) > 0) {
++      discount = total;
++    }
++    var lines = new ArrayList<>(quote.lines());
++    lines.add(
++        new PriceLine(
++            PriceKind.PROMO,
++            null,
++            "Promo code " + code,
++            Money.zero(total.currency()).minus(discount).amount()));
++    return new Quote(
++        quote.roomTypeCode(),
++        quote.stay(),
++        quote.rooms(),
++        quote.guests(),
++        lines,
++        total.minus(discount));
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/PromoExhaustedException.java b/src/main/java/com/innkeep/booking/domain/PromoExhaustedException.java
+new file mode 100644
+index 0000000..08df724
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/PromoExhaustedException.java
+@@ -0,0 +1,9 @@
++package com.innkeep.booking.domain;
++
++/** The promo code has been used as many times as it allows. */
++public class PromoExhaustedException extends ConflictException {
++
++  public PromoExhaustedException(String code) {
++    super("promo code " + code + " has no uses left");
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/Reservation.java b/src/main/java/com/innkeep/booking/domain/Reservation.java
+index d2ced6c..772837c 100644
+--- a/src/main/java/com/innkeep/booking/domain/Reservation.java
++++ b/src/main/java/com/innkeep/booking/domain/Reservation.java
+@@ -91,6 +91,9 @@ public class Reservation extends AbstractEntity<Long> {
+   @Column(name = "cancelled_at")
+   private Instant cancelledAt;
+ 
++  @Column(name = "promo_code_id")
++  private Long promoCodeId;
++
+   @Version private Long version;
+ 
+   protected Reservation() {}
+@@ -109,6 +112,7 @@ public class Reservation extends AbstractEntity<Long> {
+     this.currency = hold.getTotal().currency().getCurrencyCode();
+     this.totalAmount = hold.getTotal().amount();
+     this.priceLines.addAll(hold.getPriceLines());
++    this.promoCodeId = hold.getPromoCodeId();
+     this.createdAt = now;
+     this.updatedAt = now;
+   }
+@@ -182,6 +186,11 @@ public class Reservation extends AbstractEntity<Long> {
+     return cancelledAt;
+   }
+ 
++  /** The promo code whose use this reservation holds, or null. */
++  public Long getPromoCodeId() {
++    return promoCodeId;
++  }
++
+   public void cancel(Instant now) {
+     requireStatus(ReservationStatus.CONFIRMED, "cancelled");
+     this.status = ReservationStatus.CANCELLED;
+diff --git a/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java b/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java
+new file mode 100644
+index 0000000..d884bad
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/persistence/PromoCodeRepository.java
+@@ -0,0 +1,13 @@
++package com.innkeep.booking.persistence;
++
++import com.innkeep.booking.domain.PromoCode;
++import java.util.List;
++import java.util.Optional;
++import org.springframework.data.jpa.repository.JpaRepository;
++
++public interface PromoCodeRepository extends JpaRepository<PromoCode, Long> {
++
++  Optional<PromoCode> findByPropertyIdAndCode(long propertyId, String code);
++
++  List<PromoCode> findByPropertyIdOrderByCodeAsc(long propertyId);
++}
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 5a246a1..242fb97 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -12,6 +12,7 @@ import com.innkeep.booking.domain.LedgerEntry;
+ import com.innkeep.booking.domain.LedgerKind;
+ import com.innkeep.booking.domain.NotFoundException;
+ import com.innkeep.booking.domain.PricingEngine;
++import com.innkeep.booking.domain.PromoCode;
+ import com.innkeep.booking.domain.Quote;
+ import com.innkeep.booking.domain.ReferenceCode;
+ import com.innkeep.booking.domain.Reservation;
+@@ -59,6 +60,7 @@ public class HoldService {
+   private final LedgerEntryRepository ledger;
+   private final SeasonalRateRepository seasonalRates;
+   private final PaymentGateway payments;
++  private final PromoService promos;
+   private final BookingConfig config;
+   private final Clock clock;
+   private final TransactionTemplate tx;
+@@ -74,6 +76,7 @@ public class HoldService {
+       LedgerEntryRepository ledger,
+       SeasonalRateRepository seasonalRates,
+       PaymentGateway payments,
++      PromoService promos,
+       BookingConfig config,
+       Clock clock,
+       TransactionTemplate tx,
+@@ -86,6 +89,7 @@ public class HoldService {
+     this.ledger = ledger;
+     this.seasonalRates = seasonalRates;
+     this.payments = payments;
++    this.promos = promos;
+     this.config = config;
+     this.clock = clock;
+     this.tx = tx;
+@@ -93,14 +97,18 @@ public class HoldService {
+     this.entities = entities;
+   }
+ 
+-  /** Prices the stay and holds the rooms for every night, or none of them. */
++  /**
++   * Prices the stay, with the discount of a promo code when {@code promoCode} is not null, and
++   * holds the rooms for every night, or none of them.
++   */
+   public Hold create(
+       String propertyCode,
+       String roomTypeCode,
+       DateRange stay,
+       int roomCount,
+       int guests,
+-      GuestDetails guest) {
++      GuestDetails guest,
++      String promoCode) {
+     config.requireWithinLimits(stay, roomCount);
+     return tx.execute(
+         status -> {
+@@ -115,12 +123,17 @@ public class HoldService {
+                   List.of(type.getId()), stay.checkIn(), stay.lastNight());
+           Quote quote =
+               PricingEngine.quote(type.getProperty(), type, rates, stay, roomCount, guests);
++          PromoCode promo =
++              promoCode == null ? null : promos.applicable(type.getProperty(), promoCode);
++          if (promo != null) {
++            quote = promo.applyTo(quote);
++          }
+           for (LocalDate night : stay.nightDates()) {
+             if (inventory.holdRooms(type.getId(), night, roomCount) == 0) {
+               throw new InsufficientAvailabilityException(type.getCode(), night);
+             }
+           }
+-          return holds.save(
++          Hold hold =
+               new Hold(
+                   type.getProperty(),
+                   type,
+@@ -130,7 +143,11 @@ public class HoldService {
+                   guest,
+                   quote,
+                   clock.instant(),
+-                  config.holdTtl()));
++                  config.holdTtl());
++          if (promo != null) {
++            hold.usePromoCode(promo.getId());
++          }
++          return holds.save(hold);
+         });
+   }
+ 
+@@ -180,7 +197,8 @@ public class HoldService {
+   /**
+    * Turns a usable hold into a confirmed reservation and charges the quoted total. The charge key
+    * is derived from the hold, so a retried confirmation charges once. A stay quoted at zero moves
+-   * no money: it is confirmed without a charge or a ledger entry.
++   * no money: it is confirmed without a charge or a ledger entry. A hold made with a promo code
++   * takes one use of it here; when the code has none left, nothing is charged.
+    */
+   public Reservation confirm(UUID id) {
+     return retry.run(
+@@ -196,6 +214,9 @@ public class HoldService {
+                     // The stay has begun at the property: the hold is refused and left to expire.
+                     throw new HoldExpiredException(id.toString());
+                   }
++                  if (hold.getPromoCodeId() != null) {
++                    promos.redeem(hold.getPromoCodeId());
++                  }
+                   boolean charged = hold.getTotal().isPositive();
+                   String gatewayReference =
+                       charged ? payments.charge("charge-" + id, hold.getTotal()) : null;
+diff --git a/src/main/java/com/innkeep/booking/service/PricingService.java b/src/main/java/com/innkeep/booking/service/PricingService.java
+index 91e5bdd..b29ec63 100644
+--- a/src/main/java/com/innkeep/booking/service/PricingService.java
++++ b/src/main/java/com/innkeep/booking/service/PricingService.java
+@@ -16,21 +16,35 @@ public class PricingService {
+ 
+   private final CatalogService catalog;
+   private final SeasonalRateRepository seasonalRates;
++  private final PromoService promos;
+   private final BookingConfig config;
+ 
+   public PricingService(
+-      CatalogService catalog, SeasonalRateRepository seasonalRates, BookingConfig config) {
++      CatalogService catalog,
++      SeasonalRateRepository seasonalRates,
++      PromoService promos,
++      BookingConfig config) {
+     this.catalog = catalog;
+     this.seasonalRates = seasonalRates;
++    this.promos = promos;
+     this.config = config;
+   }
+ 
++  /** The quote with the promo code's line last, when {@code promoCode} is not null. */
+   public Quote quote(
+-      String propertyCode, String roomTypeCode, DateRange stay, int rooms, int guests) {
++      String propertyCode,
++      String roomTypeCode,
++      DateRange stay,
++      int rooms,
++      int guests,
++      String promoCode) {
+     config.requireWithinLimits(stay, rooms);
+     RoomType type = catalog.roomType(propertyCode, roomTypeCode);
+     List<SeasonalRate> rates =
+         seasonalRates.findOverlapping(List.of(type.getId()), stay.checkIn(), stay.lastNight());
+-    return PricingEngine.quote(type.getProperty(), type, rates, stay, rooms, guests);
++    Quote quote = PricingEngine.quote(type.getProperty(), type, rates, stay, rooms, guests);
++    return promoCode == null
++        ? quote
++        : promos.applicable(type.getProperty(), promoCode).applyTo(quote);
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/service/PromoCodeDraft.java b/src/main/java/com/innkeep/booking/service/PromoCodeDraft.java
+new file mode 100644
+index 0000000..5267e97
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/PromoCodeDraft.java
+@@ -0,0 +1,12 @@
++package com.innkeep.booking.service;
++
++import java.math.BigDecimal;
++import java.time.LocalDate;
++
++public record PromoCodeDraft(
++    String code,
++    Integer percent,
++    BigDecimal amount,
++    LocalDate validFrom,
++    LocalDate validUntil,
++    int maxUses) {}
+diff --git a/src/main/java/com/innkeep/booking/service/PromoService.java b/src/main/java/com/innkeep/booking/service/PromoService.java
+new file mode 100644
+index 0000000..7ba7a95
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/PromoService.java
+@@ -0,0 +1,143 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.domain.ConflictException;
++import com.innkeep.booking.domain.NotFoundException;
++import com.innkeep.booking.domain.PromoCode;
++import com.innkeep.booking.domain.PromoExhaustedException;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.ValidationException;
++import com.innkeep.booking.persistence.PromoCodeRepository;
++import java.time.Clock;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.Locale;
++import java.util.regex.Pattern;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.support.TransactionTemplate;
++
++/**
++ * Promo codes of a property: the admin writes, the check a quote or hold makes before applying a
++ * code, the use a confirmation takes and a cancellation gives back. Codes are stored in upper case,
++ * so lookups ignore case.
++ */
++@Service
++public class PromoService {
++
++  private static final Pattern CODE = Pattern.compile("[A-Z0-9][A-Z0-9-]{1,39}");
++
++  private final CatalogService catalog;
++  private final PromoCodeRepository promos;
++  private final Clock clock;
++  private final TransactionTemplate tx;
++
++  public PromoService(
++      CatalogService catalog, PromoCodeRepository promos, Clock clock, TransactionTemplate tx) {
++    this.catalog = catalog;
++    this.promos = promos;
++    this.clock = clock;
++    this.tx = tx;
++  }
++
++  public PromoCode create(String propertyCode, PromoCodeDraft draft) {
++    Property property = catalog.property(propertyCode);
++    String code = normalize(draft.code());
++    if (!CODE.matcher(code).matches()) {
++      throw new ValidationException("promo codes are 2 to 40 letters, digits and hyphens");
++    }
++    if ((draft.percent() == null) == (draft.amount() == null)) {
++      throw new ValidationException("a promo code has either a percent or an amount");
++    }
++    if (draft.percent() != null && (draft.percent() < 1 || draft.percent() > 100)) {
++      throw new ValidationException("percent must be between 1 and 100");
++    }
++    if (draft.amount() != null
++        && (draft.amount().signum() <= 0
++            || draft.amount().stripTrailingZeros().scale()
++                > property.currency().getDefaultFractionDigits())) {
++      throw new ValidationException("amount must be positive, in the property's currency");
++    }
++    if (draft.validFrom() == null
++        || draft.validUntil() == null
++        || draft.validUntil().isBefore(draft.validFrom())
++        || draft.maxUses() < 1) {
++      throw new ValidationException("validUntil must not be before validFrom, maxUses at least 1");
++    }
++    if (promos.findByPropertyIdAndCode(property.getId(), code).isPresent()) {
++      throw new ConflictException("promo code " + code + " already exists");
++    }
++    return promos.save(
++        new PromoCode(
++            property,
++            code,
++            draft.percent(),
++            draft.amount(),
++            draft.validFrom(),
++            draft.validUntil(),
++            draft.maxUses()));
++  }
++
++  public List<PromoCode> list(String propertyCode) {
++    return promos.findByPropertyIdOrderByCodeAsc(catalog.property(propertyCode).getId());
++  }
++
++  public PromoCode disable(String propertyCode, String code) {
++    return tx.execute(
++        status -> {
++          PromoCode promo = find(catalog.property(propertyCode), code);
++          promo.disable();
++          return promo;
++        });
++  }
++
++  /**
++   * The code a quote or hold asks for, checked against the booking day (today at the property).
++   * Unknown, disabled and out-of-date codes are refused as invalid requests.
++   */
++  public PromoCode applicable(Property property, String code) {
++    PromoCode promo =
++        promos
++            .findByPropertyIdAndCode(property.getId(), normalize(code))
++            .orElseThrow(() -> new ValidationException("unknown promo code " + code));
++    LocalDate today = LocalDate.ofInstant(clock.instant(), property.zone());
++    if (!promo.isEnabled()) {
++      throw new ValidationException("promo code " + promo.getCode() + " is disabled");
++    }
++    if (!promo.isValidOn(today)) {
++      throw new ValidationException("promo code " + promo.getCode() + " is not valid on " + today);
++    }
++    if (!promo.hasUsesLeft()) {
++      throw new PromoExhaustedException(promo.getCode());
++    }
++    return promo;
++  }
++
++  /** Takes one use of the code for a confirmation, inside the confirmation's transaction. */
++  public void redeem(long promoCodeId) {
++    PromoCode promo = byId(promoCodeId);
++    if (!promo.hasUsesLeft()) {
++      throw new PromoExhaustedException(promo.getCode());
++    }
++    promo.recordUse();
++  }
++
++  /** Gives the use of a cancelled reservation back, inside the cancellation's transaction. */
++  public void giveBack(long promoCodeId) {
++    byId(promoCodeId).releaseUse();
++  }
++
++  private PromoCode byId(long promoCodeId) {
++    return promos
++        .findById(promoCodeId)
++        .orElseThrow(() -> new NotFoundException("promo code", promoCodeId));
++  }
++
++  private PromoCode find(Property property, String code) {
++    return promos
++        .findByPropertyIdAndCode(property.getId(), normalize(code))
++        .orElseThrow(() -> new NotFoundException("promo code", code));
++  }
++
++  private static String normalize(String code) {
++    return code == null ? "" : code.trim().toUpperCase(Locale.ROOT);
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/service/ReservationService.java b/src/main/java/com/innkeep/booking/service/ReservationService.java
+index 0401253..60ac736 100644
+--- a/src/main/java/com/innkeep/booking/service/ReservationService.java
++++ b/src/main/java/com/innkeep/booking/service/ReservationService.java
+@@ -45,6 +45,7 @@ public class ReservationService {
+   private final InventoryRepository inventory;
+   private final LedgerEntryRepository ledger;
+   private final PaymentGateway payments;
++  private final PromoService promos;
+   private final Clock clock;
+   private final TransactionTemplate tx;
+   private final OptimisticRetry retry;
+@@ -54,6 +55,7 @@ public class ReservationService {
+       InventoryRepository inventory,
+       LedgerEntryRepository ledger,
+       PaymentGateway payments,
++      PromoService promos,
+       Clock clock,
+       TransactionTemplate tx,
+       OptimisticRetry retry) {
+@@ -61,6 +63,7 @@ public class ReservationService {
+     this.inventory = inventory;
+     this.ledger = ledger;
+     this.payments = payments;
++    this.promos = promos;
+     this.clock = clock;
+     this.tx = tx;
+     this.retry = retry;
+@@ -116,6 +119,9 @@ public class ReservationService {
+                           .refund(reservation.getTotal(), reservation.getCheckIn(), now);
+                   reservation.cancel(now);
+                   reservations.saveAndFlush(reservation);
++                  if (reservation.getPromoCodeId() != null) {
++                    promos.giveBack(reservation.getPromoCodeId());
++                  }
+                   releaseBooked(reservation);
+                   if (refund.isPositive()) {
+                     String gatewayReference =
+diff --git a/src/main/resources/db/migration/V2__promo_codes.sql b/src/main/resources/db/migration/V2__promo_codes.sql
+new file mode 100644
+index 0000000..33bad03
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__promo_codes.sql
+@@ -0,0 +1,19 @@
++CREATE TABLE promo_code (
++    id          BIGSERIAL PRIMARY KEY,
++    property_id BIGINT         NOT NULL REFERENCES property (id),
++    code        VARCHAR(40)    NOT NULL,
++    percent     INTEGER        CHECK (percent BETWEEN 1 AND 100),
++    amount      NUMERIC(12, 2) CHECK (amount > 0),
++    valid_from  DATE           NOT NULL,
++    valid_until DATE           NOT NULL,
++    max_uses    INTEGER        NOT NULL CHECK (max_uses >= 1),
++    uses        INTEGER        NOT NULL DEFAULT 0 CHECK (uses >= 0),
++    enabled     BOOLEAN        NOT NULL DEFAULT TRUE,
++    UNIQUE (property_id, code),
++    CHECK ((percent IS NULL) <> (amount IS NULL)),
++    CHECK (valid_until >= valid_from),
++    CHECK (uses <= max_uses)
++);
++
++ALTER TABLE hold ADD COLUMN promo_code_id BIGINT REFERENCES promo_code (id);
++ALTER TABLE reservation ADD COLUMN promo_code_id BIGINT REFERENCES promo_code (id);
+diff --git a/src/test/java/com/innkeep/booking/api/PromoCodeApiTest.java b/src/test/java/com/innkeep/booking/api/PromoCodeApiTest.java
+new file mode 100644
+index 0000000..03d6b92
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/PromoCodeApiTest.java
+@@ -0,0 +1,145 @@
++package com.innkeep.booking.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.GuestDetails;
++import com.innkeep.booking.domain.Hold;
++import com.innkeep.booking.service.HoldService;
++import com.innkeep.booking.service.ReservationService;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.Instant;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.RequestBuilder;
++
++class PromoCodeApiTest extends IntegrationTestBase {
++
++  private static final String PROMOS = "/api/v1/admin/properties/harbour-house/promo-codes";
++  private static final LocalDate IN = LocalDate.parse("2027-06-01");
++  private static final LocalDate OUT = LocalDate.parse("2027-06-03");
++
++  @Autowired private HoldService holds;
++  @Autowired private ReservationService reservations;
++
++  @BeforeEach
++  void setUp() {
++    var property = data.harbourHouse();
++    data.rooms(property, data.roomType(property, "double", 2, "100.00"), IN, OUT, 5);
++  }
++
++  @Test
++  void anAdminCreatesListsAndDisablesCodes() throws Exception {
++    createPromo("spring-10", "\"percent\": 10", "2027-04-01", "2027-05-31", 5);
++    mvc.perform(get(PROMOS).header("Authorization", ADMIN_AUTH))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$[0].code").value("SPRING-10"))
++        .andExpect(jsonPath("$[0].uses").value(0));
++
++    mvc.perform(post(PROMOS + "/Spring-10/disable").header("Authorization", ADMIN_AUTH))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.enabled").value(false));
++    mvc.perform(quote("spring-10")).andExpect(status().isBadRequest());
++  }
++
++  @Test
++  void aCodeHasEitherAPercentOrAnAmountAndIsUniqueWhateverTheCase() throws Exception {
++    mvc.perform(
++            promoRequest(
++                "both",
++                "\"percent\": 10, \"amount\": 5, \"maxUses\": 1",
++                "2027-05-01",
++                "2027-05-31"))
++        .andExpect(status().isBadRequest());
++    createPromo("SUMMER", "\"amount\": 20", "2027-05-01", "2027-05-31", 1);
++    mvc.perform(
++            promoRequest("summer", "\"percent\": 5, \"maxUses\": 1", "2027-05-01", "2027-05-31"))
++        .andExpect(status().isConflict());
++  }
++
++  @Test
++  void theDiscountIsTheLastLineAndNeverTakesTheTotalBelowZero() throws Exception {
++    createPromo("spring-10", "\"percent\": 10", "2027-04-01", "2027-05-31", 5);
++    createPromo("free-stay", "\"amount\": 500", "2027-04-01", "2027-05-31", 5);
++
++    mvc.perform(quote("spring-10"))
++        .andExpect(jsonPath("$.lines[2].kind").value("PROMO"))
++        .andExpect(jsonPath("$.lines[2].amount").value(-20.00))
++        .andExpect(jsonPath("$.total").value(180.00));
++    mvc.perform(quote("FREE-STAY"))
++        .andExpect(jsonPath("$.lines[2].amount").value(-200.00))
++        .andExpect(jsonPath("$.total").value(0));
++  }
++
++  @Test
++  void unknownAndOutOfDateCodesAreRefused() throws Exception {
++    createPromo("june", "\"percent\": 10", "2027-06-01", "2027-06-30", 5);
++
++    mvc.perform(quote("nothing")).andExpect(status().isBadRequest());
++    mvc.perform(quote("june"))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:innkeep:problem:invalid-request"));
++    clock.set(Instant.parse("2027-07-01T10:00:00Z"));
++    mvc.perform(quote("june")).andExpect(status().isBadRequest());
++  }
++
++  @Test
++  void aConfirmationTakesAUseAndACancellationGivesItBack() throws Exception {
++    createPromo("one-off", "\"percent\": 50", "2027-04-01", "2027-05-31", 1);
++    Hold first = hold("one-off");
++    Hold second = hold("one-off");
++
++    var reservation = holds.confirm(first.getId());
++    assertThat(reservation.getTotal().amount()).isEqualByComparingTo("100.00");
++    mvc.perform(post("/api/v1/holds/" + second.getId() + "/confirm"))
++        .andExpect(status().isConflict())
++        .andExpect(jsonPath("$.type").value("urn:innkeep:problem:promo-exhausted"));
++    assertThat(payments.movements()).hasSize(1);
++
++    reservations.cancel(reservation.getReference());
++    mvc.perform(post("/api/v1/holds/" + second.getId() + "/confirm"))
++        .andExpect(status().isCreated());
++  }
++
++  private Hold hold(String promoCode) {
++    return holds.create(
++        "harbour-house",
++        "double",
++        new DateRange(IN, OUT),
++        1,
++        2,
++        new GuestDetails("Ines Varo", "ines@example.com", null),
++        promoCode);
++  }
++
++  private void createPromo(String code, String discount, String from, String until, int maxUses)
++      throws Exception {
++    mvc.perform(promoRequest(code, discount + ", \"maxUses\": " + maxUses, from, until))
++        .andExpect(status().isCreated());
++  }
++
++  private RequestBuilder promoRequest(String code, String fields, String from, String until) {
++    return post(PROMOS)
++        .header("Authorization", ADMIN_AUTH)
++        .contentType(MediaType.APPLICATION_JSON)
++        .content(
++            "{\"code\": \"%s\", %s, \"validFrom\": \"%s\", \"validUntil\": \"%s\"}"
++                .formatted(code, fields, from, until));
++  }
++
++  private RequestBuilder quote(String promoCode) {
++    return post("/api/v1/properties/harbour-house/quotes")
++        .contentType(MediaType.APPLICATION_JSON)
++        .content(
++            ("{\"roomType\": \"double\", \"checkIn\": \"%s\", \"checkOut\": \"%s\", \"rooms\": 1,"
++                    + " \"guests\": 2, \"promoCode\": \"%s\"}")
++                .formatted(IN, OUT, promoCode));
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java b/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java
+index 2a9c1b7..6ccabc9 100644
+--- a/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java
++++ b/src/test/java/com/innkeep/booking/support/IntegrationTestBase.java
+@@ -39,7 +39,7 @@ public abstract class IntegrationTestBase {
+   @BeforeEach
+   void resetState() {
+     jdbc.execute(
+-        "TRUNCATE ledger_entry, reservation_price_line, reservation, hold_price_line, hold,"
++        "TRUNCATE ledger_entry, reservation_price_line, reservation, hold_price_line, hold, promo_code,"
+             + " inventory, seasonal_rate, room_type, property RESTART IDENTITY CASCADE");
+     clock.set(TestConfig.START);
+     payments.reset();
+diff --git a/src/test/java/com/innkeep/booking/support/TestData.java b/src/test/java/com/innkeep/booking/support/TestData.java
+index 5021c54..3851305 100644
+--- a/src/test/java/com/innkeep/booking/support/TestData.java
++++ b/src/test/java/com/innkeep/booking/support/TestData.java
+@@ -105,7 +105,8 @@ public class TestData {
+         new DateRange(in, out),
+         rooms,
+         rooms * type.getCapacity(),
+-        new GuestDetails("Mara Quill", GUEST_EMAIL, "+351 000 000 000"));
++        new GuestDetails("Mara Quill", GUEST_EMAIL, "+351 000 000 000"),
++        null);
+   }
+ 
+   public Reservation book(

@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T10",
+  "repo": "jobqueue-go",
+  "kind": "buggy",
+  "title": "Retention: purge finished jobs after RETENTION_PERIOD",
+  "description": "Nothing ever deletes a job today, so the jobs table only grows: on the busiest deployment it holds a few hundred million succeeded rows and listing, dead-letter queries and vacuum all get slower. This adds a retention purger that runs in every instance next to the reaper and the scheduler.\n\n- `RETENTION_PERIOD` (default `336h`, 14 days) and `PURGE_INTERVAL` (default `10m`), both validated as positive at startup.\n- `store.PurgeFinished(ctx, cutoff)` deletes up to `PurgeBatchSize` (1000) jobs in a terminal state - succeeded, failed, cancelled or dead - whose `finished_at` is before the cutoff, oldest first: it selects the batch's ids, then deletes them with `DELETE ... WHERE id = ANY($1)` and returns the deleted jobs' id, queue and state.\n- Migration 0003 adds a partial index on `(finished_at, id)` for finished jobs, so finding a batch does not scan live jobs.\n- New package `internal/retention`: `Purger.Run` purges at start and then every `PURGE_INTERVAL`, calling the store again while batches come back full (like the reaper). Each pass logs how many jobs it deleted; `jobqueue_jobs_purged_total{queue,state}` counts them.\n- `cmd/jobqueue` starts the purger with the other background loops and waits for it on shutdown. README documents the settings and that dead jobs are deleted with the rest once the period has passed.\n\nTests: store tests for which jobs are purged (each terminal state, recent, waiting and running jobs, the exclusive cutoff) and batching; purger tests with a fake store and the manual clock (cutoff, draining full batches, metrics, the interval); config defaults and validation.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/store/purge.go",
+      "lines": [27, 44],
+      "category": "concurrency",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "PurgeFinished selects candidate ids and then deletes them with DELETE ... WHERE id = ANY($1), which does not re-check state or finished_at. A dead job that an operator requeues between the two statements (or while the DELETE waits for the requeue's row lock) is available again, with finished_at NULL, but is still deleted: the requeued job silently disappears and never runs. Under READ COMMITTED the DELETE re-evaluates only its own WHERE clause on the updated row, and id still matches.",
+      "trigger": "POST /v1/dead/{id}/requeue on a dead job older than RETENTION_PERIOD while a purge pass is running (the purger runs at start and every PURGE_INTERVAL on every instance): the requeue returns 200, then the job is gone.",
+      "testable": true,
+      "hidden_tests": ["internal/store/purge_requeue_test.go"],
+      "hidden_test_cmd": "go test -count=1 -run '^TestPurgeKeepsAJobRequeuedMeanwhile$' ./internal/store/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A requeued job cannot be among the ids: Requeue in internal/store/jobs.go only touches jobs in state dead and the SELECT in PurgeFinished only returns jobs that are already terminal, and the purge deletes exactly the rows it just selected in the same call, so a job that is available or running is never in the batch.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

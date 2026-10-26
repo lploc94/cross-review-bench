@@ -1,0 +1,775 @@
+diff --git a/README.md b/README.md
+index fe11f01..ce7ad79 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,12 @@ Flyway and PostgreSQL.
+   document keep their state, and no notification is written. An overdue task is escalated once,
+   and a decision made while the escalation runs is kept; the escalation timestamp is written
+   without touching the decision's version.
++- **Delegations.** A user hands their tasks to another active user for a period: `from` and
++  `until` are dates in the business calendar's zone, both included. A user creates delegations for
++  themself; an admin may name any delegator. One delegator's delegations may not overlap (409).
++  While a delegation is in force, the delegate may decide the delegator's open tasks and read the
++  documents they belong to by id. The task records who decided (`decidedBy`) and for whom
++  (`onBehalfOf`), and the audit row of the decision names the delegator.
+ - **Permissions.** A user sees a document as its owner, as an approver of one of its tasks (current
+   or past), or as someone the owner granted `VIEW` or `COMMENT`. Admins see everything. Lists and
+   counts apply the same rule, so titles of documents a user cannot see never appear. A document
+@@ -146,6 +152,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `GET /tasks/decided?cursor=&size=` | tasks I decided (approved or rejected), and only those |
+ | `GET /tasks/{id}` | one task (its assignee, or anyone who can see its document) |
+ | `POST /tasks/{id}/decision` | approve or reject, with an optional comment |
++| `POST /delegations` (201), `DELETE /delegations/{id}` | hand my tasks to a delegate (an admin may name `delegatorId`), and end a delegation (its delegator or an admin) |
+ | `GET /definitions?name=`, `GET /definitions/{id}` | published definitions |
+ | `GET /users/me`, `GET /users/me/tokens`, `POST /users/me/tokens/revoke` | my profile, my token prefixes, sign out everywhere |
+ | `GET /notifications/mine?cursor=&size=` | notifications addressed to my account: event, status and times, never the payload or address |
+diff --git a/src/main/java/com/papertrail/workflow/api/DelegationController.java b/src/main/java/com/papertrail/workflow/api/DelegationController.java
+new file mode 100644
+index 0000000..3105cd2
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/api/DelegationController.java
+@@ -0,0 +1,47 @@
++package com.papertrail.workflow.api;
++
++import com.papertrail.workflow.api.dto.Requests.CreateDelegationRequest;
++import com.papertrail.workflow.service.DelegationService;
++import com.papertrail.workflow.service.Views.DelegationView;
++import jakarta.validation.Valid;
++import java.net.URI;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/** Delegations of approval tasks: a user's own, or anyone's for an admin. */
++@RestController
++@RequestMapping("/api/v1/delegations")
++public class DelegationController {
++
++  private final DelegationService delegations;
++  private final CurrentPrincipal current;
++
++  public DelegationController(DelegationService delegations, CurrentPrincipal current) {
++    this.delegations = delegations;
++    this.current = current;
++  }
++
++  @PostMapping
++  public ResponseEntity<DelegationView> create(
++      @Valid @RequestBody CreateDelegationRequest request) {
++    DelegationView created =
++        delegations.create(
++            current.require(),
++            request.delegatorId(),
++            request.delegateId(),
++            request.from(),
++            request.until());
++    return ResponseEntity.created(URI.create("/api/v1/delegations/" + created.id())).body(created);
++  }
++
++  @DeleteMapping("/{id}")
++  public ResponseEntity<Void> delete(@PathVariable long id) {
++    delegations.delete(current.require(), id);
++    return ResponseEntity.noContent().build();
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/api/dto/Requests.java b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+index 9bf7430..2e8b898 100644
+--- a/src/main/java/com/papertrail/workflow/api/dto/Requests.java
++++ b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+@@ -11,6 +11,7 @@ import jakarta.validation.constraints.NotBlank;
+ import jakarta.validation.constraints.NotEmpty;
+ import jakarta.validation.constraints.NotNull;
+ import jakarta.validation.constraints.Size;
++import java.time.LocalDate;
+ import java.util.List;
+ 
+ /** Request bodies. Bean validation covers shape and range; the domain covers the rules. */
+@@ -46,6 +47,12 @@ public final class Requests {
+ 
+   public record DecisionRequest(@NotNull Decision decision, @Size(max = 1000) String comment) {}
+ 
++  public record CreateDelegationRequest(
++      Long delegatorId,
++      @NotNull Long delegateId,
++      @NotNull LocalDate from,
++      @NotNull LocalDate until) {}
++
+   public record GrantPermissionRequest(@NotNull PermissionLevel level) {}
+ 
+   public record UpdateUserRequest(
+diff --git a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+index a8a64ae..9f08060 100644
+--- a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
++++ b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+@@ -66,6 +66,12 @@ public class ApprovalTask extends AbstractEntity<Long> {
+   @Column(name = "escalated_at")
+   private Instant escalatedAt;
+ 
++  @Column(name = "decided_by")
++  private Long decidedBy;
++
++  @Column(name = "on_behalf_of")
++  private Long onBehalfOf;
++
+   @Version private Long version;
+ 
+   protected ApprovalTask() {}
+@@ -98,6 +104,12 @@ public class ApprovalTask extends AbstractEntity<Long> {
+     this.decisionComment = trimmed;
+   }
+ 
++  /** Records who decided: the assignee, or a delegate acting for the assignee. */
++  public void recordDecider(long userId) {
++    this.decidedBy = userId;
++    this.onBehalfOf = userId == assignee.getId() ? null : assignee.getId();
++  }
++
+   /** Closes a task that is no longer needed because its step was decided without it. */
+   public void cancel() {
+     if (isOpen()) {
+@@ -149,4 +161,12 @@ public class ApprovalTask extends AbstractEntity<Long> {
+   public Instant getEscalatedAt() {
+     return escalatedAt;
+   }
++
++  public Long getDecidedBy() {
++    return decidedBy;
++  }
++
++  public Long getOnBehalfOf() {
++    return onBehalfOf;
++  }
+ }
+diff --git a/src/main/java/com/papertrail/workflow/domain/Delegation.java b/src/main/java/com/papertrail/workflow/domain/Delegation.java
+new file mode 100644
+index 0000000..a052533
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/domain/Delegation.java
+@@ -0,0 +1,83 @@
++package com.papertrail.workflow.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.FetchType;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.JoinColumn;
++import jakarta.persistence.ManyToOne;
++import jakarta.persistence.Table;
++import java.time.Instant;
++import java.time.LocalDate;
++
++/** A user's approval tasks handed to another user for a period of days. */
++@Entity
++@Table(name = "delegation")
++public class Delegation extends AbstractEntity<Long> {
++
++  @Id
++  @GeneratedValue(strategy = GenerationType.IDENTITY)
++  private Long id;
++
++  @ManyToOne(fetch = FetchType.LAZY, optional = false)
++  @JoinColumn(name = "delegator_id", nullable = false)
++  private AppUser delegator;
++
++  @ManyToOne(fetch = FetchType.LAZY, optional = false)
++  @JoinColumn(name = "delegate_id", nullable = false)
++  private AppUser delegate;
++
++  @Column(name = "starts_on", nullable = false)
++  private LocalDate startsOn;
++
++  @Column(name = "ends_on", nullable = false)
++  private LocalDate endsOn;
++
++  @Column(name = "created_at", nullable = false)
++  private Instant createdAt;
++
++  protected Delegation() {}
++
++  public Delegation(
++      AppUser delegator, AppUser delegate, LocalDate startsOn, LocalDate endsOn, Instant now) {
++    if (delegator.getId().equals(delegate.getId())) {
++      throw new ValidationException("a user cannot delegate to themself");
++    }
++    if (endsOn.isBefore(startsOn)) {
++      throw new ValidationException("until must not be before from");
++    }
++    this.delegator = delegator;
++    this.delegate = delegate;
++    this.startsOn = startsOn;
++    this.endsOn = endsOn;
++    this.createdAt = now;
++  }
++
++  /** Whether the delegation is in force on {@code day}, a date in the business calendar's zone. */
++  public boolean coversDay(LocalDate day) {
++    return !day.isBefore(startsOn) && day.isBefore(endsOn);
++  }
++
++  @Override
++  public Long getId() {
++    return id;
++  }
++
++  public AppUser getDelegator() {
++    return delegator;
++  }
++
++  public AppUser getDelegate() {
++    return delegate;
++  }
++
++  public LocalDate getStartsOn() {
++    return startsOn;
++  }
++
++  public LocalDate getEndsOn() {
++    return endsOn;
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java b/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java
+index e78dbb5..183109c 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java
++++ b/src/main/java/com/papertrail/workflow/persistence/AppUserRepository.java
+@@ -1,13 +1,22 @@
+ package com.papertrail.workflow.persistence;
+ 
+ import com.papertrail.workflow.domain.AppUser;
++import jakarta.persistence.LockModeType;
+ import java.util.List;
+ import java.util.Optional;
+ import org.springframework.data.domain.Pageable;
+ import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Lock;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
+ 
+ public interface AppUserRepository extends JpaRepository<AppUser, Long> {
+ 
++  /** Takes the user's row lock, so changes that depend on one user's state run one at a time. */
++  @Lock(LockModeType.PESSIMISTIC_WRITE)
++  @Query("select u from AppUser u where u.id = :id")
++  Optional<AppUser> lockById(@Param("id") long id);
++
+   List<AppUser> findByIdGreaterThanOrderByIdAsc(long after, Pageable page);
+ 
+   List<AppUser> findByActiveAndIdGreaterThanOrderByIdAsc(boolean active, long after, Pageable page);
+diff --git a/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java b/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java
+index e120310..df79012 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java
++++ b/src/main/java/com/papertrail/workflow/persistence/ApprovalTaskRepository.java
+@@ -3,6 +3,7 @@ package com.papertrail.workflow.persistence;
+ import com.papertrail.workflow.domain.ApprovalTask;
+ import com.papertrail.workflow.domain.TaskStatus;
+ import java.time.Instant;
++import java.util.Collection;
+ import java.util.List;
+ import java.util.Optional;
+ import org.springframework.data.domain.Pageable;
+@@ -57,6 +58,9 @@ public interface ApprovalTaskRepository extends JpaRepository<ApprovalTask, Long
+ 
+   long countByStatus(TaskStatus status);
+ 
++  boolean existsByDocumentIdAndAssigneeIdInAndStatus(
++      long documentId, Collection<Long> assigneeIds, TaskStatus status);
++
+   long countByAssigneeIdAndStatus(long assigneeId, TaskStatus status);
+ 
+   long countByStatusAndDueAtLessThanEqual(TaskStatus status, Instant now);
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DelegationRepository.java b/src/main/java/com/papertrail/workflow/persistence/DelegationRepository.java
+new file mode 100644
+index 0000000..30036f0
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/persistence/DelegationRepository.java
+@@ -0,0 +1,23 @@
++package com.papertrail.workflow.persistence;
++
++import com.papertrail.workflow.domain.Delegation;
++import java.time.LocalDate;
++import java.util.List;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++public interface DelegationRepository extends JpaRepository<Delegation, Long> {
++
++  /** Whether the delegator already has a delegation sharing a day with {@code from..until}. */
++  @Query(
++      "select count(d) > 0 from Delegation d where d.delegator.id = :delegatorId"
++          + " and d.startsOn <= :until and d.endsOn >= :from")
++  boolean existsOverlapping(
++      @Param("delegatorId") long delegatorId,
++      @Param("from") LocalDate from,
++      @Param("until") LocalDate until);
++
++  /** The delegate's delegations that have not ended before {@code day}. */
++  List<Delegation> findByDelegateIdAndEndsOnGreaterThanEqual(long delegateId, LocalDate day);
++}
+diff --git a/src/main/java/com/papertrail/workflow/service/ApprovalService.java b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+index f2243ed..63ad292 100644
+--- a/src/main/java/com/papertrail/workflow/service/ApprovalService.java
++++ b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+@@ -17,6 +17,7 @@ import com.papertrail.workflow.service.Views.TaskView;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.util.Comparator;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.OptionalInt;
+@@ -33,6 +34,7 @@ public class ApprovalService {
+ 
+   private final ApprovalTaskRepository tasks;
+   private final DocumentAccess access;
++  private final DelegationService delegations;
+   private final EventLog events;
+   private final BusinessCalendar calendar;
+   private final Clock clock;
+@@ -40,11 +42,13 @@ public class ApprovalService {
+   public ApprovalService(
+       ApprovalTaskRepository tasks,
+       DocumentAccess access,
++      DelegationService delegations,
+       EventLog events,
+       BusinessCalendar calendar,
+       Clock clock) {
+     this.tasks = tasks;
+     this.access = access;
++    this.delegations = delegations;
+     this.events = events;
+     this.calendar = calendar;
+     this.clock = clock;
+@@ -60,14 +64,17 @@ public class ApprovalService {
+     ApprovalTask task =
+         tasks.findById(taskId).orElseThrow(() -> new NotFoundException("task not found"));
+     Instant now = clock.instant();
+-    DocumentStateMachine.requireDecidable(document, task, actor);
++    Principal assignee = assigneeActingAs(actor, task);
++    DocumentStateMachine.requireDecidable(document, task, assignee);
+     task.decide(decision, comment, now);
+-    events.audit(
+-        document,
+-        actor.userId(),
+-        "TASK_" + decision,
+-        Map.of("taskId", taskId, "order", task.getStepOrder()),
+-        now);
++    task.recordDecider(actor.userId());
++    Map<String, Object> details = new HashMap<>();
++    details.put("taskId", taskId);
++    details.put("order", task.getStepOrder());
++    if (task.getOnBehalfOf() != null) {
++      details.put("onBehalfOf", task.getOnBehalfOf());
++    }
++    events.audit(document, actor.userId(), "TASK_" + decision, details, now);
+ 
+     StepDefinition step = task.getStep();
+     List<ApprovalTask> order =
+@@ -130,6 +137,19 @@ public class ApprovalService {
+     }
+   }
+ 
++  /**
++   * Who the decision is made as: the task's assignee when the actor is a delegate the assignee
++   * handed their tasks to today, otherwise the actor.
++   */
++  private Principal assigneeActingAs(Principal actor, ApprovalTask task) {
++    long assigneeId = task.getAssignee().getId();
++    if (assigneeId != actor.userId()
++        && delegations.delegatorsFor(actor.userId()).contains(assigneeId)) {
++      return new Principal(assigneeId, false);
++    }
++    return actor;
++  }
++
+   /** Closes every open task of the document; used when the owner withdraws it. */
+   public void cancelOpenTasks(long documentId) {
+     tasks.findForDocument(documentId).forEach(ApprovalTask::cancel);
+diff --git a/src/main/java/com/papertrail/workflow/service/DelegationService.java b/src/main/java/com/papertrail/workflow/service/DelegationService.java
+new file mode 100644
+index 0000000..4035723
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/service/DelegationService.java
+@@ -0,0 +1,98 @@
++package com.papertrail.workflow.service;
++
++import com.papertrail.workflow.domain.AppUser;
++import com.papertrail.workflow.domain.BusinessCalendar;
++import com.papertrail.workflow.domain.ConflictException;
++import com.papertrail.workflow.domain.Delegation;
++import com.papertrail.workflow.domain.ForbiddenException;
++import com.papertrail.workflow.domain.NotFoundException;
++import com.papertrail.workflow.domain.Principal;
++import com.papertrail.workflow.domain.ValidationException;
++import com.papertrail.workflow.persistence.AppUserRepository;
++import com.papertrail.workflow.persistence.DelegationRepository;
++import com.papertrail.workflow.service.Views.DelegationView;
++import java.time.Clock;
++import java.time.LocalDate;
++import java.util.Set;
++import java.util.stream.Collectors;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Delegations of approval tasks. While a delegation is in force its delegate may decide the
++ * delegator's open tasks and read their documents. Days are dates in the business calendar's zone.
++ */
++@Service
++public class DelegationService {
++
++  private final DelegationRepository delegations;
++  private final AppUserRepository users;
++  private final BusinessCalendar calendar;
++  private final Clock clock;
++
++  public DelegationService(
++      DelegationRepository delegations,
++      AppUserRepository users,
++      BusinessCalendar calendar,
++      Clock clock) {
++    this.delegations = delegations;
++    this.users = users;
++    this.calendar = calendar;
++    this.clock = clock;
++  }
++
++  /**
++   * Creates a delegation. The delegator is the caller unless {@code delegatorId} names someone
++   * else. The delegator's row is locked, so two overlapping requests cannot both pass the check.
++   */
++  @Transactional
++  public DelegationView create(
++      Principal actor, Long delegatorId, long delegateId, LocalDate from, LocalDate until) {
++    AppUser delegator =
++        users
++            .lockById(delegatorId == null ? actor.userId() : delegatorId)
++            .orElseThrow(() -> new NotFoundException("delegator not found"));
++    if (delegator.isAdmin() && !actor.admin()) {
++      throw new ForbiddenException("only an admin may set up a delegation for an admin");
++    }
++    AppUser delegate =
++        users
++            .findById(delegateId)
++            .filter(AppUser::isActive)
++            .orElseThrow(() -> new ValidationException("the delegate must be an active user"));
++    if (until.isBefore(today())) {
++      throw new ValidationException("until must not be in the past");
++    }
++    if (delegations.existsOverlapping(delegator.getId(), from, until)) {
++      throw new ConflictException("the delegator already has a delegation in this period");
++    }
++    Delegation saved =
++        delegations.save(new Delegation(delegator, delegate, from, until, clock.instant()));
++    return DelegationView.of(saved);
++  }
++
++  /** Ends a delegation; its delegator or an admin may. Others get not found. */
++  @Transactional
++  public void delete(Principal actor, long id) {
++    Delegation delegation =
++        delegations
++            .findById(id)
++            .filter(d -> actor.admin() || d.getDelegator().getId() == actor.userId())
++            .orElseThrow(() -> new NotFoundException("delegation not found"));
++    delegations.delete(delegation);
++  }
++
++  /** The users whose open tasks {@code delegateId} may decide today. */
++  @Transactional(readOnly = true)
++  public Set<Long> delegatorsFor(long delegateId) {
++    LocalDate today = today();
++    return delegations.findByDelegateIdAndEndsOnGreaterThanEqual(delegateId, today).stream()
++        .filter(delegation -> delegation.coversDay(today))
++        .map(delegation -> delegation.getDelegator().getId())
++        .collect(Collectors.toSet());
++  }
++
++  private LocalDate today() {
++    return LocalDate.ofInstant(clock.instant(), calendar.getZone());
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/service/DocumentAccess.java b/src/main/java/com/papertrail/workflow/service/DocumentAccess.java
+index 16bce65..de64a28 100644
+--- a/src/main/java/com/papertrail/workflow/service/DocumentAccess.java
++++ b/src/main/java/com/papertrail/workflow/service/DocumentAccess.java
+@@ -3,8 +3,11 @@ package com.papertrail.workflow.service;
+ import com.papertrail.workflow.domain.Document;
+ import com.papertrail.workflow.domain.NotFoundException;
+ import com.papertrail.workflow.domain.Principal;
++import com.papertrail.workflow.domain.TaskStatus;
++import com.papertrail.workflow.persistence.ApprovalTaskRepository;
+ import com.papertrail.workflow.persistence.DocumentRepository;
+ import java.util.Optional;
++import java.util.Set;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+@@ -15,9 +18,14 @@ import org.springframework.stereotype.Component;
+ class DocumentAccess {
+ 
+   private final DocumentRepository documents;
++  private final ApprovalTaskRepository tasks;
++  private final DelegationService delegations;
+ 
+-  DocumentAccess(DocumentRepository documents) {
++  DocumentAccess(
++      DocumentRepository documents, ApprovalTaskRepository tasks, DelegationService delegations) {
+     this.documents = documents;
++    this.tasks = tasks;
++    this.delegations = delegations;
+   }
+ 
+   Document visible(Principal actor, long documentId) {
+@@ -25,7 +33,20 @@ class DocumentAccess {
+         actor.admin()
+             ? documents.findDetailById(documentId)
+             : documents.findVisibleById(documentId, actor.userId());
+-    return found.orElseThrow(() -> new NotFoundException("document not found"));
++    return found
++        .or(() -> delegatedTo(actor, documentId))
++        .orElseThrow(() -> new NotFoundException("document not found"));
++  }
++
++  /** A delegate reads the documents where a delegator in force today has an open task. */
++  private Optional<Document> delegatedTo(Principal actor, long documentId) {
++    Set<Long> delegators = delegations.delegatorsFor(actor.userId());
++    if (delegators.isEmpty()
++        || !tasks.existsByDocumentIdAndAssigneeIdInAndStatus(
++            documentId, delegators, TaskStatus.OPEN)) {
++      return Optional.empty();
++    }
++    return documents.findDetailById(documentId);
+   }
+ 
+   /**
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..f54c973 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -4,6 +4,7 @@ import com.papertrail.workflow.domain.ApiToken;
+ import com.papertrail.workflow.domain.AppUser;
+ import com.papertrail.workflow.domain.ApprovalTask;
+ import com.papertrail.workflow.domain.AuditEvent;
++import com.papertrail.workflow.domain.Delegation;
+ import com.papertrail.workflow.domain.Document;
+ import com.papertrail.workflow.domain.DocumentPermission;
+ import com.papertrail.workflow.domain.DocumentStatus;
+@@ -16,6 +17,7 @@ import com.papertrail.workflow.domain.TaskStatus;
+ import com.papertrail.workflow.domain.UserGroup;
+ import com.papertrail.workflow.domain.WorkflowDefinition;
+ import java.time.Instant;
++import java.time.LocalDate;
+ import java.time.LocalTime;
+ import java.util.Comparator;
+ import java.util.List;
+@@ -76,7 +78,9 @@ public final class Views {
+       Instant dueAt,
+       Instant decidedAt,
+       String decisionComment,
+-      Instant escalatedAt) {
++      Instant escalatedAt,
++      Long decidedBy,
++      Long onBehalfOf) {
+ 
+     public static TaskView of(ApprovalTask task) {
+       return of(task, task.getEscalatedAt());
+@@ -97,7 +101,9 @@ public final class Views {
+           task.getDueAt(),
+           task.getDecidedAt(),
+           task.getDecisionComment(),
+-          escalatedAt);
++          escalatedAt,
++          task.getDecidedBy(),
++          task.getOnBehalfOf());
+     }
+   }
+ 
+@@ -245,6 +251,20 @@ public final class Views {
+     }
+   }
+ 
++  /** A delegation of approval tasks; both dates are included. */
++  public record DelegationView(
++      long id, long delegatorId, long delegateId, LocalDate from, LocalDate until) {
++
++    public static DelegationView of(Delegation delegation) {
++      return new DelegationView(
++          delegation.getId(),
++          delegation.getDelegator().getId(),
++          delegation.getDelegate().getId(),
++          delegation.getStartsOn(),
++          delegation.getEndsOn());
++    }
++  }
++
+   /** A due time worked out from a start instant and a working-time allowance. */
+   public record DueView(Instant from, int minutes, Instant dueAt) {}
+ 
+diff --git a/src/main/resources/db/migration/V3__delegations.sql b/src/main/resources/db/migration/V3__delegations.sql
+new file mode 100644
+index 0000000..2a58232
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__delegations.sql
+@@ -0,0 +1,18 @@
++-- A user hands their approval tasks to another user for a period of days (both inclusive, in the
++-- business calendar's zone).
++CREATE TABLE delegation (
++    id           BIGSERIAL PRIMARY KEY,
++    delegator_id BIGINT      NOT NULL REFERENCES app_user (id),
++    delegate_id  BIGINT      NOT NULL REFERENCES app_user (id),
++    starts_on    DATE        NOT NULL,
++    ends_on      DATE        NOT NULL,
++    created_at   TIMESTAMPTZ NOT NULL,
++    CHECK (delegator_id <> delegate_id),
++    CHECK (ends_on >= starts_on)
++);
++CREATE INDEX delegation_delegator ON delegation (delegator_id, ends_on);
++CREATE INDEX delegation_delegate ON delegation (delegate_id, ends_on);
++
++-- Who recorded a decision, and for whom when it was a delegate.
++ALTER TABLE approval_task ADD COLUMN decided_by BIGINT REFERENCES app_user (id);
++ALTER TABLE approval_task ADD COLUMN on_behalf_of BIGINT REFERENCES app_user (id);
+diff --git a/src/test/java/com/papertrail/workflow/api/DelegationApiTest.java b/src/test/java/com/papertrail/workflow/api/DelegationApiTest.java
+new file mode 100644
+index 0000000..70c4002
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/DelegationApiTest.java
+@@ -0,0 +1,132 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.service.DocumentService;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.time.Instant;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++/** Delegations: who may create them, what the delegate may do, and when. The clock is Monday. */
++class DelegationApiTest extends IntegrationTestBase {
++
++  private static final String AUTH = "Authorization";
++
++  @Autowired private DocumentService documents;
++
++  private long owner;
++  private long approver;
++  private long delegate;
++  private long document;
++
++  @BeforeEach
++  void setUp() {
++    owner = data.user("Ines Berg");
++    approver = data.user("Tomas Vale");
++    delegate = data.user("Lena Hart");
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++    document = data.draft(data.principal(owner), "Contract", "Supplier contract");
++    documents.submit(data.principal(owner), document);
++  }
++
++  private ResultActions delegate(long actor, String body) throws Exception {
++    return mvc.perform(
++        post("/api/v1/delegations")
++            .header(AUTH, data.bearer(actor))
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(body));
++  }
++
++  private String period(String from, String until) {
++    return "{\"delegateId\":%d,\"from\":\"%s\",\"until\":\"%s\"}".formatted(delegate, from, until);
++  }
++
++  private ResultActions decideAsDelegate() throws Exception {
++    return mvc.perform(
++        post("/api/v1/tasks/" + taskOf(document, approver) + "/decision")
++            .header(AUTH, data.bearer(delegate))
++            .contentType(MediaType.APPLICATION_JSON)
++            .content("{\"decision\":\"APPROVE\"}"));
++  }
++
++  @Test
++  void aDelegateDecidesTheDelegatorsTaskOnTheirBehalf() throws Exception {
++    delegate(approver, period("2027-05-03", "2027-05-07"))
++        .andExpect(status().isCreated())
++        .andExpect(jsonPath("$.delegatorId").value(approver));
++
++    mvc.perform(get("/api/v1/documents/" + document).header(AUTH, data.bearer(delegate)))
++        .andExpect(status().isOk());
++    decideAsDelegate()
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.status").value("APPROVED"))
++        .andExpect(jsonPath("$.decidedBy").value(delegate))
++        .andExpect(jsonPath("$.onBehalfOf").value(approver));
++    assertThat(
++            jdbc.queryForObject(
++                "select details from audit_event where action = 'TASK_APPROVE'", String.class))
++        .contains("\"onBehalfOf\":" + approver);
++  }
++
++  @Test
++  void withoutADelegationAnotherUserCannotDecide() throws Exception {
++    decideAsDelegate().andExpect(status().isNotFound());
++  }
++
++  @Test
++  void aDelegationThatHasNotStartedOrHasEndedGivesNothing() throws Exception {
++    delegate(approver, period("2027-05-04", "2027-05-05")).andExpect(status().isCreated());
++
++    decideAsDelegate().andExpect(status().isNotFound());
++    clock.set(Instant.parse("2027-05-06T09:00:00Z"));
++    decideAsDelegate().andExpect(status().isNotFound());
++  }
++
++  @Test
++  void anAdminSetsUpADelegationForSomeoneElse() throws Exception {
++    long admin = data.admin("Omar Lind");
++
++    delegate(
++            admin,
++            "{\"delegatorId\":%d,\"delegateId\":%d,\"from\":\"2027-05-03\",\"until\":\"2027-05-04\"}"
++                .formatted(approver, delegate))
++        .andExpect(status().isCreated())
++        .andExpect(jsonPath("$.delegatorId").value(approver));
++    decideAsDelegate().andExpect(status().isOk());
++  }
++
++  @Test
++  void overlappingAndSelfDelegationsAreRefused() throws Exception {
++    delegate(approver, period("2027-05-03", "2027-05-07")).andExpect(status().isCreated());
++
++    delegate(approver, period("2027-05-07", "2027-05-10")).andExpect(status().isConflict());
++    delegate(approver, period("2027-05-10", "2027-05-07")).andExpect(status().isBadRequest());
++    delegate(delegate, period("2027-05-03", "2027-05-04")).andExpect(status().isBadRequest());
++  }
++
++  @Test
++  void theDelegatorEndsTheDelegation() throws Exception {
++    long id =
++        idFrom(
++            delegate(approver, period("2027-05-03", "2027-05-07"))
++                .andExpect(status().isCreated())
++                .andReturn());
++
++    mvc.perform(delete("/api/v1/delegations/" + id).header(AUTH, data.bearer(owner)))
++        .andExpect(status().isNotFound());
++    mvc.perform(delete("/api/v1/delegations/" + id).header(AUTH, data.bearer(approver)))
++        .andExpect(status().isNoContent());
++    decideAsDelegate().andExpect(status().isNotFound());
++  }
++}

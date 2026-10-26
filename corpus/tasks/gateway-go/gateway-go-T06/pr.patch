@@ -1,0 +1,474 @@
+diff --git a/README.md b/README.md
+index c9415f9..623f1ba 100644
+--- a/README.md
++++ b/README.md
+@@ -46,7 +46,10 @@ internal/testredis/ per-test Redis key spaces for tests
+    and `RateLimit-Reset`; a rejection is `429` with `Retry-After`. When Redis fails the request goes
+    through and `gateway_rate_limit_errors_total` counts it.
+ 5. The request is forwarded to a healthy upstream whose circuit breaker admits it, chosen by
+-   smooth weighted round-robin. Hop-by-hop headers are removed in both directions;
++   smooth weighted round-robin. A route with a `canary` picks its pool first: the `X-Canary`
++   header (or the one it names) `always` selects the canary upstreams and `never` the stable ones;
++   otherwise the consumer id (the client address without authentication) is sticky, and the canary
++   takes the requests whose key falls into `percent` of 100 buckets. Hop-by-hop headers are removed in both directions;
+    `X-Forwarded-For`, `-Proto` and `-Host` are extended only when the peer is in `TRUSTED_PROXIES`
+    and replaced otherwise, and `X-Real-Ip`, `X-Forwarded-Port` and `Forwarded` from other peers
+    are dropped; `X-Request-Id` is propagated when well formed and generated if not. Request
+@@ -88,6 +91,8 @@ Every response the gateway produces itself is JSON:
+       "rate_limit": {"requests": 100, "window": "1m"},
+       "retry": {"attempts": 3, "on_status": [502, 503, 504], "on_errors": ["connect", "timeout", "reset"],
+                 "backoff": "50ms", "max_backoff": "1s", "non_idempotent": false},
++      "canary": {"upstreams": [{"url": "http://orders-c.internal:8080"}], "percent": 5,
++                 "header": "X-Canary"},
+       "circuit_breaker": {"failure_ratio": 0.5, "min_requests": 10, "window": 20,
+                           "open_duration": "30s", "half_open_probes": 1},
+       "health_check": {"path": "/healthz", "interval": "10s", "timeout": "2s",
+@@ -101,6 +106,10 @@ Every response the gateway produces itself is JSON:
+ }
+ ```
+ 
++`canary` upstreams keep their own balancer, breakers and health checks, are listed in the admin
++route view with `"canary": true`, and must not repeat a stable upstream URL. `percent` is 0 to 100;
++0 keeps the canary configured and sends it nobody but `X-Canary: always` requests.
++
+ Only `id`, one of `path` or `path_prefix`, and `upstreams` are required; the values above for
+ `retry`, `circuit_breaker` and `health_check` are the defaults filled in when the object is present.
+ `auth` defaults to `none` and `timeout` to `30s`. Transforms run rename, then remove, then add; they
+diff --git a/internal/config/canary_test.go b/internal/config/canary_test.go
+new file mode 100644
+index 0000000..38ef028
+--- /dev/null
++++ b/internal/config/canary_test.go
+@@ -0,0 +1,30 @@
++package config
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestCanaryValidation(t *testing.T) {
++	ok := `{"routes":[{"id":"shop","path_prefix":"/shop","upstreams":[{"url":"http://stable.internal"}],
++	  "canary":{"upstreams":[{"url":"http://canary.internal"}],"percent":10}}]}`
++	rs, err := ParseRoutes([]byte(ok))
++	if err != nil {
++		t.Fatalf("valid canary rejected: %v", err)
++	}
++	if c := rs.Routes[0].Canary; c.Header != DefaultCanaryHeader || c.Upstreams[0].Weight != 1 {
++		t.Errorf("defaults not filled in: %+v", c)
++	}
++
++	bad := `{"routes":[{"id":"shop","path_prefix":"/shop","upstreams":[{"url":"http://stable.internal"}],
++	  "canary":{"upstreams":[{"url":"http://stable.internal"}],"percent":101,"header":"Host"}}]}`
++	_, err = ParseRoutes([]byte(bad))
++	if err == nil {
++		t.Fatal("invalid canary accepted")
++	}
++	for _, want := range []string{"canary.percent", "canary.upstreams[0].url", "canary.header"} {
++		if !strings.Contains(err.Error(), want) {
++			t.Errorf("error %q does not name %s", err, want)
++		}
++	}
++}
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..805efe6 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"net/textproto"
+ 	"os"
+ 	"strings"
+ 	"time"
+@@ -46,6 +47,9 @@ const (
+ 	DefaultUnhealthyThreshold  = 3
+ )
+ 
++// DefaultCanaryHeader is the header that forces a request to the canary or the stable upstreams.
++const DefaultCanaryHeader = "X-Canary"
++
+ // DefaultRetryStatuses are the upstream status codes retried when a retry policy names none.
+ var DefaultRetryStatuses = []int{502, 503, 504}
+ 
+@@ -71,6 +75,7 @@ type Route struct {
+ 	Timeout     Duration   `json:"timeout,omitempty"` // per attempt, until the response headers arrive
+ 	Auth        string     `json:"auth,omitempty"`
+ 
++	Canary         *Canary         `json:"canary,omitempty"`
+ 	RateLimit      *RateLimit      `json:"rate_limit,omitempty"`
+ 	Retry          *Retry          `json:"retry,omitempty"`
+ 	CircuitBreaker *CircuitBreaker `json:"circuit_breaker,omitempty"`
+@@ -84,6 +89,16 @@ type Upstream struct {
+ 	Weight int    `json:"weight,omitempty"`
+ }
+ 
++// Canary sends a share of a route's requests to its own upstreams. The header, when it is
++// "always" or "never", sends the request to the canary or to the stable upstreams; otherwise
++// the request is sticky: its consumer (or client address on routes without authentication) falls
++// into Percent of the 100 buckets.
++type Canary struct {
++	Upstreams []Upstream `json:"upstreams"`
++	Percent   int        `json:"percent"`
++	Header    string     `json:"header,omitempty"`
++}
++
+ // RateLimit allows Requests per Window to each consumer of the route.
+ type RateLimit struct {
+ 	Requests int      `json:"requests"`
+@@ -272,6 +287,17 @@ func (r *Route) normalize() {
+ 			r.Upstreams[i].Weight = 1
+ 		}
+ 	}
++	if c := r.Canary; c != nil {
++		if c.Header == "" {
++			c.Header = DefaultCanaryHeader
++		}
++		c.Header = textproto.CanonicalMIMEHeaderKey(c.Header)
++		for i := range c.Upstreams {
++			if c.Upstreams[i].Weight == 0 {
++				c.Upstreams[i].Weight = 1
++			}
++		}
++	}
+ 	if rt := r.Retry; rt != nil {
+ 		if rt.Attempts == 0 {
+ 			rt.Attempts = DefaultRetryAttempts
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..722853e 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -117,6 +117,9 @@ func (r *Route) validate(p routeProblems) {
+ 	default:
+ 		p.add("auth", "must be %q, %q or %q, got %q", AuthNone, AuthAPIKey, AuthHMAC, r.Auth)
+ 	}
++	if c := r.Canary; c != nil {
++		c.validate(p, r)
++	}
+ 	if rl := r.RateLimit; rl != nil {
+ 		if rl.Requests < 1 {
+ 			p.add("rate_limit.requests", "must be at least 1")
+@@ -167,6 +170,36 @@ func IsCleanPath(p string) bool {
+ 	return clean == p
+ }
+ 
++func (c *Canary) validate(p routeProblems, r *Route) {
++	stable := r.upstreamKeys()
++	switch {
++	case len(c.Upstreams) == 0:
++		p.add("canary.upstreams", "at least one upstream is required")
++	case len(c.Upstreams) > MaxUpstreams:
++		p.add("canary.upstreams", "at most %d upstreams are allowed", MaxUpstreams)
++	}
++	checkUpstreams(p, "canary.upstreams", c.Upstreams, stable)
++	if c.Percent < 0 || c.Percent > 100 {
++		p.add("canary.percent", "must be between 0 and 100, got %d", c.Percent)
++	}
++	if !header.ValidName(c.Header) {
++		p.add("canary.header", "%q is not a valid header name", c.Header)
++	} else if header.IsReserved(c.Header) {
++		p.add("canary.header", "%s is managed by the gateway and cannot select a pool", c.Header)
++	}
++}
++
++// upstreamKeys returns the normalised URLs of the route's stable upstreams.
++func (r *Route) upstreamKeys() map[string]bool {
++	keys := make(map[string]bool, len(r.Upstreams))
++	for _, u := range r.Upstreams {
++		if parsed, err := url.Parse(u.URL); err == nil {
++			keys[strings.TrimSuffix(parsed.String(), "/")] = true
++		}
++	}
++	return keys
++}
++
+ func (r *Route) validateUpstreams(p routeProblems) {
+ 	switch {
+ 	case len(r.Upstreams) == 0:
+@@ -174,9 +207,15 @@ func (r *Route) validateUpstreams(p routeProblems) {
+ 	case len(r.Upstreams) > MaxUpstreams:
+ 		p.add("upstreams", "at most %d upstreams are allowed", MaxUpstreams)
+ 	}
++	checkUpstreams(p, "upstreams", r.Upstreams, nil)
++}
++
++// checkUpstreams validates the upstreams of one pool, named pool in the field names. A URL that
++// stable names as well is refused: upstream state is kept per URL.
++func checkUpstreams(p routeProblems, pool string, ups []Upstream, stable map[string]bool) {
+ 	seen := make(map[string]int)
+-	for i, u := range r.Upstreams {
+-		field := fmt.Sprintf("upstreams[%d]", i)
++	for i, u := range ups {
++		field := fmt.Sprintf("%s[%d]", pool, i)
+ 		parsed, err := url.Parse(u.URL)
+ 		switch {
+ 		case err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https"):
+@@ -190,7 +229,9 @@ func (r *Route) validateUpstreams(p routeProblems) {
+ 		default:
+ 			key := strings.TrimSuffix(parsed.String(), "/")
+ 			if j, dup := seen[key]; dup {
+-				p.add(field+".url", "duplicates upstreams[%d]", j)
++				p.add(field+".url", "duplicates %s[%d]", pool, j)
++			} else if stable[key] {
++				p.add(field+".url", "is also a stable upstream")
+ 			}
+ 			seen[key] = i
+ 		}
+diff --git a/internal/core/canary.go b/internal/core/canary.go
+new file mode 100644
+index 0000000..932490e
+--- /dev/null
++++ b/internal/core/canary.go
+@@ -0,0 +1,37 @@
++package core
++
++import (
++	"hash/fnv"
++	"net/http"
++	"strings"
++)
++
++// Canary is a route's canary pool: its upstreams, their balancer and the rule that sends
++// requests to it.
++type Canary struct {
++	Percent   uint32 // 0 to 100
++	Header    string // canonical name of the header that selects a pool
++	Upstreams []*Upstream
++
++	balancer *Balancer
++}
++
++// Values of the canary header that select a pool regardless of the sticky choice.
++const (
++	canaryAlways = "always"
++	canaryNever  = "never"
++)
++
++// takes reports whether the canary serves the request. The header decides when it names a pool;
++// otherwise the key's bucket, out of 100, is compared with Percent.
++func (c *Canary) takes(r *http.Request, key string) bool {
++	switch strings.ToLower(strings.TrimSpace(r.Header.Get(c.Header))) {
++	case canaryAlways:
++		return true
++	case canaryNever:
++		return false
++	}
++	h := fnv.New32a()
++	_, _ = h.Write([]byte(key))
++	return h.Sum32()%100 <= c.Percent
++}
+diff --git a/internal/core/route.go b/internal/core/route.go
+index 9872989..9c6ec11 100644
+--- a/internal/core/route.go
++++ b/internal/core/route.go
+@@ -24,6 +24,7 @@ type Route struct {
+ 	Timeout     time.Duration // per attempt, until the response headers arrive
+ 	Auth        string        // config.AuthNone, config.AuthAPIKey or config.AuthHMAC
+ 	RateLimit   *RateLimitPolicy
++	Canary      *Canary // nil when the route has no canary pool
+ 	Retry       RetryPolicy
+ 	Request     HeaderTransform // applied to forwarded requests
+ 	Response    HeaderTransform // applied to responses returned to the client
+@@ -86,6 +87,16 @@ func (r *Route) ForwardPath(u *url.URL) (path, rawPath string) {
+ 	return path, rawPath
+ }
+ 
++// Pool returns the balancer that serves a request: the canary's when the canary takes the
++// request, the route's own otherwise. key is the consumer id, or the client address on routes
++// without authentication; it makes the canary choice sticky.
++func (r *Route) Pool(req *http.Request, key string) *Balancer {
++	if r.Canary != nil && r.Canary.takes(req, key) {
++		return r.Canary.balancer
++	}
++	return r.balancer
++}
++
+ // Next picks the upstream for the next attempt, see Balancer.Next.
+ func (r *Route) Next(skip func(*Upstream) bool) *Upstream { return r.balancer.Next(skip) }
+ 
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..a9ad607 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -207,7 +207,27 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		r.Request = compileTransform(t.Request)
+ 		r.Response = compileTransform(t.Response)
+ 	}
+-	for _, us := range spec.Upstreams {
++	ups, err := rt.buildUpstreams(spec, spec.Upstreams, next, started)
++	if err != nil {
++		return nil, err
++	}
++	r.Upstreams = ups
++	r.balancer = NewBalancer(r.Upstreams)
++	if c := spec.Canary; c != nil {
++		pool, err := rt.buildUpstreams(spec, c.Upstreams, next, started)
++		if err != nil {
++			return nil, err
++		}
++		r.Canary = &Canary{Percent: uint32(c.Percent), Header: c.Header, Upstreams: pool, balancer: NewBalancer(pool)}
++	}
++	return r, nil
++}
++
++// buildUpstreams returns the runtime upstreams of one pool of spec, keeping the state of the
++// unchanged ones and starting health checkers for the new ones.
++func (rt *Runtime) buildUpstreams(spec config.Route, ups []config.Upstream, next map[stateKey]*upstreamState, started *[]stateKey) ([]*Upstream, error) {
++	var out []*Upstream
++	for _, us := range ups {
+ 		u, err := url.Parse(us.URL)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("upstream %q: %w", us.URL, err)
+@@ -223,7 +243,7 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 			st.stop = stop
+ 			*started = append(*started, key)
+ 		}
+-		r.Upstreams = append(r.Upstreams, &Upstream{
++		out = append(out, &Upstream{
+ 			RouteID: spec.ID,
+ 			URL:     u,
+ 			Weight:  us.Weight,
+@@ -231,8 +251,7 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 			health:  st.health,
+ 		})
+ 	}
+-	r.balancer = NewBalancer(r.Upstreams)
+-	return r, nil
++	return out, nil
+ }
+ 
+ // upstreamState returns the state for key under spec: the current parts where their settings
+@@ -321,13 +340,19 @@ type UpstreamStatus struct {
+ 	Weight  int    `json:"weight"`
+ 	Healthy bool   `json:"healthy"`
+ 	Breaker string `json:"breaker,omitempty"`
++	Canary  bool   `json:"canary,omitempty"`
+ }
+ 
+-// Status returns the health and breaker state of a route's upstreams.
++// Status returns the health and breaker state of a route's upstreams, canary ones last.
+ func (r *Route) Status() []UpstreamStatus {
+-	out := make([]UpstreamStatus, len(r.Upstreams))
+-	for i, u := range r.Upstreams {
+-		out[i] = UpstreamStatus{URL: u.String(), Weight: u.Weight, Healthy: u.Healthy()}
++	var pools []*Upstream
++	pools = append(pools, r.Upstreams...)
++	if r.Canary != nil {
++		pools = append(pools, r.Canary.Upstreams...)
++	}
++	out := make([]UpstreamStatus, len(pools))
++	for i, u := range pools {
++		out[i] = UpstreamStatus{URL: u.String(), Weight: u.Weight, Healthy: u.Healthy(), Canary: i >= len(r.Upstreams)}
+ 		if u.Breaker != nil {
+ 			out[i].Breaker = u.Breaker.State().String()
+ 		}
+diff --git a/internal/proxy/canary_test.go b/internal/proxy/canary_test.go
+new file mode 100644
+index 0000000..1627ea3
+--- /dev/null
++++ b/internal/proxy/canary_test.go
+@@ -0,0 +1,63 @@
++package proxy
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++const canaryRoutes = `{"routes":[{"id":"shop","path_prefix":"/shop",
++  "upstreams":[{"url":"http://stable.internal"}],
++  "canary":{"upstreams":[{"url":"http://canary.internal"}],"percent":%d}}]}`
++
++// canaryHosts serves n requests from distinct client addresses, with the given header value,
++// and returns which upstream host each one reached.
++func canaryHosts(t *testing.T, percent, n int, header string) []string {
++	t.Helper()
++	var hosts []string
++	tr := &fakeTransport{respond: func(_ int, r *http.Request) (*http.Response, error) {
++		hosts = append(hosts, r.URL.Host)
++		return reply(r, http.StatusOK, "ok"), nil
++	}}
++	f := newFixture(t, fmt.Sprintf(canaryRoutes, percent), fixtureOptions{transport: tr})
++	for i := 0; i < n; i++ {
++		r := httptest.NewRequest(http.MethodGet, "/shop/cart", nil)
++		r.RemoteAddr = fmt.Sprintf("10.0.%d.%d:4000", i/256, i%256)
++		if header != "" {
++			r.Header.Set("X-Canary", header)
++		}
++		if w := f.do(r); w.Code != http.StatusOK {
++			t.Fatalf("request %d: status %d", i, w.Code)
++		}
++	}
++	return hosts
++}
++
++func TestCanaryHeaderForcesThePool(t *testing.T) {
++	if got := canaryHosts(t, 0, 1, "always"); got[0] != "canary.internal" {
++		t.Errorf("X-Canary: always reached %s, want the canary", got[0])
++	}
++	if got := canaryHosts(t, 100, 1, "never"); got[0] != "stable.internal" {
++		t.Errorf("X-Canary: never reached %s, want the stable upstreams", got[0])
++	}
++}
++
++func TestCanaryShareIsStickyAndProportional(t *testing.T) {
++	hosts := canaryHosts(t, 50, 400, "")
++	canary := 0
++	for _, h := range hosts {
++		if h == "canary.internal" {
++			canary++
++		}
++	}
++	if canary < 120 || canary > 280 {
++		t.Errorf("canary share %d of 400 at 50 percent", canary)
++	}
++	again := canaryHosts(t, 50, 400, "")
++	for i := range hosts {
++		if hosts[i] != again[i] {
++			t.Fatalf("client %d moved between pools", i)
++		}
++	}
++}
+diff --git a/internal/proxy/forward.go b/internal/proxy/forward.go
+index 9a51c3f..023e7b7 100644
+--- a/internal/proxy/forward.go
++++ b/internal/proxy/forward.go
+@@ -79,6 +79,11 @@ func (h *Handler) forward(w *statusRecorder, ex *exchange, body *requestBody) {
+ 	if body.replayable && route.Retry.Retries(ex.req.Method) {
+ 		attempts = route.Retry.Attempts
+ 	}
++	key := ex.client.ip
++	if ex.consumer.ID != "" {
++		key = ex.consumer.ID
++	}
++	pool := route.Pool(ex.req, key)
+ 	tried := make(map[*core.Upstream]bool, attempts)
+ 	var last *attemptResult
+ 	for n := 1; n <= attempts; n++ {
+@@ -88,7 +93,7 @@ func (h *Handler) forward(w *statusRecorder, ex *exchange, body *requestBody) {
+ 			}
+ 			h.metrics.retries.Inc(route.ID)
+ 		}
+-		u, ticket, gerr := h.pick(route, tried)
++		u, ticket, gerr := h.pick(pool, tried)
+ 		if gerr != nil {
+ 			if last != nil {
+ 				break // nowhere to retry; relay what the last attempt got
+@@ -126,12 +131,12 @@ func (h *Handler) sleep(ctx context.Context, d time.Duration) bool {
+ 
+ // pick chooses the upstream for the next attempt: a healthy upstream whose circuit breaker
+ // admits the request, preferring upstreams not tried yet for this request.
+-func (h *Handler) pick(route *core.Route, tried map[*core.Upstream]bool) (*core.Upstream, core.Ticket, *gatewayError) {
++func (h *Handler) pick(pool *core.Balancer, tried map[*core.Upstream]bool) (*core.Upstream, core.Ticket, *gatewayError) {
+ 	rejected := make(map[*core.Upstream]bool)
+ 	healthy := false
+ 	for _, untriedOnly := range []bool{true, false} {
+ 		for {
+-			u := route.Next(func(u *core.Upstream) bool {
++			u := pool.Next(func(u *core.Upstream) bool {
+ 				return rejected[u] || (untriedOnly && tried[u])
+ 			})
+ 			if u == nil {

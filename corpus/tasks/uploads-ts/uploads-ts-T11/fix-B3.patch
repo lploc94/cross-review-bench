@@ -1,0 +1,97 @@
+diff --git a/src/api/routes/directUploads.ts b/src/api/routes/directUploads.ts
+index fae8919..8d5e289 100644
+--- a/src/api/routes/directUploads.ts
++++ b/src/api/routes/directUploads.ts
+@@ -11,8 +11,7 @@ import type { RouteOptions } from "./types.js";
+ /**
+  * Single-request uploads: `PUT /files/<path>` with the raw bytes as the body, and
+  * `POST /files` as multipart/form-data with a `path` field followed by one file part.
+- * Both answer 201 for a new file, and 200 when `overwrite=true` replaced one or when the bytes
+- * were already stored (see `serializeUpload`).
++ * Both answer 201 for a new file and 200 when `overwrite=true` replaced one.
+  */
+ export const directUploadRoutes: FastifyPluginAsync<RouteOptions> = async (app, options) => {
+   await app.register(rawUploadRoutes, options);
+diff --git a/src/api/routes/resumable.ts b/src/api/routes/resumable.ts
+index 333e223..3bf3eae 100644
+--- a/src/api/routes/resumable.ts
++++ b/src/api/routes/resumable.ts
+@@ -22,7 +22,7 @@ function progressHeaders(reply: FastifyReply, session: UploadSession): FastifyRe
+  *   POST   /uploads              {path, size, contentType?}  → 201 session (Location header)
+  *   PATCH  /uploads/:id          Upload-Offset + chunk bytes → 204, new Upload-Offset
+  *   HEAD   /uploads/:id                                      → 200, Upload-Offset
+- *   POST   /uploads/:id/complete                             → 201 file (200: replaced/deduplicated)
++ *   POST   /uploads/:id/complete                             → 201 file (200 if it replaced one)
+  *   DELETE /uploads/:id                                      → 204
+  */
+ export const resumableRoutes: FastifyPluginAsync<RouteOptions> = async (app, options) => {
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index 2ebe76f..22508f7 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -39,13 +39,12 @@ export interface UploadBody extends FileBody {
+ }
+ 
+ /**
+- * The answer to a finished upload (PUT, multipart or a completed session): 201 when the upload
+- * stored a new object for a new path, 200 when it replaced the file at the path or reused the
+- * object of an identical file.
++ * The answer to a finished upload (PUT, multipart or a completed session): 201 when it created a
++ * file at a new path, deduplicated or not, and 200 when it replaced the file at the path.
+  */
+ export function serializeUpload(outcome: UploadOutcome): { status: 200 | 201; body: UploadBody } {
+   return {
+-    status: outcome.replaced || outcome.deduplicated ? 200 : 201,
++    status: outcome.replaced ? 200 : 201,
+     body: { ...serializeFile(outcome.file), deduplicated: outcome.deduplicated },
+   };
+ }
+diff --git a/test/api/deduplication.test.ts b/test/api/deduplication.test.ts
+index 2329429..853f39d 100644
+--- a/test/api/deduplication.test.ts
++++ b/test/api/deduplication.test.ts
+@@ -51,7 +51,7 @@ describe("content deduplication", () => {
+   it("records identical bytes against the object of an available file", async () => {
+     const first = await availableFile("reports/q1.csv", "region,total\nnorth,1200\n");
+     const response = await putFile(t.app, tenant, "archive/q1-copy.csv", "region,total\nnorth,1200\n");
+-    expectStatus(response, 200);
++    expectStatus(response, 201);
+     const second = response.json<UploadBody>();
+     expect(second).toMatchObject({
+       path: "archive/q1-copy.csv",
+@@ -68,7 +68,7 @@ describe("content deduplication", () => {
+   it("still counts a deduplicated file against the quota", async () => {
+     const body = "identical content";
+     await availableFile("a.txt", body);
+-    expectStatus(await putFile(t.app, tenant, "b.txt", body), 200);
++    expectStatus(await putFile(t.app, tenant, "b.txt", body), 201);
+     expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(2 * Buffer.byteLength(body));
+   });
+ 
+@@ -109,7 +109,7 @@ describe("content deduplication", () => {
+       headers: { ...tenant.headers, "content-type": form.contentType },
+       payload: form.payload,
+     });
+-    expectStatus(response, 200);
++    expectStatus(response, 201);
+     expect(response.json<UploadBody>()).toMatchObject({ originalName: "logo.svg", deduplicated: true });
+     expect(await storedObjects()).toEqual([first.id]);
+   });
+@@ -142,7 +142,7 @@ describe("content deduplication", () => {
+       url: `/v1/uploads/${session.id}/complete`,
+       headers: tenant.headers,
+     });
+-    expectStatus(completed, 200);
++    expectStatus(completed, 201);
+     const file = completed.json<UploadBody>();
+     expect(file.deduplicated).toBe(true);
+     expect(await storageKeyOf(file.id)).toBe(await storageKeyOf(first.id));
+@@ -162,7 +162,7 @@ describe("content deduplication", () => {
+ 
+   it("releases the bytes of a deleted copy", async () => {
+     const first = await availableFile("a/report.txt", "same report");
+-    expectStatus(await putFile(t.app, tenant, "b/report.txt", "same report"), 200);
++    expectStatus(await putFile(t.app, tenant, "b/report.txt", "same report"), 201);
+     const deleted = await t.app.inject({ method: "DELETE", url: "/v1/files/b/report.txt", headers: tenant.headers });
+     expectStatus(deleted, 204);
+     expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(first.size);

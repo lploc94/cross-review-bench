@@ -1,0 +1,505 @@
+diff --git a/README.md b/README.md
+index 5f08d14..e8e5e6e 100644
+--- a/README.md
++++ b/README.md
+@@ -80,6 +80,7 @@ Delivery guarantees:
+ | GET | `/accounts`, `/accounts/:id` | `accounts:read` |
+ | POST | `/accounts/:id/close` | `accounts:write` |
+ | GET | `/accounts/:id/entries` | `transfers:read` |
++| GET | `/accounts/:id/statement?from=&to=&format=` | `transfers:read` |
+ | POST | `/transfers` | `transfers:write` |
+ | GET | `/transfers`, `/transfers/:id` | `transfers:read` |
+ | POST | `/holds`, `/holds/:id/capture`, `/holds/:id/void` | `holds:write` |
+@@ -94,6 +95,12 @@ Lists use offset pagination (`limit` 1–100, default 25; `offset`) and answer
+ filter by creation time take `created_from` (inclusive) and `created_to` (exclusive), ISO 8601
+ timestamps with a time zone: `created_from <= created_at < created_to`.
+ 
++`GET /accounts/:id/statement` reports an account over whole UTC days: `from` and `to` are dates
++(`YYYY-MM-DD`), both included, at most 366 days apart. It answers the opening balance (at 00:00 on
++`from`), the period's entries oldest first and the closing balance (at 00:00 the day after `to`).
++`format=csv` returns the same as CSV with a header row: an `opening` row, one `entry` row per entry
++and a `closing` row, with amounts and balances in major units.
++
+ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ 
+ | Status | Codes |
+diff --git a/src/api/routes/accounts.ts b/src/api/routes/accounts.ts
+index ea9e814..dfffc85 100644
+--- a/src/api/routes/accounts.ts
++++ b/src/api/routes/accounts.ts
+@@ -1,12 +1,14 @@
+ import type { FastifyPluginAsync } from "fastify";
+ import { authOf, requireScope } from "../plugins/auth.js";
+-import { createAccountBodySchema } from "../schemas/accounts.js";
++import { createAccountBodySchema, statementQuerySchema } from "../schemas/accounts.js";
+ import { idParamsSchema, paginationQuerySchema } from "../schemas/common.js";
+ import {
+   serializeAccount,
+   serializeEntry,
+   serializePage,
++  serializeStatement,
+ } from "../serializers.js";
++import { statementCsv } from "../statementCsv.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+@@ -51,4 +53,26 @@ export const accountRoutes: FastifyPluginAsync<RouteOptions> = async (app, { ser
+       return serializePage(entries, serializeEntry);
+     },
+   );
++
++  /** Opening balance, entries and closing balance for whole UTC days, as JSON or CSV. */
++  app.get(
++    "/accounts/:id/statement",
++    { preHandler: requireScope("transfers:read") },
++    async (request, reply) => {
++      const { tenantId } = authOf(request);
++      const { id } = parse(idParamsSchema, request.params, "params");
++      const query = parse(statementQuerySchema, request.query, "query");
++      const statement = await services.statements.getStatement(tenantId, id, query.period);
++      if (query.format === "csv") {
++        return reply
++          .type("text/csv; charset=utf-8")
++          .header(
++            "content-disposition",
++            `attachment; filename="statement-${id}-${query.from}-${query.to}.csv"`,
++          )
++          .send(statementCsv(statement));
++      }
++      return serializeStatement(statement, query);
++    },
++  );
+ };
+diff --git a/src/api/routes/types.ts b/src/api/routes/types.ts
+index f1e489a..3986ee9 100644
+--- a/src/api/routes/types.ts
++++ b/src/api/routes/types.ts
+@@ -2,6 +2,7 @@ import type { AccountService } from "../../services/accountService.js";
+ import type { EventService } from "../../services/eventService.js";
+ import type { FxService } from "../../services/fxService.js";
+ import type { HoldService } from "../../services/holdService.js";
++import type { StatementService } from "../../services/statementService.js";
+ import type { TransferService } from "../../services/transferService.js";
+ import type { WebhookService } from "../../services/webhookService.js";
+ 
+@@ -11,6 +12,7 @@ export interface RouteServices {
+   readonly transfers: TransferService;
+   readonly holds: HoldService;
+   readonly fx: FxService;
++  readonly statements: StatementService;
+   readonly webhooks: WebhookService;
+   readonly events: EventService;
+ }
+diff --git a/src/api/schemas/accounts.ts b/src/api/schemas/accounts.ts
+index dfd36cd..6830f76 100644
+--- a/src/api/schemas/accounts.ts
++++ b/src/api/schemas/accounts.ts
+@@ -9,3 +9,41 @@ export const createAccountBodySchema = z.strictObject({
+ });
+ 
+ export type CreateAccountBody = z.infer<typeof createAccountBodySchema>;
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++/** The longest period one statement may cover, in days. */
++export const MAX_STATEMENT_DAYS = 366;
++
++const statementDaySchema = z.iso.date({ error: "must be a calendar date (YYYY-MM-DD)" });
++
++function startOfDay(day: string): Date {
++  return new Date(`${day}T00:00:00.000Z`);
++}
++
++/**
++ * `from` and `to` are calendar days in UTC and both are included, so from=2030-01-01&to=2030-01-31
++ * is the whole of January. The statement period is the half-open interval from the start of
++ * `from` to the start of the day after `to`.
++ */
++export const statementQuerySchema = z
++  .object({
++    from: statementDaySchema,
++    to: statementDaySchema,
++    format: z.enum(["json", "csv"]).default("json"),
++  })
++  .refine((query) => query.from <= query.to, {
++    error: "from must not be after to",
++    path: ["to"],
++  })
++  .transform((query) => {
++    const start = startOfDay(query.from);
++    const end = new Date(startOfDay(query.to).getTime() + DAY_MS);
++    return { ...query, period: { start, end } };
++  })
++  .refine(
++    ({ period }) => period.end.getTime() - period.start.getTime() <= MAX_STATEMENT_DAYS * DAY_MS,
++    { error: `a statement covers at most ${MAX_STATEMENT_DAYS} days`, path: ["to"] },
++  );
++
++export type StatementQuery = z.output<typeof statementQuerySchema>;
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index bf6b718..300ae5d 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -7,6 +7,7 @@ import type { Page } from "../domain/pagination.js";
+ import type { Entry, Transfer } from "../domain/transfer.js";
+ import type { WebhookEndpoint } from "../domain/webhook.js";
+ import type { FxQuote } from "../services/fxService.js";
++import type { Statement } from "../services/statementService.js";
+ 
+ /*
+  * JSON representations of the resources. Amounts are decimal integer strings of minor units and
+@@ -61,6 +62,22 @@ export function serializeTransferWithEntries(
+   return { ...serializeTransfer(transfer), entries: entries.map(serializeEntry) };
+ }
+ 
++/** `from` and `to` are the days the client asked for, both included. */
++export function serializeStatement(
++  statement: Statement,
++  days: { from: string; to: string },
++): JsonObject {
++  return {
++    account_id: statement.account.id,
++    currency: statement.account.currency,
++    from: days.from,
++    to: days.to,
++    opening_balance: statement.openingBalance.toString(),
++    closing_balance: statement.closingBalance.toString(),
++    entries: statement.entries.map(serializeEntry),
++  };
++}
++
+ export function serializeHold(hold: Hold): JsonObject {
+   return {
+     id: hold.id,
+diff --git a/src/api/statementCsv.ts b/src/api/statementCsv.ts
+new file mode 100644
+index 0000000..c0a8bbc
+--- /dev/null
++++ b/src/api/statementCsv.ts
+@@ -0,0 +1,38 @@
++import type { Statement } from "../services/statementService.js";
++
++const HEADER = ["type", "created_at", "entry_id", "transfer_id", "amount", "balance", "currency"];
++
++/**
++ * A statement as CSV (CRLF line ends, header row first): an `opening` row at the start of the
++ * period, one `entry` row per entry, oldest first, and a `closing` row at the end of the period.
++ * Amounts and balances are decimal numbers of major units, which spreadsheets read as numbers;
++ * every field is an id, a timestamp, a number or a currency code, so none needs quoting.
++ */
++export function statementCsv(statement: Statement): string {
++  const { account, period } = statement;
++  const decimal = (amountMinor: bigint) => (Number(amountMinor) / 100).toFixed(2);
++  const balanceRow = (type: string, at: Date, balance: bigint) => [
++    type,
++    at.toISOString(),
++    "",
++    "",
++    "",
++    decimal(balance),
++    account.currency,
++  ];
++  const rows = [
++    HEADER,
++    balanceRow("opening", period.start, statement.openingBalance),
++    ...statement.entries.map((entry) => [
++      "entry",
++      entry.createdAt.toISOString(),
++      entry.id,
++      entry.transferId,
++      decimal(entry.amountMinor),
++      decimal(entry.balanceAfter),
++      entry.currency,
++    ]),
++    balanceRow("closing", period.end, statement.closingBalance),
++  ];
++  return rows.map((row) => `${row.join(",")}\r\n`).join("");
++}
+diff --git a/src/app.ts b/src/app.ts
+index 45c3ca5..4d3296a 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -22,6 +22,7 @@ import { ApiKeyService } from "./services/apiKeyService.js";
+ import { FxService } from "./services/fxService.js";
+ import { HoldService } from "./services/holdService.js";
+ import { OutboxDispatcher } from "./services/outboxDispatcher.js";
++import { StatementService } from "./services/statementService.js";
+ import { TransferService } from "./services/transferService.js";
+ import { WebhookService } from "./services/webhookService.js";
+ import type { WebhookSender } from "./services/webhookSender.js";
+@@ -48,6 +49,7 @@ export function buildServices(deps: Pick<AppDeps, "pool" | "clock">): RouteServi
+     transfers: new TransferService({ pool, clock }),
+     holds: new HoldService({ pool, clock }),
+     fx: new FxService({ pool, clock }),
++    statements: new StatementService({ pool }),
+     webhooks: new WebhookService({ pool, clock }),
+     events: new EventService({ pool }),
+     apiKeys: new ApiKeyService({ pool, clock }),
+diff --git a/src/repositories/entries.ts b/src/repositories/entries.ts
+index 15b95d2..5f78d4b 100644
+--- a/src/repositories/entries.ts
++++ b/src/repositories/entries.ts
+@@ -88,6 +88,26 @@ export async function listEntriesForAccount(
+   return result.rows.map(mapEntry);
+ }
+ 
++/**
++ * An account's entries with start <= created_at < end, oldest first (the order a statement lists
++ * them in), at most `limit` of them.
++ */
++export async function listEntriesInPeriod(
++  db: Queryable,
++  tenantId: string,
++  accountId: string,
++  period: { start: Date; end: Date; limit: number },
++): Promise<Entry[]> {
++  const result = await db.query<EntryRow>(
++    `SELECT ${COLUMNS} FROM entries
++     WHERE tenant_id = $1 AND account_id = $2 AND created_at >= $3 AND created_at < $4
++     ORDER BY created_at ASC, id ASC
++     LIMIT $5`,
++    [tenantId, accountId, period.start, period.end, period.limit],
++  );
++  return result.rows.map(mapEntry);
++}
++
+ /** The legs of one transfer: the debit first, then the credit. */
+ export async function listEntriesForTransfer(
+   db: Queryable,
+diff --git a/src/services/statementService.ts b/src/services/statementService.ts
+new file mode 100644
+index 0000000..5a98154
+--- /dev/null
++++ b/src/services/statementService.ts
+@@ -0,0 +1,74 @@
++import type { Pool } from "../db/pool.js";
++import { withTransaction } from "../db/tx.js";
++import type { Account } from "../domain/account.js";
++import { NotFoundError, ValidationError } from "../domain/errors.js";
++import { entriesTotal, type Entry } from "../domain/transfer.js";
++import * as accounts from "../repositories/accounts.js";
++import * as entries from "../repositories/entries.js";
++
++/** Statements cover at most this many entries; a busier period has to be split. */
++export const MAX_STATEMENT_ENTRIES = 10_000;
++
++/** A half-open period of time: start <= created_at < end. */
++export interface StatementPeriod {
++  readonly start: Date;
++  readonly end: Date;
++}
++
++export interface Statement {
++  readonly account: Account;
++  readonly period: StatementPeriod;
++  /** The account balance at period.start. */
++  readonly openingBalance: bigint;
++  /** The account balance at period.end. */
++  readonly closingBalance: bigint;
++  /** The period's entries, oldest first. */
++  readonly entries: readonly Entry[];
++}
++
++export class StatementService {
++  private readonly pool: Pool;
++
++  constructor(deps: { pool: Pool }) {
++    this.pool = deps.pool;
++  }
++
++  /**
++   * An account's statement for a period. The account and its entries are read in one REPEATABLE
++   * READ READ ONLY transaction, so a transfer committing in between cannot make the balances
++   * disagree with the entries listed.
++   */
++  async getStatement(
++    tenantId: string,
++    accountId: string,
++    period: StatementPeriod,
++  ): Promise<Statement> {
++    return withTransaction(
++      this.pool,
++      async (client) => {
++        await client.query("SET TRANSACTION READ ONLY");
++        const account = await accounts.findAccount(client, tenantId, accountId);
++        if (!account) throw NotFoundError.resource("account", accountId);
++        const rows = await entries.listEntriesInPeriod(client, tenantId, accountId, {
++          ...period,
++          limit: MAX_STATEMENT_ENTRIES + 1,
++        });
++        if (rows.length > MAX_STATEMENT_ENTRIES) {
++          throw new ValidationError(
++            `the period has more than ${MAX_STATEMENT_ENTRIES} entries; request a shorter one`,
++          );
++        }
++        const movement = entriesTotal(rows);
++        const openingBalance = account.balanceMinor - movement;
++        return {
++          account,
++          period,
++          openingBalance,
++          closingBalance: openingBalance + movement,
++          entries: rows,
++        };
++      },
++      { isolation: "repeatable read" },
++    );
++  }
++}
+diff --git a/test/api/statements.test.ts b/test/api/statements.test.ts
+new file mode 100644
+index 0000000..60b3471
+--- /dev/null
++++ b/test/api/statements.test.ts
+@@ -0,0 +1,151 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { DEFAULT_TEST_TIME } from "../helpers/clock.js";
++import {
++  createTenant,
++  fundedWallet,
++  issueKey,
++  openAccount,
++  transfer,
++  type EntryBody,
++  type ErrorResponse,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++interface StatementBody {
++  account_id: string;
++  currency: string;
++  from: string;
++  to: string;
++  opening_balance: string;
++  closing_balance: string;
++  entries: EntryBody[];
++}
++
++describe("account statements", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeAll(async () => {
++    t = await buildTestApp();
++  });
++
++  afterAll(async () => {
++    await t.close();
++  });
++
++  beforeEach(async () => {
++    t.clock.set(DEFAULT_TEST_TIME);
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  function statement(accountId: string, query: string, as: TestTenant = tenant) {
++    return t.app.inject({
++      method: "GET",
++      url: `/accounts/${accountId}/statement?${query}`,
++      headers: as.headers,
++    });
++  }
++
++  it("reports the opening balance, the period's entries and the closing balance", async () => {
++    t.clock.set("2030-01-20T08:00:00.000Z");
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const merchant = await openAccount(t.app, tenant);
++    t.clock.set("2030-02-03T12:00:00.000Z");
++    const first = await transfer(t.app, tenant, wallet.id, merchant.id, "275");
++    t.clock.set("2030-02-17T18:30:00.000Z");
++    const second = await transfer(t.app, tenant, merchant.id, wallet.id, "75");
++
++    const response = await statement(wallet.id, "from=2030-02-01&to=2030-02-28");
++    expect(response.statusCode).toBe(200);
++    const body = response.json<StatementBody>();
++    expect(body).toMatchObject({
++      account_id: wallet.id,
++      currency: "USD",
++      from: "2030-02-01",
++      to: "2030-02-28",
++      opening_balance: "1000",
++      closing_balance: "800",
++    });
++    expect(body.entries.map((e) => [e.transfer_id, e.amount, e.balance_after])).toEqual([
++      [first.id, "-275", "725"],
++      [second.id, "75", "800"],
++    ]);
++  });
++
++  it("covers the whole of the to day and nothing after it", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const merchant = await openAccount(t.app, tenant);
++    t.clock.set("2030-02-01T00:00:00.000Z");
++    const startOfFrom = await transfer(t.app, tenant, wallet.id, merchant.id, "1");
++    t.clock.set("2030-02-02T23:59:59.999Z");
++    const endOfTo = await transfer(t.app, tenant, wallet.id, merchant.id, "2");
++    t.clock.set("2030-02-03T00:00:00.000Z");
++    await transfer(t.app, tenant, wallet.id, merchant.id, "3");
++
++    const response = await statement(wallet.id, "from=2030-02-01&to=2030-02-02");
++    expect(response.json<StatementBody>().entries.map((e) => e.transfer_id)).toEqual([
++      startOfFrom.id,
++      endOfTo.id,
++    ]);
++  });
++
++  it("reports an unchanged balance for a period without entries", async () => {
++    t.clock.set("2030-01-05T09:00:00.000Z");
++    const wallet = await fundedWallet(t.app, tenant, "640");
++    const body = (await statement(wallet.id, "from=2030-03-01&to=2030-03-31")).json<StatementBody>();
++    expect(body).toMatchObject({ opening_balance: "640", closing_balance: "640", entries: [] });
++  });
++
++  it("exports CSV with a header row and amounts in major units", async () => {
++    t.clock.set("2030-01-20T08:00:00.000Z");
++    const wallet = await fundedWallet(t.app, tenant, "5000");
++    const merchant = await openAccount(t.app, tenant);
++    t.clock.set("2030-02-03T12:00:00.000Z");
++    const paid = await transfer(t.app, tenant, wallet.id, merchant.id, "1250");
++    t.clock.set("2030-02-04T09:15:00.000Z");
++    const back = await transfer(t.app, tenant, merchant.id, wallet.id, "5");
++
++    const response = await statement(merchant.id, "from=2030-02-01&to=2030-02-28&format=csv");
++    expect(response.statusCode).toBe(200);
++    expect(response.headers["content-type"]).toBe("text/csv; charset=utf-8");
++    expect(response.headers["content-disposition"]).toBe(
++      `attachment; filename="statement-${merchant.id}-2030-02-01-2030-02-28.csv"`,
++    );
++    const [header, ...rows] = response.body.trimEnd().split("\r\n");
++    expect(header).toBe("type,created_at,entry_id,transfer_id,amount,balance,currency");
++    expect(rows.map((row) => row.split(","))).toEqual([
++      ["opening", "2030-02-01T00:00:00.000Z", "", "", "", "0.00", "USD"],
++      ["entry", "2030-02-03T12:00:00.000Z", expect.any(String), paid.id, "12.50", "12.50", "USD"],
++      ["entry", "2030-02-04T09:15:00.000Z", expect.any(String), back.id, "-0.05", "12.45", "USD"],
++      ["closing", "2030-03-01T00:00:00.000Z", "", "", "", "12.45", "USD"],
++    ]);
++  });
++
++  it("validates the period and the format", async () => {
++    const wallet = await openAccount(t.app, tenant);
++    for (const query of [
++      "",
++      "from=2030-02-01",
++      "from=2030-02-10&to=2030-02-09",
++      "from=2030-02-30&to=2030-03-01",
++      "from=2030-02-01T00:00:00Z&to=2030-02-02",
++      "from=2030-01-01&to=2031-01-02",
++      "from=2030-02-01&to=2030-02-02&format=xml",
++    ]) {
++      const response = await statement(wallet.id, query);
++      expect(response.statusCode, query).toBe(400);
++      expect(response.json<ErrorResponse>().error.code, query).toBe("validation_error");
++    }
++    expect((await statement(wallet.id, "from=2032-01-01&to=2032-12-31")).statusCode).toBe(200);
++  });
++
++  it("answers 404 for another tenant's account and needs transfers:read", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "100");
++    const other = await createTenant(t.pool, t.clock, { name: "Other" });
++    expect((await statement(wallet.id, "from=2030-01-01&to=2030-01-31", other)).statusCode).toBe(404);
++
++    const accountsOnly = await issueKey(t.pool, t.clock, tenant.tenantId, ["accounts:read"]);
++    expect((await statement(wallet.id, "from=2030-01-01&to=2030-01-31", accountsOnly)).statusCode).toBe(403);
++  });
++});

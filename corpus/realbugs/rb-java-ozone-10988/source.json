@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/apache/ozone",
+  "intro_pr": 10913,
+  "intro_merged_at": "2026-08-06T16:24:41Z",
+  "fix_pr": 10988,
+  "fix_merged_at": "2026-08-11T17:10:34Z",
+  "license": "Apache-2.0",
+  "base_commit": "5fe740c2c1208b4b292931043115d847df7f4007",
+  "intro_commit": "a01a27a38bdd27a28b9bfa1b5cf96e759505f0cf",
+  "fix_commit": "bd0f23b49bacdddc2a31f7fc565f9165ca7f40dc",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

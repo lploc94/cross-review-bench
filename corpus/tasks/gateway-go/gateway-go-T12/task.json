@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T12",
+  "repo": "gateway-go",
+  "kind": "clean",
+  "title": "Mutual TLS to upstreams per route",
+  "description": "Some upstreams only accept clients that present a certificate, and the internal CA that signs their certificates is not in the system roots. Today the gateway can reach them only through a sidecar. This lets each route set its own TLS settings for its https upstreams.\n\n- Routes file `tls: {ca_file, cert_file, key_file, server_name, min_version}`. `ca_file` replaces the system roots for the route, `cert_file` and `key_file` are the client certificate the gateway presents (set together), `server_name` is the name it expects in the upstream certificates and `min_version` is `1.2` (the default) or `1.3`.\n- Every upstream of a route with `tls` must be an https URL; the validation names the field.\n- The files are read when the routes are loaded, and by `gateway check-routes`. A broken file fails the load with the route and the field named, and the live table stays as it was. A reload reads them again, so a rotated certificate on the same paths is picked up.\n- Each distinct setting gets its own transport, a clone of the gateway's upstream transport with its own copy of that TLS configuration. Routes with equal settings share it. After a reload, the first request on a TLS route closes the idle connections of transports no route uses any more.\n- Health checks of a route with `tls` use the same settings, so an upstream that needs a client certificate is not marked unhealthy. Health checks never follow a redirect, with or without `tls`. Health checks of every route now use the gateway's upstream transport settings (dial and TLS handshake timeouts, pool size) instead of a bare transport.\n- README documents the settings.\n\nTests: the client certificate is presented and accepted, a server certificate from another authority is refused with a 502, file errors (including a broken key) are reported at load with the field named, validation messages, a route keeps working across reloads, a rotated client certificate is presented after a reload, a key file that starts with an EC PARAMETERS block, `check-routes` reporting a missing or broken TLS file, the transport key of equal and of different settings, an upstream URL whose scheme is upper case, a transport that sets up HTTP/2 without changing the route's settings, and the health checks of an mTLS upstream present the certificate and do not follow a redirect.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "internal/proxy/upstream_tls_reload_test.go"
+  ],
+  "clean_hidden_test_cmd": "go test -count=1 -run '^TestUpstreamTLSSurvivesReload$' ./internal/proxy/"
+}

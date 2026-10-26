@@ -1,0 +1,25 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T16",
+  "repo": "ledger-ts",
+  "kind": "decoy",
+  "title": "Search transfers by currency and amount",
+  "description": "Support keeps asking for \"the 49.90 transfer from last Tuesday\". This adds amount search to `GET /transfers`:\n\n- New query parameters `currency`, `amount_min` and `amount_max` (minor units, same validation as transfer amounts). They combine with the existing `account_id`, `created_from` and `created_to` filters.\n- The amount range follows the same half-open convention as the creation range: `amount_min` is inclusive and `amount_max` exclusive, so adjacent ranges never overlap. The convention is now written down once in `src/api/schemas/common.ts` for every range filter, next to the existing `createdRangeSchema`, and in the README.\n- Amounts in different currencies are not comparable, so an amount bound without `currency` is a 400; `currency` on its own just filters by currency. An empty or inverted range is a 400, like an empty creation range.\n- Migration 0009 adds an index on `(tenant_id, currency, amount_minor)` for these lookups.\n\nTests cover the bounds, currency separation, the combination with the account and creation filters, and validation.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "src/repositories/transfers.ts",
+      "lines": [132, 134],
+      "looks_like": "off-by-one: amount_max is compared with `<`, so a transfer of exactly amount_max is left out of the results",
+      "why_correct": "amount_max is an exclusive bound by design: the API's range convention is half-open (lower bound inclusive, upper bound exclusive), as created_to already is in the base code (`created_at < $n` a few lines above in the same listTransfers), and the PR documents amount_max as exclusive in its schema, the README and its tests",
+      "valid_rebuttal": "The strict comparison is the documented contract, not a slip. src/api/schemas/common.ts states that every range filter is half-open, with `*_to`/`*_max` exclusive, and the base's createdRangeSchema in the same file already defines created_to as exclusive; listTransfers implements it with `created_at < $n` right above the new amount condition. amountRangeSchema documents `amount_min <= amount < amount_max`, the README says amount_max is exclusive (amount_min=1000&amount_max=5000 is 10.00 up to 49.99 USD), and the test \"includes amount_min and excludes amount_max\" in test/api/transfers.test.ts pins it. Using `<=` would make adjacent ranges overlap.",
+      "hidden_tests": ["test/hidden/transferAmountRange.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/transferAmountRange.test.ts"
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

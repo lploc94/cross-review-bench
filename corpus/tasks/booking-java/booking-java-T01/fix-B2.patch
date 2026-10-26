@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/innkeep/booking/domain/PromoCode.java b/src/main/java/com/innkeep/booking/domain/PromoCode.java
+index 08afaed..7834e43 100644
+--- a/src/main/java/com/innkeep/booking/domain/PromoCode.java
++++ b/src/main/java/com/innkeep/booking/domain/PromoCode.java
+@@ -114,7 +114,7 @@ public class PromoCode extends AbstractEntity<Long> {
+ 
+   /** Whether a booking made on {@code today}, the property's local date, may use the code. */
+   public boolean isValidOn(LocalDate today) {
+-    return !today.isBefore(validFrom) && today.isBefore(validUntil);
++    return !today.isBefore(validFrom) && !today.isAfter(validUntil);
+   }
+ 
+   public boolean hasUsesLeft() {

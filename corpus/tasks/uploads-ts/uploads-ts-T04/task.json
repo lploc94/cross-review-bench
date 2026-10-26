@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T04",
+  "repo": "uploads-ts",
+  "kind": "buggy",
+  "title": "Presigned upload URLs",
+  "description": "Tenants want to let someone without an API key (a customer on their portal, a partner's script) drop one file into their space, the same way signed links let someone download one. This adds presigned upload URLs.\n\n- `POST /v1/uploads/presign` (scope `files:write`) takes `{path, size, contentType?, expiresIn}` and returns `{url, headers, expiresAt}`. The URL is `/v1/public/uploads?tenant=&path=&size=&exp=&sig=`; `headers` lists what the upload should send (the `Content-Type`, when one was given). `expiresIn` is in seconds, 1 to `SIGNED_URL_MAX_TTL_S` like download links, and the URL stops working once it has passed. `size` above `MAX_UPLOAD_BYTES` is a 413 right away.\n- `PUT /v1/public/uploads?…` needs no Authorization header: the signature (HMAC-SHA256 with `SIGNING_SECRET`) covers the tenant, the normalized path, the size and the expiry. The body must come with a `Content-Length` equal to the signed size (400 otherwise). It then goes through `UploadService.upload` like any PUT: the quota is reserved when the upload arrives, the type is sniffed, the file is scanned, and an existing file at the path is never replaced (409 `path_exists`), so a URL stores at most one file. A changed URL is 403 `invalid_signature`, an expired one 403 `signed_url_expired`.\n- `UrlSigner` gains `signUpload`/`verifyUpload` over `uploadPayload(grant)`, which starts with an `upload` prefix so an upload signature can never pass for a download one. `buildServices` now shares one signer and one `UploadService` between the routes that need them.\n\nTests in `test/api/presignedUploads.test.ts`: upload without a key and no second upload through the same URL, changed parameters, an expired URL, body size, quota at upload time, request validation and scope; `test/services/urlSigner.test.ts` covers the upload payload. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/urlSigner.ts",
+      "lines": [47, 49],
+      "category": "security",
+      "severity": "low",
+      "difficulty": "L1",
+      "summary": "verifyUpload compares the presented signature with the expected one using `===`, a string comparison that stops at the first differing character, while `verify` a few lines above uses `timingSafeEqual` on the decoded bytes. The response time leaks how many leading characters of a guessed signature are right, a timing side channel on the only authority a presigned upload URL has.",
+      "trigger": "Repeated PUTs to /v1/public/uploads with signatures that vary one character at a time, measuring response times.",
+      "testable": false,
+      "hidden_tests": [],
+      "hidden_test_cmd": null,
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "There is nothing to leak: signUpload returns a fresh 64-character HMAC for each grant and the comparison is between two strings of the same fixed length, so `===` takes the same time as timingSafeEqual would; `verify` only needs timingSafeEqual because it decodes hex into Buffers first.",
+      "justification": "A timing side channel of a string comparison cannot be observed deterministically in a test; the fix is a behaviour-preserving switch to the constant-time `verify`."
+    },
+    {
+      "id": "B2",
+      "file": "src/services/presignedUploads.ts",
+      "lines": [66, 66],
+      "category": "spec-deviation",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "presign computes the expiry in milliseconds (`clock.now().getTime() + expiresIn * 1000`) and signs it into `exp`, but authorize compares `exp` with `unixNow(clock)`, which is in seconds. A millisecond timestamp is about 1000 times the current unix time in seconds, so every presigned upload URL stays valid for tens of thousands of years instead of `expiresIn` seconds, as the description promises. The `expiresAt` returned to the caller (`new Date(exp)`) looks right, which hides it.",
+      "trigger": "Presign with expiresIn 600, advance the clock by 601 seconds (or any amount), PUT: 201 instead of 403 signed_url_expired.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/presignedUploadExpiry.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/presignedUploadExpiry.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "The units agree: exp is a millisecond timestamp everywhere in the presigned flow, the API returns `expiresAt` as `new Date(exp)`, which the test checks is exactly ten minutes after the request, and the visible test \"refuses an expired URL\" shows authorize turning an expired URL away with 403 signed_url_expired.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

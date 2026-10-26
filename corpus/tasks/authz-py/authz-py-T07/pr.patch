@@ -1,0 +1,439 @@
+diff --git a/.env.example b/.env.example
+index dea4cd1..d860b3c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -13,6 +13,7 @@ LOGIN_RATE_WINDOW_SECONDS=300
+ REFRESH_RATE_LIMIT=60
+ REFRESH_RATE_WINDOW_SECONDS=60
+ INVITATION_TTL_SECONDS=604800
++AUDIT_EXPORT_PAGE_SIZE=500
+ PUBLIC_BASE_URL=http://localhost:8000
+ TRUST_PROXY_HEADERS=false
+ MAIL_BACKEND=log
+diff --git a/README.md b/README.md
+index 20ef4f0..627a109 100644
+--- a/README.md
++++ b/README.md
+@@ -84,7 +84,11 @@ invitation is used once.
+ `target_type`, `target_id`, `data`, client `ip`, `created_at`) in the same transaction as the
+ change, so an event exists exactly when its change does. Events are never updated (a trigger
+ refuses it). `GET /v1/orgs/{org_id}/audit` pages through them newest first with an opaque
+-cursor.
++cursor. For compliance exports, `GET /v1/orgs/{org_id}/audit/export` streams the whole log (or
++one `action`) as NDJSON, newest first: one event per line with the same fields plus
++`actor_email`, the actor's current address (`null` for system events). The export reads
++`AUDIT_EXPORT_PAGE_SIZE` events at a time from one read-only snapshot, so events written while
++it runs do not shift it.
+ 
+ ## API
+ 
+@@ -115,6 +119,7 @@ cursor.
+ | POST, GET | `/v1/orgs/{org_id}/invitations` | `invitations:manage` |
+ | POST | `/v1/invitations/{token}/accept` | access token of the invited address |
+ | GET | `/v1/orgs/{org_id}/audit?cursor=&limit=&action=` | `audit:read` |
++| GET | `/v1/orgs/{org_id}/audit/export?action=` | `audit:read`; NDJSON stream |
+ 
+ Paginated lists answer `{"data": [...], "next_cursor": "…" | null}` (`limit` 1–200, default 50);
+ other lists answer `{"data": [...]}`. Errors always have the shape
+@@ -181,6 +186,7 @@ tests/                 pytest suites; tests/helpers has the clock, test doubles
+ | `LOGIN_RATE_LIMIT`, `LOGIN_RATE_WINDOW_SECONDS` | `10`, `300` | per email and IP |
+ | `REFRESH_RATE_LIMIT`, `REFRESH_RATE_WINDOW_SECONDS` | `60`, `60` | per IP |
+ | `INVITATION_TTL_SECONDS` | `604800` | 7 days |
++| `AUDIT_EXPORT_PAGE_SIZE` | `500` | events per query of an audit export, 10–5000 |
+ | `PUBLIC_BASE_URL` | `http://localhost:8000` | base of links in emails; https in production |
+ | `TRUST_PROXY_HEADERS` | `false` | take the client IP from `X-Forwarded-For` |
+ | `MAIL_BACKEND` | `log` | `log` (logs recipient and subject only) or `smtp` |
+diff --git a/src/authz/api/routers/audit.py b/src/authz/api/routers/audit.py
+index 7425a2a..b4a7986 100644
+--- a/src/authz/api/routers/audit.py
++++ b/src/authz/api/routers/audit.py
+@@ -2,14 +2,17 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import AsyncIterator
+ from typing import Annotated
+ 
+ from fastapi import APIRouter, Depends, Query
++from fastapi.responses import StreamingResponse
+ 
+ from authz.api.deps import Authorized, ContainerDep, require
+ from authz.api.schemas.common import PageResponse
+-from authz.api.schemas.resources import AuditEventResponse
++from authz.api.schemas.resources import AuditEventResponse, AuditExportLine
+ from authz.domain.permissions import Permission
++from authz.services.audit import ExportedEvent
+ 
+ router = APIRouter(tags=["audit"])
+ 
+@@ -30,3 +33,30 @@ async def list_audit_events(
+         data=[AuditEventResponse.of(event) for event in page.items],
+         next_cursor=page.next_cursor,
+     )
++
++
++@router.get(
++    "/v1/orgs/{org_id}/audit/export",
++    response_class=StreamingResponse,
++    responses={200: {"content": {"application/x-ndjson": {}}}},
++)
++async def export_audit_events(
++    auth: CanReadAudit,
++    container: ContainerDep,
++    action: Annotated[str | None, Query(max_length=100)] = None,
++) -> StreamingResponse:
++    """The whole log as NDJSON, newest first: one event per line, with the actor's email."""
++    events = container.audit.export(auth.org_id, action=action)
++    return StreamingResponse(
++        _ndjson(events),
++        media_type="application/x-ndjson",
++        headers={
++            "Content-Disposition": f'attachment; filename="audit-{auth.org_id}.ndjson"',
++            "Cache-Control": "no-store",
++        },
++    )
++
++
++async def _ndjson(events: AsyncIterator[ExportedEvent]) -> AsyncIterator[str]:
++    async for item in events:
++        yield AuditExportLine.of_export(item).model_dump_json() + "\n"
+diff --git a/src/authz/api/schemas/resources.py b/src/authz/api/schemas/resources.py
+index 34ea56e..77a736f 100644
+--- a/src/authz/api/schemas/resources.py
++++ b/src/authz/api/schemas/resources.py
+@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
+ 
+ from authz.api.schemas.common import RequestModel, ResponseModel
+ from authz.models import AuditEvent, Invitation, Project
++from authz.services.audit import ExportedEvent
+ 
+ 
+ class ProjectCreate(RequestModel):
+@@ -84,3 +85,15 @@ class AuditEventResponse(ResponseModel):
+     @classmethod
+     def of(cls, event: AuditEvent) -> AuditEventResponse:
+         return cls.model_validate(event)
++
++
++class AuditExportLine(AuditEventResponse):
++    """One line of an NDJSON audit export."""
++
++    actor_email: str | None
++
++    @classmethod
++    def of_export(cls, item: ExportedEvent) -> AuditExportLine:
++        return cls.model_validate(
++            {**AuditEventResponse.of(item.event).model_dump(), "actor_email": item.actor_email}
++        )
+diff --git a/src/authz/config.py b/src/authz/config.py
+index 9ee6ede..1c0633e 100644
+--- a/src/authz/config.py
++++ b/src/authz/config.py
+@@ -60,6 +60,7 @@ class Settings(BaseSettings):
+     refresh_rate_window_seconds: int = Field(default=60, ge=1, le=86_400)
+ 
+     invitation_ttl_seconds: int = Field(default=7 * 86_400, ge=60, le=90 * 86_400)
++    audit_export_page_size: int = Field(default=500, ge=10, le=5_000)
+     public_base_url: str = "http://localhost:8000"
+ 
+     trust_proxy_headers: bool = False
+diff --git a/src/authz/container.py b/src/authz/container.py
+index db4b112..dcc2c4b 100644
+--- a/src/authz/container.py
++++ b/src/authz/container.py
+@@ -163,6 +163,6 @@ def build_container(
+                 accept_url_base=settings.public_base_url,
+             ),
+         ),
+-        audit=AuditQueryService(db),
++        audit=AuditQueryService(db, export_page_size=settings.audit_export_page_size),
+         health=HealthService({"database": check_database, "redis": check_redis}),
+     )
+diff --git a/src/authz/infra/db.py b/src/authz/infra/db.py
+index 35c3bbb..3ef3656 100644
+--- a/src/authz/infra/db.py
++++ b/src/authz/infra/db.py
+@@ -53,6 +53,15 @@ class Database:
+         async with self._sessions() as session:
+             yield session
+ 
++    async def snapshot(self) -> AsyncSession:
++        """A session in a read-only REPEATABLE READ transaction, for reads that span many
++        queries: every query sees the database as the first one did. The caller closes it."""
++        session = self._sessions()
++        await session.connection(
++            execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
++        )
++        return session
++
+     async def ping(self) -> None:
+         async with self.engine.connect() as connection:
+             await connection.execute(text("SELECT 1"))
+diff --git a/src/authz/repositories/users.py b/src/authz/repositories/users.py
+index b326e5b..49ca883 100644
+--- a/src/authz/repositories/users.py
++++ b/src/authz/repositories/users.py
+@@ -20,6 +20,10 @@ class UserRepository:
+     async def get(self, user_id: uuid.UUID) -> User | None:
+         return await self._session.get(User, user_id)
+ 
++    async def email_of(self, user_id: uuid.UUID) -> str | None:
++        result = await self._session.execute(select(User.email).where(User.id == user_id))
++        return result.scalar_one_or_none()
++
+     async def get_by_email(self, email: str) -> User | None:
+         """Look a user up by an already normalised address."""
+         result = await self._session.execute(
+diff --git a/src/authz/services/audit.py b/src/authz/services/audit.py
+index f6ec05a..b3888d9 100644
+--- a/src/authz/services/audit.py
++++ b/src/authz/services/audit.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import uuid
++from collections.abc import AsyncIterator
+ from dataclasses import dataclass
+ from datetime import datetime
+ from enum import StrEnum
+@@ -16,6 +17,9 @@ from authz.infra.clock import Clock
+ from authz.infra.db import Database
+ from authz.models import AuditEvent
+ from authz.repositories.audit import AuditRepository
++from authz.repositories.users import UserRepository
++
++EXPORT_PAGE_SIZE = 500
+ 
+ 
+ class AuditAction(StrEnum):
+@@ -99,9 +103,16 @@ def _jsonable(value: Any) -> Any:
+     return value
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class ExportedEvent:
++    event: AuditEvent
++    actor_email: str | None
++
++
+ class AuditQueryService:
+-    def __init__(self, db: Database) -> None:
++    def __init__(self, db: Database, *, export_page_size: int = EXPORT_PAGE_SIZE) -> None:
+         self._db = db
++        self._export_page_size = export_page_size
+ 
+     async def page(
+         self,
+@@ -123,3 +134,36 @@ class AuditQueryService:
+             last = items[-1]
+             next_cursor = Cursor(created_at=last.created_at, id=str(last.id)).encode()
+         return Page(items=items, next_cursor=next_cursor)
++
++    async def export(
++        self, org_id: uuid.UUID, *, action: str | None = None
++    ) -> AsyncIterator[ExportedEvent]:
++        """Every event of the organisation, newest first, with the actor's current email.
++
++        Pages are read from one snapshot, so an export is consistent even while events are
++        being written, and a long export never holds more than one page in memory.
++        """
++        session = await self._db.snapshot()
++        async for item in self._export_pages(session, org_id, action):
++            yield item
++        await session.close()
++
++    async def _export_pages(
++        self, session: AsyncSession, org_id: uuid.UUID, action: str | None
++    ) -> AsyncIterator[ExportedEvent]:
++        events = AuditRepository(session)
++        users = UserRepository(session)
++        after: Cursor | None = None
++        while True:
++            rows = await events.page(
++                org_id, limit=self._export_page_size, after=after, action=action
++            )
++            page = rows[: self._export_page_size]
++            for event in page:
++                email = None
++                if event.actor_id is not None:
++                    email = await users.email_of(event.actor_id)
++                yield ExportedEvent(event=event, actor_email=email)
++            if len(rows) <= self._export_page_size:
++                return
++            after = Cursor(created_at=page[-1].created_at, id=str(page[-1].id))
+diff --git a/tests/api/test_audit_export.py b/tests/api/test_audit_export.py
+new file mode 100644
+index 0000000..12a4fad
+--- /dev/null
++++ b/tests/api/test_audit_export.py
+@@ -0,0 +1,120 @@
++from __future__ import annotations
++
++import json
++import uuid
++from typing import Any
++
++import pytest
++
++from authz.config import Settings
++from authz.domain.principal import Actor
++from authz.services.audit import AuditAction
++from tests.conftest import make_settings
++from tests.helpers.clock import FrozenClock
++from tests.helpers.factories import org_with_member, signed_in
++
++
++@pytest.fixture
++def settings(migrated_database: str, redis_url: str) -> Settings:
++    # Small pages, so a handful of events spans several of them.
++    return make_settings(migrated_database, redis_url, audit_export_page_size=10)
++
++
++def lines(body: str) -> list[dict[str, Any]]:
++    return [json.loads(line) for line in body.splitlines()]
++
++
++async def test_export_streams_every_event_newest_first(client, container, clock: FrozenClock):
++    org, owner, _ = await org_with_member(client, container, "viewer")
++    base = f"/v1/orgs/{org['id']}/projects"
++    for number in range(23):
++        clock.advance(seconds=1)
++        response = await client.post(
++            base, json={"name": f"Project {number}"}, headers=owner.headers
++        )
++        assert response.status_code == 201
++
++    response = await client.get(f"/v1/orgs/{org['id']}/audit/export", headers=owner.headers)
++
++    assert response.status_code == 200
++    assert response.headers["content-type"].startswith("application/x-ndjson")
++    assert response.headers["content-disposition"] == (
++        f'attachment; filename="audit-{org["id"]}.ndjson"'
++    )
++    events = lines(response.text)
++    created = [e["data"]["name"] for e in events if e["action"] == "project.created"]
++    assert created == [f"Project {number}" for number in reversed(range(23))]
++    assert events[-1]["action"] == "org.created"
++    ids = [e["id"] for e in events]
++    assert len(ids) == len(set(ids))
++
++
++async def test_export_names_the_actor(client, container):
++    org, owner, _ = await org_with_member(client, container, "viewer")
++    async with container.db.transaction() as session:
++        await container.audit_log.record(
++            session,
++            Actor.system(),
++            org_id=uuid.UUID(org["id"]),
++            action=AuditAction.ORG_UPDATED,
++            target_type="organization",
++            target_id=org["id"],
++            data={"name": "Acme Rockets"},
++        )
++
++    response = await client.get(f"/v1/orgs/{org['id']}/audit/export", headers=owner.headers)
++
++    events = lines(response.text)
++    assert events[0]["action"] == "org.updated"
++    assert events[0]["actor_id"] is None
++    assert events[0]["actor_email"] is None
++    by_owner = [e for e in events if e["actor_id"] == str(owner.id)]
++    assert by_owner
++    assert {e["actor_email"] for e in by_owner} == {owner.email}
++
++
++async def test_export_filters_by_action(client, container):
++    org, owner, _ = await org_with_member(client, container, "viewer")
++    await client.post(
++        f"/v1/orgs/{org['id']}/projects", json={"name": "Vega"}, headers=owner.headers
++    )
++
++    response = await client.get(
++        f"/v1/orgs/{org['id']}/audit/export",
++        params={"action": "project.created"},
++        headers=owner.headers,
++    )
++
++    assert [(e["action"], e["data"]) for e in lines(response.text)] == [
++        ("project.created", {"name": "Vega"})
++    ]
++
++
++async def test_export_of_an_empty_selection_is_empty(client, container):
++    org, owner, _ = await org_with_member(client, container, "viewer")
++
++    response = await client.get(
++        f"/v1/orgs/{org['id']}/audit/export",
++        params={"action": "project.deleted"},
++        headers=owner.headers,
++    )
++
++    assert response.status_code == 200
++    assert response.text == ""
++
++
++async def test_export_requires_audit_read(client, container):
++    org, _, member = await org_with_member(client, container, "member")
++
++    response = await client.get(f"/v1/orgs/{org['id']}/audit/export", headers=member.headers)
++
++    assert response.status_code == 403
++
++
++async def test_export_of_another_organisation_is_not_found(client, container):
++    org, _, _ = await org_with_member(client, container, "viewer")
++    stranger = await signed_in(client, container)
++
++    response = await client.get(f"/v1/orgs/{org['id']}/audit/export", headers=stranger.headers)
++
++    assert response.status_code == 404
+diff --git a/tests/infra/test_db.py b/tests/infra/test_db.py
+index 497e8c9..e864904 100644
+--- a/tests/infra/test_db.py
++++ b/tests/infra/test_db.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ import pytest
++from sqlalchemy import text
++from sqlalchemy.exc import DBAPIError
+ 
+ from authz.infra.db import to_driver_url
+ 
+@@ -27,3 +29,20 @@ def test_driver_url_rejects_other_databases():
+ 
+ async def test_ping(container):
+     await container.db.ping()
++
++
++async def test_snapshot_sees_one_state_and_cannot_write(container):
++    count = text("SELECT count(*) FROM users")
++    snapshot = await container.db.snapshot()
++    try:
++        before = (await snapshot.execute(count)).scalar_one()
++        async with container.db.transaction() as session:
++            await session.execute(
++                text("INSERT INTO users (id, email, password_hash) VALUES (:id, :email, 'x')"),
++                {"id": "6f1c1d2e-0000-4000-8000-000000000001", "email": "snap@example.com"},
++            )
++        assert (await snapshot.execute(count)).scalar_one() == before
++        with pytest.raises(DBAPIError, match="read-only transaction"):
++            await snapshot.execute(text("DELETE FROM users"))
++    finally:
++        await snapshot.close()
+diff --git a/tests/unit/test_config.py b/tests/unit/test_config.py
+index 976b3af..003d5bb 100644
+--- a/tests/unit/test_config.py
++++ b/tests/unit/test_config.py
+@@ -76,3 +76,11 @@ def test_error_message_never_contains_secrets(env):
+         load_settings()
+ 
+     assert "tiny-secret-value" not in str(caught.value)
++
++
++def test_audit_export_page_size_is_bounded(env):
++    assert load_settings().audit_export_page_size == 500
++    env.setenv("AUDIT_EXPORT_PAGE_SIZE", "5")
++
++    with pytest.raises(ConfigError, match="AUDIT_EXPORT_PAGE_SIZE"):
++        load_settings()

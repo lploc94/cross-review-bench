@@ -1,0 +1,15 @@
+diff --git a/src/etl/pipeline/runner.py b/src/etl/pipeline/runner.py
+index a1c5135..8ea165b 100644
+--- a/src/etl/pipeline/runner.py
++++ b/src/etl/pipeline/runner.py
+@@ -138,6 +138,10 @@ class Pipeline:
+                 # The drift policy refused the file before anything was staged: the run is
+                 # recorded as failed together with its drift, which `etl runs show` lists.
+                 self._record_failure(spec, attempt, drift)
++                if drift.undeclared:
++                    # Columns nobody declared mean the export changed shape: fail the command.
++                    drift.run_id = run_id
++                    raise
+                 return RunResult(
+                     run_id=run_id,
+                     source=spec.name,

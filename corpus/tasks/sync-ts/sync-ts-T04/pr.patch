@@ -1,0 +1,951 @@
+diff --git a/README.md b/README.md
+index 603ec06..607ccd1 100644
+--- a/README.md
++++ b/README.md
+@@ -22,7 +22,7 @@ by a zod schema on the client and again on the server:
+ | Collection | Fields |
+ |---|---|
+ | `notes` | `title` (≤200 chars), `body` (≤8000), `pinned` (boolean), `tags` (≤20 non-empty strings of ≤40), `color` (`none`, `red`, `orange`, `yellow`, `green`, `blue`, `purple`) |
+-| `tasks` | `title` (≤200), `done` (boolean), `dueDate` (`YYYY-MM-DD` or null), `priority` (0–3), `notes` (≤4000), `noteId` (a document id or null) |
++| `tasks` | `title` (≤200), `done` (boolean), `dueDate` (`YYYY-MM-DD` or null), `priority` (0–3), `notes` (≤4000), `noteId` (a document id or null), `timeSpentSec` (counter) |
+ 
+ Document ids are 1–64 letters, digits, `_` or `-`, chosen by the client. Documents are never
+ deleted.
+@@ -42,6 +42,13 @@ document carries the timestamp of the write that set it; a write replaces a fiel
+ timestamp is greater. The server applies the same rule, so the order in which mutations arrive
+ does not change the result.
+ 
++**Counters.** A counter field (`tasks.timeSpentSec`) is not last-writer-wins: it holds the sum
++of every increment made on any device. `SyncClient.increment(collection, id, field, delta)` adds
++a non-zero integer delta (at most 10⁹ either way) to the local total at once and queues an
++`increment` mutation, whose `fields` hold the delta of each counter. The server adds each
++increment once, and its event carries the delta, which a pull adds to the local total of every
++other device. A `set` cannot write a counter, and an increment cannot write any other field.
++
+ **Push.** `POST /v1/sync/push` takes up to `PUSH_MAX_MUTATIONS` mutations and applies them in one
+ transaction. Mutation ids already recorded for the user are acknowledged without being applied
+ again, so a client that lost an answer can simply send the batch again. Every field write that
+diff --git a/packages/client/src/cli/fieldValues.ts b/packages/client/src/cli/fieldValues.ts
+index 74a1253..357cc2f 100644
+--- a/packages/client/src/cli/fieldValues.ts
++++ b/packages/client/src/cli/fieldValues.ts
+@@ -16,6 +16,7 @@ const KINDS: { readonly [C in CollectionName]: { readonly [F in keyof Required<F
+     priority: "integer",
+     notes: "text",
+     noteId: "nullableText",
++    timeSpentSec: "integer",
+   },
+ };
+ 
+diff --git a/packages/client/src/store/outboxStore.ts b/packages/client/src/store/outboxStore.ts
+index 2b0089c..14d9a7d 100644
+--- a/packages/client/src/store/outboxStore.ts
++++ b/packages/client/src/store/outboxStore.ts
+@@ -1,4 +1,4 @@
+-import type { Mutation } from "@sync/shared";
++import type { Mutation, MutationOp } from "@sync/shared";
+ import type { Statement } from "better-sqlite3";
+ import type { SqliteDatabase } from "./database.js";
+ import { parseJsonObject } from "./errors.js";
+@@ -18,6 +18,7 @@ interface OutboxRow {
+   mutation_id: string;
+   collection: string;
+   doc_id: string;
++  op: MutationOp;
+   fields: string;
+   hlc: string;
+   attempts: number;
+@@ -31,7 +32,7 @@ function toEntry(row: OutboxRow): OutboxEntry {
+       mutationId: row.mutation_id,
+       collection: row.collection,
+       docId: row.doc_id,
+-      op: "set",
++      op: row.op,
+       fields: parseJsonObject<unknown>(row.fields, `fields of outbox entry ${row.seq}`),
+       hlc: row.hlc,
+     },
+@@ -40,14 +41,14 @@ function toEntry(row: OutboxRow): OutboxEntry {
+   };
+ }
+ 
+-const COLUMNS = "seq, mutation_id, collection, doc_id, fields, hlc, attempts, last_error";
++const COLUMNS = "seq, mutation_id, collection, doc_id, op, fields, hlc, attempts, last_error";
+ /** Longest error message kept in `last_error`. */
+ const MAX_ERROR_LENGTH = 500;
+ 
+ /** The `outbox` table: mutations in the order they were made, until the server acknowledges them. */
+ export class OutboxStore {
+   private readonly db: SqliteDatabase;
+-  private readonly insert: Statement<[string, string, string, string, string]>;
++  private readonly insert: Statement<[string, string, string, MutationOp, string, string]>;
+   private readonly selectAfter: Statement<[number, number], OutboxRow>;
+   private readonly deleteByMutationId: Statement<[string]>;
+   private readonly markFailed: Statement<[string, number]>;
+@@ -56,7 +57,7 @@ export class OutboxStore {
+   constructor(db: SqliteDatabase) {
+     this.db = db;
+     this.insert = db.prepare(
+-      "INSERT INTO outbox (mutation_id, collection, doc_id, fields, hlc) VALUES (?, ?, ?, ?, ?)",
++      "INSERT INTO outbox (mutation_id, collection, doc_id, op, fields, hlc) VALUES (?, ?, ?, ?, ?, ?)",
+     );
+     this.selectAfter = db.prepare(`SELECT ${COLUMNS} FROM outbox WHERE seq > ? ORDER BY seq LIMIT ?`);
+     this.deleteByMutationId = db.prepare("DELETE FROM outbox WHERE mutation_id = ?");
+@@ -72,6 +73,7 @@ export class OutboxStore {
+       mutation.mutationId,
+       mutation.collection,
+       mutation.docId,
++      mutation.op,
+       JSON.stringify(mutation.fields),
+       mutation.hlc,
+     );
+diff --git a/packages/client/src/store/schema.ts b/packages/client/src/store/schema.ts
+index 7ffd9ff..6f3bc81 100644
+--- a/packages/client/src/store/schema.ts
++++ b/packages/client/src/store/schema.ts
+@@ -39,12 +39,22 @@ const V1 = `
+   ) WITHOUT ROWID;
+ `;
+ 
++const V2 = `
++  -- Outbox entries are sets (field values) or increments (counter deltas).
++  ALTER TABLE outbox ADD COLUMN op TEXT NOT NULL DEFAULT 'set' CHECK (op IN ('set', 'increment'));
++`;
++
+ export const CLIENT_MIGRATIONS: readonly SchemaMigration[] = [
+   {
+     version: 1,
+     description: "docs, outbox and meta",
+     up: (db) => db.exec(V1),
+   },
++  {
++    version: 2,
++    description: "outbox op",
++    up: (db) => db.exec(V2),
++  },
+ ];
+ 
+ export const CLIENT_SCHEMA_VERSION = CLIENT_MIGRATIONS.length;
+diff --git a/packages/client/src/sync/applyRemote.ts b/packages/client/src/sync/applyRemote.ts
+index 7e200fb..36c8088 100644
+--- a/packages/client/src/sync/applyRemote.ts
++++ b/packages/client/src/sync/applyRemote.ts
+@@ -1,7 +1,9 @@
+ import {
+   EMPTY_DOC_STATE,
++  addToCounters,
+   docKey,
+   isCollectionName,
++  isCounterField,
+   isValidFieldValue,
+   mergeWrites,
+   parseHlc,
+@@ -16,7 +18,7 @@ import type { DocumentChange } from "./changes.js";
+ 
+ export interface RemoteApplyResult {
+   readonly changes: DocumentChange[];
+-  /** Field writes that replaced the local value. */
++  /** Field writes that replaced the local value, and increments of other devices. */
+   readonly applied: number;
+ }
+ 
+@@ -24,12 +26,17 @@ interface PendingDoc {
+   readonly collection: CollectionName;
+   readonly id: string;
+   readonly writes: FieldWrite[];
++  /** Deltas other devices added to counter fields, per field. */
++  readonly deltas: Record<string, number>;
++  counted: number;
+ }
+ 
+ /**
+  * Apply pulled events to the replica with the same per-field last-writer-wins as the server, and
+  * merge each event's timestamp into the local clock. A write older than the local value of its
+- * field (a local change not pushed yet, or the echo of this replica's own write) is skipped.
++ * field (a local change not pushed yet, or the echo of this replica's own write) is skipped. An
++ * event of a counter field carries one increment's delta: it is added to the local total unless
++ * this replica made the increment (it counted it locally then).
+  * Run inside the transaction that also stores the pull cursor.
+  */
+ export function applyRemoteEvents(docs: DocsStore, hlc: Hlc, events: readonly SyncEvent[]): RemoteApplyResult {
+@@ -45,10 +52,15 @@ export function applyRemoteEvents(docs: DocsStore, hlc: Hlc, events: readonly Sy
+     const key = docKey(event.collection, event.docId);
+     let doc = pending.get(key);
+     if (!doc) {
+-      doc = { collection: event.collection, id: event.docId, writes: [] };
++      doc = { collection: event.collection, id: event.docId, writes: [], deltas: {}, counted: 0 };
+       pending.set(key, doc);
+     }
+-    doc.writes.push({ field: event.field, value: event.value, hlc: event.hlc });
++    if (!isCounterField(event.collection, event.field)) {
++      doc.writes.push({ field: event.field, value: event.value, hlc: event.hlc });
++    } else if (parseHlc(event.hlc).node !== hlc.node) {
++      doc.deltas[event.field] = (doc.deltas[event.field] ?? 0) + (event.value as number);
++      doc.counted += 1;
++    }
+   }
+ 
+   const changes: DocumentChange[] = [];
+@@ -56,14 +68,15 @@ export function applyRemoteEvents(docs: DocsStore, hlc: Hlc, events: readonly Sy
+   for (const doc of pending.values()) {
+     const current = docs.get(doc.collection, doc.id) ?? EMPTY_DOC_STATE;
+     const merged = mergeWrites(current, doc.writes);
+-    if (merged.applied.length === 0) continue;
+-    docs.put(doc.collection, doc.id, merged.state);
+-    applied += merged.applied.length;
++    if (merged.applied.length === 0 && doc.counted === 0) continue;
++    const state = addToCounters(merged.state, doc.deltas);
++    docs.put(doc.collection, doc.id, state);
++    applied += merged.applied.length + doc.counted;
+     changes.push({
+       collection: doc.collection,
+       id: doc.id,
+-      fields: merged.state.fields,
+-      changedFields: [...new Set(merged.applied.map((w) => w.field))].sort(),
++      fields: state.fields,
++      changedFields: [...new Set([...merged.applied.map((w) => w.field), ...Object.keys(doc.deltas)])].sort(),
+       source: "remote",
+     });
+   }
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 694c08a..e554f5d 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -4,6 +4,7 @@ import {
+   Hlc,
+   MutationValidationError,
+   SyncError,
++  addToCounters,
+   cryptoRandom,
+   fieldWritesOf,
+   formatHlc,
+@@ -17,6 +18,7 @@ import {
+   type CollectionName,
+   type FieldsOf,
+   type Mutation,
++  type MutationOp,
+   type PhysicalClock,
+   type RandomSource,
+ } from "@sync/shared";
+@@ -71,7 +73,7 @@ export interface SyncResult {
+   readonly pushed: number;
+   /** Remote events received. */
+   readonly pulled: number;
+-  /** Remote field writes that replaced a local value. */
++  /** Remote field writes that replaced a local value, and increments of other devices. */
+   readonly applied: number;
+ }
+ 
+@@ -118,8 +120,11 @@ export interface ListPage {
+   readonly afterId?: string;
+ }
+ 
+-/** Validate a local write; returns the parsed field values. */
+-function checkLocalWrite(write: LocalWrite): Record<string, unknown> {
++/** Validate a local write; returns the parsed field values (or counter deltas). */
++function checkLocalWrite(
++  write: { readonly collection: string; readonly id: string; readonly fields: Readonly<Record<string, unknown>> },
++  op: MutationOp = "set",
++): Record<string, unknown> {
+   if (!isCollectionName(write.collection)) {
+     throw new MutationValidationError(`unknown collection ${JSON.stringify(write.collection)}`, [
+       { field: "", message: "unknown collection" },
+@@ -130,7 +135,7 @@ function checkLocalWrite(write: LocalWrite): Record<string, unknown> {
+       { field: "", message: "document ids are 1 to 64 letters, digits, '_' or '-'" },
+     ]);
+   }
+-  return validateFieldWrites(write.collection, write.fields);
++  return validateFieldWrites(write.collection, write.fields, op);
+ }
+ 
+ /**
+@@ -246,6 +251,36 @@ export class SyncClient {
+     return results.map((r) => r.mutation);
+   }
+ 
++  /**
++   * Add `delta` to a counter field of a document (creating the document if needed), applied to
++   * the replica and queued for the server in one transaction. Increments made on every device
++   * add up: the server sums them, and a pull adds the other devices' deltas to the local total.
++   */
++  increment<C extends CollectionName>(collection: C, id: string, field: string, delta: number): Mutation {
++    this.assertOpen();
++    const deltas = checkLocalWrite({ collection, id, fields: { [field]: delta } }, "increment") as Record<string, number>;
++    const { db, docs, outbox, meta, hlc, random } = this.parts;
++    const result = db.transaction(() => {
++      const ts = hlc.now();
++      const mutation: Mutation = {
++        mutationId: randomUuid(random),
++        collection,
++        docId: id,
++        op: "increment",
++        fields: deltas,
++        hlc: formatHlc(ts),
++      };
++      const state = addToCounters(docs.get(collection, id) ?? EMPTY_DOC_STATE, deltas);
++      docs.put(collection, id, state);
++      outbox.append(mutation);
++      meta.setLastHlc(ts);
++      const change: DocumentChange = { collection, id, fields: state.fields, changedFields: [field], source: "local" };
++      return { mutation, change };
++    })();
++    this.parts.emitter.emit([result.change]);
++    return result.mutation;
++  }
++
+   get<C extends CollectionName>(collection: C, id: string): TypedDocument<C> | null {
+     this.assertOpen();
+     const doc = this.parts.docs.get(collection, id);
+diff --git a/packages/client/test/e2e/counters.test.ts b/packages/client/test/e2e/counters.test.ts
+new file mode 100644
+index 0000000..c8985a9
+--- /dev/null
++++ b/packages/client/test/e2e/counters.test.ts
+@@ -0,0 +1,64 @@
++import { NetworkError } from "@sync/client";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { openClient, type TestClient } from "../helpers/clients.js";
++import { startTestServer, type TestAccount, type TestServer } from "../helpers/testServer.js";
++
++let server: TestServer;
++let laptop: TestAccount;
++let phone: TestAccount;
++const opened: TestClient[] = [];
++
++function client(account: TestAccount): TestClient {
++  const c = openClient(server, account);
++  opened.push(c);
++  return c;
++}
++
++beforeEach(async () => {
++  server = await startTestServer();
++  laptop = await server.createUser("Ada");
++  phone = await server.addDevice(laptop);
++});
++
++afterEach(async () => {
++  for (const c of opened.splice(0)) await c.client.close();
++  await server.close();
++});
++
++describe("counter fields", () => {
++  it("count a local increment at once and queue it", () => {
++    const a = client(laptop);
++    a.client.set("tasks", "t1", { title: "Review" });
++    expect(a.client.increment("tasks", "t1", "timeSpentSec", 300)).toMatchObject({ op: "increment" });
++    a.client.increment("tasks", "t1", "timeSpentSec", 120);
++    expect(a.client.get("tasks", "t1")?.fields).toEqual({ title: "Review", timeSpentSec: 420 });
++    expect(() => a.client.increment("tasks", "t1", "priority", 1)).toThrow(/not a counter/);
++    expect(() => a.client.set("tasks", "t1", { timeSpentSec: 1 })).toThrow(/counter/);
++  });
++
++  it("add up concurrent increments of two devices on both", async () => {
++    const a = client(laptop);
++    const b = client(phone);
++    a.client.increment("tasks", "t1", "timeSpentSec", 600);
++    b.client.increment("tasks", "t1", "timeSpentSec", 45);
++    b.client.increment("tasks", "t1", "timeSpentSec", 15);
++
++    await a.client.sync();
++    expect(await b.client.sync()).toMatchObject({ pushed: 2, pulled: 3, applied: 1 });
++    expect(await a.client.sync()).toMatchObject({ pulled: 2, applied: 2 });
++    for (const c of [a, b]) expect(c.client.get("tasks", "t1")?.fields).toEqual({ timeSpentSec: 660 });
++  });
++
++  it("count an increment once when its push answer was lost", async () => {
++    const a = client(laptop);
++    a.client.increment("tasks", "t1", "timeSpentSec", 90);
++    a.transport.dropNextResponse();
++    await expect(a.client.sync()).rejects.toBeInstanceOf(NetworkError);
++    await a.client.sync();
++    expect(a.client.get("tasks", "t1")?.fields).toEqual({ timeSpentSec: 90 });
++
++    const fresh = client(phone);
++    await fresh.client.sync();
++    expect(fresh.client.get("tasks", "t1")?.fields).toEqual({ timeSpentSec: 90 });
++  });
++});
+diff --git a/packages/client/test/store/migrator.test.ts b/packages/client/test/store/migrator.test.ts
+index ac02670..279a9d9 100644
+--- a/packages/client/test/store/migrator.test.ts
++++ b/packages/client/test/store/migrator.test.ts
+@@ -1,4 +1,5 @@
+ import {
++  CLIENT_MIGRATIONS,
+   CLIENT_SCHEMA_VERSION,
+   IN_MEMORY,
+   SchemaVersionError,
+@@ -22,7 +23,7 @@ describe("client schema migrator", () => {
+     const db = openDatabase(IN_MEMORY);
+     expect(migrate(db)).toEqual({ from: 0, to: CLIENT_SCHEMA_VERSION });
+     expect(tables(db)).toEqual(["docs", "meta", "outbox"]);
+-    expect(schemaVersion(db)).toBe(1);
++    expect(schemaVersion(db)).toBe(CLIENT_SCHEMA_VERSION);
+     db.close();
+   });
+ 
+@@ -32,13 +33,13 @@ describe("client schema migrator", () => {
+     migrate(first);
+     first.close();
+     const again = openDatabase(path);
+-    expect(migrate(again)).toEqual({ from: 1, to: 1 });
++    expect(migrate(again)).toEqual({ from: CLIENT_SCHEMA_VERSION, to: CLIENT_SCHEMA_VERSION });
+     again.close();
+   });
+ 
+   it("applies later migrations in order", () => {
+     const db = openDatabase(IN_MEMORY);
+-    migrate(db);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
+     const steps: SchemaMigration[] = [
+       { version: 1, description: "base", up: () => expect.unreachable() },
+       { version: 2, description: "add a table", up: (d) => d.exec("CREATE TABLE extra (id TEXT)") },
+@@ -51,7 +52,7 @@ describe("client schema migrator", () => {
+ 
+   it("leaves the previous version intact when a migration fails", () => {
+     const db = openDatabase(IN_MEMORY);
+-    migrate(db);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
+     const steps: SchemaMigration[] = [
+       { version: 1, description: "base", up: () => undefined },
+       {
+diff --git a/packages/server/src/repositories/counters.ts b/packages/server/src/repositories/counters.ts
+new file mode 100644
+index 0000000..1cd9a3c
+--- /dev/null
++++ b/packages/server/src/repositories/counters.ts
+@@ -0,0 +1,84 @@
++import { docKey } from "@sync/shared";
++import type { Queryable } from "../db/pool.js";
++import { toSafeInteger } from "./mapping.js";
++
++/** What one increment adds to one counter field of a document. */
++export interface CounterDelta {
++  readonly mutationId: string;
++  readonly collection: string;
++  readonly docId: string;
++  readonly field: string;
++  readonly delta: number;
++  readonly hlc: string;
++}
++
++/**
++ * Apply counter deltas: each becomes an event whose value is the delta (devices add it to their
++ * own total), and is added to the field's total in the stored document, which is created when
++ * it does not exist yet. Returns the number of events written.
++ */
++export async function applyIncrements(
++  db: Queryable,
++  userId: string,
++  deviceId: string,
++  deltas: readonly CounterDelta[],
++  receivedAt: Date,
++): Promise<number> {
++  if (deltas.length === 0) return 0;
++  // An event is unique per mutation and field: one already stored is kept as it is.
++  const events = await db.query<{ seq: string; collection: string; doc_id: string }>(
++    `INSERT INTO events (user_id, device_id, mutation_id, collection, doc_id, field, value, hlc, server_received_at)
++     SELECT $1, $2, e.mutation_id, e.collection, e.doc_id, e.field, to_jsonb(e.delta), e.hlc, $3
++       FROM unnest($4::uuid[], $5::text[], $6::text[], $7::text[], $8::bigint[], $9::text[])
++            WITH ORDINALITY AS e(mutation_id, collection, doc_id, field, delta, hlc, ord)
++      ORDER BY e.ord
++     ON CONFLICT (user_id, mutation_id, field) DO NOTHING
++     RETURNING seq, collection, doc_id`,
++    [
++      userId,
++      deviceId,
++      receivedAt,
++      deltas.map((d) => d.mutationId),
++      deltas.map((d) => d.collection),
++      deltas.map((d) => d.docId),
++      deltas.map((d) => d.field),
++      deltas.map((d) => d.delta),
++      deltas.map((d) => d.hlc),
++    ],
++  );
++
++  // Per document: the sum of the deltas of each field, and the seq of its last new event.
++  const totals = new Map<string, { collection: string; docId: string; deltas: Record<string, number>; seq: number }>();
++  for (const d of deltas) {
++    const key = docKey(d.collection, d.docId);
++    const doc = totals.get(key) ?? { collection: d.collection, docId: d.docId, deltas: {}, seq: 0 };
++    doc.deltas[d.field] = (doc.deltas[d.field] ?? 0) + d.delta;
++    totals.set(key, doc);
++  }
++  for (const row of events.rows) {
++    const doc = totals.get(docKey(row.collection, row.doc_id));
++    if (doc) doc.seq = Math.max(doc.seq, toSafeInteger(row.seq, "events.seq"));
++  }
++
++  const docs = [...totals.values()];
++  await db.query(
++    `INSERT INTO documents (user_id, collection, doc_id, fields, field_hlcs, updated_seq, updated_at)
++     SELECT $1, d.collection, d.doc_id, d.deltas::jsonb, '{}'::jsonb, d.seq, $2
++       FROM unnest($3::text[], $4::text[], $5::text[], $6::bigint[]) AS d(collection, doc_id, deltas, seq)
++     ON CONFLICT (user_id, collection, doc_id) DO UPDATE
++       SET fields = documents.fields || (
++             SELECT jsonb_object_agg(c.key, coalesce((documents.fields ->> c.key)::bigint, 0) + c.value::bigint)
++               FROM jsonb_each_text(EXCLUDED.fields) AS c),
++           updated_seq = GREATEST(documents.updated_seq, EXCLUDED.updated_seq),
++           updated_at = EXCLUDED.updated_at`,
++    [
++      userId,
++      receivedAt,
++      docs.map((d) => d.collection),
++      docs.map((d) => d.docId),
++      docs.map((d) => JSON.stringify(d.deltas)),
++      docs.map((d) => d.seq),
++    ],
++  );
++  return events.rowCount ?? 0;
++}
+diff --git a/packages/server/src/repositories/mutations.ts b/packages/server/src/repositories/mutations.ts
+index 8037f38..2a35092 100644
+--- a/packages/server/src/repositories/mutations.ts
++++ b/packages/server/src/repositories/mutations.ts
+@@ -40,3 +40,17 @@ export async function claimMutations(
+   );
+   return new Set(result.rows.map((row) => row.mutation_id));
+ }
++
++/** The ids among `mutationIds` that are already recorded for the user. */
++export async function findRecordedMutations(
++  db: Queryable,
++  userId: string,
++  mutationIds: readonly string[],
++): Promise<Set<string>> {
++  if (mutationIds.length === 0) return new Set();
++  const result = await db.query<{ mutation_id: string }>(
++    "SELECT mutation_id FROM mutations WHERE user_id = $1 AND mutation_id = ANY($2::uuid[])",
++    [userId, mutationIds],
++  );
++  return new Set(result.rows.map((row) => row.mutation_id));
++}
+diff --git a/packages/server/src/services/consistencyService.ts b/packages/server/src/services/consistencyService.ts
+index 7ffde12..895fba5 100644
+--- a/packages/server/src/services/consistencyService.ts
++++ b/packages/server/src/services/consistencyService.ts
+@@ -1,6 +1,9 @@
+ import {
+   EMPTY_DOC_STATE,
++  addToCounters,
+   docKey,
++  isCollectionName,
++  isCounterField,
+   jsonEqual,
+   mergeWrites,
+   type DocState,
+@@ -36,9 +39,9 @@ interface Replayed {
+ /**
+  * Checks that the materialised documents of a user are what the change feed says they are:
+  * replaying every event in seq order with last-writer-wins must accept each event (each one won
+- * when it was written) and end with exactly the stored documents. Reads one consistent snapshot
+- * page by page; the replayed documents are held in memory, so it is meant for operators
+- * checking one user, not for a request path.
++ * when it was written), adding the deltas of counter fields, and end with exactly the stored
++ * documents. Reads one consistent snapshot page by page; the replayed documents are held in
++ * memory, so it is meant for operators checking one user, not for a request path.
+  */
+ export class ConsistencyService {
+   private readonly pool: Pool;
+@@ -86,6 +89,12 @@ export class ConsistencyService {
+       for (const event of page) {
+         const key = docKey(event.collection, event.docId);
+         const doc = replayed.get(key) ?? { state: EMPTY_DOC_STATE, lastSeq: 0, seen: false };
++        if (isCollectionName(event.collection) && isCounterField(event.collection, event.field)) {
++          const delta = typeof event.value === "number" ? event.value : 0;
++          const state = addToCounters(doc.state, { [event.field]: delta });
++          replayed.set(key, { state, lastSeq: event.seq, seen: false });
++          continue;
++        }
+         const merged = mergeWrites(doc.state, [{ field: event.field, value: event.value, hlc: event.hlc }]);
+         if (merged.applied.length === 0) {
+           report({ kind: "event_does_not_win", seq: event.seq, doc: key, field: event.field });
+diff --git a/packages/server/src/services/pushService.ts b/packages/server/src/services/pushService.ts
+index 82c0be0..47604fd 100644
+--- a/packages/server/src/services/pushService.ts
++++ b/packages/server/src/services/pushService.ts
+@@ -24,9 +24,10 @@ import {
+   UnavailableError,
+ } from "../domain/errors.js";
+ import type { Logger } from "../infra/logger.js";
++import { applyIncrements, type CounterDelta } from "../repositories/counters.js";
+ import { saveDocuments, loadDocuments, type DocRef, type DocumentWrite } from "../repositories/documents.js";
+ import { insertEvents, type NewEvent } from "../repositories/events.js";
+-import { claimMutations } from "../repositories/mutations.js";
++import { claimMutations, findRecordedMutations } from "../repositories/mutations.js";
+ import { lockUser } from "../repositories/users.js";
+ 
+ export interface PushResult {
+@@ -49,7 +50,8 @@ interface CheckedMutation extends Omit<MutationPayload, "fields"> {
+  * Applies pushed mutations. One request is one transaction: mutations already recorded are
+  * acknowledged without being applied again; the others are recorded, merged field by field into
+  * the stored documents (last writer wins by HLC), and every field write that wins becomes an
+- * event. A request with an invalid mutation changes nothing.
++ * event. Increments add their deltas to the stored counters, and each delta becomes an event. A
++ * request with an invalid mutation changes nothing.
+  */
+ export class PushService {
+   private readonly pool: Pool;
+@@ -70,6 +72,14 @@ export class PushService {
+     // Taken before the transaction, so nothing can fail between the commit and the answer.
+     const serverHlc = formatHlc(this.tick(() => this.hlc.now()));
+     const receivedAt = new Date(this.clock.now());
++    // Unlike a set, an increment applied twice counts twice: leave out the increments already
++    // recorded (a batch sent again after its answer was lost).
++    const recorded = await findRecordedMutations(
++      this.pool,
++      auth.userId,
++      checked.filter((m) => m.op === "increment").map((m) => m.mutationId),
++    );
++    const increments = checked.filter((m) => m.op === "increment" && !recorded.has(m.mutationId));
+ 
+     const { fresh, events } = await withTransaction(this.pool, async (client) => {
+       // Pushes of one user run one at a time: their events get sequence numbers in commit
+@@ -78,7 +88,7 @@ export class PushService {
+         throw new UnauthorizedError("the device's user no longer exists");
+       }
+       const claimed = await claimMutations(client, auth.userId, auth.deviceId, checked, receivedAt);
+-      const freshMutations = checked.filter((m) => claimed.has(m.mutationId));
++      const freshMutations = checked.filter((m) => m.op === "set" && claimed.has(m.mutationId));
+       const refs = uniqueDocs(freshMutations);
+       const stored = await loadDocuments(client, auth.userId, refs);
+       const states = new Map<string, DocState>(
+@@ -118,7 +128,14 @@ export class PushService {
+         writes.push({ ...ref, ...state, updatedSeq: seq });
+       }
+       await saveDocuments(client, auth.userId, writes, receivedAt);
+-      return { fresh: freshMutations.length, events: inserted.length };
++      const counted = await applyIncrements(
++        client,
++        auth.userId,
++        auth.deviceId,
++        increments.flatMap(counterDeltas),
++        receivedAt,
++      );
++      return { fresh: freshMutations.length + increments.length, events: inserted.length + counted };
+     });
+ 
+     this.logger.debug(
+@@ -141,7 +158,7 @@ export class PushService {
+         );
+       }
+       seen.add(mutation.mutationId);
+-      const result = checkFieldWrites(mutation.collection, mutation.fields);
++      const result = checkFieldWrites(mutation.collection, mutation.fields, mutation.op);
+       if (!result.ok) throw new InvalidMutationError(index, mutation.mutationId, result.issues);
+       return { ...mutation, fields: result.fields };
+     });
+@@ -179,6 +196,20 @@ export class PushService {
+   }
+ }
+ 
++/** The counter deltas of an increment, in field-name order. */
++function counterDeltas(mutation: CheckedMutation): CounterDelta[] {
++  return Object.keys(mutation.fields)
++    .sort()
++    .map((field) => ({
++      mutationId: mutation.mutationId,
++      collection: mutation.collection,
++      docId: mutation.docId,
++      field,
++      delta: mutation.fields[field] as number,
++      hlc: mutation.hlc,
++    }));
++}
++
+ /** The documents the mutations write, each once, in first-seen order. */
+ function uniqueDocs(mutations: readonly Pick<MutationPayload, "collection" | "docId">[]): DocRef[] {
+   const refs = new Map<string, DocRef>();
+diff --git a/packages/server/test/api/counters.test.ts b/packages/server/test/api/counters.test.ts
+new file mode 100644
+index 0000000..87d3bc4
+--- /dev/null
++++ b/packages/server/test/api/counters.test.ts
+@@ -0,0 +1,73 @@
++import type { PushResponse } from "@sync/shared";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { ConsistencyService } from "../../src/services/consistencyService.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { addDevice, createUser, hlc, mutation, pull, push, type TestDevice } from "../helpers/fixtures.js";
++
++let t: TestApp;
++let ada: TestDevice;
++let now: number;
++
++beforeEach(async () => {
++  t = await buildTestApp();
++  ada = await createUser(t);
++  now = t.clock.now();
++});
++
++afterEach(async () => {
++  await t.close();
++});
++
++function increment(delta: number, at: string) {
++  return mutation({ collection: "tasks", docId: "task-1", op: "increment", fields: { timeSpentSec: delta }, hlc: at });
++}
++
++async function task() {
++  const result = await t.pool.query<{ fields: Record<string, unknown>; updated_seq: string }>(
++    "SELECT fields, updated_seq FROM documents WHERE user_id = $1 AND collection = 'tasks' AND doc_id = 'task-1'",
++    [ada.userId],
++  );
++  return result.rows[0];
++}
++
++describe("counter fields", () => {
++  it("add up the increments of every device, whatever their timestamps", async () => {
++    const phone = await addDevice(t, ada);
++    await push(t, ada, [mutation({ collection: "tasks", docId: "task-1", fields: { title: "Write report" }, hlc: hlc(now - 50) })]);
++    await push(t, ada, [increment(600, hlc(now - 40))]);
++    await push(t, phone, [increment(300, hlc(now - 45, 0, "device-b")), increment(-60, hlc(now - 44, 0, "device-b"))]);
++    expect((await task())?.fields).toEqual({ title: "Write report", timeSpentSec: 840 });
++
++    const page = (await pull(t, ada)).json<{ events: { field: string; value: unknown; seq: number }[] }>();
++    expect(page.events.map((e) => [e.field, e.value])).toEqual([
++      ["title", "Write report"],
++      ["timeSpentSec", 600],
++      ["timeSpentSec", 300],
++      ["timeSpentSec", -60],
++    ]);
++    expect((await task())?.updated_seq).toBe(String(page.events.at(-1)?.seq));
++  });
++
++  it("counts an increment pushed again once", async () => {
++    const m = increment(120, hlc(now - 10));
++    await push(t, ada, [m]);
++    const again = await push(t, ada, [m, increment(30, hlc(now - 5))]);
++    expect(again.json<PushResponse>().acked).toHaveLength(2);
++    expect((await task())?.fields).toEqual({ timeSpentSec: 150 });
++  });
++
++  it("refuses to set a counter or to increment another field", async () => {
++    const set = await push(t, ada, [mutation({ collection: "tasks", docId: "task-1", fields: { timeSpentSec: 5 }, hlc: hlc(now) })]);
++    expect(set.statusCode).toBe(422);
++    const other = await push(t, ada, [mutation({ collection: "tasks", op: "increment", fields: { priority: 1 }, hlc: hlc(now) })]);
++    expect(other.statusCode).toBe(422);
++    expect(await task()).toBeUndefined();
++  });
++
++  it("leaves the documents consistent with the change feed", async () => {
++    await push(t, ada, [increment(10, hlc(now - 30)), mutation({ collection: "tasks", docId: "task-1", fields: { done: true }, hlc: hlc(now - 20) })]);
++    await push(t, ada, [increment(5, hlc(now - 10))]);
++    const report = await new ConsistencyService({ pool: t.pool, pageSize: 2 }).verifyUser(ada.userId);
++    expect(report).toMatchObject({ events: 3, documents: 1, problems: [] });
++  });
++});
+diff --git a/packages/shared/src/core/collections.ts b/packages/shared/src/core/collections.ts
+index c169496..97bb233 100644
+--- a/packages/shared/src/core/collections.ts
++++ b/packages/shared/src/core/collections.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import type { MutationOp } from "./documents.js";
+ import { DOC_ID_PATTERN } from "./ids.js";
+ import { MutationValidationError, type FieldIssue } from "./errors.js";
+ 
+@@ -49,6 +50,8 @@ const taskFields = {
+   notes: text(4_000),
+   /** The note this task belongs to, if any. */
+   noteId: z.string().regex(DOC_ID_PATTERN).nullable(),
++  /** Seconds spent on the task: a counter, to which every device adds its own time. */
++  timeSpentSec: z.int(),
+ };
+ 
+ export const COLLECTIONS = {
+@@ -59,6 +62,24 @@ export const COLLECTIONS = {
+ export type CollectionName = keyof typeof COLLECTIONS;
+ export const COLLECTION_NAMES = Object.keys(COLLECTIONS) as CollectionName[];
+ 
++/**
++ * Counter fields: integers changed only by `increment` mutations, never by `set`. A counter is
++ * not last-writer-wins: it holds the sum of every delta, so concurrent increments all count.
++ */
++export const COUNTER_FIELDS: { readonly [C in CollectionName]: readonly string[] } = {
++  notes: [],
++  tasks: ["timeSpentSec"],
++};
++
++/** Largest delta of one increment, either way. */
++export const MAX_COUNTER_DELTA = 1_000_000_000;
++
++const counterDelta = z.int().min(-MAX_COUNTER_DELTA).max(MAX_COUNTER_DELTA).refine((d) => d !== 0, "must not be 0");
++
++export function isCounterField(collection: CollectionName, field: string): boolean {
++  return COUNTER_FIELDS[collection].includes(field);
++}
++
+ export type NoteFields = z.output<z.ZodObject<typeof noteFields>>;
+ export type TaskFields = z.output<z.ZodObject<typeof taskFields>>;
+ 
+@@ -88,10 +109,15 @@ export type FieldCheck =
+ 
+ /**
+  * Check the field writes of one mutation: the collection must exist, at least one field must be
+- * written, and every field must belong to the collection and hold a value of its type. Returns
+- * the parsed values (zod output) or every issue found.
++ * written, and every field must belong to the collection and hold a value of its type. A `set`
++ * cannot write a counter; an `increment` writes only counters, each with a non-zero integer
++ * delta. Returns the parsed values (zod output) or every issue found.
+  */
+-export function checkFieldWrites(collection: string, fields: Record<string, unknown>): FieldCheck {
++export function checkFieldWrites(
++  collection: string,
++  fields: Record<string, unknown>,
++  op: MutationOp = "set",
++): FieldCheck {
+   if (!isCollectionName(collection)) {
+     return { ok: false, issues: [{ field: "", message: `unknown collection ${JSON.stringify(collection)}` }] };
+   }
+@@ -102,11 +128,18 @@ export function checkFieldWrites(collection: string, fields: Record<string, unkn
+   const issues: FieldIssue[] = [];
+   const parsed: Record<string, unknown> = {};
+   for (const name of names) {
+-    const schema = fieldSchema(collection, name);
+-    if (!schema) {
++    const known = fieldSchema(collection, name);
++    if (!known) {
+       issues.push({ field: name, message: `unknown field of ${collection}` });
+       continue;
+     }
++    const counter = isCounterField(collection, name);
++    if (counter !== (op === "increment")) {
++      const message = counter ? "is a counter: change it with an increment" : "is not a counter";
++      issues.push({ field: name, message });
++      continue;
++    }
++    const schema = counter ? counterDelta : known;
+     const result = schema.safeParse(fields[name]);
+     if (result.success) {
+       parsed[name] = result.data;
+@@ -124,8 +157,9 @@ export function checkFieldWrites(collection: string, fields: Record<string, unkn
+ export function validateFieldWrites(
+   collection: string,
+   fields: Record<string, unknown>,
++  op: MutationOp = "set",
+ ): Record<string, unknown> {
+-  const result = checkFieldWrites(collection, fields);
++  const result = checkFieldWrites(collection, fields, op);
+   if (!result.ok) {
+     const first = result.issues[0];
+     const summary = first ? (first.field ? `${first.field}: ${first.message}` : first.message) : "invalid";
+diff --git a/packages/shared/src/core/documents.ts b/packages/shared/src/core/documents.ts
+index 93f5195..81b6b80 100644
+--- a/packages/shared/src/core/documents.ts
++++ b/packages/shared/src/core/documents.ts
+@@ -8,15 +8,19 @@ export interface SyncDocument {
+   readonly fields: Readonly<Record<string, unknown>>;
+ }
+ 
++/** `set` writes field values; `increment` adds a delta to each of its counter fields. */
++export type MutationOp = "set" | "increment";
++
+ /**
+- * One local change: set some fields of one document. Creating a document is setting its first
+- * fields. Every field written by a mutation carries the mutation's timestamp.
++ * One local change: set some fields of one document, or add to some of its counters. Creating a
++ * document is setting its first fields. Every field written by a mutation carries the mutation's
++ * timestamp.
+  */
+ export interface Mutation {
+   readonly mutationId: string;
+   readonly collection: string;
+   readonly docId: string;
+-  readonly op: "set";
++  readonly op: MutationOp;
+   readonly fields: Readonly<Record<string, unknown>>;
+   readonly hlc: string;
+ }
+diff --git a/packages/shared/src/core/merge.ts b/packages/shared/src/core/merge.ts
+index 485f651..1e868be 100644
+--- a/packages/shared/src/core/merge.ts
++++ b/packages/shared/src/core/merge.ts
+@@ -20,7 +20,7 @@ export interface FieldWrite {
+ 
+ export interface DocState {
+   readonly fields: Readonly<Record<string, unknown>>;
+-  /** For each field in `fields`, the canonical HLC of the write that set it. */
++  /** For each field in `fields` but counters, the canonical HLC of the write that set it. */
+   readonly fieldHlcs: Readonly<Record<string, string>>;
+ }
+ 
+@@ -75,6 +75,19 @@ export function mergeWrites(state: DocState, writes: readonly FieldWrite[]): Mer
+   return { state: { fields, fieldHlcs }, applied, skipped };
+ }
+ 
++/**
++ * Add each delta to its counter field (a counter never written counts from 0) and return the new
++ * state; `state` is not modified. Counters keep no timestamp: increments commute.
++ */
++export function addToCounters(state: DocState, deltas: Readonly<Record<string, number>>): DocState {
++  const fields: Record<string, unknown> = { ...state.fields };
++  for (const [field, delta] of Object.entries(deltas)) {
++    const current = Object.hasOwn(fields, field) ? fields[field] : undefined;
++    fields[field] = (typeof current === "number" ? current : 0) + delta;
++  }
++  return { fields, fieldHlcs: state.fieldHlcs };
++}
++
+ /** The HLC of the last write to a field, if the field was ever written. */
+ export function fieldHlc(state: DocState, field: string): string | undefined {
+   return storedHlc(state, field);
+diff --git a/packages/shared/src/core/protocol.ts b/packages/shared/src/core/protocol.ts
+index a07635c..87b9951 100644
+--- a/packages/shared/src/core/protocol.ts
++++ b/packages/shared/src/core/protocol.ts
+@@ -28,7 +28,8 @@ export const mutationSchema = z.strictObject({
+   mutationId: uuidSchema,
+   collection: z.string().min(1).max(64),
+   docId: docIdSchema,
+-  op: z.literal("set"),
++  op: z.enum(["set", "increment"]),
++  /** Values for `set`; for `increment`, the delta of each counter field. */
+   fields: z.record(z.string(), z.json()),
+   hlc: hlcSchema,
+ });
+diff --git a/packages/shared/test/collections.test.ts b/packages/shared/test/collections.test.ts
+index 30b5c3d..ffbaa78 100644
+--- a/packages/shared/test/collections.test.ts
++++ b/packages/shared/test/collections.test.ts
+@@ -1,9 +1,11 @@
+ import { describe, expect, it } from "vitest";
+ import {
+   COLLECTION_NAMES,
++  MAX_COUNTER_DELTA,
+   checkFieldWrites,
+   fieldNamesOf,
+   isCollectionName,
++  isCounterField,
+   isValidFieldValue,
+   validateFieldWrites,
+ } from "../src/core/collections.js";
+@@ -14,7 +16,7 @@ describe("collections", () => {
+     expect(COLLECTION_NAMES).toEqual(["notes", "tasks"]);
+     expect(isCollectionName("notes")).toBe(true);
+     expect(isCollectionName("toString")).toBe(false);
+-    expect(fieldNamesOf("tasks")).toEqual(["title", "done", "dueDate", "priority", "notes", "noteId"]);
++    expect(fieldNamesOf("tasks")).toEqual(["title", "done", "dueDate", "priority", "notes", "noteId", "timeSpentSec"]);
+   });
+ 
+   it("accept any subset of a collection's fields", () => {
+@@ -67,6 +69,18 @@ describe("collections", () => {
+     expect(checkFieldWrites("notes", { toString: "x" }).ok).toBe(false);
+   });
+ 
++  it("change counters only by increments of a non-zero integer", () => {
++    expect(isCounterField("tasks", "timeSpentSec")).toBe(true);
++    expect(isCounterField("tasks", "priority")).toBe(false);
++    expect(checkFieldWrites("tasks", { timeSpentSec: 60 }, "increment")).toEqual({ ok: true, fields: { timeSpentSec: 60 } });
++    expect(checkFieldWrites("tasks", { timeSpentSec: -15 }, "increment").ok).toBe(true);
++    expect(checkFieldWrites("tasks", { timeSpentSec: 60 })).toMatchObject({ ok: false, issues: [{ field: "timeSpentSec" }] });
++    expect(checkFieldWrites("tasks", { priority: 1 }, "increment")).toMatchObject({ ok: false, issues: [{ field: "priority" }] });
++    for (const delta of [0, 1.5, "5", MAX_COUNTER_DELTA + 1]) {
++      expect(checkFieldWrites("tasks", { timeSpentSec: delta }, "increment").ok).toBe(false);
++    }
++  });
++
+   it("throw a MutationValidationError from validateFieldWrites", () => {
+     expect(() => validateFieldWrites("notes", { pinned: "yes" })).toThrow(MutationValidationError);
+     try {

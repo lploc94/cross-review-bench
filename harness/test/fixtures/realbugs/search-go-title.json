@@ -1,0 +1,51 @@
+{
+  "total_count": 5,
+  "incomplete_results": false,
+  "items": [
+    {
+      "number": 412,
+      "title": "fix: retry counter resets after a lease expires",
+      "html_url": "https://github.com/acme/tinyq/pull/412",
+      "repository_url": "https://api.github.com/repos/acme/tinyq",
+      "user": { "login": "dev-a", "type": "User" },
+      "labels": [],
+      "pull_request": { "merged_at": "2026-08-14T09:12:00Z" }
+    },
+    {
+      "number": 77,
+      "title": "Fix typo in README",
+      "html_url": "https://github.com/acme/tinyq/pull/77",
+      "repository_url": "https://api.github.com/repos/acme/tinyq",
+      "user": { "login": "dev-b", "type": "User" },
+      "labels": [],
+      "pull_request": { "merged_at": "2026-07-20T10:00:00Z" }
+    },
+    {
+      "number": 9,
+      "title": "fix(deps): bump golang.org/x/net",
+      "html_url": "https://github.com/acme/tinyq/pull/9",
+      "repository_url": "https://api.github.com/repos/acme/tinyq",
+      "user": { "login": "renovate[bot]", "type": "Bot" },
+      "labels": [{ "name": "dependencies" }],
+      "pull_request": { "merged_at": "2026-07-03T00:00:00Z" }
+    },
+    {
+      "number": 1200,
+      "title": "fix race in cache eviction",
+      "html_url": "https://github.com/acme/viralcode/pull/1200",
+      "repository_url": "https://api.github.com/repos/acme/viralcode",
+      "user": { "login": "dev-c", "type": "User" },
+      "labels": [],
+      "pull_request": { "merged_at": "2026-09-01T12:00:00Z" }
+    },
+    {
+      "number": 51,
+      "title": "fix off-by-one in pager",
+      "html_url": "https://github.com/acme/small/pull/51",
+      "repository_url": "https://api.github.com/repos/acme/small",
+      "user": { "login": "dev-d", "type": "User" },
+      "labels": [],
+      "pull_request": { "merged_at": "2026-08-02T08:00:00Z" }
+    }
+  ]
+}

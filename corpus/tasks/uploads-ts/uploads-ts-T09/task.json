@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T09",
+  "repo": "uploads-ts",
+  "kind": "buggy",
+  "title": "Upload-completed webhooks",
+  "description": "Integrators poll `GET /v1/files` to find out when a new upload has passed its scan and can be downloaded. This lets a tenant register a webhook instead: the service POSTs a `file.available` event as soon as a file becomes available.\n\n- Migration 0004 adds `tenants.webhook_url` and `tenants.webhook_secret` (both or neither).\n- `PUT /v1/tenant/webhook` (`tenant:admin`) takes `{ \"url\" }` (http or https, at most 2000 characters, no user name or password) and answers `{ url, secret }` with a freshly generated signing secret; the secret is only returned there and every PUT rotates it. `DELETE /v1/tenant/webhook` removes it.\n- New `WebhookNotifier` (`src/services/webhooks.ts`): the event is `{ id, type: \"file.available\", createdAt, data: { file: { id, path, size, sha256, contentType, image } } }`, sent with `Webhook-Id` and `Webhook-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of \"<t>.<body>\">`. An error status, a network failure, a redirect or no answer within `WEBHOOK_TIMEOUT_MS` (default 10 s) is retried in process, three attempts in all, after `WEBHOOK_RETRY_DELAY_MS` (default 5 s) and then twice that; retries keep the same event id. There is no outbox: an event whose attempts all fail is dropped, and the failure is logged per attempt.\n- The scan worker notifies after it records a clean verdict (this covers `SCANNER=noop` too, where every file goes through the worker). It does not wait for the delivery, so a slow receiver does not hold up the scan batch.\n\nTests: `test/services/webhooks.test.ts` (signed event for clean files only, retries with the same id, giving up after three attempts including timeouts) against a local receiver in `test/helpers/webhookReceiver.ts`; setting, rotating and removing the webhook, scopes and URL validation in `test/api/tenant.test.ts`; config defaults. README and .env.example updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/scanWorker.ts",
+      "lines": [
+        104,
+        106
+      ],
+      "category": "error-handling",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "The scan worker starts the delivery with `void notifier.fileAvailable(file, now)` and never handles its rejection, while WebhookNotifier.fileAvailable rejects with a WebhookDeliveryError once all three attempts fail (and on any database error in its lookup). The rejection is unhandled, and Node 22 terminates the process on an unhandled rejection, so one tenant whose webhook endpoint is down crashes the service (API, scan worker and cleanup) after every clean scan of one of its files.",
+      "trigger": "A tenant registers a webhook whose receiver answers 500 (or does not answer, or the host is gone); upload any file: once the scan worker marks it available and the third delivery attempt fails, the process exits with the unhandled WebhookDeliveryError.",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/webhookOutage.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run test/hidden/webhookOutage.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A failed delivery cannot escape: the scan worker only runs inside PeriodicTask (src/infra/loop.ts), whose tick wraps every run in a try/catch that logs \"background task failed\" and schedules the next run, so even a rejected notification is caught and logged there, and WebhookNotifier already logs every failed attempt.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

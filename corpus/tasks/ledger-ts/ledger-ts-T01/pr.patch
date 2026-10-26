@@ -1,0 +1,529 @@
+diff --git a/README.md b/README.md
+index 5f08d14..89e7f43 100644
+--- a/README.md
++++ b/README.md
+@@ -37,6 +37,11 @@ entries, a negative debit and a positive credit that sum to zero, each with the
+ Both accounts are locked in ascending id order inside the transaction, so concurrent transfers
+ are serialized without deadlocks.
+ 
++**Reversals.** `POST /transfers/:id/reverse` undoes a transfer by posting the same amount back
++from its destination to its source. The reversal is a transfer of its own with `reversal_of` set
++to the original. A transfer can be reversed once, and a reversal cannot be reversed (both 409);
++the destination must still hold the funds, like for any transfer.
++
+ **Idempotency.** `POST /transfers` requires an `Idempotency-Key` header (1–255 visible ASCII
+ characters). A retry with the same key and body returns the original response with
+ `Idempotent-Replayed: true`; the same key with a different body is 409 `idempotency_conflict`.
+@@ -52,7 +57,7 @@ effective from `effective_at`. Conversion uses bigint arithmetic only and rounds
+ Rates are loaded with `npm run seed-fx-rates`.
+ 
+ **Webhooks and events.** Changes write events to a transactional outbox (`transfer.posted`,
+-`hold.created`, `hold.captured`, `hold.voided`). The dispatcher posts each event to the tenant's
++`transfer.reversed`, `hold.created`, `hold.captured`, `hold.voided`). The dispatcher posts each event to the tenant's
+ active endpoints with
+ 
+ ```
+@@ -80,7 +85,7 @@ Delivery guarantees:
+ | GET | `/accounts`, `/accounts/:id` | `accounts:read` |
+ | POST | `/accounts/:id/close` | `accounts:write` |
+ | GET | `/accounts/:id/entries` | `transfers:read` |
+-| POST | `/transfers` | `transfers:write` |
++| POST | `/transfers`, `/transfers/:id/reverse` | `transfers:write` |
+ | GET | `/transfers`, `/transfers/:id` | `transfers:read` |
+ | POST | `/holds`, `/holds/:id/capture`, `/holds/:id/void` | `holds:write` |
+ | GET | `/holds`, `/holds/:id` | `holds:read` |
+diff --git a/migrations/0009_transfer_reversals.sql b/migrations/0009_transfer_reversals.sql
+new file mode 100644
+index 0000000..e470a88
+--- /dev/null
++++ b/migrations/0009_transfer_reversals.sql
+@@ -0,0 +1,10 @@
++-- A reversal is an ordinary transfer in the opposite direction that points at the transfer it
++-- undoes. Reversals are looked up by the transfer they reverse.
++ALTER TABLE transfers ADD COLUMN reversal_of uuid;
++
++ALTER TABLE transfers
++    ADD CONSTRAINT transfers_reversal_of_fkey FOREIGN KEY (tenant_id, reversal_of)
++        REFERENCES transfers (tenant_id, id);
++
++CREATE INDEX transfers_reversal_of_idx ON transfers (tenant_id, reversal_of)
++    WHERE reversal_of IS NOT NULL;
+diff --git a/src/api/routes/transfers.ts b/src/api/routes/transfers.ts
+index 2b220dd..9ee1114 100644
+--- a/src/api/routes/transfers.ts
++++ b/src/api/routes/transfers.ts
+@@ -1,7 +1,11 @@
+ import type { FastifyPluginAsync } from "fastify";
+ import { authOf, requireScope } from "../plugins/auth.js";
+ import { idParamsSchema, idempotencyKeySchema } from "../schemas/common.js";
+-import { createTransferBodySchema, listTransfersQuerySchema } from "../schemas/transfers.js";
++import {
++  createTransferBodySchema,
++  listTransfersQuerySchema,
++  reverseTransferBodySchema,
++} from "../schemas/transfers.js";
+ import {
+   serializePage,
+   serializeTransfer,
+@@ -44,6 +48,25 @@ export const transferRoutes: FastifyPluginAsync<RouteOptions> = async (app, { se
+       .send(response.body);
+   });
+ 
++  /**
++   * Post the reversal of a transfer: the same amount back from its destination to its source.
++   * 409 when the transfer was already reversed or is itself a reversal. Retrying a reversal is
++   * safe without an Idempotency-Key: a second attempt gets the 409.
++   */
++  app.post(
++    "/transfers/:id/reverse",
++    { preHandler: requireScope("transfers:write") },
++    async (request, reply) => {
++      const { tenantId } = authOf(request);
++      const { id } = parse(idParamsSchema, request.params, "params");
++      const body = parse(reverseTransferBodySchema, request.body, "body");
++      const result = await services.transfers.reverseTransfer(tenantId, id, {
++        description: body.description,
++      });
++      return reply.code(201).send(serializeTransferWithEntries(result.transfer, result.entries));
++    },
++  );
++
+   app.get("/transfers", { preHandler: requireScope("transfers:read") }, async (request) => {
+     const { tenantId } = authOf(request);
+     const query = parse(listTransfersQuerySchema, request.query, "query");
+diff --git a/src/api/schemas/transfers.ts b/src/api/schemas/transfers.ts
+index 21fcf88..64e9d4b 100644
+--- a/src/api/schemas/transfers.ts
++++ b/src/api/schemas/transfers.ts
+@@ -22,6 +22,11 @@ export const createTransferBodySchema = z
+     path: ["to_account_id"],
+   });
+ 
++/** Optional body of `POST /transfers/:id/reverse`. */
++export const reverseTransferBodySchema = z.strictObject({
++  description: z.string().trim().min(1).max(500).optional(),
++});
++
+ export type CreateTransferBody = z.infer<typeof createTransferBodySchema>;
+ 
+ export const listTransfersQuerySchema = z.intersection(
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index bf6b718..ab65c82 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -38,6 +38,7 @@ export function serializeTransfer(transfer: Transfer): JsonObject {
+     description: transfer.description,
+     metadata: { ...transfer.metadata },
+     status: transfer.status,
++    reversal_of: transfer.reversalOf,
+     created_at: transfer.createdAt.toISOString(),
+   };
+ }
+diff --git a/src/domain/events.ts b/src/domain/events.ts
+index 514d2f8..87c52af 100644
+--- a/src/domain/events.ts
++++ b/src/domain/events.ts
+@@ -2,7 +2,13 @@ import type { Hold } from "./hold.js";
+ import type { JsonObject } from "./json.js";
+ import type { Transfer } from "./transfer.js";
+ 
+-export const EVENT_TYPES = ["transfer.posted", "hold.created", "hold.captured", "hold.voided"] as const;
++export const EVENT_TYPES = [
++  "transfer.posted",
++  "transfer.reversed",
++  "hold.created",
++  "hold.captured",
++  "hold.voided",
++] as const;
+ export type EventType = (typeof EVENT_TYPES)[number];
+ 
+ /**
+@@ -39,6 +45,7 @@ function transferPayload(transfer: Transfer): JsonObject {
+     description: transfer.description,
+     metadata: { ...transfer.metadata },
+     status: transfer.status,
++    reversal_of: transfer.reversalOf,
+     created_at: transfer.createdAt.toISOString(),
+   };
+ }
+@@ -64,6 +71,16 @@ export function transferPosted(transfer: Transfer): NewEvent {
+   };
+ }
+ 
++/** Written on the original transfer's aggregate, after the reversal's own `transfer.posted`. */
++export function transferReversed(original: Transfer, reversal: Transfer): NewEvent {
++  return {
++    tenantId: original.tenantId,
++    aggregateId: original.id,
++    eventType: "transfer.reversed",
++    payload: { transfer: transferPayload(original), reversal: transferPayload(reversal) },
++  };
++}
++
+ export function holdCreated(hold: Hold): NewEvent {
+   return {
+     tenantId: hold.tenantId,
+diff --git a/src/domain/transfer.ts b/src/domain/transfer.ts
+index 5acb38a..1d5a264 100644
+--- a/src/domain/transfer.ts
++++ b/src/domain/transfer.ts
+@@ -14,6 +14,8 @@ export interface Transfer {
+   readonly description: string | null;
+   readonly metadata: Metadata;
+   readonly status: TransferStatus;
++  /** The transfer this one reverses, or null for an ordinary transfer. */
++  readonly reversalOf: string | null;
+   readonly createdAt: Date;
+ }
+ 
+diff --git a/src/repositories/transfers.ts b/src/repositories/transfers.ts
+index 30be05a..a1ff4fa 100644
+--- a/src/repositories/transfers.ts
++++ b/src/repositories/transfers.ts
+@@ -14,11 +14,12 @@ interface TransferRow {
+   description: string | null;
+   metadata: Record<string, string>;
+   status: TransferStatus;
++  reversal_of: string | null;
+   created_at: Date;
+ }
+ 
+ const COLUMNS =
+-  "id, tenant_id, from_account_id, to_account_id, amount_minor, currency, description, metadata, status, created_at";
++  "id, tenant_id, from_account_id, to_account_id, amount_minor, currency, description, metadata, status, reversal_of, created_at";
+ 
+ function mapTransfer(row: TransferRow): Transfer {
+   return {
+@@ -31,6 +32,7 @@ function mapTransfer(row: TransferRow): Transfer {
+     description: row.description,
+     metadata: row.metadata,
+     status: row.status,
++    reversalOf: row.reversal_of,
+     createdAt: row.created_at,
+   };
+ }
+@@ -43,14 +45,15 @@ export interface NewTransfer {
+   readonly currency: CurrencyCode;
+   readonly description: string | null;
+   readonly metadata: Metadata;
++  readonly reversalOf?: string | null;
+   readonly createdAt: Date;
+ }
+ 
+ export async function insertTransfer(db: Queryable, transfer: NewTransfer): Promise<Transfer> {
+   const result = await db.query<TransferRow>(
+     `INSERT INTO transfers
+-       (tenant_id, from_account_id, to_account_id, amount_minor, currency, description, metadata, created_at)
+-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
++       (tenant_id, from_account_id, to_account_id, amount_minor, currency, description, metadata, reversal_of, created_at)
++     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+      RETURNING ${COLUMNS}`,
+     [
+       transfer.tenantId,
+@@ -60,6 +63,7 @@ export async function insertTransfer(db: Queryable, transfer: NewTransfer): Prom
+       transfer.currency,
+       transfer.description,
+       JSON.stringify(transfer.metadata),
++      transfer.reversalOf ?? null,
+       transfer.createdAt,
+     ],
+   );
+@@ -79,6 +83,20 @@ export async function findTransfer(
+   return row ? mapTransfer(row) : null;
+ }
+ 
++/** The transfer that reverses `transferId`, or null when it has not been reversed. */
++export async function findReversal(
++  db: Queryable,
++  tenantId: string,
++  transferId: string,
++): Promise<Transfer | null> {
++  const result = await db.query<TransferRow>(
++    `SELECT ${COLUMNS} FROM transfers WHERE tenant_id = $1 AND reversal_of = $2`,
++    [tenantId, transferId],
++  );
++  const row = firstRow(result.rows);
++  return row ? mapTransfer(row) : null;
++}
++
+ /** A transfer of any tenant, for operator tooling that works across tenants (`show-transfer`). */
+ export async function findTransferById(db: Queryable, id: string): Promise<Transfer | null> {
+   const result = await db.query<TransferRow>(`SELECT ${COLUMNS} FROM transfers WHERE id = $1`, [id]);
+diff --git a/src/services/ledgerPosting.ts b/src/services/ledgerPosting.ts
+index 6a81bae..c4650d4 100644
+--- a/src/services/ledgerPosting.ts
++++ b/src/services/ledgerPosting.ts
+@@ -20,6 +20,8 @@ export interface PostingInput {
+   readonly currency: CurrencyCode;
+   readonly description: string | null;
+   readonly metadata: Metadata;
++  /** Set when the transfer reverses an earlier one. */
++  readonly reversalOf?: string | null;
+   readonly now: Date;
+ }
+ 
+@@ -59,6 +61,7 @@ export async function postTransfer(db: Queryable, input: PostingInput): Promise<
+     currency,
+     description: input.description,
+     metadata: input.metadata,
++    reversalOf: input.reversalOf ?? null,
+     createdAt: now,
+   });
+   const debited = await accounts.applyBalanceChange(db, tenantId, from.id, {
+diff --git a/src/services/transferService.ts b/src/services/transferService.ts
+index f4bdf2f..24caf44 100644
+--- a/src/services/transferService.ts
++++ b/src/services/transferService.ts
+@@ -1,12 +1,14 @@
+ import type { Pool } from "../db/pool.js";
+ import { withTransaction } from "../db/tx.js";
+-import { NotFoundError } from "../domain/errors.js";
++import { ConflictError, NotFoundError } from "../domain/errors.js";
++import { transferReversed } from "../domain/events.js";
+ import type { JsonValue } from "../domain/json.js";
+ import { toPage, type OffsetPage, type Page } from "../domain/pagination.js";
+ import type { Entry, Transfer, TransferInput } from "../domain/transfer.js";
+ import type { Clock } from "../infra/clock.js";
+ import * as accounts from "../repositories/accounts.js";
+ import * as entries from "../repositories/entries.js";
++import * as outbox from "../repositories/outbox.js";
+ import * as transfers from "../repositories/transfers.js";
+ import type { TransferFilter } from "../repositories/transfers.js";
+ import { hashRequest, runIdempotent, type IdempotentResult } from "./idempotency.js";
+@@ -20,6 +22,11 @@ export interface CreateTransferRequest {
+   readonly present: (result: PostingResult) => JsonValue;
+ }
+ 
++export interface ReverseTransferRequest {
++  /** Defaults to "Reversal of transfer <id>". */
++  readonly description?: string | undefined;
++}
++
+ export interface TransferWithEntries {
+   readonly transfer: Transfer;
+   readonly entries: readonly Entry[];
+@@ -85,6 +92,60 @@ export class TransferService {
+     );
+   }
+ 
++  /**
++   * Undo a posted transfer by posting the same amount back from its destination to its source,
++   * as a new transfer that points at the original (`reversal_of`). A transfer is reversed at most
++   * once and a reversal cannot itself be reversed. The destination must still be able to pay:
++   * a wallet that has spent the funds cannot be reversed below zero.
++   */
++  async reverseTransfer(
++    tenantId: string,
++    id: string,
++    request: ReverseTransferRequest = {},
++  ): Promise<PostingResult> {
++    const now = this.clock.now();
++    return withTransaction(this.pool, async (client) => {
++      const original = await transfers.findTransfer(client, tenantId, id);
++      if (!original) throw NotFoundError.resource("transfer", id);
++      if (original.reversalOf !== null) {
++        throw new ConflictError(`transfer ${original.id} is a reversal and cannot be reversed`, {
++          transfer_id: original.id,
++          reversal_of: original.reversalOf,
++        });
++      }
++      const existing = await transfers.findReversal(client, tenantId, original.id);
++      if (existing) {
++        throw new ConflictError(`transfer ${original.id} was already reversed`, {
++          transfer_id: original.id,
++          reversal_id: existing.id,
++        });
++      }
++
++      const locked = await accounts.lockAccounts(client, tenantId, [
++        original.fromAccountId,
++        original.toAccountId,
++      ]);
++      const from = locked.get(original.toAccountId);
++      if (!from) throw NotFoundError.resource("account", original.toAccountId);
++      const to = locked.get(original.fromAccountId);
++      if (!to) throw NotFoundError.resource("account", original.fromAccountId);
++
++      const result = await postTransfer(client, {
++        tenantId,
++        from,
++        to,
++        amountMinor: original.amountMinor,
++        currency: original.currency,
++        description: request.description ?? `Reversal of transfer ${original.id}`,
++        metadata: { reversal_of: original.id },
++        reversalOf: original.id,
++        now,
++      });
++      await outbox.insertEvent(client, transferReversed(original, result.transfer), now);
++      return result;
++    });
++  }
++
+   async getTransfer(tenantId: string, id: string): Promise<TransferWithEntries> {
+     const transfer = await transfers.findTransfer(this.pool, tenantId, id);
+     if (!transfer) throw NotFoundError.resource("transfer", id);
+diff --git a/test/api/reversals.test.ts b/test/api/reversals.test.ts
+new file mode 100644
+index 0000000..c590814
+--- /dev/null
++++ b/test/api/reversals.test.ts
+@@ -0,0 +1,146 @@
++import { randomUUID } from "node:crypto";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  fundedWallet,
++  getAccount,
++  issueKey,
++  openAccount,
++  transfer,
++  type AccountBody,
++  type ErrorResponse,
++  type TestTenant,
++  type TransferBody,
++} from "../helpers/fixtures.js";
++
++describe("transfer reversals", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++  let wallet: AccountBody;
++  let merchant: AccountBody;
++
++  beforeAll(async () => {
++    t = await buildTestApp();
++  });
++
++  afterAll(async () => {
++    await t.close();
++  });
++
++  beforeEach(async () => {
++    tenant = await createTenant(t.pool, t.clock);
++    wallet = await fundedWallet(t.app, tenant, "1000");
++    merchant = await openAccount(t.app, tenant);
++  });
++
++  function reverse(id: string, payload?: Record<string, unknown>, headers = tenant.headers) {
++    return t.app.inject({
++      method: "POST",
++      url: `/transfers/${id}/reverse`,
++      headers,
++      ...(payload ? { payload } : {}),
++    });
++  }
++
++  it("posts the same amount back and restores both balances", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    t.clock.advanceSeconds(60);
++
++    const response = await reverse(original.id);
++    expect(response.statusCode).toBe(201);
++    const reversal = response.json<TransferBody>();
++    expect(reversal).toMatchObject({
++      from_account_id: merchant.id,
++      to_account_id: wallet.id,
++      amount: "300",
++      currency: "USD",
++      description: `Reversal of transfer ${original.id}`,
++      metadata: { reversal_of: original.id },
++      reversal_of: original.id,
++      created_at: t.clock.now().toISOString(),
++    });
++    expect(reversal.entries).toEqual([
++      expect.objectContaining({ account_id: merchant.id, amount: "-300", balance_after: "0" }),
++      expect.objectContaining({ account_id: wallet.id, amount: "300", balance_after: "1000" }),
++    ]);
++    expect((await getAccount(t.app, tenant, wallet.id)).balance).toBe("1000");
++    expect((await getAccount(t.app, tenant, merchant.id)).balance).toBe("0");
++
++    const reread = await t.app.inject({ method: "GET", url: `/transfers/${original.id}`, headers: tenant.headers });
++    expect(reread.json<TransferBody>().reversal_of).toBeNull();
++  });
++
++  it("takes an optional description", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "100");
++    const response = await reverse(original.id, { description: "Refund for order 1001" });
++    expect(response.statusCode).toBe(201);
++    expect(response.json<TransferBody>().description).toBe("Refund for order 1001");
++
++    const other = await transfer(t.app, tenant, wallet.id, merchant.id, "100");
++    expect((await reverse(other.id, { description: "" })).statusCode).toBe(400);
++    expect((await reverse(other.id, { amount: "50" })).statusCode).toBe(400);
++  });
++
++  it("reverses a transfer only once", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    const first = await reverse(original.id);
++    expect(first.statusCode).toBe(201);
++
++    const again = await reverse(original.id);
++    expect(again.statusCode).toBe(409);
++    expect(again.json<ErrorResponse>().error).toMatchObject({
++      code: "conflict",
++      details: { transfer_id: original.id, reversal_id: first.json<TransferBody>().id },
++    });
++    expect((await getAccount(t.app, tenant, wallet.id)).balance).toBe("1000");
++    expect((await getAccount(t.app, tenant, merchant.id)).balance).toBe("0");
++  });
++
++  it("does not reverse a reversal", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    const reversal = (await reverse(original.id)).json<TransferBody>();
++    const response = await reverse(reversal.id);
++    expect(response.statusCode).toBe(409);
++    expect(response.json<ErrorResponse>().error.details).toMatchObject({ reversal_of: original.id });
++  });
++
++  it("needs the destination to still hold the funds", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    const supplier = await openAccount(t.app, tenant);
++    await transfer(t.app, tenant, merchant.id, supplier.id, "200");
++
++    const refused = await reverse(original.id);
++    expect(refused.statusCode).toBe(422);
++    expect(refused.json<ErrorResponse>().error.code).toBe("insufficient_funds");
++
++    await transfer(t.app, tenant, supplier.id, merchant.id, "200");
++    expect((await reverse(original.id)).statusCode).toBe(201);
++    expect((await getAccount(t.app, tenant, wallet.id)).balance).toBe("1000");
++  });
++
++  it("writes the reversal's transfer.posted and transfer.reversed on the original", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    const reversal = (await reverse(original.id)).json<TransferBody>();
++    const events = await t.pool.query<{ aggregate_id: string; event_type: string }>(
++      "SELECT aggregate_id, event_type FROM outbox WHERE aggregate_id = ANY($1) ORDER BY id",
++      [[original.id, reversal.id]],
++    );
++    expect(events.rows).toEqual([
++      { aggregate_id: original.id, event_type: "transfer.posted" },
++      { aggregate_id: reversal.id, event_type: "transfer.posted" },
++      { aggregate_id: original.id, event_type: "transfer.reversed" },
++    ]);
++  });
++
++  it("requires transfers:write and hides other tenants' transfers", async () => {
++    const original = await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    const reader = await issueKey(t.pool, t.clock, tenant.tenantId, ["transfers:read"]);
++    expect((await reverse(original.id, undefined, reader.headers)).statusCode).toBe(403);
++
++    const other = await createTenant(t.pool, t.clock, { name: "Other" });
++    expect((await reverse(original.id, undefined, other.headers)).statusCode).toBe(404);
++    expect((await reverse(randomUUID())).statusCode).toBe(404);
++    expect((await getAccount(t.app, tenant, merchant.id)).balance).toBe("300");
++  });
++});
+diff --git a/test/helpers/fixtures.ts b/test/helpers/fixtures.ts
+index 5928705..bd7fec0 100644
+--- a/test/helpers/fixtures.ts
++++ b/test/helpers/fixtures.ts
+@@ -37,6 +37,7 @@ export interface TransferBody {
+   description: string | null;
+   metadata: Record<string, string>;
+   status: string;
++  reversal_of: string | null;
+   created_at: string;
+   entries?: EntryBody[];
+ }

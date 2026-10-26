@@ -1,0 +1,56 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T16",
+  "repo": "workflow-java",
+  "kind": "decoy",
+  "title": "Out-of-office substitutes for approval tasks",
+  "description": "When an approver is on leave, documents sit in their queue until the SLA escalates them, and an admin then has to step in. This lets a user name a substitute for an out-of-office period, so that tasks activated while they are away go straight to that person.\n\n- Migration V3 adds `away_from`, `away_until` (dates) and `substitute_id` to `app_user`, with a check that the three are set together, `away_until >= away_from` and the substitute is not the user. It adds `approval_task.on_behalf_of_id` (nullable, never equal to `assignee_id`).\n- `PUT /api/v1/users/me/out-of-office` with `{\"from\", \"until\", \"substituteId\"}` sets the caller's own period and returns the profile, which now has `outOfOffice` (`{from, until, substituteId}` or null); `DELETE` clears it and returns the profile. Dates are days in the business zone (Europe/London by default), both included. The period may already have started but must end today or later, last at most 365 days and end within 365 days of today; the substitute must be another active user (an unknown id gets the same 400 as an inactive one). Changing the period locks the user row, and `AppUser` now uses `@DynamicUpdate`, so an admin editing the profile at the same time does not overwrite it.\n- Behaviour to be aware of: in `ApprovalService.activate`, an assignee who is out of office on the activation day (in the business zone) does not get the task; the substitute does, as the task's assignee, with `on_behalf_of_id` naming the absent user. The substitute does not have to be an approver of the definition or a member of the step's group: they decide the task, it counts for the step exactly like the absent user's task would (quorum and `ALL_OF` counting are unchanged because the number of tasks is), the `TASK_ASSIGNED` notification (with `onBehalfOf`) and any escalation go to them, and because they hold a task they can see the document and appear among its approvers, as every task holder does. The absent user, holding no task on it, sees the document only if they could anyway.\n- Guards: the absent user keeps the task when the substitute is the document's owner (nobody approves their own document this way), is inactive, is out of office that day as well, or already holds a task of the same step (in a group step whose members name each other, or two members naming the same substitute, the first by user id gets them; nobody gets two tasks of one step and the unique `(document, round, step, assignee)` key is never hit).\n- No chains: a substitute's own substitute is never consulted. If A is away with substitute B and B is away with substitute C, A's task stays with A (B is away), and a task of B's own goes to C.\n- Only the activation day matters. Tasks created before the period stay with their assignee, and tasks the substitute took stay with them after the period ends; nothing is moved later. A resubmitted document's new round is activated afresh. `TaskView` gains `onBehalfOfId`.\n\nTests: `OutOfOfficeApiTest` (substitute gets and decides the task while the absent approver gets 404 on the document, the day is the London day across midnight UTC, the assignee keeps the task when the substitute is away or inactive, a group step with the substitute as a member keeps both tasks, validation and clearing). README: concepts and the new routes.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [
+    {
+      "id": "D1",
+      "file": "src/main/java/com/papertrail/workflow/service/ApprovalService.java",
+      "lines": [
+        134,
+        138
+      ],
+      "looks_like": "Task activation creates the approval task for a user picked by the absent assignee rather than by the workflow definition: the holder can be anyone (not a step assignee, not a group member), becomes the task's assignee, can approve it, and through that task gains read access to the document. It looks like approval rights and document visibility can be handed to someone who was never an approver.",
+      "why_correct": "Delegating to a substitute is the feature, and the substitute is chosen by the absent approver themselves, who held exactly this right, through PUT /users/me/out-of-office (own account only, substitute must be another active user). The guards in holderOf keep it from widening anything else: never the document's owner (no self-approval), never an inactive or absent user, never someone already holding a task of the step, and never more than one hop. The step's arithmetic is untouched because one task replaces one task (requireAssignable runs on the original assignees, and quorum/ALL_OF count tasks), and on_behalf_of_id records whose task it is. Seeing the document through a task is the existing visibility rule for every task holder, which the README's Permissions and Out of office sections state.",
+      "valid_rebuttal": "The README's Out of office section says the substitute need not be an approver of the definition and holds the task as its assignee, seeing the document as any approver does; the user sets this only for themselves (UserController uses current.require().userId()). holderOf returns the original assignee when the substitute is the owner, inactive, away or already holds a task of the step, and never follows a second substitute. OutOfOfficeApiTest shows the substitute deciding the task, and the owner-as-substitute and chain cases keep the original assignee.",
+      "hidden_tests": [
+        "src/test/java/com/papertrail/workflow/service/OutOfOfficeHandoverCheckTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=OutOfOfficeHandoverCheckTest"
+    },
+    {
+      "id": "D2",
+      "file": "src/main/java/com/papertrail/workflow/service/ApprovalService.java",
+      "lines": [
+        159,
+        161
+      ],
+      "looks_like": "The out-of-office period is checked only once, when the task is activated: a task created the day before the period stays with the absent user for the whole period, and a task the substitute took keeps them as assignee after the period has ended, so the substitute seems to keep approval rights longer than granted.",
+      "why_correct": "The specification is that tasks activated for the user in the period go to the substitute; nothing is reassigned later. Moving open tasks when a period starts or ends would change who holds a task under a decision in progress and invalidate escalations and notifications already sent, and the README says plainly that tasks created before the period stay with the assignee and tasks the substitute took stay with them after it ends. The task row records on_behalf_of_id, so an admin can see and reassign it by the usual means. The day is computed in the business zone (BusinessCalendar.dateAt), so a submission at 23:30 UTC on Monday counts as Tuesday in London.",
+      "valid_rebuttal": "README, Out of office: 'Only the activation day counts: tasks created before the period stay with the assignee, and tasks the substitute took stay with them after it ends.' The check uses calendar.dateAt(now) in ApprovalService.activate, and OutOfOfficeApiTest.theDayIsTheBusinessZonesDay shows Monday, Tuesday (the one-day period, entered at 00:30 London time) and Wednesday activations going to the assignee, the substitute and the assignee respectively.",
+      "hidden_tests": [],
+      "hidden_test_cmd": null
+    },
+    {
+      "id": "D3",
+      "file": "src/main/java/com/papertrail/workflow/service/ApprovalService.java",
+      "lines": [
+        165,
+        167
+      ],
+      "looks_like": "When the substitute is away too (or is the owner, inactive, or already holds a task of the step), the task is created for the original assignee, who is known to be out of office. It looks like the task is knowingly parked with an absent user instead of following the substitute's own substitute, so documents will wait until the SLA escalates.",
+      "why_correct": "No chains is part of the specification: following substitutes transitively would let a task travel to someone neither the definition nor the absent approver chose, could loop (A names B, B names A), and would make it hard to see who holds it. When the one allowed hop is not possible, the defined fallback is that the original assignee keeps the task; the SLA escalation that already exists then raises it. The README lists every case in which the original assignee keeps the task.",
+      "valid_rebuttal": "The description and the README's Out of office section say the absent user keeps the task when the substitute is the owner, inactive, also out of office, or already holds a task of the step, and that a substitute's own substitute is never used. holderOf implements exactly that list, and OutOfOfficeApiTest.theAssigneeKeepsTheTaskWhenTheSubstituteCannotTakeIt covers the away and inactive substitutes.",
+      "hidden_tests": [],
+      "hidden_test_cmd": null
+    }
+  ],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

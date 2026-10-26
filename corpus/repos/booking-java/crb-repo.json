@@ -1,0 +1,10 @@
+{
+  "language": "java",
+  "test_cmd": "mvn -q -B test",
+  "typecheck_cmd": "mvn -q -B test-compile",
+  "lint_cmd": "mvn -q -B spotless:check",
+  "deps_cmd": null,
+  "warm_cmd": "mvn -q -B dependency:go-offline test-compile test spotless:check",
+  "services": ["postgres"],
+  "allow_words": []
+}

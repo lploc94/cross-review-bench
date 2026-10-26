@@ -1,0 +1,24 @@
+diff --git a/internal/core/budget.go b/internal/core/budget.go
+index abfef95..e72d4a7 100644
+--- a/internal/core/budget.go
++++ b/internal/core/budget.go
+@@ -47,10 +47,18 @@ func (b *RetryBudget) bucket(now time.Time) *budgetBucket {
+ 	return bk
+ }
+ 
+-// Request counts a first attempt at time now.
++// Request counts a first attempt at time now. After an idle period of a whole window, the ring
++// is emptied first, so the counts from before the idle period no longer count.
+ func (b *RetryBudget) Request(now time.Time) {
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
++	var newest int64
++	for _, bk := range b.buckets {
++		newest = max(newest, bk.second)
++	}
++	if now.Unix()-newest >= int64(len(b.buckets)) {
++		clear(b.buckets)
++	}
+ 	b.bucket(now).requests++
+ }
+ 

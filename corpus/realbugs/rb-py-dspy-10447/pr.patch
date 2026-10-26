@@ -1,0 +1,1398 @@
+diff --git a/.github/workflows/bootstrap-versioned-docs.yml b/.github/workflows/bootstrap-versioned-docs.yml
+new file mode 100644
+index 00000000..2ed6ee81
+--- /dev/null
++++ b/.github/workflows/bootstrap-versioned-docs.yml
+@@ -0,0 +1,78 @@
++---
++name: Bootstrap versioned documentation
++
++on:
++  workflow_dispatch:
++
++permissions: {}
++
++jobs:
++  bootstrap:
++    if: github.repository == 'stanfordnlp/dspy'
++    runs-on: ubuntu-latest
++    timeout-minutes: 180
++    concurrency:
++      group: dspy-docs-bootstrap
++      cancel-in-progress: false
++    permissions:
++      contents: read
++    steps:
++      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          persist-credentials: false
++          fetch-depth: 0
++      - name: Set up Python 3.11
++        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
++        with:
++          python-version: "3.11"
++      - name: Install bootstrap dependencies
++        run: |
++          grep -v 'github.com/stanfordnlp/dspy' docs/requirements.txt > "$RUNNER_TEMP/docs-requirements.txt"
++          python -m pip install -r "$RUNNER_TEMP/docs-requirements.txt" -e .
++      - name: Build Material Current
++        run: |
++          python docs/scripts/build_docs.py current \
++            --config docs/mkdocs.yml \
++            --output current-site
++      - name: Check out documentation deployment
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          repository: krypticmouse/dspy-docs
++          ref: master
++          path: docs-deployment
++          persist-credentials: false
++          token: ${{ secrets.GH_PAT }} # zizmor: ignore[secrets-outside-env]
++      - name: Prepare Mike deployment branch
++        run: |
++          git -C docs-deployment config user.name github-actions
++          git -C docs-deployment config user.email github-actions@github.com
++          set +e
++          git -C docs-deployment ls-remote --exit-code --heads origin versioned-docs >/dev/null
++          branch_status=$?
++          set -e
++          if [[ "$branch_status" == 0 ]]; then
++            git -C docs-deployment fetch origin versioned-docs:versioned-docs
++          elif [[ "$branch_status" != 2 ]]; then
++            exit "$branch_status"
++          fi
++      - name: Reconstruct all historical snapshots
++        run: |
++          python docs/scripts/bootstrap_versioned_docs.py \
++            --deployment docs-deployment \
++            --branch versioned-docs
++      - name: Add Material Current to the candidate deployment
++        run: |
++          python docs/scripts/publish_versioned_docs.py \
++            --repository docs-deployment \
++            --site current-site \
++            --identifier current \
++            --package-source working-tree \
++            --branch versioned-docs
++      - name: Push the complete candidate for deployment review
++        env:
++          GH_TOKEN: ${{ secrets.GH_PAT }}
++        run: |
++          gh auth setup-git
++          # This staging push does not change production or activate Mike.
++          # A reviewed dspy-docs PR promotes the candidate to master atomically.
++          git -C docs-deployment push origin versioned-docs
+diff --git a/.github/workflows/docs-push.yml b/.github/workflows/docs-push.yml
+index 12f55d2c..8cd68a87 100644
+--- a/.github/workflows/docs-push.yml
++++ b/.github/workflows/docs-push.yml
+@@ -6,9 +6,15 @@ on:
+       - main
+     paths:
+       - "docs/**"
++      - "dspy/**"
++      - "pyproject.toml"
++      - "uv.lock"
+   pull_request:
+     paths:
+       - "docs/**"
++      - "dspy/**"
++      - "pyproject.toml"
++      - "uv.lock"
+ 
+ permissions: {}
+ 
+@@ -27,11 +33,42 @@ jobs:
+         run: |
+           cd docs
+           pip install -r requirements.txt
+-          mkdocs build
++          python scripts/build_docs.py current
+ 
+-  update-docs-subtree:
++  detect-versioned-deployment:
+     if: github.event_name == 'push' && github.repository == 'stanfordnlp/dspy'
+     runs-on: ubuntu-latest
++    permissions:
++      contents: read
++    outputs:
++      enabled: ${{ steps.deployment.outputs.enabled }}
++    steps:
++      - name: Check out deployment tooling
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          persist-credentials: false
++      - name: Check the production deployment format
++        id: deployment
++        run: |
++          git clone --depth 1 --branch master https://github.com/krypticmouse/dspy-docs.git docs-deployment
++          # The staging branch deliberately does not activate Mike. Only the
++          # reviewed promotion of versions.json to production master does.
++          if [[ ! -f docs-deployment/versions.json ]]; then
++            echo "enabled=false" >> "$GITHUB_OUTPUT"
++          elif jq -e 'type == "array" and any(.[]; .version == "current")' docs-deployment/versions.json >/dev/null; then
++            echo "enabled=true" >> "$GITHUB_OUTPUT"
++          else
++            echo "::error::Production versions.json does not contain Current"
++            exit 1
++          fi
++
++  update-legacy-deployment:
++    needs: detect-versioned-deployment
++    if: needs.detect-versioned-deployment.outputs.enabled == 'false'
++    runs-on: ubuntu-latest
++    concurrency:
++      group: dspy-docs-deployment
++      cancel-in-progress: false
+     permissions:
+       contents: read
+     steps:
+@@ -39,13 +76,90 @@ jobs:
+         with:
+           persist-credentials: false
+           fetch-depth: 0
+-      - name: Push docs to separate repo
+-        uses: cpina/github-action-push-to-another-repository@55306faa4ed53b815ae49e564af8cfb359d32ae2 # main
++      - name: Check out the legacy deployment
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          repository: krypticmouse/dspy-docs
++          ref: master
++          path: docs-deployment
++          persist-credentials: false
++          token: ${{ secrets.GH_PAT }} # zizmor: ignore[secrets-outside-env]
++      - name: Update the legacy deployment without crossing the cutover
+         env:
+-          API_TOKEN_GITHUB: ${{ secrets.GH_PAT }} # zizmor: ignore[secrets-outside-env]
++          GH_TOKEN: ${{ secrets.GH_PAT }}
++        run: |
++          gh auth setup-git
++          if [[ -f docs-deployment/versions.json ]]; then
++            echo "The versioned deployment is already live; leaving it unchanged."
++            exit 0
++          fi
++          rsync --archive --delete --exclude=.git docs/ docs-deployment/
++          git -C docs-deployment config user.name github-actions
++          git -C docs-deployment config user.email github-actions@github.com
++          git -C docs-deployment add --all
++          if git -C docs-deployment diff --cached --quiet; then
++            exit 0
++          fi
++          git -C docs-deployment commit -m "Update documentation"
++          if git -C docs-deployment push origin HEAD:master; then
++            exit 0
++          fi
++          git -C docs-deployment fetch origin master
++          if git -C docs-deployment show origin/master:versions.json >/dev/null 2>&1; then
++            echo "The versioned deployment won the race; leaving it unchanged."
++            exit 0
++          fi
++          echo "::error::The deployment changed concurrently; rerun this workflow"
++          exit 1
++
++  update-versioned-deployment:
++    needs: detect-versioned-deployment
++    if: needs.detect-versioned-deployment.outputs.enabled == 'true'
++    runs-on: ubuntu-latest
++    concurrency:
++      group: dspy-docs-deployment
++      cancel-in-progress: false
++    permissions:
++      contents: read
++    steps:
++      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          persist-credentials: false
++          fetch-depth: 0
++      - name: Set up Python 3.11
++        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+         with:
+-          source-directory: "docs"
+-          destination-github-username: "krypticmouse"
+-          destination-repository-name: "dspy-docs"
+-          user-email: github-actions@github.com
+-          target-branch: master
++          python-version: "3.11"
++          cache: "pip"
++          cache-dependency-path: docs/requirements.txt
++      - name: Install documentation dependencies
++        run: |
++          grep -v 'github.com/stanfordnlp/dspy' docs/requirements.txt > "$RUNNER_TEMP/docs-requirements.txt"
++          python -m pip install -r "$RUNNER_TEMP/docs-requirements.txt" -e .
++      - name: Build Current documentation
++        run: |
++          python docs/scripts/build_docs.py current \
++            --config docs/mkdocs.yml \
++            --output current-site
++      - name: Check out documentation deployment
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          repository: krypticmouse/dspy-docs
++          ref: master
++          path: docs-deployment
++          persist-credentials: false
++          token: ${{ secrets.GH_PAT }} # zizmor: ignore[secrets-outside-env]
++      - name: Publish Current through Mike
++        env:
++          GH_TOKEN: ${{ secrets.GH_PAT }}
++        run: |
++          gh auth setup-git
++          git -C docs-deployment config user.name github-actions
++          git -C docs-deployment config user.email github-actions@github.com
++          python docs/scripts/publish_versioned_docs.py \
++            --repository docs-deployment \
++            --site current-site \
++            --identifier current \
++            --package-source working-tree \
++            --branch master
++          git -C docs-deployment push origin master
+diff --git a/docs/mkdocs.yml b/docs/mkdocs.yml
+index e1cd5cab..65313de4 100644
+--- a/docs/mkdocs.yml
++++ b/docs/mkdocs.yml
+@@ -354,6 +354,9 @@ hooks:
+     - hooks/fetch_stats.py
+ 
+ extra:
++    version:
++        provider: mike
++        alias: true
+     social:
+         - icon: fontawesome/brands/github
+           link: https://github.com/stanfordnlp/dspy
+diff --git a/docs/requirements.txt b/docs/requirements.txt
+index 81eff772..574cae0f 100644
+--- a/docs/requirements.txt
++++ b/docs/requirements.txt
+@@ -6,5 +6,6 @@ mkdocs-redirects
+ mkdocstrings
+ mkdocstrings-python
+ mkdocs-llmstxt>=0.5.0
++mike==2.2.0
+ urllib3==2.7.0
+ mistune==3.3.4
+diff --git a/docs/scripts/bootstrap_versioned_docs.py b/docs/scripts/bootstrap_versioned_docs.py
+new file mode 100644
+index 00000000..3bfb7011
+--- /dev/null
++++ b/docs/scripts/bootstrap_versioned_docs.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python3
++"""Reconstruct all configured historical documentation snapshots atomically."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import re
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++from publish_versioned_docs import DEFAULT_BRANCH
++
++
++def run(*command: object, cwd: Path | None = None) -> None:
++    subprocess.run([str(part) for part in command], cwd=cwd, check=True)
++
++
++def output(*command: object, cwd: Path | None = None) -> str:
++    return subprocess.check_output([str(part) for part in command], cwd=cwd, text=True).strip()
++
++
++def download_pypi_wheel(version: str, destination: Path) -> Path:
++    run(
++        sys.executable,
++        "-m",
++        "pip",
++        "download",
++        "--no-deps",
++        "--only-binary=:all:",
++        "--dest",
++        destination,
++        f"dspy=={version}",
++    )
++    wheels = list(destination.glob("*.whl"))
++    if len(wheels) != 1:
++        raise RuntimeError(f"expected one wheel for dspy=={version}, found {len(wheels)}")
++    return wheels[0]
++
++
++def set_release_metadata(worktree: Path, version: str) -> None:
++    replacements = (
++        (worktree / "pyproject.toml", r'(?m)^(version\s*=\s*)"[^"]+"', rf'\g<1>"{version}"'),
++        (worktree / "dspy" / "__metadata__.py", r'(?m)^(__version__\s*=\s*)"[^"]+"', rf'\g<1>"{version}"'),
++        (worktree / "pyproject.toml", r'(?m)^(name\s*=\s*)"[^"]+"', r'\g<1>"dspy"'),
++        (worktree / "dspy" / "__metadata__.py", r'(?m)^(__name__\s*=\s*)"[^"]+"', r'\g<1>"dspy"'),
++    )
++    for path, pattern, replacement in replacements:
++        text, count = re.subn(pattern, replacement, path.read_text(), count=1)
++        if count != 1:
++            raise RuntimeError(f"release metadata marker not found in {path}")
++        path.write_text(text)
++
++
++def build_tag_wheel(worktree: Path, python: Path, version: str, destination: Path, tag_date: str) -> Path:
++    set_release_metadata(worktree, version)
++    run(
++        "uv",
++        "pip",
++        "install",
++        "--python",
++        python,
++        "--exclude-newer",
++        tag_date,
++        "build",
++        "setuptools",
++        "wheel",
++        cwd=worktree,
++    )
++    run(
++        python,
++        "-m",
++        "build",
++        "--wheel",
++        "--no-isolation",
++        "--outdir",
++        destination,
++        cwd=worktree,
++    )
++    wheels = list(destination.glob("*.whl"))
++    if len(wheels) != 1:
++        raise RuntimeError(f"expected one tag-built wheel for {version}, found {len(wheels)}")
++    return wheels[0]
++
++
++def filtered_requirements(source: Path, destination: Path) -> None:
++    lines = [line for line in source.read_text().splitlines() if "github.com/stanfordnlp/dspy" not in line]
++    destination.write_text("\n".join(lines) + "\n")
++
++
++def bootstrap_release(
++    *,
++    repository: Path,
++    deployment: Path,
++    scripts: Path,
++    version: str,
++    branch: str,
++    temporary: Path,
++) -> None:
++    worktree = temporary / f"source-{version}"
++    environment = temporary / f"venv-{version}"
++    artifact_dir = temporary / f"artifacts-{version}"
++    site = temporary / f"site-{version}"
++    artifact_dir.mkdir()
++    run("git", "worktree", "add", "--detach", worktree, version, cwd=repository)
++    try:
++        run("uv", "venv", "--python", sys.executable, environment)
++        python = environment / "bin" / "python"
++        requirements = temporary / f"requirements-{version}.txt"
++        filtered_requirements(worktree / "docs" / "requirements.txt", requirements)
++        tag_date = output("git", "show", "-s", "--format=%cI", f"{version}^{{commit}}", cwd=repository)
++        run(
++            "uv",
++            "pip",
++            "install",
++            "--python",
++            python,
++            "--exclude-newer",
++            tag_date,
++            "-r",
++            requirements,
++        )
++
++        package_source = "tag-built-wheel" if version == "3.1.1" else "pypi-wheel"
++        if package_source == "pypi-wheel":
++            artifact = download_pypi_wheel(version, artifact_dir)
++        else:
++            artifact = build_tag_wheel(worktree, python, version, artifact_dir, tag_date)
++        run(
++            "uv",
++            "pip",
++            "install",
++            "--python",
++            python,
++            "--exclude-newer",
++            tag_date,
++            artifact,
++        )
++        run(
++            python,
++            scripts / "build_docs.py",
++            "release",
++            "--config",
++            worktree / "docs" / "mkdocs.yml",
++            "--output",
++            site,
++            "--version",
++            version,
++            "--artifact",
++            artifact,
++            "--package-source",
++            package_source,
++        )
++        alias = (
++            ["--alias", ".".join(version.split(".")[:2])]
++            if re.fullmatch(r"\d+\.\d+\.\d+", version)
++            else []
++        )
++        run(
++            sys.executable,
++            scripts / "publish_versioned_docs.py",
++            "--repository",
++            deployment,
++            "--site",
++            site,
++            "--identifier",
++            version,
++            *alias,
++            "--package-source",
++            package_source,
++            "--branch",
++            branch,
++        )
++    finally:
++        run("git", "worktree", "remove", "--force", worktree, cwd=repository)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--repository", type=Path, default=Path.cwd())
++    parser.add_argument("--deployment", type=Path, required=True)
++    parser.add_argument("--manifest", type=Path, default=Path("docs/versioning/releases.json"))
++    parser.add_argument("--branch", default=DEFAULT_BRANCH)
++    parser.add_argument("--only", action="append", default=[])
++    args = parser.parse_args()
++
++    repository = args.repository.resolve()
++    deployment = args.deployment.resolve()
++    manifest = json.loads(args.manifest.resolve().read_text())
++    releases = [version for version in manifest["releases"] if not args.only or version in args.only]
++    unknown = set(args.only) - set(releases)
++    if unknown:
++        parser.error(f"versions absent from manifest: {', '.join(sorted(unknown))}")
++
++    scripts = Path(__file__).resolve().parent
++    with tempfile.TemporaryDirectory(prefix="dspy-docs-bootstrap-") as directory:
++        temporary = Path(directory)
++        for version in releases:
++            bootstrap_release(
++                repository=repository,
++                deployment=deployment,
++                scripts=scripts,
++                version=version,
++                branch=args.branch,
++                temporary=temporary,
++            )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/scripts/build_docs.py b/docs/scripts/build_docs.py
+new file mode 100644
+index 00000000..a63610c1
+--- /dev/null
++++ b/docs/scripts/build_docs.py
+@@ -0,0 +1,266 @@
++#!/usr/bin/env python3
++"""Build Current or one immutable documentation release snapshot."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import importlib.metadata
++import json
++import os
++import re
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++RELEASE_VERSION = re.compile(
++    r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:(?:a|b|rc)\d+)?$"
++)
++SOURCE_MAP_COMMENT = re.compile(rb"(?:\n?//# sourceMappingURL=[^\r\n]*|/\*# sourceMappingURL=.*?\*/)", re.DOTALL)
++ROOT_URL_ATTRIBUTE = re.compile(
++    r'(?P<prefix>\b(?:href|src|action)=["\x27])(?P<url>/(?!/)[^"\x27]*)(?P<suffix>["\x27])',
++    re.IGNORECASE,
++)
++VERSIONED_PATH = re.compile(r"^/(?:current|\d+\.\d+(?:\.\d+(?:(?:a|b|rc)\d+)?)?)(?:/|$)")
++SHARED_HEADER_STYLES = Path(__file__).parent.parent / "versioning" / "header.css"
++
++
++def release_version(value: str) -> str:
++    match = RELEASE_VERSION.fullmatch(value)
++    if not match or int(match.group("major")) < 3:
++        raise argparse.ArgumentTypeError("expected an X.Y.Z release version at or after 3.0.0")
++    return value
++
++
++def sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def git_value(repository: Path, *arguments: str) -> str:
++    return subprocess.check_output(["git", "-C", str(repository), *arguments], text=True).strip()
++
++
++def patched_config(config: Path, identifier: str, *, edit_ref: str | None = None) -> Path:
++    text = config.read_text()
++    text, site_count = re.subn(r"(?m)^site_url:\s*.*$", f"site_url: https://dspy.ai/{identifier}/", text, count=1)
++    if site_count != 1:
++        raise RuntimeError(f"could not patch site_url in {config}")
++    if edit_ref:
++        text, edit_count = re.subn(r"(?m)^edit_uri:\s*.*$", f"edit_uri: blob/{edit_ref}/docs/docs/", text, count=1)
++        if edit_count != 1:
++            raise RuntimeError(f"could not patch edit_uri in {config}")
++        # Release API reference must import the installed release artifact, not
++        # preferentially resolve the source checkout through mkdocstrings.
++        text = re.sub(r'(?m)^[ \t]+paths:\s*\[\s*["\x27]?\.\.["\x27]?\s*\][ \t]*\n', "", text, count=1)
++    if not re.search(r"(?m)^\s+provider:\s*mike\s*$", text):
++        version_config = "    version:\n        provider: mike\n        alias: true\n"
++        text, extra_count = re.subn(r"(?m)^extra:\s*$", f"extra:\n{version_config}", text, count=1)
++        if extra_count == 0:
++            text = f"{text.rstrip()}\n\nextra:\n{version_config}"
++
++    handle, name = tempfile.mkstemp(prefix=f".mkdocs-{identifier}-", suffix=".yml", dir=config.parent)
++    os.close(handle)
++    output = Path(name)
++    output.write_text(text)
++    return output
++
++
++def remove_source_maps(site: Path) -> dict[str, int]:
++    """Remove browser source maps from the generated site."""
++    before = sum(path.stat().st_size for path in site.rglob("*") if path.is_file())
++    source_maps = list(site.rglob("*.map"))
++    for path in source_maps:
++        path.unlink()
++    for pattern in ("*.js", "*.css"):
++        for path in site.rglob(pattern):
++            source = path.read_bytes()
++            optimized = SOURCE_MAP_COMMENT.sub(b"", source)
++            if optimized != source:
++                path.write_bytes(optimized)
++    after = sum(path.stat().st_size for path in site.rglob("*") if path.is_file())
++    return {"before": before, "after": after, "source_maps": len(source_maps)}
++
++
++def install_shared_header_styles(site: Path, source: Path = SHARED_HEADER_STYLES) -> None:
++    """Give every renderer and historical snapshot the same header controls."""
++    destination = site / "_static" / "dspy-header.css"
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    destination.write_bytes(source.read_bytes())
++    for page in site.rglob("*.html"):
++        relative = Path(os.path.relpath(destination, page.parent)).as_posix()
++        tag = f'<link rel="stylesheet" href="{relative}">'
++        html = page.read_text()
++        if tag not in html:
++            page.write_text(html.replace("</head>", f"{tag}</head>", 1))
++
++
++def scope_root_relative_urls(site: Path, identifier: str) -> None:
++    """Keep hand-authored root-relative links inside the selected version."""
++
++    def replace(match: re.Match[str]) -> str:
++        url = match.group("url")
++        if VERSIONED_PATH.match(url):
++            return match.group(0)
++        scoped = f"/{identifier}{url}"
++        return f"{match.group('prefix')}{scoped}{match.group('suffix')}"
++
++    for page in site.rglob("*.html"):
++        html = page.read_text()
++        scoped = ROOT_URL_ATTRIBUTE.sub(replace, html)
++        if scoped != html:
++            page.write_text(scoped)
++
++
++def installed_packages() -> dict[str, str]:
++    return dict(
++        sorted(
++            (distribution.metadata["Name"], distribution.version)
++            for distribution in importlib.metadata.distributions()
++            if distribution.metadata["Name"]
++        )
++    )
++
++
++def renderer_version() -> str:
++    return importlib.metadata.version("mkdocs-material")
++
++
++def validate_release_site(site: Path, config: Path, version: str) -> None:
++    expected = (site / "index.html", site / "api" / "index.html", site / "search" / "search_index.json")
++    missing = [str(path.relative_to(site)) for path in expected if not path.exists()]
++    if missing:
++        raise RuntimeError(f"release site is missing required output: {', '.join(missing)}")
++
++    home = (site / "index.html").read_text()
++    canonical = f'<link rel="canonical" href="https://dspy.ai/{version}/">'
++    if canonical not in home:
++        raise RuntimeError(f"release home page is missing canonical URL {canonical}")
++
++    docs_dir = config.parent / "docs"
++    missing_notebooks = []
++    for notebook in docs_dir.rglob("*.ipynb"):
++        relative = notebook.relative_to(docs_dir)
++        outputs = (
++            site / relative.with_suffix(".html"),
++            site / relative.with_suffix("") / "index.html",
++        )
++        if not any(output.exists() for output in outputs):
++            missing_notebooks.append(str(notebook.relative_to(docs_dir)))
++    if missing_notebooks:
++        raise RuntimeError(f"notebooks were not rendered: {', '.join(missing_notebooks)}")
++
++    config_text = config.read_text()
++    if re.search(r"(?m)^\s*- social\s*$", config_text):
++        cards = site / "assets" / "images" / "social"
++        if not cards.exists() or not any(cards.rglob("*.png")) or 'property="og:image"' not in home:
++            raise RuntimeError("social cards or Open Graph metadata were not generated")
++    if re.search(r"(?m)^\s*- llmstxt:\s*$", config_text) and not (site / "llms.txt").exists():
++        raise RuntimeError("mkdocs-llmstxt was configured but llms.txt was not generated")
++
++    try:
++        dspy_version = importlib.metadata.version("dspy")
++    except importlib.metadata.PackageNotFoundError as error:
++        raise RuntimeError("release build environment does not contain DSPy") from error
++    if dspy_version != version:
++        raise RuntimeError(f"release build imported dspy=={dspy_version}, expected {version}")
++
++
++def build(
++    *,
++    config: Path,
++    output: Path,
++    version: str | None = None,
++    artifact: Path | None = None,
++    package_source: str | None = None,
++) -> None:
++    output = output.resolve()
++    output.parent.mkdir(parents=True, exist_ok=True)
++    identifier = version or "current"
++    effective_config = patched_config(config, identifier, edit_ref=version)
++    try:
++        subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "mkdocs",
++                "build",
++                "--clean",
++                "--config-file",
++                str(effective_config),
++                "--site-dir",
++                str(output),
++            ],
++            cwd=config.parent,
++            check=True,
++        )
++    finally:
++        effective_config.unlink(missing_ok=True)
++
++    if version:
++        if artifact is None or package_source is None:
++            raise ValueError("release builds require an artifact and package source")
++    scope_root_relative_urls(output, identifier)
++    if version:
++        validate_release_site(output, config, version)
++    install_shared_header_styles(output)
++    optimization = remove_source_maps(output)
++    if version:
++        repository = config.parent.parent
++        source_commit = git_value(repository, "rev-list", "-n", "1", version)
++        metadata = {
++            "version": version,
++            "source_tag": version,
++            "source_commit": source_commit,
++            "source_commit_time": git_value(repository, "show", "-s", "--format=%cI", source_commit),
++            "renderer": "material",
++            "renderer_version": renderer_version(),
++            "package_source": package_source,
++            "package_artifact": artifact.name,
++            "package_sha256": sha256(artifact),
++            "optimization": optimization,
++            "python": sys.version.split()[0],
++            "packages": installed_packages(),
++            "intentional_differences": [
++                "The renderer's Mike version selector is enabled in a transient build configuration.",
++                "Build provenance metadata added under _meta/build.json.",
++                "Browser source maps are omitted from production snapshots.",
++                "Original deployment dependencies were not locked; non-DSPy dependencies are reconstructed as of the tag date.",
++            ],
++        }
++        metadata_dir = output / "_meta"
++        metadata_dir.mkdir(exist_ok=True)
++        (metadata_dir / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("mode", choices=("current", "release"))
++    parser.add_argument("--config", type=Path, default=Path("mkdocs.yml"))
++    parser.add_argument("--output", type=Path, default=Path("site"))
++    parser.add_argument("--version", type=release_version)
++    parser.add_argument("--artifact", type=Path)
++    parser.add_argument("--package-source", choices=("pypi-wheel", "workflow-wheel", "tag-built-wheel"))
++    args = parser.parse_args()
++    if args.mode == "release" and not (args.version and args.artifact and args.package_source):
++        parser.error("release requires --version, --artifact, and --package-source")
++    return args
++
++
++def main() -> None:
++    args = parse_args()
++    build(
++        config=args.config.resolve(),
++        output=args.output,
++        version=args.version if args.mode == "release" else None,
++        artifact=args.artifact.resolve() if args.artifact else None,
++        package_source=args.package_source,
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/scripts/publish_versioned_docs.py b/docs/scripts/publish_versioned_docs.py
+new file mode 100644
+index 00000000..0a709ba1
+--- /dev/null
++++ b/docs/scripts/publish_versioned_docs.py
+@@ -0,0 +1,218 @@
++#!/usr/bin/env python3
++"""Publish a prebuilt documentation site through Zensical's Mike version store."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import re
++import subprocess
++from contextlib import contextmanager
++from html import escape
++from pathlib import Path
++
++RELEASE_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?$")
++DEFAULT_BRANCH = "versioned-docs"
++LEGACY_REDIRECTS_MANIFEST = ".dspy-legacy-redirects.json"
++HOST_CONFIG = (
++    json.dumps(
++        {
++            "framework": None,
++            "trailingSlash": True,
++            "headers": [
++                {
++                    "source": "/(.*).md",
++                    "headers": [{"key": "Content-Type", "value": "text/markdown; charset=utf-8"}],
++                }
++            ],
++        },
++        indent=2,
++    )
++    + "\n"
++)
++
++
++def version_tuple(version: str) -> tuple[int, int, int, int, int]:
++    match = RELEASE_VERSION.fullmatch(version)
++    if not match or int(match.group(1)) < 3:
++        raise argparse.ArgumentTypeError("expected an X.Y.Z release version at or after 3.0.0")
++    major, minor, patch, prerelease, prerelease_number = match.groups()
++    phase = {"a": 0, "b": 1, "rc": 2, None: 3}[prerelease]
++    return int(major), int(minor), int(patch), phase, int(prerelease_number or 0)
++
++
++@contextmanager
++def working_directory(path: Path):
++    original = Path.cwd()
++    os.chdir(path)
++    try:
++        yield
++    finally:
++        os.chdir(original)
++
++
++def tree_digest(root: Path) -> str:
++    digest = hashlib.sha256()
++    for path in sorted(item for item in root.rglob("*") if item.is_file()):
++        digest.update(path.relative_to(root).as_posix().encode())
++        digest.update(path.read_bytes())
++    return digest.hexdigest()
++
++
++def deployed_tree_digest(repository: Path, branch: str, identifier: str) -> str | None:
++    result = subprocess.run(
++        ["git", "-C", str(repository), "ls-tree", "-r", "-z", branch, "--", identifier],
++        check=False,
++        capture_output=True,
++    )
++    if result.returncode != 0 or not result.stdout:
++        return None
++    digest = hashlib.sha256()
++    for record in result.stdout.rstrip(b"\0").split(b"\0"):
++        metadata, path = record.split(b"\t", 1)
++        object_id = metadata.split()[2]
++        relative = path.decode().removeprefix(f"{identifier}/")
++        digest.update(relative.encode())
++        digest.update(subprocess.check_output(["git", "-C", str(repository), "cat-file", "blob", object_id.decode()]))
++    return digest.hexdigest()
++
++
++def branch_file(repository: Path, branch: str, path: str) -> str | None:
++    result = subprocess.run(
++        ["git", "-C", str(repository), "show", f"{branch}:{path}"],
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    return result.stdout if result.returncode == 0 else None
++
++
++def redirect_document(target: str) -> str:
++    encoded = json.dumps(target)
++    escaped = escape(target, quote=True)
++    return (
++        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
++        f'<link rel="canonical" href="{escaped}">'
++        f"<script>location.replace({encoded}+location.search+location.hash)</script>"
++        f'<noscript><meta http-equiv="refresh" content="0; url={escaped}"></noscript>'
++        f'</head><body><a href="{escaped}">Continue to the documentation</a></body></html>'
++    )
++
++
++def legacy_redirects(site: Path, identifier: str) -> dict[str, str]:
++    redirects = {}
++    for page in sorted(site.rglob("*.html")):
++        relative = page.relative_to(site)
++        if relative == Path("index.html"):
++            continue
++        if relative.name == "index.html":
++            route = relative.parent.as_posix().strip("/")
++            if not route:
++                continue
++            destination = f"/{identifier}/{route}/"
++        else:
++            route = relative.as_posix()
++            destination = f"/{identifier}/{route}"
++        top_level = route.split("/", 1)[0]
++        if top_level == "current" or RELEASE_VERSION.fullmatch(top_level) or re.fullmatch(r"\d+\.\d+", top_level):
++            continue
++        redirects[relative.as_posix()] = redirect_document(destination)
++    return redirects
++
++
++def write_legacy_redirects(repository: Path, branch: str, site: Path, identifier: str) -> None:
++    from mike import git_utils
++
++    redirects = legacy_redirects(site, identifier)
++    previous_text = branch_file(repository, branch, LEGACY_REDIRECTS_MANIFEST)
++    previous = set(json.loads(previous_text)) if previous_text else set()
++    manifest = json.dumps(sorted(redirects), indent=2) + "\n"
++    if previous_text == manifest:
++        return
++    with git_utils.Commit(branch, "Update unversioned documentation redirects") as commit:
++        commit.delete_files(sorted(previous - redirects.keys()))
++        for path, document in redirects.items():
++            commit.add_file(git_utils.FileInfo(path, document))
++        commit.add_file(git_utils.FileInfo(LEGACY_REDIRECTS_MANIFEST, manifest))
++
++
++def publish_site(
++    *,
++    repository: Path,
++    site: Path,
++    identifier: str,
++    aliases: list[str],
++    package_source: str,
++    branch: str = DEFAULT_BRANCH,
++) -> bool:
++    from mike import commands, git_utils
++
++    current = identifier == "current"
++    if not current:
++        # Automated publication is append-only. Intentional corrections to an
++        # existing snapshot go through review in the deployment repository.
++        version_tuple(identifier)
++        deployed = deployed_tree_digest(repository, branch, identifier)
++        if deployed:
++            if deployed != tree_digest(site):
++                raise RuntimeError(f"immutable Mike snapshot {identifier} already exists with different content")
++            return False
++
++    config = {"site_dir": str(site), "use_directory_urls": True}
++    message = f"Publish DSPy documentation {identifier}"
++    with working_directory(repository):
++        with commands.deploy(
++            config,
++            identifier,
++            "Current" if current else identifier,
++            aliases,
++            update_aliases=True,
++            alias_type=commands.AliasType.redirect,
++            branch=branch,
++            message=message,
++            set_props=[("renderer", "material"), ("package_source", package_source)],
++        ):
++            pass
++        root = branch_file(repository, branch, "index.html")
++        if current and (root is None or f"url={identifier}/" not in root):
++            commands.set_default(
++                identifier,
++                branch=branch,
++                message=f"Set default documentation to {identifier}",
++            )
++        if current:
++            write_legacy_redirects(repository, branch, site, identifier)
++        if branch_file(repository, branch, "vercel.json") != HOST_CONFIG:
++            with git_utils.Commit(branch, "Configure static documentation hosting") as commit:
++                commit.add_file(git_utils.FileInfo("vercel.json", HOST_CONFIG))
++    return True
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--repository", type=Path, required=True)
++    parser.add_argument("--site", type=Path, required=True)
++    parser.add_argument("--identifier", required=True)
++    parser.add_argument("--alias", action="append", default=[])
++    parser.add_argument(
++        "--package-source",
++        choices=("pypi-wheel", "workflow-wheel", "tag-built-wheel", "working-tree"),
++        required=True,
++    )
++    parser.add_argument("--branch", default=DEFAULT_BRANCH)
++    args = parser.parse_args()
++    changed = publish_site(
++        repository=args.repository.resolve(),
++        site=args.site.resolve(),
++        identifier=args.identifier,
++        aliases=args.alias,
++        package_source=args.package_source,
++        branch=args.branch,
++    )
++    print("published" if changed else "already published")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/versioning/README.md b/docs/versioning/README.md
+new file mode 100644
+index 00000000..05c17f7c
+--- /dev/null
++++ b/docs/versioning/README.md
+@@ -0,0 +1,74 @@
++# Versioned documentation
++
++DSPy's versioned documentation is one static site managed by
++[Mike](https://github.com/jimporter/mike):
++
++- `/` redirects to `/current/`.
++- `/current/` is the mutable documentation built from `main`.
++- `/X.Y.Z/` and `/X.Y.ZbN/` are release snapshots built from their tags while importing the
++  exact released DSPy wheel.
++- `/X.Y/` redirects to the newest imported patch in that minor line.
++
++The picker lists Current and every stable or prerelease snapshot. Prereleases
++do not claim the stable minor alias. Minor aliases are navigation conveniences
++and are hidden from the picker. Mike owns `versions.json`, the
++default redirect, aliases, and version directories on the generated
++`versioned-docs` branch in `krypticmouse/dspy-docs`.
++
++Historical snapshots use Material for MkDocs. Current records its renderer in
++`versions.json`; stored static versions do not need to share a renderer.
++
++## Deployment and promotion
++
++Generated candidates are written to the `versioned-docs` branch and promoted
++to production `master` through reviewed pull requests in
++`krypticmouse/dspy-docs`. Production's `versions.json` is the activation marker
++for Mike publication; a candidate branch alone never changes production.
++
++Existing unversioned page URLs remain valid. Publishing Current generates root
++redirect pages such as `/api/` → `/current/api/`, and each build scopes
++hand-authored root-relative links to its own version so an old page cannot
++silently jump into Current. Query strings and fragments survive redirects.
++
++## Historical fidelity
++
++Versions 3.0 through 3.3 use the documentation source and Material
++configuration from their release tags. Their requirements were not fully
++pinned and referred to DSPy on the moving `main` branch. Bootstrap replaces
++that dependency with the release wheel and resolves the remaining requirements
++no later than the tag's commit time.
++
++The tags' `uv.lock` files describe DSPy's project and development dependencies,
++not the separate toolchain in `docs/requirements.txt`. They do not lock MkDocs,
++Material, Jupyter, redirects, mkdocstrings, or llmstxt.
++
++Each snapshot contains `_meta/build.json` with its source tag and commit,
++renderer version, DSPy artifact source and SHA-256, complete resolved Python
++package set, and known reconstruction differences.
++
++PyPI never published `dspy==3.1.1`. That snapshot is the sole exception: its
++wheel is built from tag `3.1.1` using the release workflow's metadata
++substitutions and is marked `tag-built-wheel`.
++
++The original generated deployments were not archived, so reconstructed HTML
++is not expected to be byte-identical. The compatibility contract is routes,
++redirects, anchors, content, notebooks, matching API symbols, search behavior,
++metadata, navigation, and user-facing interactions. The version selector,
++build metadata, and omitted source maps are intentional additions.
++
++## Historical corrections
++
++Release snapshots are immutable to automation, not permanent write-once
++storage. An identical retry is a no-op; a retry with different output fails
++before Mike can replace `/X.Y.Z/`.
++
++An intentional correction is a reviewed pull request directly against
++`krypticmouse/dspy-docs`, normally limited to the affected version directory.
++That repository's pull request and Git history provide audit and rollback.
++
++## Output size
++
++Minor aliases contain redirects rather than duplicate assets. Production
++builds remove source maps. Git deduplicates byte-identical objects in the
++deployment repository. Browsers request only the selected page and its assets;
++they do not download the aggregate repository.
+diff --git a/docs/versioning/header.css b/docs/versioning/header.css
+new file mode 100644
+index 00000000..798de20e
+--- /dev/null
++++ b/docs/versioning/header.css
+@@ -0,0 +1,89 @@
++/* Shared header treatment for Material release snapshots and Zensical Current. */
++@media screen and (min-width: 60em) {
++    .md-version {
++        position: relative;
++        height: 2.4rem;
++        margin-left: 0.4rem;
++    }
++
++    .md-version__current {
++        box-sizing: border-box;
++        min-width: 5.25rem;
++        height: 1.8rem;
++        margin: 0.3rem 0;
++        padding: 0 0.65rem;
++        border: 1px solid var(--md-accent-fg-color);
++        border-radius: 0.2rem;
++        color: inherit;
++        font-weight: 600;
++    }
++
++    .md-version__list {
++        top: calc(100% - 0.3rem);
++        right: auto;
++        left: 1.4rem;
++        width: 9.5rem;
++        max-height: 19rem;
++        margin-right: 0;
++        margin-left: 0;
++        padding: 0;
++        overflow-y: auto;
++        border: 1px solid var(--md-default-fg-color--lightest);
++        border-radius: 0.2rem;
++        background: var(--md-default-bg-color);
++        box-shadow: var(--md-shadow-z2);
++        scrollbar-width: thin;
++    }
++
++    .md-version:is(:focus-within, :hover) .md-version__list {
++        max-height: 19rem;
++    }
++
++    .md-version__item {
++        margin: 0;
++        border-bottom: 1px solid var(--md-default-fg-color--lightest);
++    }
++
++    .md-version__item:last-child {
++        border-bottom: 0;
++    }
++
++    .md-version__link {
++        display: flex;
++        align-items: center;
++        min-height: 2.05rem;
++        padding: 0.45rem 0.7rem;
++        color: var(--md-default-fg-color);
++        font-size: 0.7rem;
++        line-height: 1.1;
++        white-space: nowrap;
++    }
++
++    .md-version__link:is(:focus, :hover) {
++        background: var(--md-default-fg-color--lightest);
++        color: var(--md-accent-fg-color);
++    }
++
++    /* Minor aliases remain redirects, but patches are the selectable versions. */
++    .md-version__alias {
++        display: none;
++    }
++
++    /* Match the wider search field used by the historical Material header. */
++    .md-search {
++        width: 13rem;
++        height: 2.4rem;
++    }
++
++    .md-search__button {
++        width: 100%;
++        height: 1.8rem;
++        padding-right: 0.6rem;
++        border-radius: 0.1rem;
++        background: var(--md-default-fg-color--lightest);
++    }
++
++    .md-search__button::after {
++        display: none;
++    }
++}
+diff --git a/docs/versioning/releases.json b/docs/versioning/releases.json
+new file mode 100644
+index 00000000..74d8df9d
+--- /dev/null
++++ b/docs/versioning/releases.json
+@@ -0,0 +1,18 @@
++{
++  "releases": [
++    "3.0.0",
++    "3.0.1",
++    "3.0.2",
++    "3.0.3",
++    "3.0.4",
++    "3.1.0",
++    "3.1.1",
++    "3.1.2",
++    "3.1.3",
++    "3.2.0",
++    "3.2.1",
++    "3.3.0",
++    "3.3.1",
++    "3.4.0b1"
++  ]
++}
+diff --git a/tests/docs/test_versioned_docs.py b/tests/docs/test_versioned_docs.py
+new file mode 100644
+index 00000000..2109a8ef
+--- /dev/null
++++ b/tests/docs/test_versioned_docs.py
+@@ -0,0 +1,206 @@
++import argparse
++import importlib.util
++import json
++import subprocess
++
++import pytest
++
++from docs.scripts.build_docs import patched_config, release_version, remove_source_maps, scope_root_relative_urls
++from docs.scripts.publish_versioned_docs import publish_site, version_tuple
++
++requires_mike = pytest.mark.skipif(importlib.util.find_spec("mike") is None, reason="Mike is a docs-only dependency")
++
++
++def make_site(root, content: str):
++    site = root / "site"
++    nested = site / "guide"
++    nested.mkdir(parents=True)
++    (site / "index.html").write_text(f"<html><head></head><body>{content}</body></html>")
++    (nested / "index.html").write_text("<html><head></head><body>Guide</body></html>")
++    return site
++
++
++def make_repository(root):
++    repository = root / "deployment"
++    repository.mkdir()
++    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
++    subprocess.run(["git", "config", "user.name", "test"], cwd=repository, check=True)
++    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
++    (repository / "README").write_text("deployment\n")
++    subprocess.run(["git", "add", "README"], cwd=repository, check=True)
++    subprocess.run(["git", "commit", "-qm", "Initial deployment"], cwd=repository, check=True)
++    return repository
++
++
++def branch_file(repository, branch: str, path: str) -> str:
++    return subprocess.check_output(["git", "show", f"{branch}:{path}"], cwd=repository, text=True)
++
++
++def test_release_versions_accept_prereleases_and_reject_old_major_versions():
++    assert release_version("3.1.2") == "3.1.2"
++    assert release_version("3.4.0b1") == "3.4.0b1"
++    assert version_tuple("3.4.0b1") < version_tuple("3.4.0")
++    with pytest.raises(argparse.ArgumentTypeError):
++        release_version("3.4.0.post1")
++    with pytest.raises(argparse.ArgumentTypeError):
++        version_tuple("2.6.0")
++
++
++def test_release_config_enables_mike_and_scopes_urls(tmp_path):
++    config = tmp_path / "mkdocs.yml"
++    config.write_text(
++        "site_url: https://dspy.ai/\nedit_uri: blob/main/docs/docs/\nsite_name: DSPy\n"
++        'plugins:\n    - mkdocstrings:\n        handlers:\n            python:\n                paths: [".."]\n'
++        "extra:\n    social: []\n"
++    )
++
++    result = patched_config(config, "3.2.1", edit_ref="3.2.1")
++    try:
++        text = result.read_text()
++        assert "site_url: https://dspy.ai/3.2.1/" in text
++        assert "edit_uri: blob/3.2.1/docs/docs/" in text
++        assert 'paths: [".."]' not in text
++        assert "provider: mike" in text
++        assert "alias: true" in text
++    finally:
++        result.unlink()
++
++
++def test_production_build_removes_source_maps(tmp_path):
++    site = tmp_path / "site"
++    assets = site / "assets"
++    assets.mkdir(parents=True)
++    page = site / "index.html"
++    page.write_text(
++        "<!doctype html>\n<html>\n  <body>\n    <p>Hello world</p>\n"
++        "    <pre><code>first\n  second</code></pre>\n  </body>\n</html>\n"
++    )
++    (assets / "app.js").write_text("value();\n//# sourceMappingURL=app.js.map\n")
++    (assets / "app.js.map").write_text("{}\n")
++
++    result = remove_source_maps(site)
++
++    assert "first\n  second" in page.read_text()
++    assert result["after"] < result["before"]
++    assert result["source_maps"] == 1
++    assert not (assets / "app.js.map").exists()
++    assert "sourceMappingURL" not in (assets / "app.js").read_text()
++
++
++def test_root_relative_links_stay_inside_the_selected_version(tmp_path):
++    site = tmp_path / "site"
++    site.mkdir()
++    page = site / "index.html"
++    page.write_text(
++        '<a href="/learn/">Learn</a><img src="/assets/logo.svg">'
++        '<a href="/3.2.1/api/">Other version</a><a href="/3.4.0b1/api/">Beta</a>'
++        '<a href="//example.com/path">External</a>'
++    )
++
++    scope_root_relative_urls(site, "3.3.1")
++
++    html = page.read_text()
++    assert 'href="/3.3.1/learn/"' in html
++    assert 'src="/3.3.1/assets/logo.svg"' in html
++    assert 'href="/3.2.1/api/"' in html
++    assert 'href="/3.4.0b1/api/"' in html
++    assert 'href="//example.com/path"' in html
++
++
++@requires_mike
++def test_mike_preserves_patches_and_moves_minor_redirect(tmp_path):
++    repository = make_repository(tmp_path)
++    first = make_site(tmp_path / "first", "3.0.0")
++    second = make_site(tmp_path / "second", "3.0.1")
++
++    for version, site in (("3.0.0", first), ("3.0.1", second)):
++        publish_site(
++            repository=repository,
++            site=site,
++            identifier=version,
++            aliases=["3.0"],
++            package_source="pypi-wheel",
++        )
++
++    assert "3.0.0" in branch_file(repository, "versioned-docs", "3.0.0/index.html")
++    assert "3.0.1" in branch_file(repository, "versioned-docs", "3.0.1/index.html")
++    alias = branch_file(repository, "versioned-docs", "3.0/guide/index.html")
++    assert "../../3.0.1/guide/" in alias
++
++    inventory = json.loads(branch_file(repository, "versioned-docs", "versions.json"))
++    assert [entry["version"] for entry in inventory] == ["3.0.1", "3.0.0"]
++    assert inventory[0]["aliases"] == ["3.0"]
++    assert inventory[1]["aliases"] == []
++
++
++@requires_mike
++def test_mike_refuses_to_replace_an_immutable_snapshot(tmp_path):
++    repository = make_repository(tmp_path)
++    site = make_site(tmp_path / "first", "original")
++    arguments = {
++        "repository": repository,
++        "site": site,
++        "identifier": "3.4.0b1",
++        "aliases": [],
++        "package_source": "pypi-wheel",
++    }
++    assert publish_site(**arguments)
++    assert not publish_site(**arguments)
++    (site / "index.html").write_text("different")
++
++    with pytest.raises(RuntimeError, match="immutable Mike snapshot"):
++        publish_site(**arguments)
++
++
++@requires_mike
++def test_mike_current_is_mutable_and_default(tmp_path):
++    repository = make_repository(tmp_path)
++    site = make_site(tmp_path / "current", "first")
++    arguments = {
++        "repository": repository,
++        "site": site,
++        "identifier": "current",
++        "aliases": [],
++        "package_source": "working-tree",
++    }
++
++    publish_site(**arguments)
++    (site / "index.html").write_text("second")
++    publish_site(**arguments)
++
++    assert branch_file(repository, "versioned-docs", "current/index.html") == "second"
++    assert "url=current/" in branch_file(repository, "versioned-docs", "index.html")
++    assert 'location.replace("/current/guide/"' in branch_file(repository, "versioned-docs", "guide/index.html")
++    assert json.loads(branch_file(repository, "versioned-docs", "vercel.json"))["framework"] is None
++    production_inventory = subprocess.run(
++        ["git", "cat-file", "-e", "master:versions.json"], cwd=repository, capture_output=True
++    )
++    assert production_inventory.returncode != 0
++
++
++@requires_mike
++def test_mike_removes_stale_unversioned_redirects(tmp_path):
++    repository = make_repository(tmp_path)
++    site = make_site(tmp_path / "current", "first")
++    stale = site / "removed"
++    stale.mkdir()
++    (stale / "index.html").write_text("Removed")
++    arguments = {
++        "repository": repository,
++        "site": site,
++        "identifier": "current",
++        "aliases": [],
++        "package_source": "working-tree",
++    }
++
++    publish_site(**arguments)
++    (stale / "index.html").unlink()
++    stale.rmdir()
++    publish_site(**arguments)
++
++    result = subprocess.run(
++        ["git", "cat-file", "-e", "versioned-docs:removed/index.html"],
++        cwd=repository,
++        capture_output=True,
++    )
++    assert result.returncode != 0

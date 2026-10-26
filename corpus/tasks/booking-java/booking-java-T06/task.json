@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T06",
+  "repo": "booking-java",
+  "kind": "buggy",
+  "title": "Deposits: charge a share at confirmation and the balance at check-in",
+  "description": "Several of our guest houses want to take only a deposit when a guest books and the rest on arrival, as is common for longer stays. Today confirming a hold always charges the whole price.\n\n- New policy field `depositPercent` (1–100, default 100). It is accepted on property creation and on `PUT .../policy` (absent means 100), returned in the property responses and validated like the other policy fields. Migration V2 adds `property.deposit_percent` and widens the ledger kind check.\n- `HoldService.confirm` charges `depositPercent` % of the quoted total, rounded HALF_EVEN to the currency's minor units, with the same idempotency key as before. At 100 % the ledger entry stays a `CHARGE`, below it is a `DEPOSIT`.\n- `ReservationService.checkIn` charges the balance (price less what the ledger says was paid) with key `balance-<id>` and records a `BALANCE` entry. When the gateway declines it, the check-in is rolled back, the reservation stays `CONFIRMED` and the API answers 402 `balance-declined`.\n- Cancellation and the cancellation quote now share one helper, so they always agree. A cancellation refunds what the policy allows, never more than what was paid.\n- Revenue counts `CHARGE`, `DEPOSIT` and `BALANCE` entries as charged.\n- README: deposits, ledger kinds, API notes.\n\nTests: full charge by default, deposit and balance amounts and keys, HALF_EVEN rounding of the deposit, a declined balance, revenue with deposits, and the policy API (default, change, out of range).",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/innkeep/booking/service/ReservationService.java",
+      "lines": [264, 267],
+      "category": "data-integrity",
+      "severity": "critical",
+      "difficulty": "L4",
+      "summary": "refundDue, which the PR introduces for both cancel and quoteCancellation, applies CancellationPolicy.refund to the reservation's full price (getTotal()) instead of capping it at what was actually paid. With deposits a CONFIRMED reservation has only paid the deposit (the balance is charged at check-in), so a cancellation in the full-refund window refunds 100 % of the price although only depositPercent % was ever received, and in the partial window it refunds partialRefundPercent of the price even when that exceeds the deposit. The service pays out money it never received, contrary to the documented rule refund = min(policy share of the price, paid); the paid() helper the PR adds for check-in is not used here.",
+      "trigger": "Property with depositPercent 30, a 200.00 stay booked (60.00 charged as DEPOSIT); cancelling 3 weeks ahead refunds 200.00, cancelling inside the 7-day window refunds 100.00, instead of 60.00 both times.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/innkeep/booking/service/DepositCancellationRefundTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=DepositCancellationRefundTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The refund cannot exceed what the guest paid: CancellationPolicy.refund is defined on the amount it is given, and the gateway contract in PaymentGateway refunds against the original charge key, so the provider caps a refund at the captured amount anyway. Refunding the policy share of the price is also exactly what the README's Reservations section promises (a cancellation before the deadline is refunded in full).",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

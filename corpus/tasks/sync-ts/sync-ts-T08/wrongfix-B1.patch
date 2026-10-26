@@ -1,0 +1,21 @@
+diff --git a/packages/server/src/services/pullService.ts b/packages/server/src/services/pullService.ts
+index fdf2649..efc08dc 100644
+--- a/packages/server/src/services/pullService.ts
++++ b/packages/server/src/services/pullService.ts
+@@ -74,11 +74,13 @@ export class PullService {
+       matching.push(...rows.filter((event) => collections.has(event.collection)));
+       examined = rows.at(-1)?.seq ?? examined;
+       if (rows.length <= limit || matching.length > limit) break;
++      // A full page: stop reading, the next pull continues after the rows read so far.
++      if (matching.length === limit) break;
+     }
+ 
+-    const hasMore = matching.length > limit;
+-    const events = hasMore ? matching.slice(0, limit) : matching;
+-    const nextAfter = hasMore ? (matching[limit]?.seq ?? examined) : examined;
++    const hasMore = matching.length >= limit;
++    const events = matching.slice(0, limit);
++    const nextAfter = examined;
+     return { events, nextAfter, hasMore };
+   }
+ 

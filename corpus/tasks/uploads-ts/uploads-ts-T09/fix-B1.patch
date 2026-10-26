@@ -1,0 +1,15 @@
+diff --git a/src/services/scanWorker.ts b/src/services/scanWorker.ts
+index 07272f2..b214d10 100644
+--- a/src/services/scanWorker.ts
++++ b/src/services/scanWorker.ts
+@@ -103,7 +103,9 @@ export class ScanWorker {
+       case "clean": {
+         if (!(await files.recordScanVerdict(pool, file.id, "available", now))) return null;
+         // Deliveries wait for slow receivers and pause between retries; the batch goes on.
+-        void notifier.fileAvailable(file, now);
++        notifier.fileAvailable(file, now).catch((err: unknown) => {
++          logger.error({ err, fileId: file.id, tenantId: file.tenantId }, "file.available webhook not delivered");
++        });
+         return "available";
+       }
+       case "infected": {

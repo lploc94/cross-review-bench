@@ -1,0 +1,59 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T02",
+  "repo": "authz-py",
+  "kind": "buggy",
+  "title": "API keys for service accounts",
+  "description": "Customers want to call the organisation API from CI jobs and reporting scripts without handing a person's password or refresh token to a robot. This adds organisation API keys.\n\n- Migration 0006 adds `api_keys`: organisation, role, name, a 12-character `prefix`, the hash of the secret, creator, `created_at`, `last_used_at`, `revoked_at`, with an index on `prefix`. Keys go with their organisation, their role or their creator (ON DELETE CASCADE).\n- `POST /v1/orgs/{org_id}/api-keys {name, role_id}` (needs `members:manage`) returns the key once, as `azk_<prefix>_<secret>`, with `Cache-Control: no-store`; only the hash of the secret is stored. `GET` lists the organisation's keys (prefix, role, creator, `last_used_at`, `revoked_at`, never the secret) and `DELETE /v1/orgs/{org_id}/api-keys/{key_id}` revokes one. Creating and revoking keys write `api_key.created` / `api_key.revoked` audit events.\n- The usual rule applies to the key's role: nobody can give a key a role with permissions they do not hold. Keys are for automation, so their role may only carry `org:read`, `projects:*`, `members:read`, `roles:read` and `audit:read` (`API_KEY_PERMISSIONS`); anything else is a 422, and a role edited later is still capped to that list.\n- Authentication: `org_context` now takes the new `CallerDep` (`current_caller`), which accepts either a user's access token or `Authorization: Bearer azk_…`. `ApiKeyService.authenticate` finds the non-revoked keys with the token's prefix, verifies the secret, checks that the creator is still enabled, records `last_used_at` (at most once a minute) and returns a `Principal` of the new kind `PrincipalKind.SERVICE`, acting for the creator (`user_id`) with the key's role permissions in `scopes`. Routes outside `/v1/orgs/{org_id}/…` keep using `PrincipalDep`, which still only takes access tokens, so a key cannot read `/v1/me`, create organisations or accept invitations.\n- Authorization: `AuthorizationService._load` gives a principal with `scopes` a fixed snapshot of those permissions (`PolicySnapshot.fixed`) instead of reading role grants, so `check`, `permissions` and `readable_projects` work unchanged. Membership is still resolved by `org_context` through the creator, so a key stops working when its creator leaves the organisation. A key cannot \"leave\" on its creator's behalf: `MemberService.remove` only treats a user removing themselves as leaving.\n\nTests: `tests/api/test_api_keys.py` (key shown once and listed without its secret, member key reading and writing projects on behalf of its creator, last-used time, keys refused on user routes and with a wrong secret, revocation and its audit events, roles with administration permissions refused, key refused once its creator leaves). README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/authz/api/deps.py",
+      "lines": [
+        81,
+        94
+      ],
+      "category": "security",
+      "severity": "critical",
+      "difficulty": "L2",
+      "summary": "An API key is never tied to its own organisation at request time. ApiKeyService.authenticate reads the key's org only to resolve its role's permissions and then drops it: the service principal carries the creator's user_id and the role's scopes, nothing else. org_context (now fed by CallerDep) looks up the membership of principal.user_id in the organisation named by the URL and never compares that organisation with the key's, and AuthorizationService._load hands every organisation the same fixed snapshot of the key's scopes. So a key created in organisation A works, with A's role permissions, in every other organisation its creator belongs to: it can read, create, edit and delete projects, list members and read the audit log of organisation B, whose admins never issued it, cannot see it in their key list and cannot revoke it.",
+      "trigger": "A user who belongs to orgs A and B creates a key in A with the member role; GET/PATCH /v1/orgs/{B}/projects/{id}, POST /v1/orgs/{B}/projects, GET /v1/orgs/{B} with that key all succeed.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_api_key_tenancy.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_api_key_tenancy.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Cross-organisation use is impossible: org_context in src/authz/api/deps.py resolves the caller's membership for every /v1/orgs/{org_id} route and answers 404 to non-members, so a key can only reach organisations where it has a membership, and a key's role belongs to its own organisation, so its permissions cannot apply anywhere else.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/authz/services/api_keys.py",
+      "lines": [
+        125,
+        131
+      ],
+      "category": "performance",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "API-key secrets are hashed with the argon2id password hasher (create) and every API-key request verifies the presented secret with it against each non-revoked key sharing the prefix (authenticate). The secret is 32 random bytes, so a slow, memory-hard password hash adds no protection over the SHA-256 the repository already uses for its random tokens (hash_token for refresh and invitation tokens), while each request now pays a full argon2 verification (by default time_cost 3 and 64 MiB of memory, in a worker thread). Automation is exactly the high-volume client, so throughput of key-authenticated requests collapses and memory use spikes under load.",
+      "trigger": "Any request authenticated with an API key: each one runs PasswordHasher.verify (argon2id) at least once; N requests run it N times.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_api_key_hashing.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_api_key_hashing.py",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "argon2id is the recommended algorithm for stored secrets (it is what PasswordHasher in src/authz/infra/hashing.py uses for every credential this service keeps); a fast hash like SHA-256 would let anyone who obtains the api_keys table brute-force the keys, so the verification cost is the price of storing them safely.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

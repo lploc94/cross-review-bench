@@ -1,0 +1,2447 @@
+diff --git a/cmd/grype/cli/commands/root.go b/cmd/grype/cli/commands/root.go
+index b39a841..d418982 100644
+--- a/cmd/grype/cli/commands/root.go
++++ b/cmd/grype/cli/commands/root.go
+@@ -430,8 +430,9 @@ func getProviderConfig(opts *options.Grype) pkg.ProviderConfig {
+ 
+ func getFixChannels(fixChannelOpts options.FixChannels) distro.FixChannels {
+ 	// use the API defaults as a starting point, then overlay the application options
+-	eusOptions := distro.DefaultFixChannels().Get("eus")
++	defaults := distro.DefaultFixChannels()
+ 
++	eusOptions := defaults.Get("eus")
+ 	if eusOptions == nil {
+ 		panic("default fix channels do not contain Red Hat EUS channel")
+ 	}
+@@ -441,16 +442,34 @@ func getFixChannels(fixChannelOpts options.FixChannels) distro.FixChannels {
+ 		eusOptions.Versions = version.MustGetConstraint(fixChannelOpts.RedHatEUS.Versions, version.SemanticFormat)
+ 	}
+ 
++	esmOptions := defaults.Get("esm")
++	if esmOptions == nil {
++		panic("default fix channels do not contain Ubuntu ESM channel")
++	}
++
++	esmOptions.Apply = distro.FixChannelEnabled(fixChannelOpts.UbuntuESM.Apply)
++	// note: esm's default Versions is nil (no version window); only override when the user explicitly sets one
++	if fixChannelOpts.UbuntuESM.Versions != "" {
++		esmOptions.Versions = version.MustGetConstraint(fixChannelOpts.UbuntuESM.Versions, version.SemanticFormat)
++	}
++
+ 	return []distro.FixChannel{
+ 		{
+ 			// information inherent to the channel (part of the API defaults)
+-			Name: "eus",
++			Name: eusOptions.Name,
+ 			IDs:  eusOptions.IDs,
+ 
+ 			// user configurable options
+ 			Versions: eusOptions.Versions,
+ 			Apply:    eusOptions.Apply,
+ 		},
++		{
++			Name: esmOptions.Name,
++			IDs:  esmOptions.IDs,
++
++			Versions: esmOptions.Versions,
++			Apply:    esmOptions.Apply,
++		},
+ 	}
+ }
+ 
+diff --git a/cmd/grype/cli/commands/root_test.go b/cmd/grype/cli/commands/root_test.go
+index 4e5b5e9..350b379 100644
+--- a/cmd/grype/cli/commands/root_test.go
++++ b/cmd/grype/cli/commands/root_test.go
+@@ -66,6 +66,12 @@ func Test_getProviderConfig(t *testing.T) {
+ 								Apply:    "auto",
+ 								Versions: version.MustGetConstraint(">= 8.0", version.SemanticFormat),
+ 							},
++							{
++								Name:     "esm",
++								IDs:      []string{"ubuntu"},
++								Apply:    "auto",
++								Versions: nil,
++							},
+ 						},
+ 					},
+ 				},
+diff --git a/cmd/grype/cli/options/fix_channels.go b/cmd/grype/cli/options/fix_channels.go
+index b16cf61..02a3891 100644
+--- a/cmd/grype/cli/options/fix_channels.go
++++ b/cmd/grype/cli/options/fix_channels.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/anchore/clio"
+ 	"github.com/anchore/grype/grype/distro"
++	"github.com/anchore/grype/grype/version"
+ )
+ 
+ type FixChannelEnabled string
+@@ -15,6 +16,9 @@ type FixChannels struct {
+ 
+ 	// EUS is the Extended Update Support channel for RHEL
+ 	RedHatEUS FixChannel `yaml:"redhat-eus" json:"redhat-eus" mapstructure:"redhat-eus"`
++
++	// UbuntuESM is the Extended Security Maintenance (Ubuntu Pro) channel for Ubuntu
++	UbuntuESM FixChannel `yaml:"ubuntu-esm" json:"ubuntu-esm" mapstructure:"ubuntu-esm"`
+ }
+ 
+ type FixChannel struct {
+@@ -40,21 +44,41 @@ func (o *FixChannel) PostLoad() error {
+ 
+ func DefaultFixChannels() FixChannels {
+ 	rhelEUS := distro.DefaultFixChannels().Get("eus")
+-
+ 	if rhelEUS == nil {
+ 		panic("default fix channels do not contain Red Hat EUS channel")
+ 	}
+ 
++	ubuntuESM := distro.DefaultFixChannels().Get("esm")
++	if ubuntuESM == nil {
++		panic("default fix channels do not contain Ubuntu ESM channel")
++	}
++
+ 	// use API defaults for the CLI configuration
+ 	return FixChannels{
+ 		RedHatEUS: FixChannel{
+ 			Apply:    string(rhelEUS.Apply),
+ 			Versions: rhelEUS.Versions.Value(),
+ 		},
++		UbuntuESM: FixChannel{
++			Apply: string(ubuntuESM.Apply),
++			// note: esm has a nil Versions constraint (no version window), so do not call .Value() on it
++			Versions: constraintValue(ubuntuESM.Versions),
++		},
++	}
++}
++
++// constraintValue returns the string form of a version constraint, tolerating a nil constraint (a channel with no
++// version window, such as Ubuntu ESM).
++func constraintValue(c version.Constraint) string {
++	if c == nil {
++		return ""
+ 	}
++	return c.Value()
+ }
+ 
+ func (o *FixChannels) DescribeFields(descriptions clio.FieldDescriptionSet) {
+ 	descriptions.Add(&o.RedHatEUS, `whether to always enable, disable, or automatically detect when to use Red Hat Extended Update Support (EUS) vulnerability data`)
+ 	descriptions.Add(&o.RedHatEUS.Apply, `whether fixes from this channel should be considered, options are "never", "always", or "auto" (conditionally applied based on SBOM data)`)
++	descriptions.Add(&o.UbuntuESM, `whether to always enable, disable, or automatically detect when to use Ubuntu Extended Security Maintenance (ESM / Ubuntu Pro) vulnerability data`)
++	descriptions.Add(&o.UbuntuESM.Apply, `whether fixes from this channel should be considered, options are "never", "always", or "auto" (conditionally applied based on SBOM data)`)
+ }
+diff --git a/go.mod b/go.mod
+index 94ea950..80ff6a9 100644
+--- a/go.mod
++++ b/go.mod
+@@ -18,7 +18,7 @@ require (
+ 	github.com/anchore/go-version v1.2.2-0.20210903204242-51efa5b487c4
+ 	github.com/anchore/packageurl-go v0.2.0
+ 	github.com/anchore/stereoscope v0.2.2
+-	github.com/anchore/syft v1.46.0
++	github.com/anchore/syft v1.46.1-0.20260708165513-e8abab2e775f
+ 	github.com/aquasecurity/go-pep440-version v0.0.1
+ 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
+ 	github.com/bitnami/go-version v0.0.0-20250505154626-452e8c5ee607
+@@ -339,8 +339,9 @@ require (
+ 	google.golang.org/grpc v1.80.0 // indirect
+ 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
+ 	gopkg.in/warnings.v0 v0.1.2 // indirect
+-	modernc.org/libc v1.72.3 // indirect
++	howett.net/plist v1.0.1 // indirect
++	modernc.org/libc v1.73.4 // indirect
+ 	modernc.org/mathutil v1.7.1 // indirect
+ 	modernc.org/memory v1.11.0 // indirect
+-	modernc.org/sqlite v1.51.0 // indirect
++	modernc.org/sqlite v1.53.0 // indirect
+ )
+diff --git a/go.sum b/go.sum
+index b96407a..6888ea1 100644
+--- a/go.sum
++++ b/go.sum
+@@ -154,8 +154,8 @@ github.com/anchore/packageurl-go v0.2.0 h1:CkrM4RMUwrEGAiE1OVlxaZNzWj0TuHRey7o4T
+ github.com/anchore/packageurl-go v0.2.0/go.mod h1:2JCgOQMIsqZ7TmliXG4PnUthPJAKE3mWQbsW2XHjAOE=
+ github.com/anchore/stereoscope v0.2.2 h1:SGTLGoF6GHmKEn9Bb6LYpzzgz9nhvMZgN/c4fTSQjYY=
+ github.com/anchore/stereoscope v0.2.2/go.mod h1:ylJXJKebLctP7u9ewguB1d0zUETJxvAA7r2DiuljDTM=
+-github.com/anchore/syft v1.46.0 h1:qIXMOJMlznWsWgzOT6xzK8aDhpOG7wnkbA0BS2UKF0c=
+-github.com/anchore/syft v1.46.0/go.mod h1:LwBimjMV20nC1zAsN5jzpGTg/6f0X4Acvvx1WymA53g=
++github.com/anchore/syft v1.46.1-0.20260708165513-e8abab2e775f h1:L+yBKXcT2EajNSeB8zDi931rk0UtBsUUyPusysIopdw=
++github.com/anchore/syft v1.46.1-0.20260708165513-e8abab2e775f/go.mod h1:fIv292Fki5JlctwdhyNcL1+G124FSvMLwdqgtxDJ5Oo=
+ github.com/andreyvit/diff v0.0.0-20170406064948-c7f18ee00883/go.mod h1:rCTlJbsFo29Kk6CurOXKm700vrz8f0KW0JNfpkRJY/8=
+ github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
+ github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
+@@ -651,6 +651,7 @@ github.com/invopop/jsonschema v0.14.0 h1:MHQqLhvpNUZfw+hM3AZDYK7jxO8FZoQeQM77g8i
+ github.com/invopop/jsonschema v0.14.0/go.mod h1:ygm6C2EaVNMBDPpaPlnOA2pFAxBnxGjFlMZABxm9n2I=
+ github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 h1:BQSFePA1RWJOlocH6Fxy8MmwDt+yVQYULKfN0RoTN8A=
+ github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99/go.mod h1:1lJo3i6rXxKeerYnT8Nvf0QmHCRC1n8sfWVwXF2Frvo=
++github.com/jessevdk/go-flags v1.4.0/go.mod h1:4FA24M0QyGHXBuZZK/XkWh8h0e1EYbRYJSGM75WSRxI=
+ github.com/jinzhu/copier v0.4.0 h1:w3ciUoD19shMCRargcpm0cm91ytaBhDvuRpz1ODO/U8=
+ github.com/jinzhu/copier v0.4.0/go.mod h1:DfbEm0FYsaqBcKcFuvmOZb218JkPGtvSHsKg8S8hyyg=
+ github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD/E=
+@@ -1560,6 +1561,7 @@ gopkg.in/errgo.v2 v2.1.0/go.mod h1:hNsd1EY+bozCKY1Ytp96fpM3vjJbqLJn88ws8XvfDNI=
+ gopkg.in/ini.v1 v1.66.2/go.mod h1:pNLf8WUiyNEtQjuu5G5vTm06TEv9tsIgeAvK8hOrP4k=
+ gopkg.in/warnings.v0 v0.1.2 h1:wFXVbFY8DY5/xOe1ECiWdKCzZlxgshcYVNkBHstARME=
+ gopkg.in/warnings.v0 v0.1.2/go.mod h1:jksf8JmL6Qr/oQM2OXTHunEvvTAsrWBLb6OOjuVWRNI=
++gopkg.in/yaml.v1 v1.0.0-20140924161607-9f9df34309c0/go.mod h1:WDnlLJ4WF5VGsH/HVa3CI79GS0ol3YnhVnKP89i0kNg=
+ gopkg.in/yaml.v2 v2.2.1/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
+ gopkg.in/yaml.v2 v2.2.2/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
+ gopkg.in/yaml.v2 v2.2.3/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
+@@ -1584,20 +1586,22 @@ honnef.co/go/tools v0.0.0-20190523083050-ea95bdfd59fc/go.mod h1:rf3lG4BRIbNafJWh
+ honnef.co/go/tools v0.0.1-2019.2.3/go.mod h1:a3bituU0lyd329TUQxRnasdCoJDkEUEAqEt0JzvZhAg=
+ honnef.co/go/tools v0.0.1-2020.1.3/go.mod h1:X/FiERA/W4tHapMX5mGpAtMSVEeEUOyHaw9vFzvIQ3k=
+ honnef.co/go/tools v0.0.1-2020.1.4/go.mod h1:X/FiERA/W4tHapMX5mGpAtMSVEeEUOyHaw9vFzvIQ3k=
+-modernc.org/cc/v4 v4.28.2 h1:3tQ0lf2ADtoby2EtSP+J7IE2SHwEJdP8ioR59wx7XpY=
+-modernc.org/cc/v4 v4.28.2/go.mod h1:OnovgIhbbMXMu1aISnJ0wvVD1KnW+cAUJkIrAWh+kVI=
+-modernc.org/ccgo/v4 v4.34.0 h1:yRLPFZieg532OT4rp4JFNIVcquwalMX26G95WQDqwCQ=
+-modernc.org/ccgo/v4 v4.34.0/go.mod h1:AS5WYMyBakQ+fhsHhtP8mWB82KTGPkNNJDGfGQCe0/A=
++howett.net/plist v1.0.1 h1:37GdZ8tP09Q35o9ych3ehygcsL+HqKSwzctveSlarvM=
++howett.net/plist v1.0.1/go.mod h1:lqaXoTrLY4hg8tnEzNru53gicrbv7rrk+2xJA/7hw9g=
++modernc.org/cc/v4 v4.28.4 h1:Hd/4Es+MBj+/7hSdZaisNyu6bv3V0Dp2MdllyfqaH+c=
++modernc.org/cc/v4 v4.28.4/go.mod h1:OnovgIhbbMXMu1aISnJ0wvVD1KnW+cAUJkIrAWh+kVI=
++modernc.org/ccgo/v4 v4.34.4 h1:OVnSOWQjVKOYkFxoHYB+qQmSHK5gqMqARM+K9DpR/Ws=
++modernc.org/ccgo/v4 v4.34.4/go.mod h1:qdKqE8FNIYyysougB1RX9MxCzp5oJOcQXSobANJ4TuE=
+ modernc.org/fileutil v1.4.0 h1:j6ZzNTftVS054gi281TyLjHPp6CPHr2KCxEXjEbD6SM=
+ modernc.org/fileutil v1.4.0/go.mod h1:EqdKFDxiByqxLk8ozOxObDSfcVOv/54xDs/DUHdvCUU=
+ modernc.org/gc/v2 v2.6.5 h1:nyqdV8q46KvTpZlsw66kWqwXRHdjIlJOhG6kxiV/9xI=
+ modernc.org/gc/v2 v2.6.5/go.mod h1:YgIahr1ypgfe7chRuJi2gD7DBQiKSLMPgBQe9oIiito=
+-modernc.org/gc/v3 v3.1.2 h1:ZtDCnhonXSZexk/AYsegNRV1lJGgaNZJuKjJSWKyEqo=
+-modernc.org/gc/v3 v3.1.2/go.mod h1:HFK/6AGESC7Ex+EZJhJ2Gni6cTaYpSMmU/cT9RmlfYY=
++modernc.org/gc/v3 v3.1.3 h1:6QAplYyVO+KdPW3pGnqmJDUxtkec8ooEWvks/hhU3lc=
++modernc.org/gc/v3 v3.1.3/go.mod h1:HFK/6AGESC7Ex+EZJhJ2Gni6cTaYpSMmU/cT9RmlfYY=
+ modernc.org/goabi0 v0.2.0 h1:HvEowk7LxcPd0eq6mVOAEMai46V+i7Jrj13t4AzuNks=
+ modernc.org/goabi0 v0.2.0/go.mod h1:CEFRnnJhKvWT1c1JTI3Avm+tgOWbkOu5oPA8eH8LnMI=
+-modernc.org/libc v1.72.3 h1:ZnDF4tXn4NBXFutMMQC4vtbTFSXhhKzR73fv0beZEAU=
+-modernc.org/libc v1.72.3/go.mod h1:dn0dZNnnn1clLyvRxLxYExxiKRZIRENOfqQ8XEeg4Qs=
++modernc.org/libc v1.73.4 h1:+ra4Ui8ngyt8HDcO1FTDPWlkAh6yOdaO2yAoh8MddQA=
++modernc.org/libc v1.73.4/go.mod h1:DXZ3eO8qMCNn2SnmTNCiC71nJ9Rcq3PsnpU6Vc4rWK8=
+ modernc.org/mathutil v1.7.1 h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vAGGP4jZMCxOU=
+ modernc.org/mathutil v1.7.1/go.mod h1:4p5IwJITfppl0G4sUEDtCr4DthTaT47/N3aT6MhfgJg=
+ modernc.org/memory v1.11.0 h1:o4QC8aMQzmcwCK3t3Ux/ZHmwFPzE6hf2Y5LbkRs+hbI=
+@@ -1606,8 +1610,8 @@ modernc.org/opt v0.2.0 h1:tGyef5ApycA7FSEOMraay9SaTk5zmbx7Tu+cJs4QKZg=
+ modernc.org/opt v0.2.0/go.mod h1:03fq9lsNfvkYSfxrfUhZCWPk1lm4cq4N+Bh//bEtgns=
+ modernc.org/sortutil v1.2.1 h1:+xyoGf15mM3NMlPDnFqrteY07klSFxLElE2PVuWIJ7w=
+ modernc.org/sortutil v1.2.1/go.mod h1:7ZI3a3REbai7gzCLcotuw9AC4VZVpYMjDzETGsSMqJE=
+-modernc.org/sqlite v1.51.0 h1:aH/MMSoayAIhozZ7uJbVTT9QO/VhzBf0J9tymmmuC/U=
+-modernc.org/sqlite v1.51.0/go.mod h1:tcNzv5p84E0skkmJn038y+hWJbLQXQqEnQfeh5r2JLM=
++modernc.org/sqlite v1.53.0 h1:20WG8N9q4ji/dEqGk4uiI0c6OPjSeLTNYGFCc3+7c1M=
++modernc.org/sqlite v1.53.0/go.mod h1:xoEpOIpGrgT48H5iiyt/YXPCZPEzlfmfFwtk8Lklw8s=
+ modernc.org/strutil v1.2.1 h1:UneZBkQA+DX2Rp35KcM69cSsNES9ly8mQWD71HKlOA0=
+ modernc.org/strutil v1.2.1/go.mod h1:EHkiggD70koQxjVdSBM3JKM7k6L0FbGE5eymy9i3B9A=
+ modernc.org/token v1.1.0 h1:Xl7Ap9dKaEs5kLoOQeQmPWevfnk/DM5qcLcYlA8ys6Y=
+diff --git a/grype/db/v6/build/transformers/os/transform_test.go b/grype/db/v6/build/transformers/os/transform_test.go
+index e1ac90f..77ef3a3 100644
+--- a/grype/db/v6/build/transformers/os/transform_test.go
++++ b/grype/db/v6/build/transformers/os/transform_test.go
+@@ -1103,6 +1103,21 @@ func TestGetOperatingSystem(t *testing.T) {
+ 				Channel:      "eus",
+ 			},
+ 		},
++		{
++			name:      "includes channel (ubuntu esm), preserves zero-padded minor",
++			osName:    "ubuntu",
++			osID:      "ubuntu",
++			osVersion: "22.04",
++			channel:   "esm",
++			expected: &db.OperatingSystem{
++				Name:         "ubuntu",
++				ReleaseID:    "ubuntu",
++				MajorVersion: "22",
++				MinorVersion: "04",
++				Codename:     "jammy",
++				Channel:      "esm",
++			},
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -1192,6 +1207,16 @@ func TestGetOSInfo(t *testing.T) {
+ 				channel: "eus",
+ 			},
+ 		},
++		{
++			name:  "ubuntu + esm",
++			group: "ubuntu:22.04+esm",
++			expected: osInfo{
++				name:    "ubuntu",
++				id:      "ubuntu",
++				version: "22.04",
++				channel: "esm",
++			},
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/grype/db/v6/operating_system_store_test.go b/grype/db/v6/operating_system_store_test.go
+index d464453..34fe36a 100644
+--- a/grype/db/v6/operating_system_store_test.go
++++ b/grype/db/v6/operating_system_store_test.go
+@@ -19,6 +19,8 @@ func TestOperatingSystemStore_ResolveOperatingSystem(t *testing.T) {
+ 
+ 	ubuntu2004 := &OperatingSystem{Name: "ubuntu", ReleaseID: "ubuntu", MajorVersion: "20", MinorVersion: "04", LabelVersion: "focal"}
+ 	ubuntu2010 := &OperatingSystem{Name: "ubuntu", MajorVersion: "20", MinorVersion: "10", LabelVersion: "groovy"}
++	ubuntu1604 := &OperatingSystem{Name: "ubuntu", ReleaseID: "ubuntu", MajorVersion: "16", MinorVersion: "04", LabelVersion: "xenial"}
++	ubuntu1604esm := &OperatingSystem{Name: "ubuntu", ReleaseID: "ubuntu", MajorVersion: "16", MinorVersion: "04", LabelVersion: "xenial", Channel: "esm"}
+ 	rhel8 := &OperatingSystem{Name: "rhel", ReleaseID: "rhel", MajorVersion: "8"}
+ 	rhel81 := &OperatingSystem{Name: "rhel", ReleaseID: "rhel", MajorVersion: "8", MinorVersion: "1"}
+ 	debian10 := &OperatingSystem{Name: "debian", ReleaseID: "debian", MajorVersion: "10"}
+@@ -40,6 +42,8 @@ func TestOperatingSystemStore_ResolveOperatingSystem(t *testing.T) {
+ 	operatingSystems := []*OperatingSystem{
+ 		ubuntu2004,
+ 		ubuntu2010,
++		ubuntu1604,
++		ubuntu1604esm,
+ 		rhel8,
+ 		rhel81,
+ 		debian10,
+@@ -75,6 +79,25 @@ func TestOperatingSystemStore_ResolveOperatingSystem(t *testing.T) {
+ 			},
+ 			expected: []OperatingSystem{*ubuntu2004},
+ 		},
++		{
++			name: "base ubuntu query returns only the vanilla (non-esm) channel row",
++			os: OSSpecifier{
++				Name:         "ubuntu",
++				MajorVersion: "16",
++				MinorVersion: "04",
++			},
++			expected: []OperatingSystem{*ubuntu1604}, // important! the +esm row is NOT returned
++		},
++		{
++			name: "ubuntu esm channel query returns only the esm row",
++			os: OSSpecifier{
++				Name:         "ubuntu",
++				MajorVersion: "16",
++				MinorVersion: "04",
++				Channel:      "esm",
++			},
++			expected: []OperatingSystem{*ubuntu1604esm}, // important! the base row is NOT returned
++		},
+ 		{
+ 			name: "specific distro with major and minor version (missing left padding)",
+ 			os: OSSpecifier{
+diff --git a/grype/distro/distro_test.go b/grype/distro/distro_test.go
+index f7ed837..77819b4 100644
+--- a/grype/distro/distro_test.go
++++ b/grype/distro/distro_test.go
+@@ -270,6 +270,74 @@ func Test_NewDistroFromRelease(t *testing.T) {
+ 			major: "9",
+ 			minor: "4",
+ 		},
++		{
++			name: "esm hinted at as attribute (ubuntu pro), nil version window applies",
++			release: linux.Release{
++				ID:              "ubuntu",
++				Version:         "16.04",
++				ExtendedSupport: true,
++			},
++			channels: testFixChannels(),
++			expected: &Distro{
++				Type:     Ubuntu,
++				Version:  "16.04",
++				Channels: names("esm"),
++			},
++			major: "16",
++			minor: "04",
++		},
++		{
++			name: "esm not applied for non-pro ubuntu (auto, no extended support)",
++			release: linux.Release{
++				ID:      "ubuntu",
++				Version: "16.04",
++			},
++			channels: testFixChannels(),
++			expected: &Distro{
++				Type:    Ubuntu,
++				Version: "16.04",
++			},
++			major: "16",
++			minor: "04",
++		},
++		{
++			name: "esm embedded in the version",
++			release: linux.Release{
++				ID:      "ubuntu",
++				Version: "16.04+esm",
++			},
++			channels: testFixChannels(),
++			expected: &Distro{
++				Type:     Ubuntu,
++				Version:  "16.04",
++				Channels: names("esm"),
++			},
++			major: "16",
++			minor: "04",
++		},
++		{
++			// force-on (GRYPE_FIX_CHANNEL_UBUNTU_ESM_APPLY=always): esm applies even for a base ubuntu with no
++			// extended-support hint and no +esm suffix.
++			name: "esm applied for non-pro ubuntu (always apply)",
++			release: linux.Release{
++				ID:      "ubuntu",
++				Version: "16.04",
++			},
++			channels: []FixChannel{
++				{
++					Name:  "esm",
++					IDs:   []string{"ubuntu"},
++					Apply: ChannelAlwaysEnabled, // important!
++				},
++			},
++			expected: &Distro{
++				Type:     Ubuntu,
++				Version:  "16.04",
++				Channels: names("esm"),
++			},
++			major: "16",
++			minor: "04",
++		},
+ 		{
+ 			name: "v versionID prefix postmarketos",
+ 			release: linux.Release{
+diff --git a/grype/distro/fix_channel.go b/grype/distro/fix_channel.go
+index 73b3dfb..ef174af 100644
+--- a/grype/distro/fix_channel.go
++++ b/grype/distro/fix_channel.go
+@@ -49,6 +49,14 @@ func DefaultFixChannels() FixChannels {
+ 			Apply:    ChannelConditionallyEnabled,
+ 			Versions: version.MustGetConstraint(">= 8.0", version.SemanticFormat),
+ 		},
++		{
++			Name:  "esm",
++			IDs:   []string{"ubuntu"},
++			Apply: ChannelConditionallyEnabled,
++			// nil is deliberate: esm-apps covers universe for the full support window (including in-support
++			// years), so there is no version gate like RHEL EUS. applyChannels already guards Versions != nil.
++			Versions: nil,
++		},
+ 	}
+ }
+ 
+diff --git a/grype/distro/fix_channel_test.go b/grype/distro/fix_channel_test.go
+index e6cd9bc..07a272a 100644
+--- a/grype/distro/fix_channel_test.go
++++ b/grype/distro/fix_channel_test.go
+@@ -11,7 +11,7 @@ import (
+ func TestDefaultFixChannels(t *testing.T) {
+ 	channels := DefaultFixChannels()
+ 
+-	// this seems like a silly test, however, it is critical to ensure that the default channels have EUS with expected values
++	// this seems like a silly test, however, it is critical to ensure that the default channels have EUS and ESM with expected values
+ 	expected := FixChannels{
+ 		{
+ 			Name:     "eus",
+@@ -19,6 +19,12 @@ func TestDefaultFixChannels(t *testing.T) {
+ 			Apply:    ChannelConditionallyEnabled,
+ 			Versions: version.MustGetConstraint(">= 8.0", version.SemanticFormat),
+ 		},
++		{
++			Name:     "esm",
++			IDs:      []string{"ubuntu"},
++			Apply:    ChannelConditionallyEnabled,
++			Versions: nil, // deliberate: no version window for ESM (esm-apps covers universe for the full support window)
++		},
+ 	}
+ 
+ 	if diff := cmp.Diff(expected, channels); diff != "" {
+diff --git a/grype/matcher/dpkg/matcher.go b/grype/matcher/dpkg/matcher.go
+index 23535e3..15159be 100644
+--- a/grype/matcher/dpkg/matcher.go
++++ b/grype/matcher/dpkg/matcher.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/anchore/grype/grype/match"
+ 	"github.com/anchore/grype/grype/matcher/internal"
++	"github.com/anchore/grype/grype/matcher/internal/result"
+ 	"github.com/anchore/grype/grype/pkg"
+ 	"github.com/anchore/grype/grype/version"
+ 	"github.com/anchore/grype/grype/vulnerability"
+@@ -37,20 +38,36 @@ func (m *Matcher) Type() match.MatcherType {
+ }
+ 
+ func (m *Matcher) Match(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
+-	matches, ignores, err := m.matchUpstreamPackages(store, p)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("failed to match by source indirection: %w", err)
+-	}
++	var matches []match.Match
++	var ignores []match.IgnoreFilter
+ 
+-	versionConfig := version.ComparisonConfig{
+-		MissingEpochStrategy: m.cfg.MissingEpochStrategy,
+-	}
+-	exactMatches, exactIgnores, err := internal.MatchPackageByDistro(store, p, nil, m.Type(), &versionConfig)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("failed to match by exact package name: %w", err)
++	// Ubuntu ESM (Pro) distros need a two-pass disclosure/resolution match to resolve base disclosures against
++	// ESM-channel fixes, covering both the binary and its source packages. Non-ESM dpkg scans keep the standard path.
++	if shouldUseUbuntuESMMatching(p.Distro) {
++		esmMatches, esmIgnores, err := m.matchUbuntuESM(store, p)
++		if err != nil {
++			return nil, nil, fmt.Errorf("failed to match Ubuntu ESM: %w", err)
++		}
++		matches = append(matches, esmMatches...)
++		ignores = append(ignores, esmIgnores...)
++	} else {
++		upstreamMatches, upstreamIgnores, err := m.matchUpstreamPackages(store, p)
++		if err != nil {
++			return nil, nil, fmt.Errorf("failed to match by source indirection: %w", err)
++		}
++		matches = append(matches, upstreamMatches...)
++		ignores = append(ignores, upstreamIgnores...)
++
++		versionConfig := version.ComparisonConfig{
++			MissingEpochStrategy: m.cfg.MissingEpochStrategy,
++		}
++		exactMatches, exactIgnores, err := internal.MatchPackageByDistro(store, p, nil, m.Type(), &versionConfig)
++		if err != nil {
++			return nil, nil, fmt.Errorf("failed to match by exact package name: %w", err)
++		}
++		matches = append(matches, exactMatches...)
++		ignores = append(ignores, exactIgnores...)
+ 	}
+-	matches = append(matches, exactMatches...)
+-	ignores = append(ignores, exactIgnores...)
+ 
+ 	// if configured, also search by CPEs for packages from EOL distros
+ 	if m.cfg.UseCPEsForEOL && internal.IsDistroEOL(store, p.Distro) {
+@@ -70,6 +87,30 @@ func (m *Matcher) Match(store vulnerability.Provider, p pkg.Package) ([]match.Ma
+ 	return matches, ignores, nil
+ }
+ 
++// matchUbuntuESM matches an Ubuntu Pro/ESM package using the two-pass disclosure/resolution search, covering both
++// the binary package and each of its source (upstream) packages. Ubuntu vulnerability data is source-keyed, so the
++// upstream pass is what actually resolves most fixes. The shared result provider is built from the binary package p,
++// so upstream matches are automatically recorded as indirect (and keyed to p) by the result detail logic.
++func (m *Matcher) matchUbuntuESM(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
++	provider := result.NewProvider(store, p, m.Type())
++
++	matches, ignores, err := ubuntuESMMatches(provider, p, m.cfg.MissingEpochStrategy)
++	if err != nil {
++		return nil, nil, fmt.Errorf("failed to match by exact package name: %w", err)
++	}
++
++	for _, indirectPackage := range pkg.UpstreamPackages(p) {
++		indirectMatches, indirectIgnores, err := ubuntuESMMatches(provider, indirectPackage, m.cfg.MissingEpochStrategy)
++		if err != nil {
++			return nil, nil, fmt.Errorf("failed to find vulnerabilities for dpkg upstream source package: %w", err)
++		}
++		matches = append(matches, indirectMatches...)
++		ignores = append(ignores, indirectIgnores...)
++	}
++
++	return matches, ignores, nil
++}
++
+ func (m *Matcher) matchUpstreamPackages(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
+ 	var matches []match.Match
+ 	var ignores []match.IgnoreFilter
+diff --git a/grype/matcher/dpkg/matcher_ubuntu_esm_test.go b/grype/matcher/dpkg/matcher_ubuntu_esm_test.go
+new file mode 100644
+index 0000000..bd0d54e
+--- /dev/null
++++ b/grype/matcher/dpkg/matcher_ubuntu_esm_test.go
+@@ -0,0 +1,353 @@
++package dpkg
++
++import (
++	"testing"
++
++	"github.com/anchore/grype/grype/distro"
++	"github.com/anchore/grype/grype/match"
++	"github.com/anchore/grype/grype/pkg"
++	"github.com/anchore/grype/grype/version"
++	"github.com/anchore/grype/grype/vulnerability"
++	"github.com/anchore/grype/internal/dbtest"
++	syftPkg "github.com/anchore/syft/syft/pkg"
++)
++
++// newESMDistro builds an Ubuntu Pro/ESM distro (channel "esm") from a version like "16.04".
++func newESMDistro(version string) *distro.Distro {
++	return distro.New(distro.Ubuntu, version+"+esm", "")
++}
++
++func TestShouldUseUbuntuESMMatching(t *testing.T) {
++	withChannels := func(d *distro.Distro, channels ...string) *distro.Distro {
++		d.Channels = channels
++		return d
++	}
++
++	tests := []struct {
++		name string
++		d    *distro.Distro
++		want bool
++	}{
++		{name: "nil distro", d: nil, want: false},
++		{name: "ubuntu with esm channel", d: newESMDistro("16.04"), want: true},
++		{name: "ubuntu without channels", d: distro.New(distro.Ubuntu, "16.04", ""), want: false},
++		{
++			// channel matching is case-insensitive (channels can arrive in any case)
++			name: "ubuntu with mixed-case ESM channel",
++			d:    withChannels(distro.New(distro.Ubuntu, "16.04", ""), "ESM"),
++			want: true,
++		},
++		{
++			// a non-esm channel on Ubuntu must not trigger ESM matching
++			name: "ubuntu with non-esm channel",
++			d:    withChannels(distro.New(distro.Ubuntu, "16.04", ""), "fips"),
++			want: false,
++		},
++		{
++			// esm should be detected even alongside other channels
++			name: "ubuntu with esm among multiple channels",
++			d:    withChannels(distro.New(distro.Ubuntu, "16.04", ""), "fips", "esm"),
++			want: true,
++		},
++		{
++			// an esm channel only makes sense on Ubuntu; guard against it leaking onto other distros
++			name: "non-ubuntu with esm channel",
++			d:    withChannels(distro.New(distro.Debian, "12", ""), "esm"),
++			want: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := shouldUseUbuntuESMMatching(tt.d); got != tt.want {
++				t.Errorf("shouldUseUbuntuESMMatching() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++// real values pulled from the ubuntu-esm fixture (see file header for source URLs).
++const (
++	pkgWayland          = "wayland"
++	cveWayland          = "CVE-2021-3782"
++	verWaylandXenial    = "1.11.0-2"
++	esmFixWaylandXenial = "1.12.0-1~ubuntu16.04.3+esm1"
++)
++
++// The ubuntu-esm fixture carries real Ubuntu Pro/ESM records (verified against ubuntu.com/security):
++//
++//   - wayland CVE-2021-3782: on 16.04 (xenial) the base pocket has NO fix (Version "None", won't-fix) and the
++//     only fix is esm-infra 1.12.0-1~ubuntu16.04.3+esm1; on 20.04 (focal) it is fixed in the standard pocket at
++//     1.18.0-1ubuntu0.1 (no +esm record). Source: https://ubuntu.com/security/cves/CVE-2021-3782.json
++//   - openssh CVE-2025-61985: on 20.04 (focal) the base pocket has no fix and esm-infra fixes it at
++//     1:8.2p1-4ubuntu0.13+esm1 (epoch form). Source: https://ubuntu.com/security/cves/CVE-2025-61985.json
++//
++// These exercise the §5 matcher scenarios: ESM-only fix surfaced when the channel is on, base won't-fix reported
++// when the channel is off, base standard-pocket fix still resolving with the channel on, epoch/tilde dpkg ordering,
++// and source-package indirection.
++
++//nolint:funlen
++func TestUbuntuESM_VulnerableCases(t *testing.T) {
++	tests := []struct {
++		name         string
++		pkgName      string
++		pkgVersion   string
++		upstreamName string
++		upstreamVer  string
++		d            *distro.Distro
++		expectCVE    string
++		expectType   match.Type
++		expectState  vulnerability.FixState
++		expectFixes  []string
++	}{
++		{
++			// ESM-only fix, channel ON, installed below the esm fix -> vulnerable with the ESM fix surfaced.
++			name:        "esm-only fix surfaced when installed below it",
++			pkgName:     pkgWayland,
++			pkgVersion:  verWaylandXenial,
++			d:           newESMDistro("16.04"),
++			expectCVE:   cveWayland,
++			expectType:  match.ExactDirectMatch,
++			expectState: vulnerability.FixStateFixed,
++			expectFixes: []string{esmFixWaylandXenial},
++		},
++		{
++			// epoch form (openssh) - dpkg comparator handles the "1:" epoch; installed below the esm fix -> vulnerable.
++			name:        "esm-only fix surfaced for epoch version form",
++			pkgName:     "openssh",
++			pkgVersion:  "1:8.2p1-4ubuntu0.12",
++			d:           newESMDistro("20.04"),
++			expectCVE:   "CVE-2025-61985",
++			expectType:  match.ExactDirectMatch,
++			expectState: vulnerability.FixStateFixed,
++			expectFixes: []string{"1:8.2p1-4ubuntu0.13+esm1"},
++		},
++		{
++			// source-package indirection: a binary package resolves the CVE via its upstream source "wayland".
++			name:         "esm fix reached by source indirection",
++			pkgName:      "libwayland-client0",
++			pkgVersion:   verWaylandXenial,
++			upstreamName: pkgWayland,
++			upstreamVer:  verWaylandXenial,
++			d:            newESMDistro("16.04"),
++			expectCVE:    cveWayland,
++			expectType:   match.ExactIndirectMatch,
++			expectState:  vulnerability.FixStateFixed,
++			expectFixes:  []string{esmFixWaylandXenial},
++		},
++		{
++			// ESM-only fix, channel OFF (no esm channel on the distro) -> base won't-fix disclosure stands, reported
++			// vulnerable. This is the worst-false-negative guard: a Pro-only fix must NOT be treated as fixed for a
++			// non-Pro user.
++			name:        "channel off leaves base wont-fix visible",
++			pkgName:     pkgWayland,
++			pkgVersion:  verWaylandXenial,
++			d:           dbtest.Ubuntu1804, // placeholder, overridden below to base 16.04
++			expectCVE:   cveWayland,
++			expectType:  match.ExactDirectMatch,
++			expectState: vulnerability.FixStateNotFixed, // base "None" record surfaces as not-fixed on the standard path
++		},
++		{
++			// base standard-pocket fix, channel ON, installed below the base fix -> vulnerable via the base fix (no
++			// +esm record involved). Proves the esm channel does not interfere with normal base resolution.
++			name:        "base standard-pocket fix still resolves with channel on",
++			pkgName:     pkgWayland,
++			pkgVersion:  "1.17.0-1ubuntu1",
++			d:           newESMDistro("20.04"),
++			expectCVE:   cveWayland,
++			expectType:  match.ExactDirectMatch,
++			expectState: vulnerability.FixStateFixed,
++			expectFixes: []string{"1.18.0-1ubuntu0.1"},
++		},
++		{
++			// channel ON but ESM has published no fix (base pocket "None", no +esm record) -> still vulnerable via the
++			// ESM path, reported not-fixed. This exercises the ESM merge producing a wont-fix/not-fixed outcome (the
++			// common "Pro subscription active but package still exposed" case), distinct from the channel-off path.
++			name:        "channel on with no esm fix stays vulnerable",
++			pkgName:     "curl",
++			pkgVersion:  "7.47.0-1ubuntu2",
++			d:           newESMDistro("16.04"),
++			expectCVE:   "CVE-2016-9586",
++			expectType:  match.ExactDirectMatch,
++			expectState: vulnerability.FixStateNotFixed,
++		},
++		{
++			// installed version is MISSING the epoch that the ESM fix carries ("1:"). Under the default (zero-epoch)
++			// strategy the missing epoch is treated as 0, so 0:...0.12 < 1:...0.13+esm1 -> vulnerable with the esm fix
++			// surfaced. Guards the dpkg epoch-normalization path that the matcher threads MissingEpochStrategy for.
++			name:        "esm fix surfaced when installed version omits the epoch",
++			pkgName:     "openssh",
++			pkgVersion:  "8.2p1-4ubuntu0.12", // note: no "1:" epoch prefix
++			d:           newESMDistro("20.04"),
++			expectCVE:   "CVE-2025-61985",
++			expectType:  match.ExactDirectMatch,
++			expectState: vulnerability.FixStateFixed,
++			expectFixes: []string{"1:8.2p1-4ubuntu0.13+esm1"},
++		},
++	}
++
++	dbtest.DBs(t, "ubuntu-esm").Run(func(t *testing.T, db *dbtest.DB) {
++		matcher := NewDpkgMatcher(MatcherConfig{})
++
++		for _, tt := range tests {
++			t.Run(tt.name, func(t *testing.T) {
++				d := tt.d
++				if tt.name == "channel off leaves base wont-fix visible" {
++					d = distro.New(distro.Ubuntu, "16.04", "") // base distro, NO esm channel -> standard path
++				}
++
++				b := dbtest.NewPackage(tt.pkgName, tt.pkgVersion, syftPkg.DebPkg).WithDistro(d)
++				if tt.upstreamName != "" {
++					b = b.WithUpstream(tt.upstreamName, tt.upstreamVer)
++				}
++				p := b.Build()
++
++				findings := db.Match(t, matcher, p)
++
++				// we intentionally assert on match presence, type, and the surfaced fix only (not every detail).
++				sf := findings.SkipCompleteness().SelectMatch(tt.expectCVE)
++				sf.HasMatchType(tt.expectType)
++				sf.HasFix(tt.expectState, tt.expectFixes...)
++			})
++		}
++	})
++}
++
++// TestUbuntuESM_FixedCases verifies that a package at or past the ESM fix is resolved (not vulnerable) and produces a
++// "Distro Not Vulnerable" ignore.
++func TestUbuntuESM_FixedCases(t *testing.T) {
++	tests := []struct {
++		name         string
++		pkgName      string
++		pkgVersion   string
++		upstreamName string
++		upstreamVer  string
++		d            *distro.Distro
++		expectCVE    string
++		expectEmpty  bool // base fix removes the disclosure entirely: no match AND no ignore (mirrors the EUS path)
++	}{
++		{
++			// installed exactly at the esm fix -> resolved: the base won't-fix disclosure is removed by the esm
++			// resolution, producing a "Distro Not Vulnerable" ignore keyed to the scanned package.
++			name:       "at esm fix is resolved with an ignore",
++			pkgName:    pkgWayland,
++			pkgVersion: esmFixWaylandXenial,
++			d:          newESMDistro("16.04"),
++			expectCVE:  cveWayland,
++		},
++		{
++			// same resolution reached through source indirection: the binary is at the esm fix via its upstream
++			// source, so the disclosure resolves and the ignore is keyed to the scanned binary package.
++			name:         "at esm fix via source indirection is resolved with an ignore",
++			pkgName:      "libwayland-client0",
++			pkgVersion:   esmFixWaylandXenial,
++			upstreamName: pkgWayland,
++			upstreamVer:  esmFixWaylandXenial,
++			d:            newESMDistro("16.04"),
++			expectCVE:    cveWayland,
++		},
++		{
++			// installed at the base standard-pocket fix (channel on) -> the base disclosure itself reports not
++			// vulnerable, so the two-pass search returns nothing at all (no leakage from esm).
++			name:        "at base standard-pocket fix yields nothing",
++			pkgName:     pkgWayland,
++			pkgVersion:  "1.18.0-1ubuntu0.1",
++			d:           newESMDistro("20.04"),
++			expectEmpty: true,
++		},
++	}
++
++	dbtest.DBs(t, "ubuntu-esm").Run(func(t *testing.T, db *dbtest.DB) {
++		matcher := NewDpkgMatcher(MatcherConfig{})
++
++		for _, tt := range tests {
++			t.Run(tt.name, func(t *testing.T) {
++				pkgID := pkg.ID(tt.name)
++				b := dbtest.NewPackage(tt.pkgName, tt.pkgVersion, syftPkg.DebPkg).WithID(pkgID).WithDistro(tt.d)
++				if tt.upstreamName != "" {
++					b = b.WithUpstream(tt.upstreamName, tt.upstreamVer)
++				}
++				p := b.Build()
++
++				findings := db.Match(t, matcher, p)
++				if tt.expectEmpty {
++					findings.IsEmpty()
++					return
++				}
++				// the ownership ignore must be keyed to the scanned package (not the upstream source)
++				findings.Ignores().
++					SelectRelatedPackageIgnore(IgnoreReasonDistroNotVulnerable, tt.expectCVE).
++					ForPackage(pkgID)
++			})
++		}
++	})
++}
++
++// TestUbuntuESM_MultipleCVEsPerPackage verifies that a single package resolving multiple ESM CVEs surfaces every one,
++// each with its own fix version. Exercises the Set/Merge fan-out over vulnerability IDs in the ESM path.
++func TestUbuntuESM_MultipleCVEsPerPackage(t *testing.T) {
++	dbtest.DBs(t, "ubuntu-esm").Run(func(t *testing.T, db *dbtest.DB) {
++		matcher := NewDpkgMatcher(MatcherConfig{})
++
++		// openssh on 20.04+esm carries two ESM-only CVEs fixed at different point releases; installed below both.
++		p := dbtest.NewPackage("openssh", "1:8.2p1-4ubuntu0.12", syftPkg.DebPkg).
++			WithDistro(newESMDistro("20.04")).
++			Build()
++
++		findings := db.Match(t, matcher, p)
++		findings.SkipCompleteness().OnlyHasVulnerabilities("CVE-2025-61985", "CVE-2023-38408")
++
++		findings.SkipCompleteness().SelectMatch("CVE-2025-61985").
++			HasFix(vulnerability.FixStateFixed, "1:8.2p1-4ubuntu0.13+esm1")
++		findings.SkipCompleteness().SelectMatch("CVE-2023-38408").
++			HasFix(vulnerability.FixStateFixed, "1:8.2p1-4ubuntu0.20+esm1")
++	})
++}
++
++// TestUbuntuESM_MissingEpochStrategy asserts how the ESM path treats MissingEpochStrategy when the installed version
++// omits the epoch that the ESM fix carries. The installed build equals the fix build "1:8.2p1-4ubuntu0.13+esm1" but
++// lacks the "1:" prefix, so the two strategies must diverge:
++//   - zero: missing epoch is treated as 0, so 0:... < 1:... -> still vulnerable (correct by definition).
++//   - auto: missing epoch adopts the constraint's epoch, so 1:... == 1:... -> resolved, not vulnerable.
++//
++// NOTE: the auto case currently FAILS. The ESM two-pass search resolves fixes by comparing against the fix version
++// (neededFixes -> version.Is, and result filtering -> search.ByFixedVersion), both of which use a plain Compare that
++// ignores MissingEpochStrategy. Only constraint.Satisfied honors it, and the base disclosure here is an
++// always-vulnerable "None" row, so the constraint check never resolves it (the RHEL EUS path has the same gap). This
++// test intentionally asserts the correct behavior so it stays red until fix-version comparison honors the strategy.
++func TestUbuntuESM_MissingEpochStrategy(t *testing.T) {
++	const (
++		cve = "CVE-2025-61985"
++		// installed at the same build as the fix "1:8.2p1-4ubuntu0.13+esm1" but with no epoch prefix
++		installedNoEpoch = "8.2p1-4ubuntu0.13+esm1"
++	)
++
++	tests := []struct {
++		strategy      version.MissingEpochStrategy
++		expectResolve bool // true: installed is the fixed build, must not be reported
++	}{
++		{strategy: version.MissingEpochStrategyZero, expectResolve: false},
++		{strategy: version.MissingEpochStrategyAuto, expectResolve: true},
++	}
++
++	for _, tt := range tests {
++		t.Run(string(tt.strategy), func(t *testing.T) {
++			dbtest.DBs(t, "ubuntu-esm").Run(func(t *testing.T, db *dbtest.DB) {
++				matcher := NewDpkgMatcher(MatcherConfig{MissingEpochStrategy: tt.strategy})
++				p := dbtest.NewPackage("openssh", installedNoEpoch, syftPkg.DebPkg).
++					WithDistro(newESMDistro("20.04")).
++					Build()
++
++				findings := db.Match(t, matcher, p)
++				if tt.expectResolve {
++					// installed is the fixed build: no match, and a "Distro Not Vulnerable" ignore is emitted instead
++					findings.SkipCompleteness().DoesNotHaveAnyVulnerabilities(cve)
++					findings.Ignores().
++						SelectRelatedPackageIgnore(IgnoreReasonDistroNotVulnerable, cve)
++				} else {
++					findings.SkipCompleteness().SelectMatch(cve)
++				}
++			})
++		})
++	}
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/db-lock.json b/grype/matcher/dpkg/testdata/ubuntu-esm/db-lock.json
+new file mode 100644
+index 0000000..3a6ecf5
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/db-lock.json
+@@ -0,0 +1,10 @@
++{
++  "content_hash": "manual",
++  "created_at": "2026-07-02T00:00:00Z",
++  "providers": {
++    "ubuntu": {
++      "vunnel_version": "vunnel@0.56.0",
++      "timestamp": "2026-05-13T09:08:13Z"
++    }
++  }
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/db.yaml b/grype/matcher/dpkg/testdata/ubuntu-esm/db.yaml
+new file mode 100644
+index 0000000..dde48f2
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/db.yaml
+@@ -0,0 +1,11 @@
++auto-generate: false
++extractions:
++    ubuntu:
++        - ubuntu:16.04/cve-2021-3782
++        - ubuntu:16.04+esm/cve-2021-3782
++        - ubuntu:20.04/cve-2021-3782
++        - ubuntu:20.04/cve-2025-61985
++        - ubuntu:20.04+esm/cve-2025-61985
++        - ubuntu:16.04/cve-2016-9586
++        - ubuntu:20.04/cve-2023-38408
++        - ubuntu:20.04+esm/cve-2023-38408
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/metadata.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/metadata.json
+new file mode 100644
+index 0000000..0f8902d
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/metadata.json
+@@ -0,0 +1,19 @@
++{
++  "provider": "ubuntu",
++  "version": 3,
++  "processor": "vunnel@0.56.0",
++  "schema": {
++    "version": "1.0.3",
++    "url": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/provider-workspace-state/schema-1.0.3.json"
++  },
++  "urls": [
++    "git://git.launchpad.net/ubuntu-cve-tracker"
++  ],
++  "timestamp": "2026-05-13T09:08:13Z",
++  "listing": {
++    "path": "results/listing.xxh64",
++    "digest": "0000000000000000",
++    "algorithm": "xxh64"
++  },
++  "store": "flat-file"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04+esm/cve-2021-3782.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04+esm/cve-2021-3782.json
+new file mode 100644
+index 0000000..30ee0a7
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04+esm/cve-2021-3782.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:16.04+esm/cve-2021-3782",
++  "item": {
++    "Vulnerability": {
++      "Description": "wayland: fixed on Ubuntu 16.04 (xenial) via ESM esm-infra. Real Pro-only fix version. Source: https://ubuntu.com/security/cves/CVE-2021-3782.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "wayland",
++          "NamespaceName": "ubuntu:16.04+esm",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "1.12.0-1~ubuntu16.04.3+esm1",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2021-3782",
++      "Metadata": {},
++      "Name": "CVE-2021-3782",
++      "NamespaceName": "ubuntu:16.04+esm",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04/cve-2016-9586.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04/cve-2016-9586.json
+new file mode 100644
+index 0000000..88635b5
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04/cve-2016-9586.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:16.04/cve-2016-9586",
++  "item": {
++    "Vulnerability": {
++      "Description": "curl: no fix on Ubuntu 16.04 (xenial) in either the base pocket or ESM (esm-infra) - the base pocket is past standard support (Version \"None\") and no +esm record exists. Exercises the channel-on wont-fix path where ESM has not published a fix. Source: https://ubuntu.com/security/cves/CVE-2016-9586.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "curl",
++          "NamespaceName": "ubuntu:16.04",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "None",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2016-9586",
++      "Metadata": {},
++      "Name": "CVE-2016-9586",
++      "NamespaceName": "ubuntu:16.04",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04/cve-2021-3782.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04/cve-2021-3782.json
+new file mode 100644
+index 0000000..e99ed3b
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@16.04/cve-2021-3782.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:16.04/cve-2021-3782",
++  "item": {
++    "Vulnerability": {
++      "Description": "wayland: buffer overflow / integer overflow in wl_map / wl_connection handling. Fixed on Ubuntu 16.04 (xenial) only via ESM (esm-infra); the base 16.04 pocket has no fix (past standard support). Source: https://ubuntu.com/security/cves/CVE-2021-3782.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "wayland",
++          "NamespaceName": "ubuntu:16.04",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "None",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2021-3782",
++      "Metadata": {},
++      "Name": "CVE-2021-3782",
++      "NamespaceName": "ubuntu:16.04",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04+esm/cve-2023-38408.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04+esm/cve-2023-38408.json
+new file mode 100644
+index 0000000..4e5d538
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04+esm/cve-2023-38408.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:20.04+esm/cve-2023-38408",
++  "item": {
++    "Vulnerability": {
++      "Description": "openssh: fixed on Ubuntu 20.04 (focal) via ESM esm-infra at a later point release than CVE-2025-61985. Source: https://ubuntu.com/security/cves/CVE-2023-38408.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "openssh",
++          "NamespaceName": "ubuntu:20.04+esm",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "1:8.2p1-4ubuntu0.20+esm1",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2023-38408",
++      "Metadata": {},
++      "Name": "CVE-2023-38408",
++      "NamespaceName": "ubuntu:20.04+esm",
++      "Severity": "High"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04+esm/cve-2025-61985.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04+esm/cve-2025-61985.json
+new file mode 100644
+index 0000000..1872ef0
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04+esm/cve-2025-61985.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:20.04+esm/cve-2025-61985",
++  "item": {
++    "Vulnerability": {
++      "Description": "openssh: fixed on Ubuntu 20.04 (focal) via ESM esm-infra. Real Pro-only fix version (epoch form). Source: https://ubuntu.com/security/cves/CVE-2025-61985.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "openssh",
++          "NamespaceName": "ubuntu:20.04+esm",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "1:8.2p1-4ubuntu0.13+esm1",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2025-61985",
++      "Metadata": {},
++      "Name": "CVE-2025-61985",
++      "NamespaceName": "ubuntu:20.04+esm",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2021-3782.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2021-3782.json
+new file mode 100644
+index 0000000..0efba7b
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2021-3782.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:20.04/cve-2021-3782",
++  "item": {
++    "Vulnerability": {
++      "Description": "wayland: fixed on Ubuntu 20.04 (focal) in the standard release/security pocket (no ESM needed). Source: https://ubuntu.com/security/cves/CVE-2021-3782.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "wayland",
++          "NamespaceName": "ubuntu:20.04",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "1.18.0-1ubuntu0.1",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2021-3782",
++      "Metadata": {},
++      "Name": "CVE-2021-3782",
++      "NamespaceName": "ubuntu:20.04",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2023-38408.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2023-38408.json
+new file mode 100644
+index 0000000..09874d9
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2023-38408.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:20.04/cve-2023-38408",
++  "item": {
++    "Vulnerability": {
++      "Description": "openssh: second CVE on Ubuntu 20.04 (focal), fixed only via ESM esm-infra; the base 20.04 pocket has no fix (Version \"None\"). Paired with CVE-2025-61985 so a single openssh scan surfaces multiple ESM-resolved CVEs. Source: https://ubuntu.com/security/cves/CVE-2023-38408.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "openssh",
++          "NamespaceName": "ubuntu:20.04",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "None",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2023-38408",
++      "Metadata": {},
++      "Name": "CVE-2023-38408",
++      "NamespaceName": "ubuntu:20.04",
++      "Severity": "High"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2025-61985.json b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2025-61985.json
+new file mode 100644
+index 0000000..57b2b22
+--- /dev/null
++++ b/grype/matcher/dpkg/testdata/ubuntu-esm/ubuntu/results/ubuntu@20.04/cve-2025-61985.json
+@@ -0,0 +1,26 @@
++{
++  "identifier": "ubuntu:20.04/cve-2025-61985",
++  "item": {
++    "Vulnerability": {
++      "Description": "openssh: fixed on Ubuntu 20.04 (focal) only via ESM esm-infra; the base 20.04 pocket has no fix (past standard support). Source: https://ubuntu.com/security/cves/CVE-2025-61985.json",
++      "FixedIn": [
++        {
++          "Available": null,
++          "Name": "openssh",
++          "NamespaceName": "ubuntu:20.04",
++          "VendorAdvisory": {
++            "NoAdvisory": false
++          },
++          "Version": "None",
++          "VersionFormat": "dpkg"
++        }
++      ],
++      "Link": "https://ubuntu.com/security/CVE-2025-61985",
++      "Metadata": {},
++      "Name": "CVE-2025-61985",
++      "NamespaceName": "ubuntu:20.04",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/dpkg/ubuntu_esm.go b/grype/matcher/dpkg/ubuntu_esm.go
+new file mode 100644
+index 0000000..00b02c4
+--- /dev/null
++++ b/grype/matcher/dpkg/ubuntu_esm.go
+@@ -0,0 +1,317 @@
++package dpkg
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/anchore/grype/grype/distro"
++	"github.com/anchore/grype/grype/match"
++	"github.com/anchore/grype/grype/matcher/internal"
++	"github.com/anchore/grype/grype/matcher/internal/result"
++	"github.com/anchore/grype/grype/pkg"
++	"github.com/anchore/grype/grype/search"
++	"github.com/anchore/grype/grype/version"
++	"github.com/anchore/grype/grype/vulnerability"
++	"github.com/anchore/grype/internal/log"
++)
++
++// IgnoreReasonDistroNotVulnerable - the distro vendor explicitly says the package is unaffected. For Ubuntu ESM
++// this is emitted when an esm-overlay "fixed" row resolves a base disclosure as no-longer-vulnerable.
++const IgnoreReasonDistroNotVulnerable = "Distro Not Vulnerable"
++
++func shouldUseUbuntuESMMatching(d *distro.Distro) bool {
++	if d == nil {
++		return false
++	}
++
++	if d.Type != distro.Ubuntu {
++		// considering ESM fixes on a non-Ubuntu distro is not valid
++		return false
++	}
++
++	for _, channel := range d.Channels {
++		if strings.ToLower(channel) == "esm" {
++			// if the distro has an ESM channel, we should consider ESM fixes
++			return true
++		}
++	}
++	return false
++}
++
++// ubuntuESMMatches returns matches for the given package with Extended Security Maintenance (ESM / Ubuntu Pro) fixes
++// considered. It mirrors the RHEL EUS disclosure/resolution split (see redhatEUSMatches):
++//
++// Ubuntu freezes a release's package versions at the end of standard support; ESM (esm-infra + esm-apps) then
++// continues to publish fixes on the same version line as a "+esm" build. So searching is done in two steps:
++//  1. find disclosures that match the base distro (e.g. 'ubuntu:16.04'), which carry the base won't-fix rows.
++//  2. find fixes from both the base distro AND the ESM channel (e.g. 'ubuntu:16.04' || 'ubuntu:16.04+esm').
++//
++// The two collections (disclosure and resolution) are merged: any disclosure that the resolution fixes for the
++// installed version is dropped, the rest are kept with the ESM fix version patched on.
++//
++// Unlike RHEL EUS there is no cross-minor reachability problem: Ubuntu ESM is one line per LTS release and the
++// resolution search only pulls same-minor 'ubuntu:XX.YY' and 'ubuntu:XX.YY+esm' rows, so every '+esm' fix pulled
++// is reachable by construction.
++func ubuntuESMMatches(provider result.Provider, searchPkg pkg.Package, missingEpochStrategy version.MissingEpochStrategy, extra ...vulnerability.Criteria) ([]match.Match, []match.IgnoreFilter, error) {
++	distroWithoutESM := *searchPkg.Distro
++	distroWithoutESM.Channels = nil // clear the ESM channel so that we can search for the base distro
++
++	pkgVersion := version.NewWithConfig(
++		searchPkg.Version,
++		pkg.VersionFormat(searchPkg),
++		version.ComparisonConfig{
++			MissingEpochStrategy: missingEpochStrategy,
++		},
++	)
++
++	disclosureCriteria := []vulnerability.Criteria{
++		search.ByPackageName(searchPkg.Name),
++		search.ByDistro(distroWithoutESM), // e.g. ubuntu:16.04 (no ESM channel)
++		internal.OnlyQualifiedPackages(searchPkg),
++		internal.OnlyVulnerableVersions(pkgVersion),
++	}
++	disclosureCriteria = append(disclosureCriteria, extra...)
++
++	// find all disclosures for the package in the base distro (e.g. ubuntu:16.04)
++	disclosures, err := provider.FindResults(disclosureCriteria...)
++	if err != nil {
++		return nil, nil, fmt.Errorf("matcher failed to fetch disclosures for distro=%q pkg=%q: %w", searchPkg.Distro, searchPkg.Name, err)
++	}
++
++	if len(disclosures) == 0 {
++		return nil, nil, nil
++	}
++
++	resolutionCriteria := []vulnerability.Criteria{
++		search.ByPackageName(searchPkg.Name),
++		search.ByDistro(distroWithoutESM, *searchPkg.Distro), // e.g. ubuntu:16.04 || ubuntu:16.04+esm
++		internal.OnlyQualifiedPackages(searchPkg),
++		// note: we do **not** apply any version criteria to the search as to raise up all possible fixes
++		// and combine within the collection. If we do filter on a fix version, it could result in
++		// false positives (missing ESM fixes that resolve a disclosure).
++	}
++	resolutionCriteria = append(resolutionCriteria, extra...)
++
++	// find all base distro fixes and ESM fixes for the package (e.g. ubuntu:16.04 || ubuntu:16.04+esm)
++	resolutions, err := provider.FindResults(resolutionCriteria...)
++	if err != nil {
++		return nil, nil, fmt.Errorf("matcher failed to fetch resolutions for distro=%q pkg=%q: %w", searchPkg.Distro, searchPkg.Name, err)
++	}
++
++	esmFixes := resolutions.Filter(search.ByFixedVersion(*pkgVersion))
++
++	// remove ESM fixed vulns for this version
++	remaining := disclosures.Remove(esmFixes)
++
++	// combine disclosures and fixes so that:
++	// a. disclosures that have ESM fixes that resolve the disclosure for an earlier version of the package (thus we're not vulnerable) are removed.
++	// b. disclosures that have ESM fixes that resolve the disclosure for future versions of the package (thus we're vulnerable) are kept.
++	// c. all fixes from the incoming resolutions are patched onto the disclosures in the returned collection, so the
++	//    final set of vulnerabilities is a fused set of disclosures and fixes together.
++	remaining = remaining.Merge(resolutions, mergeESMAdvisoriesIntoMainDisclosures(pkgVersion))
++
++	return remaining.ToMatches(), internal.OwnershipIgnores(searchPkg, IgnoreReasonDistroNotVulnerable, esmFixes.Vulnerabilities()...), nil
++}
++
++// mergeESMAdvisoriesIntoMainDisclosures returns a function that filters disclosures based on the provided advisory
++// information (by fix version only) and merges applicable fixes into one vulnerability record, so the final result
++// contains only one vulnerability record per disclosure.
++func mergeESMAdvisoriesIntoMainDisclosures(v *version.Version) func(disclosures, advisoryOverlays []result.Result) []result.Result {
++	return func(disclosures, advisoryOverlays []result.Result) []result.Result {
++		var out []result.Result
++
++		for _, ds := range disclosures {
++			processedResult := mergeESMAdvisoryIntoMainDisclosure(v, ds, advisoryOverlays)
++			if len(processedResult.Vulnerabilities) > 0 {
++				out = append(out, processedResult)
++			}
++		}
++
++		return out
++	}
++}
++
++// mergeESMAdvisoryIntoMainDisclosure processes a single disclosure Result against its corresponding advisory overlay Results.
++func mergeESMAdvisoryIntoMainDisclosure(v *version.Version, disclosures result.Result, advisoryOverlays []result.Result) result.Result {
++	processedResult := result.Result{
++		ID:      disclosures.ID,
++		Package: disclosures.Package,
++	}
++
++	for _, disclosure := range disclosures.Vulnerabilities {
++		processedVuln, advisoryDetails := mergeESMAdvisoryIntoSingleDisclosure(v, disclosure, advisoryOverlays)
++		if processedVuln != nil {
++			processedResult.Vulnerabilities = append(processedResult.Vulnerabilities, *processedVuln)
++			processedResult.Details = append(processedResult.Details, advisoryDetails...)
++		}
++	}
++
++	finalizeMatchDetails(&processedResult, disclosures.Details, v)
++	return processedResult
++}
++
++// mergeESMAdvisoryIntoSingleDisclosure processes a single vulnerability against advisory overlays.
++func mergeESMAdvisoryIntoSingleDisclosure(v *version.Version, disclosure vulnerability.Vulnerability, advisoryOverlays []result.Result) (*vulnerability.Vulnerability, match.Details) {
++	fixVersions := version.NewSet(true)
++	var constraints []version.Constraint
++	var state vulnerability.FixState
++	var allAdvisoryDetails match.Details
++
++	// check if we're vulnerable to the original disclosure
++	if isVulnerableVersion(v, disclosure.Constraint, disclosure.ID) {
++		constraints = append(constraints, disclosure.Constraint)
++	}
++
++	// process advisory overlays, incorporating new fix versions and updating the version constraints
++	for _, advisoryOverlay := range advisoryOverlays {
++		collectMatchingConstraintsDetailsAndFixState(v, advisoryOverlay, fixVersions, &constraints, &state, &allAdvisoryDetails)
++	}
++
++	if len(constraints) == 0 {
++		// all of the advisories showed we're not vulnerable, so we can skip this disclosure
++		return nil, nil
++	}
++
++	patchedRecord := buildPatchedVulnerabilityRecord(v, disclosure, fixVersions, constraints, state)
++	return &patchedRecord, allAdvisoryDetails
++}
++
++// collectMatchingConstraintsDetailsAndFixState processes vulnerabilities from advisory overlays, applying any new fix
++// versions and updating the given fix state / constraints.
++func collectMatchingConstraintsDetailsAndFixState(v *version.Version, advisoryResult result.Result, fixVersions *version.Set, constraints *[]version.Constraint, state *vulnerability.FixState, allAdvisoryDetails *match.Details) {
++	advisories := advisoryResult.Vulnerabilities
++	var keepDetails bool
++	for _, advisory := range advisories {
++		if advisory.Fix.State == vulnerability.FixStateWontFix && *state != vulnerability.FixStateFixed {
++			*state = advisory.Fix.State
++		}
++
++		// get all fixes greater than current version (parses versions once). unlike RHEL EUS (see filterFixesForEUS)
++		// there is no reachability filter: Ubuntu ESM is one line per LTS release and the resolution search only pulls
++		// same-minor 'ubuntu:XX.YY' and 'ubuntu:XX.YY+esm' rows, so every '+esm' fix is reachable by construction.
++		applicableFixes := neededFixes(v, advisory.Fix.Versions, advisory.Constraint.Format(), advisory.ID)
++
++		if len(applicableFixes) == 0 {
++			// none of the fixes on this advisory are greater than the current version, so we can skip adding fixes
++			continue
++		}
++
++		// we're vulnerable! keep any fix versions that could have been applied
++		*constraints = append(*constraints, advisory.Constraint)
++		fixVersions.Add(applicableFixes...)
++		if *state != vulnerability.FixStateFixed {
++			*state = advisory.Fix.State
++		}
++		keepDetails = true
++	}
++
++	// collect details from the advisory overlay only if we kept any of the advisory details
++	if keepDetails && len(advisoryResult.Details) > 0 {
++		*allAdvisoryDetails = append(*allAdvisoryDetails, advisoryResult.Details...)
++	}
++}
++
++// buildPatchedVulnerabilityRecord creates the final patched vulnerability record from the original disclosure and
++// fix/constraint information from applicable advisories.
++func buildPatchedVulnerabilityRecord(v *version.Version, disclosure vulnerability.Vulnerability, fixVersions *version.Set, constraints []version.Constraint, state vulnerability.FixState) vulnerability.Vulnerability {
++	patchedRecord := disclosure
++
++	if state == vulnerability.FixStateFixed {
++		patchedRecord.Fix.Versions = nil
++		for _, fixVersion := range fixVersions.Values() {
++			patchedRecord.Fix.Versions = append(patchedRecord.Fix.Versions, fixVersion.Raw)
++			fixConstraint, err := version.GetConstraint(fmt.Sprintf("< %s", fixVersion.Raw), v.Format)
++			if err != nil {
++				log.WithFields("vulnerability", disclosure.ID, "fixVersion", fixVersion, "error", err).Trace("failed to create constraint for fix version")
++				continue // skip this fix version if we cannot create a constraint
++			}
++			constraints = append(constraints, fixConstraint)
++		}
++	}
++
++	patchedRecord.Fix.State = finalizeFixState(disclosure, state)
++	patchedRecord.Constraint = version.CombineConstraints(constraints...)
++	return patchedRecord
++}
++
++// finalizeMatchDetails patches the processed result details with that of details in the post-processed result.
++func finalizeMatchDetails(processedResult *result.Result, originalDetails match.Details, v *version.Version) {
++	if len(processedResult.Vulnerabilities) == 0 {
++		return
++	}
++
++	// keep details around only if we have vulnerabilities they describe
++	processedResult.Details = append(processedResult.Details, originalDetails...)
++	processedResult.Details = result.NewMatchDetailsSet(processedResult.Details...).ToSlice()
++
++	// patch the version in the details if it is missing
++	for idx := range processedResult.Details {
++		d := &processedResult.Details[idx]
++
++		switch params := d.SearchedBy.(type) {
++		case match.CPEParameters:
++			if params.Package.Version == "" {
++				params.Package.Version = v.Raw
++				d.SearchedBy = params
++			}
++		case match.DistroParameters:
++			if params.Package.Version == "" {
++				params.Package.Version = v.Raw
++				d.SearchedBy = params
++			}
++		case match.EcosystemParameters:
++			if params.Package.Version == "" {
++				params.Package.Version = v.Raw
++				d.SearchedBy = params
++			}
++		}
++	}
++}
++
++func isVulnerableVersion(v *version.Version, c version.Constraint, id string) bool {
++	if c == nil {
++		// nil constraint is different than an empty constraint, so we should not consider this vulnerable
++		return false
++	}
++
++	isVulnerable, err := c.Satisfied(v)
++	if err != nil {
++		log.WithFields("vulnerability", id, "error", err).Trace("failed to check constraint")
++		return false // if we cannot determine if the version is vulnerable, we assume it is not
++	}
++
++	return isVulnerable
++}
++
++func neededFixes(v *version.Version, fixVersions []string, format version.Format, id string) []*version.Version {
++	var needed []*version.Version
++	for _, fixVersion := range fixVersions {
++		fixVersionObj := version.New(fixVersion, format) // note: we use the format from the advisory, not the version itself
++		res, err := v.Is(version.LT, fixVersionObj)
++		if err != nil {
++			log.WithFields("format", format, "version", fixVersion, "error", err, "vulnerability", id).Trace("failed to evaluate fix version")
++			continue
++		}
++		if res {
++			needed = append(needed, fixVersionObj)
++		}
++	}
++
++	return needed
++}
++
++func finalizeFixState(record vulnerability.Vulnerability, state vulnerability.FixState) vulnerability.FixState {
++	if state == "" {
++		state = vulnerability.FixStateUnknown
++	}
++
++	if state != vulnerability.FixStateUnknown {
++		return state
++	}
++
++	if record.Fix.State != vulnerability.FixStateUnknown {
++		return record.Fix.State
++	}
++
++	return vulnerability.FixStateUnknown
++}
+diff --git a/grype/matcher/dpkg/ubuntu_esm_test.go b/grype/matcher/dpkg/ubuntu_esm_test.go
+new file mode 100644
+index 0000000..9ac66c9
+--- /dev/null
++++ b/grype/matcher/dpkg/ubuntu_esm_test.go
+@@ -0,0 +1,572 @@
++package dpkg
++
++import (
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
++
++	"github.com/anchore/grype/grype/match"
++	"github.com/anchore/grype/grype/matcher/internal/result"
++	"github.com/anchore/grype/grype/version"
++	"github.com/anchore/grype/grype/vulnerability"
++)
++
++// TestResolveESMDisclosures exercises mergeESMAdvisoriesIntoMainDisclosures, the pure data-merging helper that fuses a
++// base Ubuntu disclosure with its ESM (+esm) advisory overlay. It is the dpkg twin of the rpm package's
++// TestResolveEUSDisclosures. The function operates on result.Result inputs (not the DB), so synthetic inputs are
++// appropriate here - these tests verify each branch of the merge logic independent of any real-world data shape.
++func TestResolveESMDisclosures(t *testing.T) {
++	tests := []struct {
++		name            string
++		packageVersion  string
++		disclosures     []result.Result
++		advisoryOverlay []result.Result
++		want            []result.Result
++	}{
++		{
++			name:           "disclosure with fix version - package version is vulnerable",
++			packageVersion: "1.0.0", // vulnerable since 1.0.0 < 1.5.0
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.6.0", version.DebFormat), // important!
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{"1.6.0"}, // important! this is the fix version that we should not consider
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat), // important!
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed, // important!
++								Versions: []string{"1.5.0"},           // important!
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference: vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.CombineConstraints(
++								version.MustGetConstraint("< 1.6.0", version.DebFormat), // from disclosure
++								version.MustGetConstraint("< 1.5.0", version.DebFormat), // from advisory
++							),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed, // important! from advisory
++								Versions: []string{"1.5.0"},           // important! from advisory, not the disclosure
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++		{
++			name:           "vulnerability fixed - package version not vulnerable",
++			packageVersion: "2.0.0", // not vulnerable since 2.0.0 > 1.5.0
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat), // important!
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat), // important!
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.5.0"},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{},
++		},
++		{
++			name:           "multiple advisories with multiple fix versions - only applicable fixes kept and deduped",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference: vulnerability.Reference{ID: "CVE-2021-1"},
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{ // advisory does not apply (fix below installed version)!
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 0.9", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"0.9"},
++							},
++						},
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.5.0", "1.4.2"},
++							},
++						},
++						{ // duplicate advisory should already be counted from the first one
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.5.0", "1.4.2"},
++							},
++						},
++						{ // duplicate advisory, with a different fix version
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.4.3"},
++							},
++						},
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 2.0.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"2.0.0"},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference: vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.CombineConstraints(
++								version.MustGetConstraint("< 1.5.0", version.DebFormat),
++								version.MustGetConstraint("< 2.0.0", version.DebFormat),
++								version.MustGetConstraint("< 1.4.2", version.DebFormat),
++								version.MustGetConstraint("< 1.4.3", version.DebFormat),
++							),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.4.2", "1.4.3", "1.5.0", "2.0.0"}, // important! all fixes for advisories that apply
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++		{
++			name:           "advisory with wont-fix state - disclosure kept with patched fix state",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 2.0.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 2.0.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateWontFix, // important! we want the match to reflect this property
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 2.0.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateWontFix,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++		{
++			name:           "advisory with unknown fix state - disclosure kept",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 2.0.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 3.0.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 2.0.0", version.DebFormat), // from the disclosure (no fix info from the overlay)
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++		{
++			name:           "empty fix versions are filtered out",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference: vulnerability.Reference{ID: "CVE-2021-1"},
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"", "1.5.0", ""},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.5.0"}, // note: empty versions are filtered out
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++		{
++			name:           "constraint satisfaction error - advisory skipped",
++			packageVersion: "W:1.2.3-456", // intentionally invalid epoch (will fail to parse) -> nil version
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateFixed,
++								Versions: []string{"1.5.0"},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{},
++		},
++		{
++			name:           "no advisory overlay, disclosure has nil constraint - remove disclosure",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: nil, // important! we're never vulnerable!
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{ // does not apply
++					ID:              "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{},
++					Details:         []match.Detail{},
++				},
++			},
++			want: []result.Result{},
++		},
++		{
++			name:           "no advisory overlay, disclosure has empty constraint - keep disclosure",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("", version.DebFormat), // important! we're always vulnerable
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{ // does not apply
++					ID:              "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{},
++					Details:         []match.Detail{},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("", version.DebFormat), // important! shows "none (dpkg)"
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++		{
++			name:           "no advisory overlay, disclosure does not apply - remove all",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 0.9", version.DebFormat), // important! we're not vulnerable!
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{ // does not apply
++					ID:              "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{},
++					Details:         []match.Detail{},
++				},
++			},
++			want: []result.Result{},
++		},
++		{
++			name:           "wont-fix advisory carrying a fix version - fix not incorporated, disclosure preserved",
++			packageVersion: "1.0.0",
++			disclosures: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference: vulnerability.Reference{ID: "CVE-2021-1"},
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateUnknown,
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			advisoryOverlay: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateWontFix,
++								Versions: []string{"1.5.0"}, // important: wont-fix advisory, so this fix should not be incorporated (inconsistent advisory)
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++			want: []result.Result{
++				{
++					ID: "CVE-2021-1",
++					Vulnerabilities: []vulnerability.Vulnerability{
++						{
++							Reference:  vulnerability.Reference{ID: "CVE-2021-1"},
++							Constraint: version.MustGetConstraint("< 1.5.0", version.DebFormat),
++							Fix: vulnerability.Fix{
++								State:    vulnerability.FixStateWontFix, // wont-fix state is preserved
++								Versions: []string{},
++							},
++						},
++					},
++					Details: []match.Detail{{Type: match.ExactDirectMatch}},
++				},
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			v := version.New(tt.packageVersion, version.DebFormat)
++			if v.Validate() != nil {
++				v = nil
++			}
++
++			resolver := mergeESMAdvisoriesIntoMainDisclosures(v)
++
++			got := resolver(tt.disclosures, tt.advisoryOverlay)
++
++			opts := cmp.Options{
++				cmpopts.IgnoreUnexported(result.Result{}),
++				cmpopts.IgnoreUnexported(version.Version{}),
++				cmpopts.EquateEmpty(),
++			}
++			if diff := cmp.Diff(tt.want, got, opts...); diff != "" {
++				t.Errorf("mergeESMAdvisoriesIntoMainDisclosures() mismatch (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/grype/matcher/rpm/rhel_eus_test.go b/grype/matcher/rpm/rhel_eus_test.go
+index 2377bb3..b777e34 100644
+--- a/grype/matcher/rpm/rhel_eus_test.go
++++ b/grype/matcher/rpm/rhel_eus_test.go
+@@ -1053,6 +1053,41 @@ func TestRedhatEUSMatches_LowerReachableFixResolvesDespiteHigherFix(t *testing.T
+ 		})
+ }
+ 
++// TestRedhatEUSMatches_MissingEpochStrategy documents that the rpm EUS binary path deliberately does NOT behave like
++// the dpkg ESM path for a missing epoch - so RHEL EUS does not share the deb epoch bug (see the dpkg twin
++// TestUbuntuESM_MissingEpochStrategy).
++//
++// nginx on 9.4+eus is fixed at "1:1.20.1-14.el9_4" (non-zero epoch); the installed build is the same but omits the
++// epoch. Unlike dpkg, the rpm binary matcher fills a missing epoch with an explicit 0 (matchPackage ->
++// addEpochIfApplicable), because per RedHat a binary rpm with no epoch genuinely IS epoch 0. That makes the install
++// "0:1.20.1-14.el9_4", which is a real, older version lineage than the epoch-1 fix, so the package is correctly
++// reported vulnerable under BOTH strategies - auto never fires because the epoch is explicit (not missing) by the
++// time comparison happens. (auto only matters on the rpm source/upstream path, which drops epochs on purpose.)
++func TestRedhatEUSMatches_MissingEpochStrategy(t *testing.T) {
++	const (
++		cve = "CVE-2024-7347"
++		// same build as the fix "1:1.20.1-14.el9_4" but with no epoch prefix; the binary matcher normalizes this to 0:
++		installedNoEpoch = "1.20.1-14.el9_4"
++	)
++
++	// both strategies report vulnerable: the missing epoch is normalized to an explicit 0, so 0:... < 1:... regardless
++	for _, strategy := range []version.MissingEpochStrategy{version.MissingEpochStrategyZero, version.MissingEpochStrategyAuto} {
++		t.Run(string(strategy), func(t *testing.T) {
++			dbtest.DBs(t, "rhel9-eus").
++				SelectOnly(cve).
++				Run(func(t *testing.T, db *dbtest.DB) {
++					matcher := NewRpmMatcher(MatcherConfig{MissingEpochStrategy: strategy})
++					p := dbtest.NewPackage("nginx", installedNoEpoch, syftPkg.RpmPkg).
++						WithDistro(newEUSDistro("9.4")).
++						Build()
++
++					findings := db.Match(t, matcher, p)
++					findings.SkipCompleteness().SelectMatch(cve)
++				})
++		})
++	}
++}
++
+ // newEUSDistro creates a properly initialized RHEL EUS distro using distro.New().
+ // This ensures MajorVersion()/MinorVersion() work correctly.
+ // Pass version like "9.4" (the "+eus" channel suffix is added automatically).
+diff --git a/grype/matcher/rpm/testdata/rhel9-eus/db.yaml b/grype/matcher/rpm/testdata/rhel9-eus/db.yaml
+index 8bfd86c..c459f5e 100644
+--- a/grype/matcher/rpm/testdata/rhel9-eus/db.yaml
++++ b/grype/matcher/rpm/testdata/rhel9-eus/db.yaml
+@@ -16,3 +16,5 @@ extractions:
+         - rhel:8/cve-2016-9840
+         - rhel:8/cve-2020-7788
+         - rhel:8.4+eus/cve-2020-7788
++        - rhel:9/cve-2024-7347
++        - rhel:9.4+eus/cve-2024-7347
+diff --git a/grype/matcher/rpm/testdata/rhel9-eus/rhel/results/rhel@9.4+eus/cve-2024-7347.json b/grype/matcher/rpm/testdata/rhel9-eus/rhel/results/rhel@9.4+eus/cve-2024-7347.json
+new file mode 100644
+index 0000000..d64a4c3
+--- /dev/null
++++ b/grype/matcher/rpm/testdata/rhel9-eus/rhel/results/rhel@9.4+eus/cve-2024-7347.json
+@@ -0,0 +1,36 @@
++{
++  "identifier": "rhel:9.4+eus/cve-2024-7347",
++  "item": {
++    "Vulnerability": {
++      "Description": "nginx: synthetic EUS fixture record fixed on rhel:9.4+eus at a non-zero epoch (1:). Paired with the rhel:9 \"None\" base record to exercise MissingEpochStrategy on the EUS fix-comparison path.",
++      "FixedIn": [
++        {
++          "Available": {
++            "date": "2026-04-22",
++            "kind": "first-observed"
++          },
++          "Module": null,
++          "Name": "nginx",
++          "NamespaceName": "rhel:9.4+eus",
++          "VendorAdvisory": {
++            "AdvisorySummary": [
++              {
++                "ID": "RHSA-2026:0001",
++                "Link": "https://access.redhat.com/errata/RHSA-2026:0001"
++              }
++            ],
++            "NoAdvisory": false
++          },
++          "Version": "1:1.20.1-14.el9_4",
++          "VersionFormat": "rpm"
++        }
++      ],
++      "Link": "https://access.redhat.com/security/cve/CVE-2024-7347",
++      "Metadata": {},
++      "Name": "CVE-2024-7347",
++      "NamespaceName": "rhel:9.4+eus",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/matcher/rpm/testdata/rhel9-eus/rhel/results/rhel@9/cve-2024-7347.json b/grype/matcher/rpm/testdata/rhel9-eus/rhel/results/rhel@9/cve-2024-7347.json
+new file mode 100644
+index 0000000..a2eb92b
+--- /dev/null
++++ b/grype/matcher/rpm/testdata/rhel9-eus/rhel/results/rhel@9/cve-2024-7347.json
+@@ -0,0 +1,27 @@
++{
++  "identifier": "rhel:9/cve-2024-7347",
++  "item": {
++    "Vulnerability": {
++      "Description": "nginx: synthetic EUS fixture record for a package that carries a non-zero rpm epoch. The base rhel:9 pocket has no fix (Version \"None\"); the fix is only published on 9.4+eus. Used to exercise MissingEpochStrategy on the EUS fix-comparison path (auto vs zero) when the installed version omits the epoch the fix carries.",
++      "FixedIn": [
++        {
++          "Module": null,
++          "Name": "nginx",
++          "NamespaceName": "rhel:9",
++          "VendorAdvisory": {
++            "AdvisorySummary": [],
++            "NoAdvisory": false
++          },
++          "Version": "None",
++          "VersionFormat": "rpm"
++        }
++      ],
++      "Link": "https://access.redhat.com/security/cve/CVE-2024-7347",
++      "Metadata": {},
++      "Name": "CVE-2024-7347",
++      "NamespaceName": "rhel:9",
++      "Severity": "Medium"
++    }
++  },
++  "schema": "https://raw.githubusercontent.com/anchore/vunnel/main/schema/vulnerability/os/schema-1.1.0.json"
++}
+diff --git a/grype/pkg/package_test.go b/grype/pkg/package_test.go
+index 9a71c59..5b72d84 100644
+--- a/grype/pkg/package_test.go
++++ b/grype/pkg/package_test.go
+@@ -1003,6 +1003,48 @@ func TestNew(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name: "apple-app-bundle-entry",
++			syftPkg: syftPkg.Package{
++				Metadata: syftPkg.AppleAppBundleEntry{
++					BundleIdentifier:     "com.apple.Safari",
++					Name:                 "Safari",
++					DisplayName:          "Safari",
++					Executable:           "Safari",
++					ShortVersion:         "17.0",
++					Version:              "17600.1.1",
++					PackageType:          "APPL",
++					SupportedPlatforms:   []string{"MacOSX"},
++					MinimumSystemVersion: "14.0",
++					MinimumOSVersion:     "14.0",
++					Copyright:            "Copyright © 2024 Apple Inc.",
++					PlatformName:         "macosx",
++					SDKName:              "macosx14.0",
++				},
++			},
++		},
++		{
++			name: "vcpkg-manifest",
++			syftPkg: syftPkg.Package{
++				Metadata: syftPkg.VcpkgManifest{
++					Description:   []string{"Test package"},
++					Documentation: "https://example.com/docs",
++					FullVersion:   "1.2.3#1",
++					Version:       "1.2.3",
++					PortVersion:   1,
++					Maintainers:   []string{"maintainer1"},
++					Name:          "test-package",
++					Supports:      "!windows",
++					Registry: &syftPkg.VcpkgRegistryEntry{
++						Baseline:   "abc123",
++						Kind:       syftPkg.Git,
++						Packages:   []string{"test-package"},
++						Repository: "https://github.com/microsoft/vcpkg",
++					},
++					Triplet: "x64-linux",
++				},
++			},
++		},
+ 	}
+ 
+ 	// capture each observed metadata type, we should see all of them relate to what syft provides by the end of testing
+diff --git a/grype/search/version_constraint.go b/grype/search/version_constraint.go
+index 2152b25..0ec129d 100644
+--- a/grype/search/version_constraint.go
++++ b/grype/search/version_constraint.go
+@@ -69,12 +69,14 @@ func ByFixedVersion(v version.Version) vulnerability.Criteria {
+ 				return false, "", nil
+ 			}
+ 			for _, fixVersion := range vuln.Fix.Versions {
+-				cmp, e := version.New(fixVersion, v.Format).Compare(&v)
++				// compare with v (the package) as the receiver so its embedded ComparisonConfig (e.g. missing-epoch
++				// strategy) is honored; cmp >= 0 means the installed version is at or past the fix, so it is fixed.
++				cmp, e := v.Compare(version.New(fixVersion, v.Format))
+ 				if e != nil {
+ 					err = e
+ 				}
+-				if cmp <= 0 {
+-					// fix version is less than or equal to the provided version, so is considered fixed
++				if cmp >= 0 {
++					// installed version is greater than or equal to the fix version, so is considered fixed
+ 					return true, fmt.Sprintf("fix version %v is less than %v", v, fixVersion), err
+ 				}
+ 			}
+diff --git a/grype/version/version.go b/grype/version/version.go
+index c9ffd8b..4e6a28c 100644
+--- a/grype/version/version.go
++++ b/grype/version/version.go
+@@ -90,6 +90,21 @@ func (v Version) String() string {
+ 	return fmt.Sprintf("%s (%s)", v.Raw, v.Format)
+ }
+ 
++// compareUsing runs the comparison honoring v's embedded ComparisonConfig for formats that support it
++// (currently rpm/deb missing-epoch handling), falling back to a plain comparison otherwise. v is always the
++// package side, other the constraint/fix side, matching CompareWithConfig's asymmetric auto-epoch semantics.
++func (v Version) compareUsing(comparator Comparator, other *Version) (int, error) {
++	if v.Config.MissingEpochStrategy != "" {
++		switch c := comparator.(type) {
++		case rpmVersion:
++			return c.CompareWithConfig(other, v.Config)
++		case debVersion:
++			return c.CompareWithConfig(other, v.Config)
++		}
++	}
++	return comparator.Compare(other)
++}
++
+ // Compare compares this version to another version.
+ // This returns -1, 0, or 1 if this version is smaller,
+ // equal, or larger than the other version, respectively.
+@@ -102,7 +117,7 @@ func (v Version) Compare(other *Version) (int, error) {
+ 	comparator, err := v.getComparator(v.Format)
+ 	if err == nil {
+ 		// if the package version, v was able to compare without error, return the result
+-		result, err = comparator.Compare(other)
++		result, err = v.compareUsing(comparator, other)
+ 		if err == nil {
+ 			// no error returned for package version or db version, return the result
+ 			return result, nil
+@@ -113,7 +128,7 @@ func (v Version) Compare(other *Version) (int, error) {
+ 		originalErr := err
+ 		comparator, err = v.getComparator(other.Format)
+ 		if err == nil {
+-			result, err = comparator.Compare(other)
++			result, err = v.compareUsing(comparator, other)
+ 			if err == nil {
+ 				return result, nil
+ 			}
+@@ -138,7 +153,7 @@ func (v *Version) Is(op Operator, other *Version) (bool, error) {
+ 		return false, fmt.Errorf("unable to get comparator for %s: %w", v.Format, err)
+ 	}
+ 
+-	result, err := comparator.Compare(other)
++	result, err := v.compareUsing(comparator, other)
+ 	if err != nil {
+ 		return false, fmt.Errorf("unable to compare versions %s and %s: %w", v, other, err)
+ 	}
+diff --git a/grype/version/version_test.go b/grype/version/version_test.go
+index a632c15..db007d1 100644
+--- a/grype/version/version_test.go
++++ b/grype/version/version_test.go
+@@ -361,3 +361,58 @@ func TestVersion_Is_AllOperators(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestVersion_Compare_HonorsEmbeddedConfig verifies that Version.Compare and Version.Is route through the
++// config-aware comparison when the receiver carries a MissingEpochStrategy (deb/rpm), rather than silently
++// ignoring it. The classic case: an installed version missing the epoch that the constraint/fix carries.
++func TestVersion_Compare_HonorsEmbeddedConfig(t *testing.T) {
++	tests := []struct {
++		name     string
++		format   Format
++		pkg      string // receiver (package), missing epoch
++		other    string // fix/constraint, carries epoch
++		strategy MissingEpochStrategy
++		wantCmp  int
++	}{
++		{
++			name:     "deb auto adopts constraint epoch - equal builds compare equal",
++			format:   DebFormat,
++			pkg:      "8.2p1-4ubuntu0.13+esm1",
++			other:    "1:8.2p1-4ubuntu0.13+esm1",
++			strategy: MissingEpochStrategyAuto,
++			wantCmp:  0,
++		},
++		{
++			name:     "deb zero treats missing epoch as 0 - lower than epoch 1",
++			format:   DebFormat,
++			pkg:      "8.2p1-4ubuntu0.13+esm1",
++			other:    "1:8.2p1-4ubuntu0.13+esm1",
++			strategy: MissingEpochStrategyZero,
++			wantCmp:  -1,
++		},
++		{
++			name:     "rpm auto adopts constraint epoch - equal builds compare equal",
++			format:   RpmFormat,
++			pkg:      "5.14.0-427.68.1.el9_4",
++			other:    "1:5.14.0-427.68.1.el9_4",
++			strategy: MissingEpochStrategyAuto,
++			wantCmp:  0,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			pkgV := NewWithConfig(tt.pkg, tt.format, ComparisonConfig{MissingEpochStrategy: tt.strategy})
++			other := New(tt.other, tt.format)
++
++			cmp, err := pkgV.Compare(other)
++			require.NoError(t, err)
++			assert.Equal(t, tt.wantCmp, cmp, "Compare")
++
++			// Is must agree with Compare (spot-check the equality operator)
++			isEq, err := pkgV.Is(EQ, other)
++			require.NoError(t, err)
++			assert.Equal(t, tt.wantCmp == 0, isEq, "Is(EQ)")
++		})
++	}
++}
+diff --git a/test/integration/compare_sbom_input_vs_lib_test.go b/test/integration/compare_sbom_input_vs_lib_test.go
+index 0ab5d6c..8b11162 100644
+--- a/test/integration/compare_sbom_input_vs_lib_test.go
++++ b/test/integration/compare_sbom_input_vs_lib_test.go
+@@ -83,6 +83,8 @@ func TestCompareSBOMInputToLibResults(t *testing.T) {
+ 		string(syftPkg.WordpressPluginPkg), // TODO: remove me when there is a matcher for this merged in https://github.com/anchore/grype/pull/1553
+ 		string(syftPkg.LuaRocksPkg),
+ 		string(syftPkg.TerraformPkg),
++		string(syftPkg.AppleAppBundlePkg),
++		string(syftPkg.VcpkgPkg),
+ 	)
+ 	observedPkgTypes := strset.New()
+ 	testCases := []struct {

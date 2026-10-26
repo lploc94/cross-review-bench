@@ -1,0 +1,819 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..80d9a60 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,8 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+ - **Properties and room types.** A property has an IANA time zone, check-in and check-out times, an
+   ISO 4217 currency (at most two minor units, since money is stored to cents) and a policy (full
+   refund days, partial refund percent, weekend surcharge, length-of-stay rule). A room type has a
+-  capacity, a base nightly rate and an extra-guest fee.
++  capacity, a base nightly rate, an extra-guest fee and a non-refundable discount (0 to 50 percent;
++  0 means the room type is sold flexible only).
+ - **Inventory.** One row per room type and night (local date of the property) with `total`, `held`
+   and `booked`. Availability is `total - held - booked`. Inventory writes take
+   their nights in ascending date order, the order holds use, so the two cannot deadlock.
+@@ -28,12 +29,19 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   it, so the other due holds still expire; the skipped hold is found again by the next run.
+ - **Pricing.** The rules run in a fixed order, and the price lines are stored with the reservation so
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+-  Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+-  is rounded with HALF_EVEN to the currency's minor units.
++  Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee, then
++  the rate plan discount on all of it. Money is rounded with HALF_EVEN to the currency's minor units.
++- **Rate plans.** A quote or hold asks for `ratePlan` `FLEXIBLE` (the default) or `NON_REFUNDABLE`.
++  A non-refundable stay gets one `RATE_PLAN_DISCOUNT` line, last: the room type's discount percent
++  of the sum of every other line (room nights, length-of-stay discount, extra-guest fees). Asking
++  for it on a room type without a discount is a 400. The hold and the reservation keep their rate
++  plan. Availability and the calendar show flexible prices.
+ - **Reservations.** Status moves `CONFIRMED` to `CHECKED_IN` (on or after the check-in date, before
+   check-out) to `COMPLETED`, or to `CANCELLED`. A cancellation made at or before the full-refund
+-  deadline is refunded in full; later ones follow the property policy. Cancelling twice is a
+-  conflict, never a second refund. Charges and refunds are recorded in a ledger with idempotency
++  deadline is refunded in full; later ones follow the property policy. A non-refundable
++  reservation can still be cancelled, which gives its rooms back, but it refunds nothing at any
++  time, and its cancellation quote says 0 percent. Cancelling twice is a conflict, never a second
++  refund. Charges and refunds are recorded in a ledger with idempotency
+   keys.
+ - **Errors.** Every error the API raises is an RFC 9457 problem detail with a
+   `urn:innkeep:problem:<slug>` type. A lock that cannot be taken in time, or a deadlock, is a 503
+diff --git a/src/main/java/com/innkeep/booking/api/HoldController.java b/src/main/java/com/innkeep/booking/api/HoldController.java
+index 7399d8c..e38423a 100644
+--- a/src/main/java/com/innkeep/booking/api/HoldController.java
++++ b/src/main/java/com/innkeep/booking/api/HoldController.java
+@@ -40,7 +40,8 @@ public class HoldController {
+             stay,
+             request.stay().rooms(),
+             request.stay().guests(),
+-            guest);
++            guest,
++            request.stay().plan());
+     return ResponseEntity.created(URI.create("/api/v1/holds/" + hold.getId()))
+         .body(HoldResponse.from(hold));
+   }
+diff --git a/src/main/java/com/innkeep/booking/api/QuoteController.java b/src/main/java/com/innkeep/booking/api/QuoteController.java
+index 1fb7302..d8e6e00 100644
+--- a/src/main/java/com/innkeep/booking/api/QuoteController.java
++++ b/src/main/java/com/innkeep/booking/api/QuoteController.java
+@@ -25,6 +25,7 @@ public class QuoteController {
+   public QuoteResponse quote(@PathVariable String code, @Valid @RequestBody StayRequest request) {
+     var stay = new DateRange(request.checkIn(), request.checkOut());
+     return QuoteResponse.from(
+-        pricing.quote(code, request.roomType(), stay, request.rooms(), request.guests()));
++        pricing.quote(
++            code, request.roomType(), stay, request.rooms(), request.guests(), request.plan()));
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/CreateRoomTypeRequest.java b/src/main/java/com/innkeep/booking/api/dto/CreateRoomTypeRequest.java
+index 736363e..2d1f3f6 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/CreateRoomTypeRequest.java
++++ b/src/main/java/com/innkeep/booking/api/dto/CreateRoomTypeRequest.java
+@@ -10,9 +10,17 @@ public record CreateRoomTypeRequest(
+     @NotBlank String name,
+     int capacity,
+     @NotNull BigDecimal baseNightlyRate,
+-    @NotNull BigDecimal extraGuestFee) {
++    @NotNull BigDecimal extraGuestFee,
++    Integer nonRefundableDiscountPercent) {
+ 
++  /** A room type without a non-refundable discount is sold flexible only. */
+   public RoomTypeDraft toDraft() {
+-    return new RoomTypeDraft(code, name, capacity, baseNightlyRate, extraGuestFee);
++    return new RoomTypeDraft(
++        code,
++        name,
++        capacity,
++        baseNightlyRate,
++        extraGuestFee,
++        nonRefundableDiscountPercent == null ? 0 : nonRefundableDiscountPercent);
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java b/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java
+index 5ff7f34..e017147 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/HoldResponse.java
+@@ -16,6 +16,7 @@ public record HoldResponse(
+     LocalDate checkOut,
+     int rooms,
+     int guests,
++    String ratePlan,
+     String currency,
+     BigDecimal total,
+     Instant expiresAt,
+@@ -31,6 +32,7 @@ public record HoldResponse(
+         hold.getStay().checkOut(),
+         hold.getRooms(),
+         hold.getGuests(),
++        hold.getRatePlan().name(),
+         hold.getTotal().currency().getCurrencyCode(),
+         hold.getTotal().amount(),
+         hold.getExpiresAt(),
+diff --git a/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java b/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java
+index 428d527..948abe2 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/QuoteResponse.java
+@@ -11,6 +11,7 @@ public record QuoteResponse(
+     LocalDate checkOut,
+     int rooms,
+     int guests,
++    String ratePlan,
+     String currency,
+     BigDecimal total,
+     List<PriceLineResponse> lines) {
+@@ -22,6 +23,7 @@ public record QuoteResponse(
+         quote.stay().checkOut(),
+         quote.rooms(),
+         quote.guests(),
++        quote.ratePlan().name(),
+         quote.total().currency().getCurrencyCode(),
+         quote.total().amount(),
+         PriceLineResponse.fromAll(quote.lines()));
+diff --git a/src/main/java/com/innkeep/booking/api/dto/ReservationSummary.java b/src/main/java/com/innkeep/booking/api/dto/ReservationSummary.java
+index 6da9cc1..5a1b284 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/ReservationSummary.java
++++ b/src/main/java/com/innkeep/booking/api/dto/ReservationSummary.java
+@@ -14,6 +14,7 @@ public record ReservationSummary(
+     LocalDate checkOut,
+     int rooms,
+     int guests,
++    String ratePlan,
+     String guestName,
+     String guestEmail,
+     String currency,
+@@ -29,6 +30,7 @@ public record ReservationSummary(
+         reservation.getCheckOut(),
+         reservation.getRooms(),
+         reservation.getGuests(),
++        reservation.getRatePlan().name(),
+         reservation.getGuest().getName(),
+         reservation.getGuest().getEmail(),
+         reservation.getTotal().currency().getCurrencyCode(),
+diff --git a/src/main/java/com/innkeep/booking/api/dto/RoomTypeResponse.java b/src/main/java/com/innkeep/booking/api/dto/RoomTypeResponse.java
+index ab6c46c..a215dc9 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/RoomTypeResponse.java
++++ b/src/main/java/com/innkeep/booking/api/dto/RoomTypeResponse.java
+@@ -9,6 +9,7 @@ public record RoomTypeResponse(
+     int capacity,
+     BigDecimal baseNightlyRate,
+     BigDecimal extraGuestFee,
++    int nonRefundableDiscountPercent,
+     String currency) {
+ 
+   public static RoomTypeResponse from(RoomType type) {
+@@ -18,6 +19,7 @@ public record RoomTypeResponse(
+         type.getCapacity(),
+         type.getBaseNightlyRate(),
+         type.getExtraGuestFee(),
++        type.getNonRefundableDiscountPercent(),
+         type.getProperty().currency().getCurrencyCode());
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/api/dto/StayRequest.java b/src/main/java/com/innkeep/booking/api/dto/StayRequest.java
+index 2758fde..cf590d0 100644
+--- a/src/main/java/com/innkeep/booking/api/dto/StayRequest.java
++++ b/src/main/java/com/innkeep/booking/api/dto/StayRequest.java
+@@ -1,14 +1,24 @@
+ package com.innkeep.booking.api.dto;
+ 
++import com.innkeep.booking.domain.RatePlan;
+ import jakarta.validation.constraints.Min;
+ import jakarta.validation.constraints.NotBlank;
+ import jakarta.validation.constraints.NotNull;
+ import java.time.LocalDate;
+ 
+-/** What a guest asks for: a room type, a date range, the number of rooms and of guests. */
++/**
++ * What a guest asks for: a room type, a date range, the number of rooms and of guests, and the rate
++ * plan (flexible when not given).
++ */
+ public record StayRequest(
+     @NotBlank String roomType,
+     @NotNull LocalDate checkIn,
+     @NotNull LocalDate checkOut,
+     @Min(1) int rooms,
+-    @Min(1) int guests) {}
++    @Min(1) int guests,
++    RatePlan ratePlan) {
++
++  public RatePlan plan() {
++    return ratePlan == null ? RatePlan.FLEXIBLE : ratePlan;
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/Hold.java b/src/main/java/com/innkeep/booking/domain/Hold.java
+index 47d5216..d97620f 100644
+--- a/src/main/java/com/innkeep/booking/domain/Hold.java
++++ b/src/main/java/com/innkeep/booking/domain/Hold.java
+@@ -56,6 +56,10 @@ public class Hold extends AbstractEntity<UUID> {
+ 
+   @Embedded private GuestDetails guest;
+ 
++  @Enumerated(EnumType.STRING)
++  @Column(name = "rate_plan", nullable = false, length = 16)
++  private RatePlan ratePlan;
++
+   @Enumerated(EnumType.STRING)
+   @Column(nullable = false, length = 16)
+   private HoldStatus status;
+@@ -99,6 +103,7 @@ public class Hold extends AbstractEntity<UUID> {
+     this.rooms = rooms;
+     this.guests = guests;
+     this.guest = guest;
++    this.ratePlan = quote.ratePlan();
+     this.status = HoldStatus.ACTIVE;
+     this.currency = quote.total().currency().getCurrencyCode();
+     this.totalAmount = quote.total().amount();
+@@ -136,6 +141,10 @@ public class Hold extends AbstractEntity<UUID> {
+     return guest;
+   }
+ 
++  public RatePlan getRatePlan() {
++    return ratePlan;
++  }
++
+   public HoldStatus getStatus() {
+     return status;
+   }
+diff --git a/src/main/java/com/innkeep/booking/domain/PriceKind.java b/src/main/java/com/innkeep/booking/domain/PriceKind.java
+index 7b22bb5..64a5e56 100644
+--- a/src/main/java/com/innkeep/booking/domain/PriceKind.java
++++ b/src/main/java/com/innkeep/booking/domain/PriceKind.java
+@@ -4,5 +4,6 @@ package com.innkeep.booking.domain;
+ public enum PriceKind {
+   NIGHTLY_RATE,
+   LENGTH_OF_STAY_DISCOUNT,
+-  EXTRA_GUEST_FEE
++  EXTRA_GUEST_FEE,
++  RATE_PLAN_DISCOUNT
+ }
+diff --git a/src/main/java/com/innkeep/booking/domain/PricingEngine.java b/src/main/java/com/innkeep/booking/domain/PricingEngine.java
+index d5cdfa3..7440301 100644
+--- a/src/main/java/com/innkeep/booking/domain/PricingEngine.java
++++ b/src/main/java/com/innkeep/booking/domain/PricingEngine.java
+@@ -14,7 +14,9 @@ import java.util.Optional;
+  *   <li>the nightly rate: the seasonal rate covering the night, else the base rate;
+  *   <li>the weekend surcharge on Friday and Saturday nights, by the property's local night date;
+  *   <li>the length-of-stay discount on the room charges, when the stay is long enough;
+- *   <li>the extra-guest fee per night for guests above the rooms' capacity (never discounted).
++ *   <li>the extra-guest fee per night for guests above the rooms' capacity (not part of the
++ *       length-of-stay discount);
++ *   <li>the rate plan discount, when the stay is sold non-refundable.
+  * </ol>
+  *
+  * Every amount is rounded to the currency's minor units with HALF_EVEN as it is produced.
+@@ -33,6 +35,17 @@ public final class PricingEngine {
+       DateRange stay,
+       int rooms,
+       int guests) {
++    return quote(property, roomType, rates, stay, rooms, guests, RatePlan.FLEXIBLE);
++  }
++
++  public static Quote quote(
++      Property property,
++      RoomType roomType,
++      List<SeasonalRate> rates,
++      DateRange stay,
++      int rooms,
++      int guests,
++      RatePlan ratePlan) {
+     if (rooms < 1) {
+       throw new ValidationException("at least one room is required");
+     }
+@@ -41,10 +54,17 @@ public final class PricingEngine {
+       throw new ValidationException(
+           "guests must be between 1 and " + maxGuests + " for " + rooms + " room(s)");
+     }
++    int planPercent =
++        ratePlan == RatePlan.NON_REFUNDABLE ? roomType.getNonRefundableDiscountPercent() : 0;
++    if (ratePlan == RatePlan.NON_REFUNDABLE && planPercent == 0) {
++      throw new ValidationException(
++          "room type " + roomType.getCode() + " has no non-refundable rate");
++    }
+     var currency = property.currency();
+     var base = Money.of(roomType.getBaseNightlyRate(), currency);
+     var lines = new ArrayList<PriceLine>();
+     var roomCharges = Money.zero(currency);
++    var planDiscount = Money.zero(currency);
+ 
+     for (LocalDate night : stay.nightDates()) {
+       Money rate =
+@@ -57,6 +77,7 @@ public final class PricingEngine {
+       Money nightly = rate.times(rooms);
+       lines.add(new PriceLine(PriceKind.NIGHTLY_RATE, night, "Room night", nightly.amount()));
+       roomCharges = roomCharges.plus(nightly);
++      planDiscount = planDiscount.plus(nightly.percent(planPercent));
+     }
+ 
+     if (stay.nights() >= property.getLosMinNights() && property.getLosDiscountPercent() > 0) {
+@@ -77,11 +98,20 @@ public final class PricingEngine {
+       }
+     }
+ 
++    if (planPercent > 0) {
++      lines.add(
++          new PriceLine(
++              PriceKind.RATE_PLAN_DISCOUNT,
++              null,
++              "Non-refundable rate",
++              Money.zero(currency).minus(planDiscount).amount()));
++    }
++
+     Money total = Money.zero(currency);
+     for (PriceLine line : lines) {
+       total = total.plus(Money.of(line.getAmount(), currency));
+     }
+-    return new Quote(roomType.getCode(), stay, rooms, guests, lines, total);
++    return new Quote(roomType.getCode(), stay, rooms, guests, ratePlan, lines, total);
+   }
+ 
+   /** The rate of the seasonal rule with the lowest priority number that covers the night. */
+diff --git a/src/main/java/com/innkeep/booking/domain/Quote.java b/src/main/java/com/innkeep/booking/domain/Quote.java
+index 7ee0a66..47f9f13 100644
+--- a/src/main/java/com/innkeep/booking/domain/Quote.java
++++ b/src/main/java/com/innkeep/booking/domain/Quote.java
+@@ -8,6 +8,7 @@ public record Quote(
+     DateRange stay,
+     int rooms,
+     int guests,
++    RatePlan ratePlan,
+     List<PriceLine> lines,
+     Money total) {
+ 
+diff --git a/src/main/java/com/innkeep/booking/domain/RatePlan.java b/src/main/java/com/innkeep/booking/domain/RatePlan.java
+new file mode 100644
+index 0000000..1b51276
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/RatePlan.java
+@@ -0,0 +1,10 @@
++package com.innkeep.booking.domain;
++
++/**
++ * How a stay is sold. A flexible stay is refunded under the property's cancellation policy; a
++ * non-refundable stay is cheaper by the room type's discount and is never refunded.
++ */
++public enum RatePlan {
++  FLEXIBLE,
++  NON_REFUNDABLE
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/Reservation.java b/src/main/java/com/innkeep/booking/domain/Reservation.java
+index d2ced6c..113e216 100644
+--- a/src/main/java/com/innkeep/booking/domain/Reservation.java
++++ b/src/main/java/com/innkeep/booking/domain/Reservation.java
+@@ -69,6 +69,10 @@ public class Reservation extends AbstractEntity<Long> {
+ 
+   @Embedded private GuestDetails guest;
+ 
++  @Enumerated(EnumType.STRING)
++  @Column(name = "rate_plan", nullable = false, length = 16)
++  private RatePlan ratePlan;
++
+   @Column(nullable = false, length = 3)
+   private String currency;
+ 
+@@ -106,6 +110,7 @@ public class Reservation extends AbstractEntity<Long> {
+     this.guests = hold.getGuests();
+     this.status = ReservationStatus.CONFIRMED;
+     this.guest = hold.getGuest();
++    this.ratePlan = hold.getRatePlan();
+     this.currency = hold.getTotal().currency().getCurrencyCode();
+     this.totalAmount = hold.getTotal().amount();
+     this.priceLines.addAll(hold.getPriceLines());
+@@ -158,6 +163,10 @@ public class Reservation extends AbstractEntity<Long> {
+     return status;
+   }
+ 
++  public RatePlan getRatePlan() {
++    return ratePlan;
++  }
++
+   public GuestDetails getGuest() {
+     return guest;
+   }
+diff --git a/src/main/java/com/innkeep/booking/domain/RoomType.java b/src/main/java/com/innkeep/booking/domain/RoomType.java
+index 81cb705..623c192 100644
+--- a/src/main/java/com/innkeep/booking/domain/RoomType.java
++++ b/src/main/java/com/innkeep/booking/domain/RoomType.java
+@@ -39,6 +39,9 @@ public class RoomType extends AbstractEntity<Long> {
+   @Column(name = "extra_guest_fee", nullable = false, precision = 12, scale = 2)
+   private BigDecimal extraGuestFee;
+ 
++  @Column(name = "non_refundable_discount_percent", nullable = false)
++  private int nonRefundableDiscountPercent;
++
+   protected RoomType() {}
+ 
+   public RoomType(
+@@ -85,6 +88,15 @@ public class RoomType extends AbstractEntity<Long> {
+     return extraGuestFee;
+   }
+ 
++  /** The discount of the non-refundable rate plan; 0 when the room type is not sold that way. */
++  public int getNonRefundableDiscountPercent() {
++    return nonRefundableDiscountPercent;
++  }
++
++  public void offerNonRefundable(int discountPercent) {
++    this.nonRefundableDiscountPercent = discountPercent;
++  }
++
+   /** Replaces the base rate and extra-guest fee for future quotes; stored quotes are unchanged. */
+   public void reprice(BigDecimal baseNightlyRate, BigDecimal extraGuestFee) {
+     this.baseNightlyRate = baseNightlyRate;
+diff --git a/src/main/java/com/innkeep/booking/service/CatalogService.java b/src/main/java/com/innkeep/booking/service/CatalogService.java
+index e249628..15df32e 100644
+--- a/src/main/java/com/innkeep/booking/service/CatalogService.java
++++ b/src/main/java/com/innkeep/booking/service/CatalogService.java
+@@ -133,17 +133,20 @@ public class CatalogService {
+     requireBetween("capacity", draft.capacity(), 1, 20);
+     requireMoney("base nightly rate", draft.baseNightlyRate(), property.currency());
+     requireMoney("extra guest fee", draft.extraGuestFee(), property.currency());
++    requireBetween("non-refundable discount percent", draft.nonRefundableDiscountPercent(), 0, 50);
+     if (roomTypes.findByPropertyCodeAndCode(propertyCode, draft.code()).isPresent()) {
+       throw new ConflictException("room type " + draft.code() + " already exists");
+     }
+-    return roomTypes.save(
++    var type =
+         new RoomType(
+             property,
+             draft.code(),
+             draft.name().trim(),
+             draft.capacity(),
+             draft.baseNightlyRate(),
+-            draft.extraGuestFee()));
++            draft.extraGuestFee());
++    type.offerNonRefundable(draft.nonRefundableDiscountPercent());
++    return roomTypes.save(type);
+   }
+ 
+   public RoomType reprice(
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 9751a26..8c0cd58 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -13,6 +13,7 @@ import com.innkeep.booking.domain.LedgerKind;
+ import com.innkeep.booking.domain.NotFoundException;
+ import com.innkeep.booking.domain.PricingEngine;
+ import com.innkeep.booking.domain.Quote;
++import com.innkeep.booking.domain.RatePlan;
+ import com.innkeep.booking.domain.ReferenceCode;
+ import com.innkeep.booking.domain.Reservation;
+ import com.innkeep.booking.domain.RoomType;
+@@ -93,14 +94,18 @@ public class HoldService {
+     this.entities = entities;
+   }
+ 
+-  /** Prices the stay and holds the rooms for every night, or none of them. */
++  /**
++   * Prices the stay under the rate plan and holds the rooms for every night, or none of them. The
++   * hold keeps the rate plan, and so does the reservation it becomes.
++   */
+   public Hold create(
+       String propertyCode,
+       String roomTypeCode,
+       DateRange stay,
+       int roomCount,
+       int guests,
+-      GuestDetails guest) {
++      GuestDetails guest,
++      RatePlan ratePlan) {
+     config.requireWithinLimits(stay, roomCount);
+     return tx.execute(
+         status -> {
+@@ -114,7 +119,8 @@ public class HoldService {
+               seasonalRates.findOverlapping(
+                   List.of(type.getId()), stay.checkIn(), stay.lastNight());
+           Quote quote =
+-              PricingEngine.quote(type.getProperty(), type, rates, stay, roomCount, guests);
++              PricingEngine.quote(
++                  type.getProperty(), type, rates, stay, roomCount, guests, ratePlan);
+           for (LocalDate night : stay.nightDates()) {
+             if (inventory.holdRooms(type.getId(), night, roomCount) == 0) {
+               throw new InsufficientAvailabilityException(type.getCode(), night);
+diff --git a/src/main/java/com/innkeep/booking/service/PricingService.java b/src/main/java/com/innkeep/booking/service/PricingService.java
+index 91e5bdd..6678f14 100644
+--- a/src/main/java/com/innkeep/booking/service/PricingService.java
++++ b/src/main/java/com/innkeep/booking/service/PricingService.java
+@@ -4,6 +4,7 @@ import com.innkeep.booking.config.BookingConfig;
+ import com.innkeep.booking.domain.DateRange;
+ import com.innkeep.booking.domain.PricingEngine;
+ import com.innkeep.booking.domain.Quote;
++import com.innkeep.booking.domain.RatePlan;
+ import com.innkeep.booking.domain.RoomType;
+ import com.innkeep.booking.domain.SeasonalRate;
+ import com.innkeep.booking.persistence.SeasonalRateRepository;
+@@ -26,11 +27,16 @@ public class PricingService {
+   }
+ 
+   public Quote quote(
+-      String propertyCode, String roomTypeCode, DateRange stay, int rooms, int guests) {
++      String propertyCode,
++      String roomTypeCode,
++      DateRange stay,
++      int rooms,
++      int guests,
++      RatePlan ratePlan) {
+     config.requireWithinLimits(stay, rooms);
+     RoomType type = catalog.roomType(propertyCode, roomTypeCode);
+     List<SeasonalRate> rates =
+         seasonalRates.findOverlapping(List.of(type.getId()), stay.checkIn(), stay.lastNight());
+-    return PricingEngine.quote(type.getProperty(), type, rates, stay, rooms, guests);
++    return PricingEngine.quote(type.getProperty(), type, rates, stay, rooms, guests, ratePlan);
+   }
+ }
+diff --git a/src/main/java/com/innkeep/booking/service/ReservationService.java b/src/main/java/com/innkeep/booking/service/ReservationService.java
+index 0401253..a256ebe 100644
+--- a/src/main/java/com/innkeep/booking/service/ReservationService.java
++++ b/src/main/java/com/innkeep/booking/service/ReservationService.java
+@@ -8,6 +8,7 @@ import com.innkeep.booking.domain.LedgerEntry;
+ import com.innkeep.booking.domain.LedgerKind;
+ import com.innkeep.booking.domain.Money;
+ import com.innkeep.booking.domain.NotFoundException;
++import com.innkeep.booking.domain.RatePlan;
+ import com.innkeep.booking.domain.Reservation;
+ import com.innkeep.booking.domain.ReservationStatus;
+ import com.innkeep.booking.domain.RoomType;
+@@ -111,9 +112,7 @@ public class ReservationService {
+                 status -> {
+                   Reservation reservation = get(reference);
+                   Instant now = clock.instant();
+-                  Money refund =
+-                      CancellationPolicy.of(reservation.getProperty())
+-                          .refund(reservation.getTotal(), reservation.getCheckIn(), now);
++                  Money refund = reservation.getTotal().percent(refundPercent(reservation, now));
+                   reservation.cancel(now);
+                   reservations.saveAndFlush(reservation);
+                   releaseBooked(reservation);
+@@ -211,12 +210,20 @@ public class ReservationService {
+           "reservation " + reference + " is " + reservation.getStatus() + ", not cancellable");
+     }
+     Instant when = at == null ? clock.instant() : at;
+-    CancellationPolicy policy = CancellationPolicy.of(reservation.getProperty());
+-    LocalDate checkIn = reservation.getCheckIn();
+-    return new CancellationQuote(
+-        when,
+-        policy.refundPercent(checkIn, when),
+-        policy.refund(reservation.getTotal(), checkIn, when));
++    int percent = refundPercent(reservation, when);
++    return new CancellationQuote(when, percent, reservation.getTotal().percent(percent));
++  }
++
++  /**
++   * The share of the total a cancellation at {@code at} refunds: nothing for a non-refundable stay,
++   * otherwise what the property's policy gives.
++   */
++  private static int refundPercent(Reservation reservation, Instant at) {
++    if (reservation.getRatePlan() == RatePlan.NON_REFUNDABLE) {
++      return 0;
++    }
++    return CancellationPolicy.of(reservation.getProperty())
++        .refundPercent(reservation.getCheckIn(), at);
+   }
+ 
+   /** The number of reservations in each status, zero for the statuses with none. */
+diff --git a/src/main/java/com/innkeep/booking/service/RoomTypeDraft.java b/src/main/java/com/innkeep/booking/service/RoomTypeDraft.java
+index 37ad160..34863d5 100644
+--- a/src/main/java/com/innkeep/booking/service/RoomTypeDraft.java
++++ b/src/main/java/com/innkeep/booking/service/RoomTypeDraft.java
+@@ -3,4 +3,9 @@ package com.innkeep.booking.service;
+ import java.math.BigDecimal;
+ 
+ public record RoomTypeDraft(
+-    String code, String name, int capacity, BigDecimal baseNightlyRate, BigDecimal extraGuestFee) {}
++    String code,
++    String name,
++    int capacity,
++    BigDecimal baseNightlyRate,
++    BigDecimal extraGuestFee,
++    int nonRefundableDiscountPercent) {}
+diff --git a/src/main/resources/db/migration/V2__rate_plans.sql b/src/main/resources/db/migration/V2__rate_plans.sql
+new file mode 100644
+index 0000000..b48db7d
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__rate_plans.sql
+@@ -0,0 +1,11 @@
++ALTER TABLE room_type
++    ADD COLUMN non_refundable_discount_percent INTEGER NOT NULL DEFAULT 0
++        CHECK (non_refundable_discount_percent BETWEEN 0 AND 50);
++
++ALTER TABLE hold
++    ADD COLUMN rate_plan VARCHAR(16) NOT NULL DEFAULT 'FLEXIBLE'
++        CHECK (rate_plan IN ('FLEXIBLE', 'NON_REFUNDABLE'));
++
++ALTER TABLE reservation
++    ADD COLUMN rate_plan VARCHAR(16) NOT NULL DEFAULT 'FLEXIBLE'
++        CHECK (rate_plan IN ('FLEXIBLE', 'NON_REFUNDABLE'));
+diff --git a/src/test/java/com/innkeep/booking/api/RatePlanApiTest.java b/src/test/java/com/innkeep/booking/api/RatePlanApiTest.java
+new file mode 100644
+index 0000000..44e0947
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/RatePlanApiTest.java
+@@ -0,0 +1,119 @@
++package com.innkeep.booking.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.service.CatalogService;
++import com.innkeep.booking.support.IntegrationTestBase;
++import com.jayway.jsonpath.JsonPath;
++import java.time.LocalDate;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++/** Non-refundable stays: 10 June 2027 is a Thursday, well before the full-refund deadline. */
++class RatePlanApiTest extends IntegrationTestBase {
++
++  @Autowired private CatalogService catalog;
++
++  private ResultActions createRoomType(String code, int discountPercent) throws Exception {
++    return mvc.perform(
++        post("/api/v1/admin/properties/harbour-house/room-types")
++            .header("Authorization", ADMIN_AUTH)
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(
++                ("{\"code\":\"%s\",\"name\":\"Saver\",\"capacity\":2,"
++                        + "\"baseNightlyRate\":100.00,\"extraGuestFee\":15.00,"
++                        + "\"nonRefundableDiscountPercent\":%d}")
++                    .formatted(code, discountPercent)));
++  }
++
++  private RoomType roomType(String code, int discountPercent) throws Exception {
++    var property = data.harbourHouse();
++    createRoomType(code, discountPercent)
++        .andExpect(status().isCreated())
++        .andExpect(jsonPath("$.nonRefundableDiscountPercent").value(discountPercent));
++    RoomType type = catalog.roomType("harbour-house", code);
++    data.rooms(property, type, LocalDate.parse("2027-06-01"), LocalDate.parse("2027-06-20"), 2);
++    return type;
++  }
++
++  private static String stay(String roomType) {
++    return ("{\"roomType\":\"%s\",\"checkIn\":\"2027-06-10\",\"checkOut\":\"2027-06-12\","
++            + "\"rooms\":1,\"guests\":2,\"ratePlan\":\"NON_REFUNDABLE\"}")
++        .formatted(roomType);
++  }
++
++  @Test
++  void aNonRefundableQuoteEndsWithTheDiscountLine() throws Exception {
++    roomType("saver", 10);
++
++    mvc.perform(
++            post("/api/v1/properties/harbour-house/quotes")
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(stay("saver")))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.ratePlan").value("NON_REFUNDABLE"))
++        .andExpect(jsonPath("$.lines.length()").value(3))
++        .andExpect(jsonPath("$.lines[2].kind").value("RATE_PLAN_DISCOUNT"))
++        .andExpect(jsonPath("$.lines[2].amount").value(-21.00))
++        .andExpect(jsonPath("$.total").value(189.00));
++  }
++
++  @Test
++  void onlyRoomTypesWithADiscountAreSoldNonRefundable() throws Exception {
++    roomType("standard", 0);
++
++    mvc.perform(
++            post("/api/v1/properties/harbour-house/quotes")
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(stay("standard")))
++        .andExpect(status().isBadRequest())
++        .andExpect(jsonPath("$.type").value("urn:innkeep:problem:invalid-request"));
++    createRoomType("deluxe", 60).andExpect(status().isBadRequest());
++  }
++
++  @Test
++  void aNonRefundableReservationIsCancelledWithoutRefund() throws Exception {
++    RoomType type = roomType("saver", 10);
++    String hold =
++        mvc.perform(
++                post("/api/v1/properties/harbour-house/holds")
++                    .contentType(MediaType.APPLICATION_JSON)
++                    .content(
++                        "{\"stay\":"
++                            + stay("saver")
++                            + ",\"guest\":{\"name\":\"Ines Lark\","
++                            + "\"email\":\"guest@example.com\"}}"))
++            .andExpect(status().isCreated())
++            .andExpect(jsonPath("$.ratePlan").value("NON_REFUNDABLE"))
++            .andReturn()
++            .getResponse()
++            .getContentAsString();
++    String reservation =
++        mvc.perform(post("/api/v1/holds/" + JsonPath.read(hold, "$.id") + "/confirm"))
++            .andExpect(status().isCreated())
++            .andExpect(jsonPath("$.ratePlan").value("NON_REFUNDABLE"))
++            .andExpect(jsonPath("$.total").value(189.00))
++            .andReturn()
++            .getResponse()
++            .getContentAsString();
++    String path = "/api/v1/reservations/" + JsonPath.read(reservation, "$.reference");
++
++    mvc.perform(get(path + "/cancellation-quote"))
++        .andExpect(jsonPath("$.refundPercent").value(0))
++        .andExpect(jsonPath("$.refundAmount").value(0.00));
++    mvc.perform(post(path + "/cancel"))
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.refundAmount").value(0.00))
++        .andExpect(jsonPath("$.reservation.status").value("CANCELLED"));
++    assertThat(payments.refundCount()).isZero();
++    assertThat(booked(type, LocalDate.parse("2027-06-10"))).isZero();
++    assertThat(booked(type, LocalDate.parse("2027-06-11"))).isZero();
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/support/TestData.java b/src/test/java/com/innkeep/booking/support/TestData.java
+index 5021c54..276bb8f 100644
+--- a/src/test/java/com/innkeep/booking/support/TestData.java
++++ b/src/test/java/com/innkeep/booking/support/TestData.java
+@@ -4,6 +4,7 @@ import com.innkeep.booking.domain.DateRange;
+ import com.innkeep.booking.domain.GuestDetails;
+ import com.innkeep.booking.domain.Hold;
+ import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RatePlan;
+ import com.innkeep.booking.domain.Reservation;
+ import com.innkeep.booking.domain.RoomType;
+ import com.innkeep.booking.domain.SeasonalRate;
+@@ -105,7 +106,8 @@ public class TestData {
+         new DateRange(in, out),
+         rooms,
+         rooms * type.getCapacity(),
+-        new GuestDetails("Mara Quill", GUEST_EMAIL, "+351 000 000 000"));
++        new GuestDetails("Mara Quill", GUEST_EMAIL, "+351 000 000 000"),
++        RatePlan.FLEXIBLE);
+   }
+ 
+   public Reservation book(
+diff --git a/src/test/java/com/innkeep/booking/unit/RatePlanPricingTest.java b/src/test/java/com/innkeep/booking/unit/RatePlanPricingTest.java
+new file mode 100644
+index 0000000..c839c9f
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/unit/RatePlanPricingTest.java
+@@ -0,0 +1,64 @@
++package com.innkeep.booking.unit;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.PriceKind;
++import com.innkeep.booking.domain.PriceLine;
++import com.innkeep.booking.domain.PricingEngine;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.Quote;
++import com.innkeep.booking.domain.RatePlan;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.domain.ValidationException;
++import com.innkeep.booking.support.Fixtures;
++import java.time.LocalDate;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++
++/** The non-refundable rate plan in the pricing rules. 4–6 January 2027 are weekday nights. */
++class RatePlanPricingTest {
++
++  private static final DateRange WEEKDAYS =
++      new DateRange(LocalDate.parse("2027-01-04"), LocalDate.parse("2027-01-06"));
++
++  private final Property property = Fixtures.property("Europe/Lisbon", 10, 0);
++  private final RoomType room = Fixtures.roomType(property, 2, "100.00");
++
++  private Quote quote(DateRange stay, RatePlan plan) {
++    return PricingEngine.quote(property, room, List.of(), stay, 1, 2, plan);
++  }
++
++  @Test
++  void aNonRefundableStayEndsWithOneDiscountLine() {
++    room.offerNonRefundable(10);
++
++    Quote quote = quote(WEEKDAYS, RatePlan.NON_REFUNDABLE);
++
++    assertThat(quote.ratePlan()).isEqualTo(RatePlan.NON_REFUNDABLE);
++    assertThat(quote.lines()).hasSize(3);
++    PriceLine last = quote.lines().get(2);
++    assertThat(last.getKind()).isEqualTo(PriceKind.RATE_PLAN_DISCOUNT);
++    assertThat(last.getNight()).isNull();
++    assertThat(last.getAmount()).isEqualByComparingTo("-20.00");
++    assertThat(quote.total().amount()).isEqualByComparingTo("180.00");
++  }
++
++  @Test
++  void aFlexibleStayHasNoDiscountLine() {
++    room.offerNonRefundable(10);
++
++    Quote quote = quote(WEEKDAYS, RatePlan.FLEXIBLE);
++
++    assertThat(quote.lines()).noneMatch(line -> line.getKind() == PriceKind.RATE_PLAN_DISCOUNT);
++    assertThat(quote.total().amount()).isEqualByComparingTo("200.00");
++  }
++
++  @Test
++  void aRoomTypeWithoutTheDiscountIsNotSoldNonRefundable() {
++    assertThatThrownBy(() -> quote(WEEKDAYS, RatePlan.NON_REFUNDABLE))
++        .isInstanceOf(ValidationException.class)
++        .hasMessageContaining("no non-refundable rate");
++  }
++}

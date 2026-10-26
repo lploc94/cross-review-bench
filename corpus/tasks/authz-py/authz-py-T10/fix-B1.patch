@@ -1,0 +1,14 @@
+diff --git a/src/authz/services/auth.py b/src/authz/services/auth.py
+index 6139497..710c2a0 100644
+--- a/src/authz/services/auth.py
++++ b/src/authz/services/auth.py
+@@ -104,6 +104,9 @@ class AuthService:
+         if user.disabled_at is not None:
+             log.info("auth.login_failed", reason="disabled", user_id=str(user.id))
+             raise InvalidCredentials()
++        if user.is_locked(self._clock.now()):
++            log.info("auth.login_failed", reason="locked", user_id=str(user.id))
++            raise InvalidCredentials()
+ 
+         new_hash = None
+         if self._hasher.needs_rehash(user.password_hash):

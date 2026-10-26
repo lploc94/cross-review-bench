@@ -1,0 +1,25 @@
+{
+  "name": "@sync/server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sync server: push and pull of field writes over HTTP, state in PostgreSQL",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "start": "node dist/main.js",
+    "migrate": "node dist/scripts/migrate.js",
+    "admin": "node dist/scripts/admin.js"
+  },
+  "dependencies": {
+    "@sync/shared": "1.0.0",
+    "fastify": "5.12.7",
+    "pg": "8.23.1",
+    "pino": "10.4.0",
+    "zod": "4.6.7"
+  }
+}

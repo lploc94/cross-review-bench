@@ -1,0 +1,1043 @@
+diff --git a/README.md b/README.md
+index c9415f9..dd00ed0 100644
+--- a/README.md
++++ b/README.md
+@@ -107,6 +107,16 @@ Only `id`, one of `path` or `path_prefix`, and `upstreams` are required; the val
+ may not touch hop-by-hop fields, `Host`, `Content-Length`, `Trailer` or the headers the gateway
+ owns (`X-Request-Id`, `X-Forwarded-For`, `-Proto` and `-Host`, `X-Consumer-Id`).
+ 
++A route may also set a `tls` object for how the gateway connects to its upstreams, which must then
++all be `https` URLs (a route with `tls` and a plain `http` upstream fails the load): `ca_file` is
++the CA that signs their certificates (the system roots are not used when it is set), `cert_file` and
++`key_file` are the client certificate the gateway presents to them (set together), `server_name` the
++name it expects in their certificates, and `min_version` is `"1.2"` (the default) or `"1.3"`. The
++files are read when the routes are loaded, and by `check-routes`, so a broken file fails the load
++and a reload picks up a rotated certificate. Health checks of the route use the same settings.
++Routes with equal settings share one transport; after a reload, the first request on a TLS route
++closes the idle connections of the transports no route uses any more.
++
+ Every problem is reported with the route and field, for example
+ `route "orders": retry.attempts: must be between 1 and 10, got 11`. Check a file without starting
+ the gateway:
+diff --git a/cmd/gateway/main.go b/cmd/gateway/main.go
+index 70abc3f..28ad2c3 100644
+--- a/cmd/gateway/main.go
++++ b/cmd/gateway/main.go
+@@ -57,13 +57,27 @@ func main() {
+ }
+ 
+ // checkRoutes validates a routes file without starting anything, for CI and for operators
+-// before they send SIGHUP. It returns the exit status.
++// before they send SIGHUP: it also reads the TLS files of the routes, as a reload does. It
++// returns the exit status.
+ func checkRoutes(path string, stdout, stderr io.Writer) int {
+ 	routes, err := config.LoadRoutes(path)
+ 	if err != nil {
+ 		fmt.Fprintln(stderr, err)
+ 		return 1
+ 	}
++	failed := false
++	for _, r := range routes.Routes {
++		if r.TLS == nil {
++			continue
++		}
++		if err := core.CheckTLS(r.TLS); err != nil {
++			fmt.Fprintf(stderr, "route %q: %v\n", r.ID, err)
++			failed = true
++		}
++	}
++	if failed {
++		return 1
++	}
+ 	fmt.Fprintf(stdout, "%s: %d routes OK\n", path, len(routes.Routes))
+ 	return 0
+ }
+@@ -91,7 +105,12 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 	reg.NewGauge("gateway_build_info", "Always 1; the labels identify the running build.",
+ 		"version", "revision", "go_version").Set(1, build.Version, build.Revision, build.GoVersion)
+ 
+-	rt, err := core.NewRuntime(core.RuntimeOptions{Clock: clk, Logger: logger, Metrics: reg})
++	rt, err := core.NewRuntime(core.RuntimeOptions{
++		Clock:           clk,
++		Logger:          logger,
++		Metrics:         reg,
++		HealthTransport: newUpstreamTransport(cfg),
++	})
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/cmd/gateway/main_test.go b/cmd/gateway/main_test.go
+index 5bd803a..0776fbc 100644
+--- a/cmd/gateway/main_test.go
++++ b/cmd/gateway/main_test.go
+@@ -2,7 +2,15 @@ package main
+ 
+ import (
+ 	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
+ 	"errors"
++	"fmt"
++	"math/big"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+@@ -34,6 +42,46 @@ func TestCheckRoutes(t *testing.T) {
+ 	}
+ }
+ 
++// check-routes reads the TLS files of the routes, as a reload does, so that a file the reload
++// would refuse is reported before SIGHUP.
++func TestCheckRoutesReadsTheTLSFiles(t *testing.T) {
++	dir := t.TempDir()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Internal CA"},
++		NotBefore: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC),
++		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ca := filepath.Join(dir, "ca.pem")
++	os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600)
++	notPEM := filepath.Join(dir, "not-pem.txt")
++	os.WriteFile(notPEM, []byte("not a certificate"), 0o600)
++
++	check := func(caFile string) (int, string, string) {
++		t.Helper()
++		routes := filepath.Join(dir, "routes.json")
++		os.WriteFile(routes, fmt.Appendf(nil, `{"routes":[{"id":"a","path":"/a","tls":{"ca_file":%q},"upstreams":[{"url":"https://a.internal"}]}]}`, caFile), 0o600)
++		var out, errOut strings.Builder
++		code := checkRoutes(routes, &out, &errOut)
++		return code, out.String(), errOut.String()
++	}
++	if code, out, errOut := check(ca); code != 0 || !strings.Contains(out, "1 routes OK") {
++		t.Errorf("readable CA file: code %d, stdout %q, stderr %q", code, out, errOut)
++	}
++	for _, caFile := range []string{filepath.Join(dir, "missing.pem"), notPEM} {
++		if code, out, errOut := check(caFile); code != 1 || out != "" || !strings.Contains(errOut, `route "a": tls.ca_file: `) {
++			t.Errorf("CA file %s: code %d, stdout %q, stderr %q", filepath.Base(caFile), code, out, errOut)
++		}
++	}
++}
++
+ func TestReloadOnHangup(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	hup := make(chan os.Signal)
+diff --git a/internal/config/routes.go b/internal/config/routes.go
+index 9f0c19a..0972ca2 100644
+--- a/internal/config/routes.go
++++ b/internal/config/routes.go
+@@ -76,6 +76,7 @@ type Route struct {
+ 	CircuitBreaker *CircuitBreaker `json:"circuit_breaker,omitempty"`
+ 	HealthCheck    *HealthCheck    `json:"health_check,omitempty"`
+ 	Transforms     *Transforms     `json:"transforms,omitempty"`
++	TLS            *UpstreamTLS    `json:"tls,omitempty"`
+ }
+ 
+ // Upstream is one backend of a route.
+@@ -119,6 +120,17 @@ type HealthCheck struct {
+ 	UnhealthyThreshold int      `json:"unhealthy_threshold,omitempty"`
+ }
+ 
++// UpstreamTLS sets how the gateway connects to a route's upstreams over TLS: the CA that signs
++// their certificates, the client certificate the gateway presents, the name it expects in their
++// certificates and the oldest protocol version it accepts.
++type UpstreamTLS struct {
++	CAFile     string `json:"ca_file,omitempty"`
++	CertFile   string `json:"cert_file,omitempty"`
++	KeyFile    string `json:"key_file,omitempty"`
++	ServerName string `json:"server_name,omitempty"`
++	MinVersion string `json:"min_version,omitempty"` // "1.2" (the default) or "1.3"
++}
++
+ // Transforms change the headers of forwarded requests and of the responses returned to clients.
+ type Transforms struct {
+ 	Request  *HeaderTransform `json:"request,omitempty"`
+diff --git a/internal/config/routes_test.go b/internal/config/routes_test.go
+index d62f5f0..f47c461 100644
+--- a/internal/config/routes_test.go
++++ b/internal/config/routes_test.go
+@@ -117,6 +117,9 @@ func TestValidationNamesRouteAndField(t *testing.T) {
+ 		{"rate window", `{"id":"a","path":"/a","rate_limit":{"requests":1,"window":"500ms"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.window: must be a whole number of milliseconds`},
+ 		{"rate requests", `{"id":"a","path":"/a","rate_limit":{"requests":0,"window":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": rate_limit.requests: must be at least 1`},
+ 		{"retry attempts", `{"id":"a","path":"/a","retry":{"attempts":11},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.attempts: must be between 1 and 10`},
++		{"tls pair", `{"id":"a","path":"/a","tls":{"cert_file":"c.pem"},"upstreams":[{"url":"https://a"}]}`, `route "a": tls.cert_file: cert_file and key_file must be set together`},
++		{"tls version", `{"id":"a","path":"/a","tls":{"min_version":"1.1"},"upstreams":[{"url":"https://a"}]}`, `route "a": tls.min_version: must be "1.2" or "1.3"`},
++		{"tls plain upstream", `{"id":"a","path":"/a","tls":{"ca_file":"ca.pem"},"upstreams":[{"url":"http://a"}]}`, `route "a": upstreams[0].url: must be an https URL when tls is set`},
+ 		{"retry status", `{"id":"a","path":"/a","retry":{"attempts":2,"on_status":[404]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_status[0]: must be a 5xx status`},
+ 		{"retry error", `{"id":"a","path":"/a","retry":{"attempts":2,"on_errors":["dns"]},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.on_errors[0]: must be`},
+ 		{"backoff order", `{"id":"a","path":"/a","retry":{"attempts":2,"backoff":"2s","max_backoff":"1s"},"upstreams":[{"url":"http://a"}]}`, `route "a": retry.max_backoff: must not be shorter than retry.backoff`},
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index 21427ac..e467b26 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -138,6 +138,26 @@ func (r *Route) validate(p routeProblems) {
+ 		t.Request.validate(p, "transforms.request")
+ 		t.Response.validate(p, "transforms.response")
+ 	}
++	if r.TLS != nil {
++		r.TLS.validate(p, r.Upstreams)
++	}
++}
++
++func (u *UpstreamTLS) validate(p routeProblems, upstreams []Upstream) {
++	if (u.CertFile == "") != (u.KeyFile == "") {
++		p.add("tls.cert_file", "cert_file and key_file must be set together")
++	}
++	switch u.MinVersion {
++	case "", "1.2", "1.3":
++	default:
++		p.add("tls.min_version", `must be "1.2" or "1.3", got %q`, u.MinVersion)
++	}
++	for i, us := range upstreams {
++		// A URL that does not parse is reported by the upstream checks.
++		if parsed, err := url.Parse(us.URL); err == nil && parsed.Scheme != "https" {
++			p.add(fmt.Sprintf("upstreams[%d].url", i), "must be an https URL when tls is set, got %q", us.URL)
++		}
++	}
+ }
+ 
+ // checkMatchPath returns why a configured path cannot be matched, or "".
+diff --git a/internal/core/route.go b/internal/core/route.go
+index 9872989..534d820 100644
+--- a/internal/core/route.go
++++ b/internal/core/route.go
+@@ -28,6 +28,7 @@ type Route struct {
+ 	Request     HeaderTransform // applied to forwarded requests
+ 	Response    HeaderTransform // applied to responses returned to the client
+ 	Upstreams   []*Upstream
++	TLS         *TLSSettings // nil when the upstreams use the gateway's default TLS
+ 
+ 	balancer *Balancer
+ 	spec     config.Route
+diff --git a/internal/core/runtime.go b/internal/core/runtime.go
+index 3418c23..a818c71 100644
+--- a/internal/core/runtime.go
++++ b/internal/core/runtime.go
+@@ -1,6 +1,7 @@
+ package core
+ 
+ import (
++	"crypto/tls"
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
+@@ -27,6 +28,7 @@ type Runtime struct {
+ 	clock        clock.Clock
+ 	log          *slog.Logger
+ 	healthClient *http.Client
++	healthBase   *http.Transport // cloned for the checks of routes with TLS settings
+ 	gauges       runtimeGauges
+ 
+ 	table atomic.Pointer[Table]
+@@ -48,6 +50,7 @@ type upstreamState struct {
+ 	breakerSpec *config.CircuitBreaker
+ 	health      *Health
+ 	healthSpec  *config.HealthCheck
++	tlsKey      string // the route's TLS settings the health checker uses; "" for none
+ 	stop        func() // stops the health checker; nil without one
+ }
+ 
+@@ -65,10 +68,20 @@ type RuntimeOptions struct {
+ 	Clock   clock.Clock
+ 	Logger  *slog.Logger
+ 	Metrics *metrics.Registry // optional
+-	// HealthTransport sends health check requests. nil means a dedicated http.Transport.
++	// HealthTransport sends health check requests. nil means a dedicated http.Transport. A routes'
++	// upstreams with TLS settings are checked with a clone of it, when it is an *http.Transport.
+ 	HealthTransport http.RoundTripper
+ }
+ 
++// newHealthClient returns the client that probes upstreams over t. A redirect answers the health
++// check; following it would check something else.
++func newHealthClient(t http.RoundTripper) *http.Client {
++	return &http.Client{
++		Transport:     t,
++		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
++	}
++}
++
+ // NewRuntime returns a runtime with an empty table. Call Apply to load routes.
+ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
+ 	if o.Clock == nil || o.Logger == nil {
+@@ -78,18 +91,19 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
+ 	if reg == nil {
+ 		reg = metrics.NewRegistry()
+ 	}
+-	transport := o.HealthTransport
+-	if transport == nil {
+-		transport = &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: time.Minute}
++	base, _ := o.HealthTransport.(*http.Transport)
++	if base == nil {
++		base = &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: time.Minute}
++	}
++	transport := http.RoundTripper(base)
++	if o.HealthTransport != nil {
++		transport = o.HealthTransport
+ 	}
+ 	rt := &Runtime{
+-		clock: o.Clock,
+-		log:   o.Logger,
+-		healthClient: &http.Client{
+-			Transport: transport,
+-			// A redirect answers the health check; following it would check something else.
+-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+-		},
++		clock:        o.Clock,
++		log:          o.Logger,
++		healthBase:   base,
++		healthClient: newHealthClient(transport),
+ 		gauges: runtimeGauges{
+ 			breaker: reg.NewGauge("gateway_circuit_breaker_state",
+ 				"Circuit breaker state per route and upstream: 0 closed, 1 open, 2 half-open.", "route", "upstream"),
+@@ -197,6 +211,13 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		Retry:       retryPolicy(spec.Retry),
+ 		spec:        spec,
+ 	}
++	if t := spec.TLS; t != nil {
++		ts, err := compileTLS(t)
++		if err != nil {
++			return nil, err
++		}
++		r.TLS = ts
++	}
+ 	if len(r.Methods) == 0 {
+ 		r.Methods = nil
+ 	}
+@@ -207,16 +228,21 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ 		r.Request = compileTransform(t.Request)
+ 		r.Response = compileTransform(t.Response)
+ 	}
++	var tlsKey string
++	var tlsCfg *tls.Config
++	if r.TLS != nil {
++		tlsKey, tlsCfg = r.TLS.Key, r.TLS.Config
++	}
+ 	for _, us := range spec.Upstreams {
+ 		u, err := url.Parse(us.URL)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("upstream %q: %w", us.URL, err)
+ 		}
+ 		key := stateKey{route: spec.ID, upstream: u.String()}
+-		st := rt.upstreamState(key, spec)
++		st := rt.upstreamState(key, spec, tlsKey)
+ 		next[key] = st
+ 		if spec.HealthCheck != nil && st.stop == nil {
+-			stop, err := rt.startChecker(key, u, *spec.HealthCheck, st.health)
++			stop, err := rt.startChecker(key, u, *spec.HealthCheck, st.health, tlsCfg)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -238,9 +264,9 @@ func (rt *Runtime) buildRoute(spec config.Route, next map[stateKey]*upstreamStat
+ // upstreamState returns the state for key under spec: the current parts where their settings
+ // are unchanged, fresh parts otherwise. It never modifies the current state, so that a failed
+ // Apply leaves the live table untouched.
+-func (rt *Runtime) upstreamState(key stateKey, spec config.Route) *upstreamState {
++func (rt *Runtime) upstreamState(key stateKey, spec config.Route, tlsKey string) *upstreamState {
+ 	old := rt.states[key]
+-	st := &upstreamState{breakerSpec: spec.CircuitBreaker, healthSpec: spec.HealthCheck}
++	st := &upstreamState{breakerSpec: spec.CircuitBreaker, healthSpec: spec.HealthCheck, tlsKey: tlsKey}
+ 	if spec.CircuitBreaker != nil {
+ 		if old != nil && old.breakerSpec != nil && *old.breakerSpec == *spec.CircuitBreaker {
+ 			st.breaker = old.breaker
+@@ -252,7 +278,7 @@ func (rt *Runtime) upstreamState(key stateKey, spec config.Route) *upstreamState
+ 			})
+ 		}
+ 	}
+-	if old != nil && sameHealthCheck(old.healthSpec, spec.HealthCheck) {
++	if old != nil && sameHealthCheck(old.healthSpec, spec.HealthCheck) && old.tlsKey == tlsKey {
+ 		st.health, st.stop = old.health, old.stop
+ 	} else {
+ 		st.health = &Health{}
+@@ -269,8 +295,16 @@ func sameHealthCheck(a, b *config.HealthCheck) bool {
+ 
+ // startChecker starts the health checker of a new upstream. The health gauge is set before the
+ // checker starts, so that the checker's first report cannot be overwritten.
+-func (rt *Runtime) startChecker(key stateKey, target *url.URL, hc config.HealthCheck, h *Health) (func(), error) {
++func (rt *Runtime) startChecker(key stateKey, target *url.URL, hc config.HealthCheck, h *Health, tlsCfg *tls.Config) (func(), error) {
+ 	rt.gauges.healthy.Set(1, key.route, key.upstream)
++	client, release := rt.healthClient, func() {}
++	if tlsCfg != nil {
++		// A route with TLS settings checks its upstreams with the same trust and client certificate,
++		// over a clone of the health transport, so that the timeouts and pool settings carry over.
++		t := rt.healthBase.Clone()
++		t.TLSClientConfig = tlsCfg.Clone() // the transport writes to it when it sets up HTTP/2
++		client, release = newHealthClient(t), t.CloseIdleConnections
++	}
+ 	c := &health.Checker{
+ 		Target:             target,
+ 		Path:               hc.Path,
+@@ -278,7 +312,7 @@ func (rt *Runtime) startChecker(key stateKey, target *url.URL, hc config.HealthC
+ 		Timeout:            hc.Timeout.D(),
+ 		HealthyThreshold:   hc.HealthyThreshold,
+ 		UnhealthyThreshold: hc.UnhealthyThreshold,
+-		Client:             rt.healthClient,
++		Client:             client,
+ 		Clock:              rt.clock,
+ 		Logger:             rt.log.With("route", key.route),
+ 		Report: func(healthy bool) {
+@@ -297,7 +331,11 @@ func (rt *Runtime) startChecker(key stateKey, target *url.URL, hc config.HealthC
+ 			rt.gauges.checks.Inc(key.route, key.upstream, result)
+ 		},
+ 	}
+-	return c.Start()
++	stop, err := c.Start()
++	if err != nil {
++		return nil, err
++	}
++	return func() { stop(); release() }, nil
+ }
+ 
+ // Close stops every health checker. The table stays readable.
+diff --git a/internal/core/tls.go b/internal/core/tls.go
+new file mode 100644
+index 0000000..cd94ae1
+--- /dev/null
++++ b/internal/core/tls.go
+@@ -0,0 +1,101 @@
++package core
++
++import (
++	"crypto/sha256"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/hex"
++	"encoding/pem"
++	"errors"
++	"fmt"
++	"hash"
++	"os"
++	"strings"
++
++	"github.com/relaywork/gateway/internal/config"
++)
++
++// TLSSettings is a compiled upstream TLS setting. Routes whose settings have the same Key share a
++// transport. Key covers the contents of the files, so a reload picks up a rotated certificate.
++type TLSSettings struct {
++	Key    string
++	Config *tls.Config
++}
++
++// CheckTLS reads and checks the files of a route's TLS settings as loading the routes does, and
++// returns the error the load would report.
++func CheckTLS(u *config.UpstreamTLS) error {
++	_, err := compileTLS(u)
++	return err
++}
++
++// compileTLS reads the files of a route's TLS settings and builds the client configuration. The
++// errors name the field whose file, or which pair of files, failed.
++func compileTLS(u *config.UpstreamTLS) (*TLSSettings, error) {
++	cfg := &tls.Config{ServerName: u.ServerName, MinVersion: tls.VersionTLS12}
++	if u.MinVersion == "1.3" {
++		cfg.MinVersion = tls.VersionTLS13
++	}
++	h := sha256.New()
++	fmt.Fprintf(h, "%s\x00%d\x00", u.ServerName, cfg.MinVersion)
++	if u.CAFile != "" {
++		pemData, err := hashFile(h, "ca_file", u.CAFile)
++		if err != nil {
++			return nil, fmt.Errorf("tls.ca_file: %w", err)
++		}
++		cfg.RootCAs = x509.NewCertPool()
++		if !cfg.RootCAs.AppendCertsFromPEM(pemData) {
++			return nil, errors.New("tls.ca_file: no PEM certificate in the file")
++		}
++	}
++	if u.CertFile != "" {
++		certPEM, err := hashFile(h, "cert_file", u.CertFile)
++		if err != nil {
++			return nil, fmt.Errorf("tls.cert_file: %w", err)
++		}
++		keyPEM, err := hashFile(h, "key_file", u.KeyFile)
++		if err != nil {
++			return nil, fmt.Errorf("tls.key_file: %w", err)
++		}
++		if !hasPEMBlock(certPEM, func(typ string) bool { return typ == "CERTIFICATE" }) {
++			return nil, errors.New("tls.cert_file: no PEM certificate in the file")
++		}
++		if !hasPEMBlock(keyPEM, func(typ string) bool { return strings.HasSuffix(typ, "PRIVATE KEY") }) {
++			return nil, errors.New("tls.key_file: no PEM private key in the file")
++		}
++		cert, err := tls.X509KeyPair(certPEM, keyPEM)
++		if err != nil {
++			return nil, fmt.Errorf("tls.cert_file and tls.key_file do not form a key pair: %w", err)
++		}
++		cfg.Certificates = []tls.Certificate{cert}
++	}
++	return &TLSSettings{Key: hex.EncodeToString(h.Sum(nil)), Config: cfg}, nil
++}
++
++// hashFile reads path into h, after the field it was named by and its length, and returns its
++// contents. The field and length keep the files apart: a CA file that holds a certificate and its
++// key is not the same setting as that certificate and key given as cert_file and key_file.
++func hashFile(h hash.Hash, field, path string) ([]byte, error) {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	fmt.Fprintf(h, "%s\x00%d\x00", field, len(data))
++	h.Write(data)
++	return data, nil
++}
++
++// hasPEMBlock reports whether data holds a PEM block of a type that match accepts. Other blocks
++// may come first, as the EC PARAMETERS block that openssl ecparam writes before the key.
++func hasPEMBlock(data []byte, match func(typ string) bool) bool {
++	for {
++		block, rest := pem.Decode(data)
++		if block == nil {
++			return false
++		}
++		if match(block.Type) {
++			return true
++		}
++		data = rest
++	}
++}
+diff --git a/internal/core/tls_test.go b/internal/core/tls_test.go
+new file mode 100644
+index 0000000..72ee38a
+--- /dev/null
++++ b/internal/core/tls_test.go
+@@ -0,0 +1,78 @@
++package core
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"math/big"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/relaywork/gateway/internal/config"
++)
++
++// writeKeyPair returns a self-signed certificate and its key in PEM.
++func writeKeyPair(t *testing.T) (certPEM, keyPEM []byte) {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "client"},
++		NotBefore: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC),
++		IsCA: true, BasicConstraintsValid: true,
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
++		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
++}
++
++// The key follows the effective settings: spellings of the same setting share a transport, and
++// different settings never do, whichever files hold the bytes.
++func TestCompileTLSKeyFollowsTheEffectiveSettings(t *testing.T) {
++	key := func(u config.UpstreamTLS) string {
++		t.Helper()
++		ts, err := compileTLS(&u)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return ts.Key
++	}
++	if key(config.UpstreamTLS{ServerName: "api"}) != key(config.UpstreamTLS{ServerName: "api", MinVersion: "1.2"}) {
++		t.Error(`min_version "" and "1.2" got different keys`)
++	}
++	if key(config.UpstreamTLS{ServerName: "api", MinVersion: "1.2"}) == key(config.UpstreamTLS{ServerName: "api", MinVersion: "1.3"}) {
++		t.Error(`min_version "1.2" and "1.3" got the same key`)
++	}
++	if key(config.UpstreamTLS{ServerName: "a"}) == key(config.UpstreamTLS{ServerName: "b"}) {
++		t.Error("different server names got the same key")
++	}
++
++	dir := t.TempDir()
++	certPEM, keyPEM := writeKeyPair(t)
++	write := func(name string, data []byte) string {
++		path := filepath.Join(dir, name)
++		if err := os.WriteFile(path, data, 0o600); err != nil {
++			t.Fatal(err)
++		}
++		return path
++	}
++	cert, priv := write("c.pem", certPEM), write("k.pem", keyPEM)
++	both := write("both.pem", append(append([]byte{}, certPEM...), keyPEM...))
++	if key(config.UpstreamTLS{CAFile: both}) == key(config.UpstreamTLS{CertFile: cert, KeyFile: priv}) {
++		t.Error("a CA file holding a certificate and its key got the key of that client certificate")
++	}
++}
+diff --git a/internal/proxy/forward.go b/internal/proxy/forward.go
+index 9a51c3f..5068d79 100644
+--- a/internal/proxy/forward.go
++++ b/internal/proxy/forward.go
+@@ -227,7 +227,7 @@ func (h *Handler) attempt(ex *exchange, u *core.Upstream, body *requestBody) *at
+ 	}
+ 
+ 	start := h.clock.Now()
+-	resp, err := h.transport.RoundTrip(out)
++	resp, err := h.upstreams.forRoute(ex.route, h.routes.Table()).RoundTrip(out)
+ 	timer.Stop()
+ 	if stream != nil && stream.interrupted.Load() {
+ 		// What is left of the body is still on the client's connection, which cannot carry
+diff --git a/internal/proxy/handler.go b/internal/proxy/handler.go
+index 5767e69..17a633f 100644
+--- a/internal/proxy/handler.go
++++ b/internal/proxy/handler.go
+@@ -53,13 +53,13 @@ type Handler struct {
+ 	routes    TableSource
+ 	auth      auth.Modes
+ 	limiter   core.RateLimiter
+-	transport http.RoundTripper
+ 	clock     clock.Clock
+ 	rand      core.Rand
+ 	log       *slog.Logger
+ 	metrics   proxyMetrics
+ 	trusted   trustedProxies
+ 	bodyLimit int64
++	upstreams *upstreamTransports
+ }
+ 
+ // New validates the options and returns a handler.
+@@ -82,13 +82,13 @@ func New(o Options) (*Handler, error) {
+ 		routes:    o.Routes,
+ 		auth:      o.Auth,
+ 		limiter:   o.RateLimiter,
+-		transport: o.Transport,
+ 		clock:     o.Clock,
+ 		rand:      rnd,
+ 		log:       o.Logger,
+ 		metrics:   newProxyMetrics(reg),
+ 		trusted:   trustedProxies(o.TrustedProxies),
+ 		bodyLimit: o.BodyBufferLimit,
++		upstreams: newUpstreamTransports(o.Transport),
+ 	}, nil
+ }
+ 
+diff --git a/internal/proxy/tls_test.go b/internal/proxy/tls_test.go
+new file mode 100644
+index 0000000..7c6ffe6
+--- /dev/null
++++ b/internal/proxy/tls_test.go
+@@ -0,0 +1,309 @@
++package proxy
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"math/big"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/relaywork/gateway/internal/config"
++)
++
++// tlsCA is a certificate authority that signs the upstream and client certificates of a test.
++type tlsCA struct {
++	cert *x509.Certificate
++	key  *ecdsa.PrivateKey
++	pem  []byte
++}
++
++// tlsFiles are a certificate and its key in PEM, as the routes file names them.
++type tlsFiles struct{ cert, key []byte }
++
++// certValid is the validity of every certificate a test makes; it is fixed, so the tests do not
++// depend on the date.
++var certValid = []time.Time{time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)}
++
++func newTLSCA(t *testing.T, name string) *tlsCA {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: name},
++		NotBefore: certValid[0], NotAfter: certValid[1],
++		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := x509.ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &tlsCA{cert: cert, key: key, pem: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
++}
++
++// issue signs a certificate for name, usable as a server (127.0.0.1) or as a client.
++func (ca *tlsCA) issue(t *testing.T, name string, usage x509.ExtKeyUsage) tlsFiles {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: name},
++		NotBefore: certValid[0], NotAfter: certValid[1],
++		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{usage},
++		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	keyDER, err := x509.MarshalECPrivateKey(key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return tlsFiles{
++		cert: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
++		key:  pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
++	}
++}
++
++// write stores the files in a new directory and returns the paths of the certificate and key.
++func (f tlsFiles) write(t *testing.T, name string) (certPath, keyPath string) {
++	t.Helper()
++	return writeFile(t, name+".crt", f.cert), writeFile(t, name+".key", f.key)
++}
++
++// writeFile stores data in a new temporary directory and returns the path.
++func writeFile(t *testing.T, name string, data []byte) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), name)
++	if err := os.WriteFile(path, data, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return path
++}
++
++// mtlsUpstream serves https with h and requires a client certificate signed by ca.
++func mtlsUpstream(t *testing.T, ca *tlsCA, h http.Handler) *httptest.Server {
++	t.Helper()
++	srv := httptest.NewUnstartedServer(h)
++	pair := ca.issue(t, "upstream", x509.ExtKeyUsageServerAuth)
++	cert, err := tls.X509KeyPair(pair.cert, pair.key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pool := x509.NewCertPool()
++	pool.AddCert(ca.cert)
++	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert}
++	srv.StartTLS()
++	t.Cleanup(srv.Close)
++	return srv
++}
++
++// greeter answers with the name of the client certificate the gateway presented.
++var greeter = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++	w.Write([]byte("hello " + r.TLS.PeerCertificates[0].Subject.CommonName))
++})
++
++func TestUpstreamTLSPresentsTheClientCertificate(t *testing.T) {
++	ca := newTLSCA(t, "gateway test CA")
++	srv := mtlsUpstream(t, ca, greeter)
++	client := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	certPath, keyPath := client.write(t, "client")
++	caPath := writeFile(t, "ca.pem", ca.pem)
++
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"` + srv.URL + `"}],
++		"tls":{"ca_file":"` + caPath + `","cert_file":"` + certPath + `","key_file":"` + keyPath + `"}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	if w := f.get("/x"); w.Code != http.StatusOK || w.Body.String() != "hello gateway" {
++		t.Fatalf("status %d, body %q; the gateway must present its client certificate", w.Code, w.Body.String())
++	}
++}
++
++// TestUpstreamTLSAcceptsAKeyAfterECParameters: openssl ecparam -genkey writes an EC PARAMETERS
++// block before the key, and the key file is still a valid one.
++func TestUpstreamTLSAcceptsAKeyAfterECParameters(t *testing.T) {
++	ca := newTLSCA(t, "gateway test CA")
++	srv := mtlsUpstream(t, ca, greeter)
++	client := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	params := pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07}})
++	client.key = append(params, client.key...)
++	certPath, keyPath := client.write(t, "client")
++	caPath := writeFile(t, "ca.pem", ca.pem)
++
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"` + srv.URL + `"}],
++		"tls":{"ca_file":"` + caPath + `","cert_file":"` + certPath + `","key_file":"` + keyPath + `"}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	if w := f.get("/x"); w.Code != http.StatusOK || w.Body.String() != "hello gateway" {
++		t.Fatalf("status %d, body %q; want the client certificate presented", w.Code, w.Body.String())
++	}
++}
++
++// TestUpstreamTLSTransportsKeepTheirOwnConfig: a transport that sets up HTTP/2 writes to its TLS
++// configuration, so the route's compiled settings, which the health checks share, must not be
++// the one it writes to. The URL's scheme is upper case, which is still https.
++func TestUpstreamTLSTransportsKeepTheirOwnConfig(t *testing.T) {
++	ca := newTLSCA(t, "gateway test CA")
++	srv := mtlsUpstream(t, ca, greeter)
++	client := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	certPath, keyPath := client.write(t, "client")
++	caPath := writeFile(t, "ca.pem", ca.pem)
++
++	upstream := "HTTPS" + strings.TrimPrefix(srv.URL, "https")
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"` + upstream + `"}],
++		"tls":{"ca_file":"` + caPath + `","cert_file":"` + certPath + `","key_file":"` + keyPath + `"},
++		"health_check":{"path":"/healthz","interval":"5s"}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: &http.Transport{ForceAttemptHTTP2: true}})
++	if w := f.get("/x"); w.Code != http.StatusOK || w.Body.String() != "hello gateway" {
++		t.Fatalf("status %d, body %q", w.Code, w.Body.String())
++	}
++	if protos := f.rt.Table().Routes()[0].TLS.Config.NextProtos; len(protos) != 0 {
++		t.Fatalf("the route's TLS settings were changed by a transport: NextProtos %q", protos)
++	}
++}
++
++func TestUpstreamTLSRejectsAnUnknownCA(t *testing.T) {
++	ca := newTLSCA(t, "upstream CA")
++	srv := mtlsUpstream(t, ca, greeter)
++	other := newTLSCA(t, "other CA")
++	client := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	certPath, keyPath := client.write(t, "client")
++	otherCA := writeFile(t, "other.pem", other.pem)
++
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"` + srv.URL + `"}],
++		"tls":{"ca_file":"` + otherCA + `","cert_file":"` + certPath + `","key_file":"` + keyPath + `"}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	if w := f.get("/x"); w.Code != http.StatusBadGateway {
++		t.Fatalf("status %d, want 502 for a server certificate the route's CA does not sign", w.Code)
++	}
++}
++
++func TestUpstreamTLSFilesAreCheckedAtLoad(t *testing.T) {
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"https://127.0.0.1:1"}],
++		"tls":{"ca_file":"/does/not/exist.pem"}}]}`
++	_, err := tryFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	if err == nil || !strings.Contains(err.Error(), `route "secure": tls.ca_file:`) {
++		t.Fatalf("error = %v, want the route and field named", err)
++	}
++}
++
++func TestUpstreamTLSRotatesTheClientCertificateOnReload(t *testing.T) {
++	ca := newTLSCA(t, "gateway test CA")
++	srv := mtlsUpstream(t, ca, greeter)
++	first := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	certPath, keyPath := first.write(t, "client")
++	caPath := writeFile(t, "ca.pem", ca.pem)
++
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"` + srv.URL + `"}],
++		"tls":{"ca_file":"` + caPath + `","cert_file":"` + certPath + `","key_file":"` + keyPath + `"}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	if w := f.get("/x"); w.Body.String() != "hello gateway" {
++		t.Fatalf("before reload: %d %q", w.Code, w.Body.String())
++	}
++
++	// Rotate the client certificate on the same paths, then reload the unchanged routes file.
++	rotated := ca.issue(t, "gateway-rotated", x509.ExtKeyUsageClientAuth)
++	if err := os.WriteFile(certPath, rotated.cert, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(keyPath, rotated.key, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	parsed, err := config.ParseRoutes([]byte(routes))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := f.rt.Apply(parsed); err != nil {
++		t.Fatal(err)
++	}
++	if w := f.get("/x"); w.Code != http.StatusOK || w.Body.String() != "hello gateway-rotated" {
++		t.Fatalf("after reload: %d %q; the rotated certificate must be presented", w.Code, w.Body.String())
++	}
++}
++
++func TestUpstreamTLSKeyFileErrorsNameTheField(t *testing.T) {
++	ca := newTLSCA(t, "gateway test CA")
++	client := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	certPath, _ := client.write(t, "client")
++	caPath := writeFile(t, "ca.pem", ca.pem)
++	garbage := writeFile(t, "garbage.key", []byte("not a key"))
++
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"https://127.0.0.1:1"}],
++		"tls":{"ca_file":"` + caPath + `","cert_file":"` + certPath + `","key_file":"` + garbage + `"}}]}`
++	_, err := tryFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	if err == nil || !strings.Contains(err.Error(), `route "secure": tls.key_file: no PEM private key`) {
++		t.Fatalf("error = %v, want the key file named", err)
++	}
++}
++
++// TestUpstreamTLSHealthChecksUseTheRouteSettings checks that the checks of an mTLS upstream
++// present the client certificate and do not follow redirects: a /healthz that redirects to a
++// failing page is a failed check, and a healthy upstream stays healthy.
++func TestUpstreamTLSHealthChecksUseTheRouteSettings(t *testing.T) {
++	ca := newTLSCA(t, "gateway test CA")
++	probes := make(chan string, 8)
++	srv := mtlsUpstream(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		probes <- r.URL.Path
++		switch r.URL.Path {
++		case "/healthz":
++			http.Redirect(w, r, "/boom", http.StatusFound)
++		case "/boom":
++			http.Error(w, "boom", http.StatusInternalServerError)
++		default:
++			w.Write([]byte("ok"))
++		}
++	}))
++	client := ca.issue(t, "gateway", x509.ExtKeyUsageClientAuth)
++	certPath, keyPath := client.write(t, "client")
++	caPath := writeFile(t, "ca.pem", ca.pem)
++
++	routes := `{"routes":[{"id":"secure","path_prefix":"/","upstreams":[{"url":"` + srv.URL + `"}],
++		"tls":{"ca_file":"` + caPath + `","cert_file":"` + certPath + `","key_file":"` + keyPath + `"},
++		"health_check":{"path":"/healthz","interval":"5s"}}]}`
++	f := newFixture(t, routes, fixtureOptions{transport: &http.Transport{}})
++	select {
++	case got := <-probes:
++		if got != "/healthz" {
++			t.Fatalf("first probe = %q, want /healthz", got)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("no health probe reached the upstream")
++	}
++	// The verdict is recorded once the checker waits on the clock for its next probe.
++	waiting := make(chan struct{})
++	go func() {
++		f.rtClock.BlockUntil(1)
++		close(waiting)
++	}()
++	select {
++	case <-waiting:
++	case <-time.After(10 * time.Second):
++		t.Fatal("the checker did not record its probe")
++	}
++	select {
++	case p := <-probes:
++		t.Fatalf("the redirect was followed to %q", p)
++	default:
++	}
++	u := f.rt.Table().Routes()[0].Upstreams[0]
++	if !u.Healthy() {
++		t.Fatal("an upstream answering its health path with a redirect was marked unhealthy")
++	}
++}
+diff --git a/internal/proxy/transports.go b/internal/proxy/transports.go
+new file mode 100644
+index 0000000..8f6259d
+--- /dev/null
++++ b/internal/proxy/transports.go
+@@ -0,0 +1,83 @@
++package proxy
++
++import (
++	"errors"
++	"net/http"
++	"sync"
++
++	"github.com/relaywork/gateway/internal/core"
++)
++
++// errNoTLSBase is the failure of a route with TLS settings when the gateway's transport is not an
++// *http.Transport, which the TLS transports are cloned from.
++var errNoTLSBase = errors.New("upstream TLS needs an *http.Transport to clone")
++
++// upstreamTransports chooses the transport of each attempt. A route without TLS settings uses the
++// gateway's transport. A route with settings uses a clone of it with those settings, shared by
++// the routes whose settings are equal.
++type upstreamTransports struct {
++	plain http.RoundTripper
++	base  *http.Transport // plain, when it is an *http.Transport
++
++	mu    sync.Mutex
++	byKey map[string]*http.Transport
++	seen  *core.Table // the table the transports were last swept against
++}
++
++func newUpstreamTransports(plain http.RoundTripper) *upstreamTransports {
++	base, _ := plain.(*http.Transport)
++	return &upstreamTransports{plain: plain, base: base, byKey: make(map[string]*http.Transport)}
++}
++
++// forRoute returns the transport for an attempt on route. table is the live route table: when it
++// has changed since the last call, the transports no route of it uses close their idle connections
++// and are forgotten.
++func (u *upstreamTransports) forRoute(route *core.Route, table *core.Table) http.RoundTripper {
++	if route.TLS == nil {
++		return u.plain
++	}
++	if u.base == nil {
++		return failingTransport{errNoTLSBase}
++	}
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if table != u.seen {
++		u.sweep(table)
++	}
++	t := u.byKey[route.TLS.Key]
++	if t == nil {
++		t = u.base.Clone()
++		// Each transport gets its own copy: a transport writes to its TLS configuration when it
++		// sets up HTTP/2, and health checks of the route use the same settings.
++		t.TLSClientConfig = route.TLS.Config.Clone()
++		u.byKey[route.TLS.Key] = t
++	}
++	return t
++}
++
++// sweep forgets the transports of settings that no route of table uses. The caller holds mu.
++func (u *upstreamTransports) sweep(table *core.Table) {
++	u.seen = table
++	inUse := make(map[string]bool)
++	for _, r := range table.Routes() {
++		if r.TLS != nil {
++			inUse[r.TLS.Key] = true
++		}
++	}
++	for key, t := range u.byKey {
++		if !inUse[key] {
++			t.CloseIdleConnections()
++			delete(u.byKey, key)
++		}
++	}
++}
++
++// failingTransport fails every request with err, as a transport that cannot be built does.
++type failingTransport struct{ err error }
++
++func (f failingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
++	if r.Body != nil {
++		r.Body.Close()
++	}
++	return nil, f.err
++}

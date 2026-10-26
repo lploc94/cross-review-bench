@@ -1,0 +1,13 @@
+diff --git a/src/v2/setup.ts b/src/v2/setup.ts
+index 5e73e2af..123ca6c9 100644
+--- a/src/v2/setup.ts
++++ b/src/v2/setup.ts
+@@ -2054,6 +2054,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
+         ) {
+           return;
+         }
++        // Consume before applying: MCP replays must not reuse this editor.
++        pendingAgentDraft = undefined;
+         const registry =
+           finalizedRegistry ??
+           registryBridge.finalize(

@@ -1,0 +1,33 @@
+diff --git a/src/etl/pipeline/metrics.py b/src/etl/pipeline/metrics.py
+index dfdac00..c9d990b 100644
+--- a/src/etl/pipeline/metrics.py
++++ b/src/etl/pipeline/metrics.py
+@@ -51,21 +51,23 @@ def _sample(out: TextIO, name: str, labels: Mapping[str, str], value: float) ->
+ def write_metrics(engine: Engine, path: Path) -> None:
+     """Replace the metrics file with the current metrics. Never raises: a failure is logged
+     and the previous file stays as it was, since metrics must never fail a run."""
++    temporary: str | None = None
+     try:
+         descriptor, temporary = tempfile.mkstemp(
+             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+         )
+-        with engine.connect() as connection:
++        with os.fdopen(descriptor, "w", encoding="utf-8") as out, engine.connect() as connection:
+             # Runs of different sources can finish together: one writer at a time, so a file
+             # rendered earlier never replaces one rendered later.
+             connection.execute(WRITER_LOCK, {"ns": LOCK_NAMESPACE, "key": lock_key("etl.metrics")})
+-            with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+-                render_metrics(connection, out)
+-                out.flush()
+-                os.fsync(out.fileno())
++            render_metrics(connection, out)
++            out.flush()
++            os.fsync(out.fileno())
+             os.chmod(temporary, FILE_MODE)
+             os.replace(temporary, path)
+     except Exception as error:
++        if temporary is not None:
++            Path(temporary).unlink(missing_ok=True)
+         log.error("metrics.not_written", path=str(path), error=describe_error(error))
+ 
+ 

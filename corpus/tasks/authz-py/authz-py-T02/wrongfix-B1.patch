@@ -1,0 +1,36 @@
+diff --git a/src/authz/api/deps.py b/src/authz/api/deps.py
+index 103be27..6a71f54 100644
+--- a/src/authz/api/deps.py
++++ b/src/authz/api/deps.py
+@@ -100,6 +100,8 @@ ResourceResolver = Callable[[OrgContext, Request, Container], Awaitable[Resource
+ 
+ 
+ async def org_scope(ctx: OrgContext, _: Request, __: Container) -> Resource:
++    if ctx.principal.org_id is not None and ctx.principal.org_id != ctx.org_id:
++        raise NotFoundError("organization")
+     return Resource(org_id=ctx.org_id)
+ 
+ 
+diff --git a/src/authz/domain/principal.py b/src/authz/domain/principal.py
+index 62681dd..0f33597 100644
+--- a/src/authz/domain/principal.py
++++ b/src/authz/domain/principal.py
+@@ -23,6 +23,7 @@ class Principal:
+     ip: str | None = None
+     user_agent: str | None = None
+     api_key_id: UUID | None = None
++    org_id: UUID | None = None
+     scopes: frozenset[str] | None = None
+ 
+     @classmethod
+diff --git a/src/authz/services/api_keys.py b/src/authz/services/api_keys.py
+index c0499c5..0b00300 100644
+--- a/src/authz/services/api_keys.py
++++ b/src/authz/services/api_keys.py
+@@ -147,5 +147,6 @@ class ApiKeyService:
+             ip=client.ip,
+             user_agent=client.user_agent,
+             api_key_id=key.id,
++            org_id=key.org_id,
+             scopes=effective_permissions(graph, [key.role_id]) & API_KEY_PERMISSIONS,
+         )

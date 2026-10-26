@@ -1,0 +1,19 @@
+diff --git a/internal/store/purge.go b/internal/store/purge.go
+index 34558eb..ac25d2d 100644
+--- a/internal/store/purge.go
++++ b/internal/store/purge.go
+@@ -41,7 +41,13 @@ func (s *Store) PurgeFinished(ctx context.Context, cutoff time.Time) ([]PurgedJo
+ 		return nil, nil
+ 	}
+ 
+-	rows, err = s.pool.Query(ctx, `DELETE FROM jobs WHERE id = ANY($1) RETURNING id, queue, state`, ids)
++	// A job can change between the two statements (a dead job may be requeued), so the
++	// DELETE checks again that it is still finished and old enough.
++	rows, err = s.pool.Query(ctx, `
++		DELETE FROM jobs
++		WHERE id = ANY($1) AND state IN ('succeeded', 'failed', 'cancelled', 'dead') AND finished_at < $2
++		RETURNING id, queue, state`,
++		ids, dbTime(cutoff))
+ 	if err != nil {
+ 		return nil, fmt.Errorf("delete finished jobs: %w", err)
+ 	}

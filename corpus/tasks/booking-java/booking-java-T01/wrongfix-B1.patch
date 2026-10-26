@@ -1,0 +1,22 @@
+diff --git a/src/main/java/com/innkeep/booking/service/PromoService.java b/src/main/java/com/innkeep/booking/service/PromoService.java
+index 7ba7a95..56bfaa8 100644
+--- a/src/main/java/com/innkeep/booking/service/PromoService.java
++++ b/src/main/java/com/innkeep/booking/service/PromoService.java
+@@ -112,7 +112,7 @@ public class PromoService {
+   }
+ 
+   /** Takes one use of the code for a confirmation, inside the confirmation's transaction. */
+-  public void redeem(long promoCodeId) {
++  public synchronized void redeem(long promoCodeId) {
+     PromoCode promo = byId(promoCodeId);
+     if (!promo.hasUsesLeft()) {
+       throw new PromoExhaustedException(promo.getCode());
+@@ -121,7 +121,7 @@ public class PromoService {
+   }
+ 
+   /** Gives the use of a cancelled reservation back, inside the cancellation's transaction. */
+-  public void giveBack(long promoCodeId) {
++  public synchronized void giveBack(long promoCodeId) {
+     byId(promoCodeId).releaseUse();
+   }
+ 

@@ -1,0 +1,692 @@
+diff --git a/.env.example b/.env.example
+index dea4cd1..01f5729 100644
+--- a/.env.example
++++ b/.env.example
+@@ -13,6 +13,9 @@ LOGIN_RATE_WINDOW_SECONDS=300
+ REFRESH_RATE_LIMIT=60
+ REFRESH_RATE_WINDOW_SECONDS=60
+ INVITATION_TTL_SECONDS=604800
++EMAIL_CHANGE_TTL_SECONDS=86400
++EMAIL_CHANGE_RATE_LIMIT=5
++EMAIL_CHANGE_RATE_WINDOW_SECONDS=3600
+ PUBLIC_BASE_URL=http://localhost:8000
+ TRUST_PROXY_HEADERS=false
+ MAIL_BACKEND=log
+diff --git a/README.md b/README.md
+index 20ef4f0..bce53d4 100644
+--- a/README.md
++++ b/README.md
+@@ -15,6 +15,18 @@ password hash and an optional `disabled_at`. The argon2 parameters come from the
+ when they change, a user's hash is upgraded the next time they log in. Users are created with the
+ admin CLI.
+ 
++**Changing the address.** `POST /v1/me/email {new_email, password}` asks for the password again
++(403 when it is wrong) and answers 202 with `{new_email, expires_at}`: it emails a link
++(`{PUBLIC_BASE_URL}/account/email/confirm?token=…`, valid for `EMAIL_CHANGE_TTL_SECONDS`) to the
++new address and a notice to the current one. The answer is the same whether or not the new
++address already has an account. `POST /v1/me/email/confirm {token}`, with an access token of the
++same account, switches the address and returns the profile, or answers 409 when another account
++has the address by then (compared case-insensitively). A link works once (409 afterwards), a new
++request replaces the previous link, a link of another account answers 404 like an unknown one,
++and an expired link 410. Sessions stay signed in; the next login uses the new address. Pending
++invitations are not transferred: they stay addressed to the old address, so this account can no
++longer accept them, while invitations sent to the new address become acceptable.
++
+ **Sessions and tokens.** `POST /v1/auth/login` opens a session (a login on one device) and returns
+ two tokens:
+ 
+@@ -33,8 +45,8 @@ status, body and, through a dummy argon2 verification for unknown addresses, sim
+ the API does not reveal which addresses have accounts.
+ 
+ **Rate limits.** Fixed-window counters in Redis (INCR and EXPIRE in one Lua script): logins per
+-(email, client IP), refreshes per client IP. Over the limit the API answers 429 with
+-`Retry-After`.
++(email, client IP), refreshes per client IP, email change requests per user. Over the limit the
++API answers 429 with `Retry-After`.
+ 
+ **Organisations.** Every organisation-scoped route lives under `/v1/orgs/{org_id}/…` and first
+ resolves the caller's membership; a caller who is not a member gets 404 for the organisation, as
+@@ -94,6 +106,7 @@ cursor.
+ | POST | `/v1/auth/login`, `/v1/auth/refresh` | none |
+ | POST | `/v1/auth/logout` | access token |
+ | GET, PATCH | `/v1/me` | access token |
++| POST | `/v1/me/email`, `/v1/me/email/confirm` | access token |
+ | GET | `/v1/sessions` | access token |
+ | DELETE | `/v1/sessions/{session_id}` | access token (own sessions) |
+ | GET | `/v1/permissions` | access token |
+@@ -126,7 +139,7 @@ other lists answer `{"data": [...]}`. Errors always have the shape
+ | 403 | `permission_denied` |
+ | 404 | `not_found` |
+ | 409 | `conflict` |
+-| 410 | `gone` (expired invitation) |
++| 410 | `gone` (expired invitation or email change link) |
+ | 422 | `validation_error`, `invalid_input` |
+ | 429 | `rate_limited` |
+ | 500, 503 | `internal_error`, `service_unavailable` |
+@@ -181,6 +194,8 @@ tests/                 pytest suites; tests/helpers has the clock, test doubles
+ | `LOGIN_RATE_LIMIT`, `LOGIN_RATE_WINDOW_SECONDS` | `10`, `300` | per email and IP |
+ | `REFRESH_RATE_LIMIT`, `REFRESH_RATE_WINDOW_SECONDS` | `60`, `60` | per IP |
+ | `INVITATION_TTL_SECONDS` | `604800` | 7 days |
++| `EMAIL_CHANGE_TTL_SECONDS` | `86400` | lifetime of an email change link |
++| `EMAIL_CHANGE_RATE_LIMIT`, `EMAIL_CHANGE_RATE_WINDOW_SECONDS` | `5`, `3600` | email change requests per user |
+ | `PUBLIC_BASE_URL` | `http://localhost:8000` | base of links in emails; https in production |
+ | `TRUST_PROXY_HEADERS` | `false` | take the client IP from `X-Forwarded-For` |
+ | `MAIL_BACKEND` | `log` | `log` (logs recipient and subject only) or `smtp` |
+diff --git a/migrations/versions/0006_email_changes.py b/migrations/versions/0006_email_changes.py
+new file mode 100644
+index 0000000..8ff8296
+--- /dev/null
++++ b/migrations/versions/0006_email_changes.py
+@@ -0,0 +1,42 @@
++"""email changes
++
++Revision ID: 0006
++Revises: 0005
++Create Date: 2026-10-19 09:00:00+00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "0006"
++down_revision: str | None = "0005"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++TZ = sa.DateTime(timezone=True)
++
++
++def upgrade() -> None:
++    op.create_table(
++        "email_changes",
++        sa.Column("id", sa.Uuid(), primary_key=True),
++        sa.Column(
++            "user_id",
++            sa.Uuid(),
++            sa.ForeignKey("users.id", ondelete="CASCADE"),
++            nullable=False,
++        ),
++        sa.Column("new_email", sa.Text(), nullable=False),
++        sa.Column("token_hash", sa.Text(), nullable=False, unique=True),
++        sa.Column("created_at", TZ, nullable=False, server_default=sa.func.now()),
++        sa.Column("expires_at", TZ, nullable=False),
++        sa.Column("used_at", TZ, nullable=True),
++        sa.CheckConstraint("new_email = lower(btrim(new_email))", name="new_email_normalised"),
++    )
++    op.create_index("ix_email_changes_user_id", "email_changes", ["user_id"])
++
++
++def downgrade() -> None:
++    op.drop_table("email_changes")
+diff --git a/src/authz/api/routers/account.py b/src/authz/api/routers/account.py
+index 860a161..01e887f 100644
+--- a/src/authz/api/routers/account.py
++++ b/src/authz/api/routers/account.py
+@@ -7,7 +7,14 @@ import uuid
+ from fastapi import APIRouter, Response, status
+ 
+ from authz.api.deps import ContainerDep, PrincipalDep
+-from authz.api.schemas.auth import ProfileUpdate, SessionResponse, UserResponse
++from authz.api.schemas.auth import (
++    EmailChangeConfirm,
++    EmailChangeRequest,
++    EmailChangeResponse,
++    ProfileUpdate,
++    SessionResponse,
++    UserResponse,
++)
+ from authz.api.schemas.common import ListResponse
+ 
+ router = APIRouter(prefix="/v1", tags=["account"])
+@@ -26,6 +33,23 @@ async def update_me(
+     return UserResponse.of(user)
+ 
+ 
++@router.post("/me/email", status_code=status.HTTP_202_ACCEPTED, response_model=EmailChangeResponse)
++async def request_email_change(
++    body: EmailChangeRequest, principal: PrincipalDep, container: ContainerDep
++) -> EmailChangeResponse:
++    change = await container.email_changes.request(
++        principal, new_email=body.new_email, password=body.password
++    )
++    return EmailChangeResponse.of(change)
++
++
++@router.post("/me/email/confirm", response_model=UserResponse)
++async def confirm_email_change(
++    body: EmailChangeConfirm, principal: PrincipalDep, container: ContainerDep
++) -> UserResponse:
++    return UserResponse.of(await container.email_changes.confirm(principal, body.token))
++
++
+ @router.get("/sessions", response_model=ListResponse[SessionResponse])
+ async def list_sessions(
+     principal: PrincipalDep, container: ContainerDep
+diff --git a/src/authz/api/schemas/auth.py b/src/authz/api/schemas/auth.py
+index ab2fd1e..b3f1dbb 100644
+--- a/src/authz/api/schemas/auth.py
++++ b/src/authz/api/schemas/auth.py
+@@ -8,7 +8,7 @@ from datetime import datetime
+ from pydantic import Field
+ 
+ from authz.api.schemas.common import RequestModel, ResponseModel
+-from authz.models import User
++from authz.models import EmailChange, User
+ from authz.services.auth import TokenPair
+ from authz.services.users import SessionView
+ 
+@@ -57,6 +57,24 @@ class ProfileUpdate(RequestModel):
+     display_name: str = Field(max_length=200)
+ 
+ 
++class EmailChangeRequest(RequestModel):
++    new_email: str = Field(min_length=3, max_length=320)
++    password: str = Field(min_length=1, max_length=1024)
++
++
++class EmailChangeConfirm(RequestModel):
++    token: str = Field(min_length=16, max_length=256)
++
++
++class EmailChangeResponse(ResponseModel):
++    new_email: str
++    expires_at: datetime
++
++    @classmethod
++    def of(cls, change: EmailChange) -> EmailChangeResponse:
++        return cls.model_validate(change)
++
++
+ class SessionResponse(ResponseModel):
+     id: uuid.UUID
+     device_label: str | None
+diff --git a/src/authz/config.py b/src/authz/config.py
+index 9ee6ede..b421cbc 100644
+--- a/src/authz/config.py
++++ b/src/authz/config.py
+@@ -60,6 +60,9 @@ class Settings(BaseSettings):
+     refresh_rate_window_seconds: int = Field(default=60, ge=1, le=86_400)
+ 
+     invitation_ttl_seconds: int = Field(default=7 * 86_400, ge=60, le=90 * 86_400)
++    email_change_ttl_seconds: int = Field(default=86_400, ge=300, le=7 * 86_400)
++    email_change_rate_limit: int = Field(default=5, ge=1, le=1_000)
++    email_change_rate_window_seconds: int = Field(default=3_600, ge=1, le=86_400)
+     public_base_url: str = "http://localhost:8000"
+ 
+     trust_proxy_headers: bool = False
+diff --git a/src/authz/container.py b/src/authz/container.py
+index db4b112..5fd2df2 100644
+--- a/src/authz/container.py
++++ b/src/authz/container.py
+@@ -18,6 +18,7 @@ from authz.infra.redis import create_redis, ping
+ from authz.services.audit import AuditLog, AuditQueryService
+ from authz.services.auth import AuthPolicy, AuthService
+ from authz.services.authorization import AuthorizationService
++from authz.services.email_changes import EmailChangePolicy, EmailChangeService
+ from authz.services.health import HealthService
+ from authz.services.invitations import InvitationPolicy, InvitationService
+ from authz.services.members import MemberService
+@@ -43,6 +44,7 @@ class Container:
+     authz: AuthorizationService
+     auth: AuthService
+     users: UserService
++    email_changes: EmailChangeService
+     sessions: SessionService
+     organizations: OrganizationService
+     roles: RoleService
+@@ -146,6 +148,23 @@ def build_container(
+         authz=authz,
+         auth=auth,
+         users=UserService(db=db, clock=clock, hasher=hasher),
++        email_changes=EmailChangeService(
++            db=db,
++            clock=clock,
++            random=random,
++            hasher=hasher,
++            limiter=limiter,
++            mailer=mailer,
++            policy=EmailChangePolicy(
++                ttl=timedelta(seconds=settings.email_change_ttl_seconds),
++                link_base=settings.public_base_url,
++                request_rule=RateLimitRule(
++                    "email_change",
++                    settings.email_change_rate_limit,
++                    settings.email_change_rate_window_seconds,
++                ),
++            ),
++        ),
+         sessions=SessionService(db=db, clock=clock),
+         organizations=OrganizationService(db=db, clock=clock, random=random, audit=audit_log),
+         roles=RoleService(db=db, clock=clock, authz=authz, audit=audit_log),
+diff --git a/src/authz/models/__init__.py b/src/authz/models/__init__.py
+index 94d5ff7..7dea4b5 100644
+--- a/src/authz/models/__init__.py
++++ b/src/authz/models/__init__.py
+@@ -11,11 +11,12 @@ from authz.models.organization import (
+     RoleAssignment,
+     RolePermission,
+ )
+-from authz.models.user import RefreshToken, Session, User
++from authz.models.user import EmailChange, RefreshToken, Session, User
+ 
+ __all__ = [
+     "AuditEvent",
+     "Base",
++    "EmailChange",
+     "Invitation",
+     "Membership",
+     "Organization",
+diff --git a/src/authz/models/user.py b/src/authz/models/user.py
+index c16bf5c..b566ede 100644
+--- a/src/authz/models/user.py
++++ b/src/authz/models/user.py
+@@ -68,3 +68,21 @@ class RefreshToken(Base):
+     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(
+         Uuid, ForeignKey("refresh_tokens.id", ondelete="SET NULL"), nullable=True
+     )
++
++
++class EmailChange(Base):
++    """A requested change of address, confirmed by a link sent to the new address; only the
++    SHA-256 of the link's token is stored."""
++
++    __tablename__ = "email_changes"
++    __table_args__ = (Index("ix_email_changes_user_id", "user_id"),)
++
++    id: Mapped[UuidPk]
++    user_id: Mapped[uuid.UUID] = mapped_column(
++        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
++    )
++    new_email: Mapped[str] = mapped_column(Text, nullable=False)
++    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
++    created_at: Mapped[Timestamp]
++    expires_at: Mapped[Timestamp]
++    used_at: Mapped[OptionalTimestamp]
+diff --git a/src/authz/repositories/users.py b/src/authz/repositories/users.py
+index b326e5b..4f9634c 100644
+--- a/src/authz/repositories/users.py
++++ b/src/authz/repositories/users.py
+@@ -5,20 +5,28 @@ from __future__ import annotations
+ import uuid
+ from datetime import datetime
+ 
+-from sqlalchemy import func, select, update
++from sqlalchemy import delete, func, select, update
+ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from authz.errors import ConflictError
+-from authz.models import User
++from authz.models import EmailChange, User
+ 
+ 
+ class UserRepository:
+     def __init__(self, session: AsyncSession) -> None:
+         self._session = session
+ 
+-    async def get(self, user_id: uuid.UUID) -> User | None:
+-        return await self._session.get(User, user_id)
++    async def get(self, user_id: uuid.UUID, *, for_update: bool = False) -> User | None:
++        if not for_update:
++            return await self._session.get(User, user_id)
++        result = await self._session.execute(
++            select(User)
++            .where(User.id == user_id)
++            .with_for_update()
++            .execution_options(populate_existing=True)
++        )
++        return result.scalar_one_or_none()
+ 
+     async def get_by_email(self, email: str) -> User | None:
+         """Look a user up by an already normalised address."""
+@@ -67,3 +75,57 @@ class UserRepository:
+         user.display_name = display_name
+         user.updated_at = now
+         await self._session.flush()
++
++    async def set_email(self, user: User, email: str, now: datetime) -> None:
++        """Give the user an already normalised address; ConflictError when another user has it."""
++        try:
++            async with self._session.begin_nested():
++                user.email = email
++                user.updated_at = now
++                await self._session.flush()
++        except IntegrityError:
++            raise ConflictError(
++                "a user with this email already exists", details={"field": "email"}
++            ) from None
++
++
++class EmailChangeRepository:
++    def __init__(self, session: AsyncSession) -> None:
++        self._session = session
++
++    async def add(
++        self,
++        *,
++        user_id: uuid.UUID,
++        new_email: str,
++        token_hash: str,
++        now: datetime,
++        expires_at: datetime,
++    ) -> EmailChange:
++        change = EmailChange(
++            id=uuid.uuid4(),
++            user_id=user_id,
++            new_email=new_email,
++            token_hash=token_hash,
++            created_at=now,
++            expires_at=expires_at,
++        )
++        self._session.add(change)
++        await self._session.flush()
++        return change
++
++    async def get_by_hash_for_update(self, token_hash: str) -> EmailChange | None:
++        result = await self._session.execute(
++            select(EmailChange).where(EmailChange.token_hash == token_hash).with_for_update()
++        )
++        return result.scalar_one_or_none()
++
++    async def discard_pending(self, user_id: uuid.UUID) -> None:
++        """Delete the user's unconfirmed changes, so that only the newest link works."""
++        await self._session.execute(
++            delete(EmailChange).where(EmailChange.user_id == user_id, EmailChange.used_at.is_(None))
++        )
++
++    async def mark_used(self, change: EmailChange, now: datetime) -> None:
++        change.used_at = now
++        await self._session.flush()
+diff --git a/src/authz/services/email_changes.py b/src/authz/services/email_changes.py
+new file mode 100644
+index 0000000..4ef8d41
+--- /dev/null
++++ b/src/authz/services/email_changes.py
+@@ -0,0 +1,149 @@
++"""Changing the address of one's own account, confirmed through a link sent to the new one."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import UTC, datetime, timedelta
++
++from authz.domain.emails import normalize_email
++from authz.domain.principal import Principal
++from authz.errors import (
++    ConflictError,
++    GoneError,
++    InvalidInputError,
++    NotFoundError,
++    PermissionDenied,
++    RateLimited,
++)
++from authz.infra.clock import Clock
++from authz.infra.db import Database
++from authz.infra.hashing import MAX_PASSWORD_LENGTH, PasswordHasher
++from authz.infra.mailer import EmailMessage, Mailer
++from authz.infra.randomness import RandomSource, hash_token
++from authz.infra.rate_limiter import RateLimiter, RateLimitRule
++from authz.logging import get_logger
++from authz.models import EmailChange, User
++from authz.repositories.users import EmailChangeRepository, UserRepository
++
++log = get_logger(__name__)
++
++
++@dataclass(frozen=True, slots=True)
++class EmailChangePolicy:
++    ttl: timedelta
++    link_base: str
++    request_rule: RateLimitRule
++
++
++def confirmation_email(to: str, link: str, expires_at: datetime) -> EmailMessage:
++    body = (
++        "Someone asked to use this address for their account.\n\n"
++        f"If it was you, open the link below while signed in to that account:\n{link}\n\n"
++        f"The link works once, until {expires_at.astimezone(UTC):%Y-%m-%d %H:%M} UTC. "
++        "If you did not ask for this, ignore this message; nothing changes."
++    )
++    return EmailMessage(
++        to=to, subject="Confirm your new email address", body=body, kind="email_change"
++    )
++
++
++def change_notice(to: str, new_address: str) -> EmailMessage:
++    body = (
++        f"Someone signed in to your account asked to change its email address to {new_address}.\n\n"
++        "Nothing changes until the link sent to that address is opened while signed in. If this "
++        "was not you, someone knows your password: contact your administrator."
++    )
++    return EmailMessage(
++        to=to, subject="Your email address is being changed", body=body, kind="email_change_notice"
++    )
++
++
++class EmailChangeService:
++    def __init__(
++        self,
++        *,
++        db: Database,
++        clock: Clock,
++        random: RandomSource,
++        hasher: PasswordHasher,
++        limiter: RateLimiter,
++        mailer: Mailer,
++        policy: EmailChangePolicy,
++    ) -> None:
++        self._db = db
++        self._clock = clock
++        self._random = random
++        self._hasher = hasher
++        self._limiter = limiter
++        self._mailer = mailer
++        self._policy = policy
++
++    async def request(self, principal: Principal, *, new_email: str, password: str) -> EmailChange:
++        """Email a confirmation link to the new address and a notice to the current one.
++
++        The answer does not depend on whether the new address already has an account; that is
++        only checked by confirm(), whose caller has proved they read that mailbox.
++        """
++        try:
++            address = normalize_email(new_email)
++        except InvalidInputError as exc:
++            raise InvalidInputError(exc.message, details={"field": "new_email"}) from exc
++        limit = await self._limiter.hit(self._policy.request_rule, str(principal.user_id))
++        if not limit.allowed:
++            raise RateLimited(limit.retry_after)
++        async with self._db.read() as session:
++            user = await UserRepository(session).get(principal.user_id)
++        if user is None:
++            raise NotFoundError("user")
++        if len(password) > MAX_PASSWORD_LENGTH or not await self._hasher.verify(
++            user.password_hash, password
++        ):
++            log.info("user.email_change_refused", reason="bad_password", user_id=str(user.id))
++            raise PermissionDenied("the password is incorrect", details={"field": "password"})
++
++        token = self._random.token()
++        now = self._clock.now()
++        async with self._db.transaction() as session:
++            # Requests and confirmations of one user take this lock first, so they run one at
++            # a time and a user never has more than one pending change.
++            current = await UserRepository(session).get(user.id, for_update=True)
++            if current is None:
++                raise NotFoundError("user")
++            if address == current.email:
++                raise InvalidInputError(
++                    "this is already the address of the account", details={"field": "new_email"}
++                )
++            changes = EmailChangeRepository(session)
++            await changes.discard_pending(current.id)
++            change = await changes.add(
++                user_id=current.id,
++                new_email=address,
++                token_hash=hash_token(token),
++                now=now,
++                expires_at=now + self._policy.ttl,
++            )
++        link = f"{self._policy.link_base}/account/email/confirm?token={token}"
++        await self._mailer.send(change_notice(current.email, address))
++        await self._mailer.send(confirmation_email(address, link, change.expires_at))
++        log.info("user.email_change_requested", user_id=str(user.id), change_id=str(change.id))
++        return change
++
++    async def confirm(self, principal: Principal, token: str) -> User:
++        """Move the account to the address of the link, if no other account has it by now."""
++        now = self._clock.now()
++        async with self._db.transaction() as session:
++            users = UserRepository(session)
++            user = await users.get(principal.user_id, for_update=True)
++            changes = EmailChangeRepository(session)
++            change = await changes.get_by_hash_for_update(hash_token(token))
++            # Someone else's link looks unknown, and is not spent.
++            if user is None or change is None or change.user_id != user.id:
++                raise NotFoundError("email change")
++            if change.used_at is not None:
++                raise ConflictError("the address change has already been confirmed")
++            if now >= change.expires_at:
++                raise GoneError("the confirmation link has expired")
++            await users.set_email(user, change.new_email, now)
++            await changes.mark_used(change, now)
++        log.info("user.email_changed", user_id=str(user.id), change_id=str(change.id))
++        return user
+diff --git a/tests/api/test_email_change.py b/tests/api/test_email_change.py
+new file mode 100644
+index 0000000..dbfe829
+--- /dev/null
++++ b/tests/api/test_email_change.py
+@@ -0,0 +1,107 @@
++from __future__ import annotations
++
++from tests.helpers.factories import DEFAULT_PASSWORD, bearer, login, make_user, signed_in
++
++
++async def _request(client, me, new_email, password=DEFAULT_PASSWORD):
++    return await client.post(
++        "/v1/me/email", json={"new_email": new_email, "password": password}, headers=me.headers
++    )
++
++
++async def _confirm(client, headers, token):
++    return await client.post("/v1/me/email/confirm", json={"token": token}, headers=headers)
++
++
++async def test_confirmed_change_moves_the_account_to_the_new_address(client, container, mailer):
++    me = await signed_in(client, container, "nina@example.com")
++
++    requested = await _request(client, me, " Nina.New@Example.COM ")
++    token = mailer.last_email_change_token("nina.new@example.com")
++    confirmed = await _confirm(client, me.headers, token)
++
++    assert requested.status_code == 202
++    assert requested.json()["new_email"] == "nina.new@example.com"
++    assert token not in requested.text
++    [notice] = [m for m in mailer.to("nina@example.com") if m.kind == "email_change_notice"]
++    assert "nina.new@example.com" in notice.body
++    assert token not in notice.body
++    assert confirmed.status_code == 200
++    assert confirmed.json()["email"] == "nina.new@example.com"
++    profile = await client.get("/v1/me", headers=me.headers)
++    assert profile.json()["email"] == "nina.new@example.com"
++    assert (await login(client, "nina@example.com")).status_code == 401
++    assert (await login(client, "nina.new@example.com")).status_code == 200
++
++
++async def test_password_is_required_again(client, container, mailer):
++    me = await signed_in(client, container)
++
++    wrong = await _request(client, me, "otto@example.com", password="not my password at all")
++    same = await _request(client, me, me.email.upper())
++
++    assert wrong.status_code == 403
++    assert same.status_code == 422
++    assert mailer.sent == []
++
++
++async def test_a_malformed_address_is_refused_as_the_new_email_field(client, container, mailer):
++    me = await signed_in(client, container)
++
++    response = await _request(client, me, "not-an-address")
++
++    assert response.status_code == 422
++    assert response.json()["error"]["details"] == {"field": "new_email"}
++    assert mailer.sent == []
++
++
++async def test_taken_address_is_only_refused_on_confirmation(client, container, mailer):
++    await make_user(container, "taken@example.com")
++    me = await signed_in(client, container)
++
++    requested = await _request(client, me, "TAKEN@example.com")
++    token = mailer.last_email_change_token("taken@example.com")
++    confirmed = await _confirm(client, me.headers, token)
++
++    assert requested.status_code == 202
++    assert confirmed.status_code == 409
++    assert (await client.get("/v1/me", headers=me.headers)).json()["email"] == me.email
++
++
++async def test_only_the_newest_link_works_once_for_its_account(client, container, mailer):
++    me = await signed_in(client, container)
++    other = await signed_in(client, container)
++    await _request(client, me, "first@example.com")
++    first = mailer.last_email_change_token("first@example.com")
++    await _request(client, me, "second@example.com")
++    second = mailer.last_email_change_token("second@example.com")
++
++    assert (await _confirm(client, me.headers, first)).status_code == 404
++    assert (await _confirm(client, other.headers, second)).status_code == 404
++    assert (await _confirm(client, me.headers, second)).status_code == 200
++    assert (await _confirm(client, me.headers, second)).status_code == 409
++
++
++async def test_links_expire(client, container, mailer, clock):
++    me = await signed_in(client, container)
++    await _request(client, me, "late@example.com")
++    clock.advance(seconds=container.settings.email_change_ttl_seconds)
++    fresh = (await login(client, me.email)).json()["access_token"]
++
++    response = await _confirm(
++        client, bearer(fresh), mailer.last_email_change_token("late@example.com")
++    )
++
++    assert response.status_code == 410
++
++
++async def test_requests_are_rate_limited_per_user(client, container, mailer):
++    me = await signed_in(client, container)
++    for _ in range(container.settings.email_change_rate_limit):
++        refused = await _request(client, me, "x@example.com", password="a wrong password")
++        assert refused.status_code == 403
++
++    blocked = await _request(client, me, "x@example.com")
++
++    assert blocked.status_code == 429
++    assert mailer.sent == []
+diff --git a/tests/helpers/doubles.py b/tests/helpers/doubles.py
+index 447b6a9..7fdd442 100644
+--- a/tests/helpers/doubles.py
++++ b/tests/helpers/doubles.py
+@@ -9,6 +9,7 @@ import uuid
+ from authz.infra.mailer import EmailMessage
+ 
+ _INVITATION_LINK = re.compile(r"/invitations/([A-Za-z0-9_-]+)")
++_EMAIL_CHANGE_LINK = re.compile(r"/account/email/confirm\?token=([A-Za-z0-9_-]+)")
+ 
+ 
+ class SeededRandom:
+@@ -48,3 +49,10 @@ class RecordingMailer:
+         match = _INVITATION_LINK.search(messages[-1].body)
+         assert match, "the invitation email has no link"
+         return match.group(1)
++
++    def last_email_change_token(self, address: str) -> str:
++        messages = [m for m in self.to(address) if m.kind == "email_change"]
++        assert messages, f"no email change link was sent to {address}"
++        match = _EMAIL_CHANGE_LINK.search(messages[-1].body)
++        assert match, "the email change message has no link"
++        return match.group(1)

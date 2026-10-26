@@ -1,0 +1,609 @@
+diff --git a/README.md b/README.md
+index 7c29825..0eccdda 100644
+--- a/README.md
++++ b/README.md
+@@ -113,11 +113,12 @@ with status 400 (malformed body), 401, 404, 409 (wrong state), 413, 415 or 422 (
+ | `GET /v1/jobs/{id}` | one job |
+ | `GET /v1/jobs?queue=&state=&after=&limit=` | jobs by ascending id; `next_after` is the cursor of the next page |
+ | `POST /v1/jobs/{id}/cancel` | cancel an available job |
++| `GET /v1/queues`, `GET /v1/queues/{queue}` | jobs per state, total and the age of the oldest due available job (`oldest_available_age_seconds`, null when none is waiting) |
+ | `GET /v1/dead?queue=&after=&limit=` | dead jobs |
+ | `POST /v1/dead/{id}/requeue` | make a dead job available again with fresh attempts |
+ | `GET /v1/schedules`, `GET/PUT/DELETE /v1/schedules/{name}` | cron schedules; `PUT` takes `{spec, queue, type, payload?, enabled?}` |
+ | `GET /healthz` | 200 when the database answers, 503 otherwise |
+-| `GET /metrics` | Prometheus metrics |
++| `GET /metrics` | Prometheus metrics, including `jobqueue_queue_jobs{queue,state}`, read from the database at each scrape |
+ 
+ Cron specs have five fields (minute, hour, day of month, month, day of week) with ranges,
+ steps, lists and names, or a macro such as `@daily`. They are evaluated in UTC. A schedule that
+diff --git a/cmd/jobctl/commands.go b/cmd/jobctl/commands.go
+index db41117..36363e6 100644
+--- a/cmd/jobctl/commands.go
++++ b/cmd/jobctl/commands.go
+@@ -27,6 +27,7 @@ var commands = map[string]command{
+ 	"dead":    deadCmd,
+ 	"requeue": requeueCmd,
+ 	"wait":    waitCmd,
++	"queues":  queuesCmd,
+ 
+ 	"schedules":       schedulesCmd,
+ 	"schedule":        scheduleCmd,
+@@ -212,6 +213,29 @@ func deadCmd(ctx context.Context, c *client.Client, args []string, stdout, stder
+ 	return printPage(stdout, page)
+ }
+ 
++// queuesCmd prints the statistics of every queue that has jobs.
++func queuesCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
++	if len(args) > 0 {
++		fmt.Fprintln(stderr, "jobctl queues: no arguments are accepted")
++		return errUsage
++	}
++	queues, err := c.ListQueues(ctx)
++	if err != nil {
++		return err
++	}
++	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
++	fmt.Fprintln(tw, "QUEUE\tAVAILABLE\tRUNNING\tSUCCEEDED\tFAILED\tCANCELLED\tDEAD\tOLDEST WAITING")
++	for _, q := range queues {
++		oldest := "-"
++		if q.OldestAvailableAgeSeconds != nil {
++			oldest = (time.Duration(*q.OldestAvailableAgeSeconds) * time.Second).String()
++		}
++		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", q.Queue, q.Counts["available"], q.Counts["running"],
++			q.Counts["succeeded"], q.Counts["failed"], q.Counts["cancelled"], q.Counts["dead"], oldest)
++	}
++	return tw.Flush()
++}
++
+ func schedulesCmd(ctx context.Context, c *client.Client, args []string, stdout, stderr io.Writer) error {
+ 	if len(args) > 0 {
+ 		fmt.Fprintln(stderr, "jobctl schedules: no arguments are accepted")
+diff --git a/cmd/jobctl/main.go b/cmd/jobctl/main.go
+index 09ee0c0..91ca09a 100644
+--- a/cmd/jobctl/main.go
++++ b/cmd/jobctl/main.go
+@@ -7,6 +7,7 @@
+ //	jobctl dead -queue default
+ //	jobctl requeue 42 43
+ //	jobctl wait -timeout 5m 42
++//	jobctl queues
+ //	jobctl schedule-put -spec '*/5 * * * *' -type noop heartbeat
+ //
+ // The server and token come from JOBQUEUE_URL (default http://localhost:8080) and
+@@ -41,6 +42,7 @@ commands:
+   dead     [-queue Q] [-after ID] [-limit N]
+   requeue  ID...
+   wait     [-timeout D] [-interval D] ID
++  queues
+   schedules
+   schedule         NAME
+   schedule-put     -spec S -type T [-queue Q] [-payload JSON] [-disabled] NAME
+diff --git a/cmd/jobctl/main_test.go b/cmd/jobctl/main_test.go
+index 192d594..f9973b1 100644
+--- a/cmd/jobctl/main_test.go
++++ b/cmd/jobctl/main_test.go
+@@ -117,6 +117,17 @@ func TestWaitCommand(t *testing.T) {
+ 	}
+ }
+ 
++func TestQueuesCommand(t *testing.T) {
++	emails := `{"queue":"emails","counts":{"available":12,"running":3,"succeeded":40,"failed":0,"cancelled":1,"dead":2},"total":58,"oldest_available_age_seconds":95.5}`
++	idle := `{"queue":"idle","counts":{"available":0},"total":0,"oldest_available_age_seconds":null}`
++	api := &fakeAPI{routes: map[string][]response{"GET /v1/queues": {{200, `{"queues":[` + emails + `,` + idle + `]}`}}}}
++	code, out, errOut := runCLI(t, api, "queues")
++	lines := strings.Split(strings.TrimSpace(out), "\n")
++	if code != 0 || len(lines) != 3 || !strings.Contains(lines[1], "1m35s") || !strings.HasSuffix(lines[2], " -") {
++		t.Errorf("queues: exit %d:\n%s%s", code, out, errOut)
++	}
++}
++
+ func TestScheduleCommands(t *testing.T) {
+ 	sc := `{"name":"nightly","spec":"0 3 * * *","queue":"default","type":"noop","enabled":true,"next_run_at":"2025-03-11T03:00:00Z"}`
+ 	api := &fakeAPI{routes: map[string][]response{
+diff --git a/internal/api/api_test.go b/internal/api/api_test.go
+index f354e18..c0c7267 100644
+--- a/internal/api/api_test.go
++++ b/internal/api/api_test.go
+@@ -130,6 +130,8 @@ type stubStore struct {
+ 
+ func (s stubStore) Ping(context.Context) error { return s.pingErr }
+ 
++func (s stubStore) QueueStats(context.Context) ([]store.QueueStats, error) { return nil, nil }
++
+ func (s stubStore) Get(_ context.Context, id int64) (domain.Job, error) { return s.get(id) }
+ 
+ func TestNewRequiresStoreAndToken(t *testing.T) {
+@@ -148,6 +150,8 @@ func TestV1RoutesRequireTheToken(t *testing.T) {
+ 		{http.MethodGet, "/v1/jobs"},
+ 		{http.MethodGet, "/v1/jobs/1"},
+ 		{http.MethodPost, "/v1/jobs/1/cancel"},
++		{http.MethodGet, "/v1/queues"},
++		{http.MethodGet, "/v1/queues/default"},
+ 		{http.MethodGet, "/v1/dead"},
+ 		{http.MethodPost, "/v1/dead/1/requeue"},
+ 		{http.MethodGet, "/v1/schedules"},
+diff --git a/internal/api/queues.go b/internal/api/queues.go
+new file mode 100644
+index 0000000..083e966
+--- /dev/null
++++ b/internal/api/queues.go
+@@ -0,0 +1,80 @@
++package api
++
++import (
++	"context"
++	"net/http"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++	"github.com/relaywork/jobqueue/internal/metrics"
++	"github.com/relaywork/jobqueue/internal/store"
++)
++
++// queueJSON is the API representation of a queue's statistics.
++type queueJSON struct {
++	Queue  string                 `json:"queue"`
++	Counts map[domain.State]int64 `json:"counts"`
++	Total  int64                  `json:"total"`
++	// OldestAvailableAgeSeconds is how long the oldest due available job has been waiting.
++	OldestAvailableAgeSeconds *float64 `json:"oldest_available_age_seconds"`
++}
++
++func (s *Server) toQueueJSON(q store.QueueStats) queueJSON {
++	out := queueJSON{Queue: q.Queue, Counts: q.Counts, Total: q.Total()}
++	if q.OldestAvailable != nil {
++		age := max(s.clock.Now().Sub(*q.OldestAvailable).Seconds(), 0)
++		out.OldestAvailableAgeSeconds = &age
++	}
++	return out
++}
++
++// GET /v1/queues lists every queue that has jobs, with its statistics.
++func (s *Server) listQueues(w http.ResponseWriter, r *http.Request) error {
++	stats, err := s.store.QueueStats(r.Context())
++	if err != nil {
++		return err
++	}
++	out := struct {
++		Queues []queueJSON `json:"queues"`
++	}{Queues: make([]queueJSON, len(stats))}
++	for i, q := range stats {
++		out.Queues[i] = s.toQueueJSON(q)
++	}
++	s.writeJSON(w, http.StatusOK, out)
++	return nil
++}
++
++// GET /v1/queues/{queue} returns one queue's statistics; a queue without jobs has zero counts.
++func (s *Server) getQueue(w http.ResponseWriter, r *http.Request) error {
++	queue := r.PathValue("queue")
++	if err := domain.ValidateQueueName(queue); err != nil {
++		return domain.Invalid("queue", "%s", err)
++	}
++	q, err := s.store.QueueStatsOf(r.Context(), queue)
++	if err != nil {
++		return err
++	}
++	s.writeJSON(w, http.StatusOK, s.toQueueJSON(q))
++	return nil
++}
++
++// registerQueueMetrics exposes the number of jobs per queue and state as a gauge that is
++// refreshed from the store on each scrape of /metrics.
++func (s *Server) registerQueueMetrics(reg *metrics.Registry) {
++	s.queued = reg.NewGauge("jobqueue_queue_jobs", "Jobs per queue and state.", "queue", "state")
++	reg.Collect(s.collectQueueStats)
++}
++
++// collectQueueStats refreshes the queue gauge. A failure is logged and leaves the previous
++// values in place: the scrape itself must not fail because of it.
++func (s *Server) collectQueueStats(ctx context.Context) {
++	stats, err := s.store.QueueStats(ctx)
++	if err != nil {
++		s.log.Warn("collect queue statistics", "error", err)
++		return
++	}
++	for _, q := range stats {
++		for _, state := range domain.States {
++			s.queued.Set(float64(q.Counts[state]), q.Queue, string(state))
++		}
++	}
++}
+diff --git a/internal/api/queues_test.go b/internal/api/queues_test.go
+new file mode 100644
+index 0000000..453f0b6
+--- /dev/null
++++ b/internal/api/queues_test.go
+@@ -0,0 +1,91 @@
++package api_test
++
++import (
++	"context"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++	"github.com/relaywork/jobqueue/internal/metrics"
++)
++
++type queueBody struct {
++	Queue                     string           `json:"queue"`
++	Counts                    map[string]int64 `json:"counts"`
++	Total                     int64            `json:"total"`
++	OldestAvailableAgeSeconds *float64         `json:"oldest_available_age_seconds"`
++}
++
++// seedQueues leaves emails with two available jobs (one due since t0), one running and one
++// succeeded job, and reports with one job not due yet; then 90 seconds pass.
++func seedQueues(t *testing.T, e *env) {
++	t.Helper()
++	ctx := context.Background()
++	for _, nj := range []domain.NewJob{
++		{Queue: "emails", Type: "email.send"},
++		{Queue: "emails", Type: "email.send"},
++		{Queue: "emails", Type: "email.send"},
++		{Queue: "emails", Type: "email.send", RunAt: t0.Add(time.Hour)},
++		{Queue: "reports", Type: "report.build", RunAt: t0.Add(time.Hour)},
++	} {
++		if _, err := e.store.Enqueue(ctx, nj); err != nil {
++			t.Fatal(err)
++		}
++	}
++	jobs, err := e.store.Lease(ctx, "emails", "w1", 2, time.Minute)
++	if err != nil || len(jobs) != 2 {
++		t.Fatalf("Lease = %d jobs, %v", len(jobs), err)
++	}
++	if err := e.store.Complete(ctx, jobs[0].ID, "w1"); err != nil {
++		t.Fatal(err)
++	}
++	e.clock.Advance(90 * time.Second)
++}
++
++func TestQueueStatistics(t *testing.T) {
++	e := newEnv(t)
++	seedQueues(t, e)
++
++	list := decode[struct {
++		Queues []queueBody `json:"queues"`
++	}](t, call(t, e.handler, http.MethodGet, "/v1/queues", ""))
++	if len(list.Queues) != 2 || list.Queues[0].Queue != "emails" || list.Queues[1].Queue != "reports" {
++		t.Fatalf("queues = %+v", list.Queues)
++	}
++	emails := list.Queues[0]
++	if c := emails.Counts; c["available"] != 2 || c["running"] != 1 || c["succeeded"] != 1 || c["dead"] != 0 || len(c) != len(domain.States) ||
++		emails.Total != 4 || emails.OldestAvailableAgeSeconds == nil || *emails.OldestAvailableAgeSeconds != 90 {
++		t.Errorf("emails = %+v", emails)
++	}
++	if reports := list.Queues[1]; reports.OldestAvailableAgeSeconds != nil {
++		t.Errorf("a queue whose only job is not due yet has no waiting age: %+v", reports)
++	}
++
++	rec := call(t, e.handler, http.MethodGet, "/v1/queues/idle", "")
++	if q := decode[queueBody](t, rec); rec.Code != http.StatusOK || q.Total != 0 || len(q.Counts) != len(domain.States) {
++		t.Errorf("GET a queue without jobs: %d %s", rec.Code, rec.Body)
++	}
++	resp := expectError(t, call(t, e.handler, http.MethodGet, "/v1/queues/Not%20A%20Queue", ""), http.StatusUnprocessableEntity, "validation_failed")
++	if got := fieldNames(resp); len(got) != 1 || got[0] != "queue" {
++		t.Errorf("fields = %v", got)
++	}
++}
++
++func TestQueueGaugeOnScrape(t *testing.T) {
++	e := newEnv(t)
++	srv := newServer(t, e.store, e.clock, metrics.NewRegistry())
++	seedQueues(t, e)
++
++	body := call(t, srv, http.MethodGet, "/metrics", "", "Authorization: ").Body.String()
++	for _, want := range []string{
++		`jobqueue_queue_jobs{queue="emails",state="available"} 2`,
++		`jobqueue_queue_jobs{queue="emails",state="dead"} 0`,
++		`jobqueue_queue_jobs{queue="reports",state="available"} 1`,
++	} {
++		if !strings.Contains(body, want+"\n") {
++			t.Errorf("metrics lack %s:\n%s", want, body)
++		}
++	}
++}
+diff --git a/internal/api/server.go b/internal/api/server.go
+index e670adb..785dc4b 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -24,6 +24,8 @@ type Store interface {
+ 	Cancel(ctx context.Context, id int64) (domain.Job, error)
+ 	ListDead(ctx context.Context, queue string, after int64, limit int) (store.Page, error)
+ 	Requeue(ctx context.Context, id int64) (domain.Job, error)
++	QueueStats(ctx context.Context) ([]store.QueueStats, error)
++	QueueStatsOf(ctx context.Context, queue string) (store.QueueStats, error)
+ 
+ 	GetSchedule(ctx context.Context, name string) (domain.Schedule, error)
+ 	ListSchedules(ctx context.Context) ([]domain.Schedule, error)
+@@ -37,7 +39,7 @@ type Options struct {
+ 	AdminToken string // required on every /v1 route as "Authorization: Bearer <token>"
+ 	Clock      clock.Clock
+ 	Logger     *slog.Logger
+-	Metrics    *metrics.Registry // served on /metrics; optional
++	Metrics    *metrics.Registry // served on /metrics with the queue gauge; optional
+ }
+ 
+ // Server routes and serves API requests.
+@@ -48,6 +50,7 @@ type Server struct {
+ 	auth    *authenticator
+ 	metrics *metrics.Registry
+ 	httpm   httpMetrics
++	queued  *metrics.Gauge
+ 	mux     *http.ServeMux
+ 	handler http.Handler
+ }
+@@ -78,6 +81,7 @@ func New(opts Options) (*Server, error) {
+ 		httpm:   newHTTPMetrics(opts.Metrics),
+ 		mux:     http.NewServeMux(),
+ 	}
++	s.registerQueueMetrics(opts.Metrics)
+ 	s.routes()
+ 	s.handler = s.withRequestID(s.mux)
+ 	return s, nil
+@@ -92,6 +96,8 @@ func (s *Server) routes() {
+ 	s.private("GET /v1/jobs", s.listJobs)
+ 	s.private("GET /v1/jobs/{id}", s.getJob)
+ 	s.private("POST /v1/jobs/{id}/cancel", s.cancelJob)
++	s.private("GET /v1/queues", s.listQueues)
++	s.private("GET /v1/queues/{queue}", s.getQueue)
+ 
+ 	s.private("GET /v1/dead", s.listDead)
+ 	s.private("POST /v1/dead/{id}/requeue", s.requeueJob)
+diff --git a/internal/client/client.go b/internal/client/client.go
+index bb784a6..f361ea3 100644
+--- a/internal/client/client.go
++++ b/internal/client/client.go
+@@ -225,6 +225,23 @@ func decodeError(status int, data []byte) error {
+ 	return body.Error
+ }
+ 
++// Queue mirrors the API's queue statistics.
++type Queue struct {
++	Queue                     string           `json:"queue"`
++	Counts                    map[string]int64 `json:"counts"`
++	Total                     int64            `json:"total"`
++	OldestAvailableAgeSeconds *float64         `json:"oldest_available_age_seconds"`
++}
++
++// ListQueues returns the statistics of every queue that has jobs.
++func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
++	var out struct {
++		Queues []Queue `json:"queues"`
++	}
++	err := c.do(ctx, http.MethodGet, "/v1/queues", nil, nil, &out)
++	return out.Queues, err
++}
++
+ // Schedule mirrors the API's schedule representation.
+ type Schedule struct {
+ 	Name      string          `json:"name"`
+diff --git a/internal/metrics/expose.go b/internal/metrics/expose.go
+index f37ea2a..3e2d234 100644
+--- a/internal/metrics/expose.go
++++ b/internal/metrics/expose.go
+@@ -27,9 +27,15 @@ func (r *Registry) WriteText(w io.Writer) error {
+ 	return bw.Flush()
+ }
+ 
+-// Handler serves the registry in the text exposition format.
++// Handler serves the registry in the text exposition format, after running the collectors.
+ func (r *Registry) Handler() http.Handler {
+-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		r.mu.Lock()
++		collectors := slices.Clone(r.collectors)
++		r.mu.Unlock()
++		for _, collect := range collectors {
++			collect(req.Context())
++		}
+ 		w.Header().Set("Content-Type", ContentType)
+ 		// A failed write means the scraper went away; there is nobody left to tell.
+ 		_ = r.WriteText(w)
+diff --git a/internal/metrics/metrics.go b/internal/metrics/metrics.go
+index 3e35acd..65a27e1 100644
+--- a/internal/metrics/metrics.go
++++ b/internal/metrics/metrics.go
+@@ -3,6 +3,7 @@
+ package metrics
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"math"
+ 	"regexp"
+@@ -29,9 +30,10 @@ const (
+ 
+ // Registry holds metric families in registration order. It is safe for concurrent use.
+ type Registry struct {
+-	mu       sync.Mutex
+-	families []*family
+-	byName   map[string]*family
++	mu         sync.Mutex
++	families   []*family
++	byName     map[string]*family
++	collectors []func(ctx context.Context)
+ }
+ 
+ // NewRegistry returns an empty registry.
+@@ -160,6 +162,16 @@ func (r *Registry) NewGaugeFunc(name, help string, fn func() float64) {
+ 	f.read = fn
+ }
+ 
++// Collect registers fn to run at the start of every scrape served by Handler, before any family
++// is written, so that gauges whose values live elsewhere (in the database, for example) are
++// current when they are exposed. fn receives the scrape request's context; collectors run in
++// registration order.
++func (r *Registry) Collect(fn func(ctx context.Context)) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.collectors = append(r.collectors, fn)
++}
++
+ // Histogram counts observations in cumulative buckets per label combination.
+ type Histogram struct{ f *family }
+ 
+diff --git a/internal/metrics/metrics_test.go b/internal/metrics/metrics_test.go
+index 4b20db6..735903f 100644
+--- a/internal/metrics/metrics_test.go
++++ b/internal/metrics/metrics_test.go
+@@ -1,6 +1,7 @@
+ package metrics
+ 
+ import (
++	"context"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -133,6 +134,23 @@ func TestConcurrentUpdates(t *testing.T) {
+ 	}
+ }
+ 
++func TestCollectorsRunOnEachScrape(t *testing.T) {
++	r := NewRegistry()
++	g := r.NewGauge("queue_depth", "Jobs waiting.", "queue")
++	depth := 3.0
++	r.Collect(func(context.Context) {
++		g.Set(depth, "emails")
++		depth++
++	})
++	for _, want := range []string{`queue_depth{queue="emails"} 3`, `queue_depth{queue="emails"} 4`} {
++		rec := httptest.NewRecorder()
++		r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++		if !strings.Contains(rec.Body.String(), want+"\n") {
++			t.Errorf("scrape lacks %s:\n%s", want, rec.Body.String())
++		}
++	}
++}
++
+ func TestHandler(t *testing.T) {
+ 	r := NewRegistry()
+ 	r.NewCounter("up", "Up.").Inc()
+diff --git a/internal/store/stats.go b/internal/store/stats.go
+new file mode 100644
+index 0000000..ef28e58
+--- /dev/null
++++ b/internal/store/stats.go
+@@ -0,0 +1,69 @@
++package store
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/jackc/pgx/v5"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++// QueueStats summarizes the jobs of one queue.
++type QueueStats struct {
++	Queue           string
++	Counts          map[domain.State]int64 // jobs per state; every state is present
++	OldestAvailable *time.Time             // run_at of the oldest due available job, if any
++}
++
++// Total returns the number of jobs in the queue, in any state.
++func (q QueueStats) Total() int64 {
++	var n int64
++	for _, c := range q.Counts {
++		n += c
++	}
++	return n
++}
++
++// QueueStats returns the statistics of every queue that has jobs, ordered by queue name.
++func (s *Store) QueueStats(ctx context.Context) ([]QueueStats, error) {
++	rows, err := s.pool.Query(ctx, `SELECT DISTINCT queue FROM jobs ORDER BY queue`)
++	if err != nil {
++		return nil, fmt.Errorf("list queues: %w", err)
++	}
++	queues, err := pgx.CollectRows(rows, pgx.RowTo[string])
++	if err != nil {
++		return nil, fmt.Errorf("list queues: %w", err)
++	}
++	out := make([]QueueStats, 0, len(queues))
++	for _, q := range queues {
++		st, err := s.QueueStatsOf(ctx, q)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, st)
++	}
++	return out, nil
++}
++
++// QueueStatsOf returns the statistics of one queue. A queue without jobs has zero counts.
++func (s *Store) QueueStatsOf(ctx context.Context, queue string) (QueueStats, error) {
++	st := QueueStats{Queue: queue, Counts: make(map[domain.State]int64, len(domain.States))}
++	for _, state := range domain.States {
++		var n int64
++		err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE queue = $1 AND state = $2`,
++			queue, string(state)).Scan(&n)
++		if err != nil {
++			return QueueStats{}, fmt.Errorf("count %s jobs of queue %q: %w", state, queue, err)
++		}
++		st.Counts[state] = n
++	}
++	err := s.pool.QueryRow(ctx, `SELECT min(run_at) FROM jobs WHERE queue = $1 AND state = 'available' AND run_at <= $2`,
++		queue, s.now()).Scan(&st.OldestAvailable)
++	if err != nil {
++		return QueueStats{}, fmt.Errorf("oldest available job of queue %q: %w", queue, err)
++	}
++	st.OldestAvailable = utcPtr(st.OldestAvailable)
++	return st, nil
++}
+diff --git a/internal/store/stats_test.go b/internal/store/stats_test.go
+new file mode 100644
+index 0000000..aac61a3
+--- /dev/null
++++ b/internal/store/stats_test.go
+@@ -0,0 +1,45 @@
++package store_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/relaywork/jobqueue/internal/domain"
++)
++
++func TestQueueStats(t *testing.T) {
++	s, clk := newStore(t)
++	ctx := context.Background()
++	a := mustEnqueue(t, s, domain.NewJob{Queue: "alpha"})
++	mustEnqueue(t, s, domain.NewJob{Queue: "alpha"})
++	mustEnqueue(t, s, domain.NewJob{Queue: "alpha", RunAt: t0.Add(time.Hour)})
++	cancelled := mustEnqueue(t, s, domain.NewJob{Queue: "beta"})
++	if _, err := s.Cancel(ctx, cancelled.ID); err != nil {
++		t.Fatal(err)
++	}
++	clk.Advance(time.Minute)
++	if leased := mustLease(t, s, "alpha", "w1", 1); len(leased) != 1 || leased[0].ID != a.ID {
++		t.Fatalf("leased %v, want job %d", ids(leased), a.ID)
++	}
++
++	stats, err := s.QueueStats(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(stats) != 2 || stats[0].Queue != "alpha" || stats[1].Queue != "beta" {
++		t.Fatalf("QueueStats = %+v", stats)
++	}
++	alpha := stats[0]
++	if alpha.Counts[domain.StateAvailable] != 2 || alpha.Counts[domain.StateRunning] != 1 || alpha.Total() != 3 ||
++		len(alpha.Counts) != len(domain.States) {
++		t.Errorf("alpha counts = %v", alpha.Counts)
++	}
++	if alpha.OldestAvailable == nil || !alpha.OldestAvailable.Equal(t0) {
++		t.Errorf("alpha oldest available = %v, want %s", alpha.OldestAvailable, t0)
++	}
++	beta := stats[1]
++	if beta.Counts[domain.StateCancelled] != 1 || beta.Total() != 1 || beta.OldestAvailable != nil {
++		t.Errorf("beta = %+v", beta)
++	}
++}

@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-java-wxjava-4115",
+  "repo": "rb-java-wxjava-4115",
+  "kind": "realbug",
+  "title": "feat: 兼容收付通旧版下单模型",
+  "description": "## 背景\n\n#4014 统一收付通下单模型时移除了 `bean.ecommerce` 下的公开类型，导致仍使用 `TransactionsResult` 等旧 API 的应用无法直接升级到包含服务商电子发票能力的 4.8.5.B。\n\n## 变更\n\n- 恢复 #4014 移除的旧收付通模型，并标记为 `@Deprecated`\n- 恢复旧 `EcommerceService#combine` 调用入口，内部转换为统一模型并委托当前实现\n- 保留现有统一 API，不改变其签名或执行路径\n- 新增旧类型可编译的兼容性测试\n\n## 迁移与后续\n\n旧 API 将保留至 5.0；新代码应继续使用统一的 `bean.request`、`bean.result` 和 `bean.notify` 模型。\n\n## 验证\n\n- `mvn -pl weixin-java-pay -Dtest=LegacyEcommerceApiCompatibilityTest test`\n- `git diff --check`\n\n注：模块当前 Surefire 配置会跳过测试执行；上述命令已完成生产代码和测试代码编译。",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "weixin-java-pay/src/main/java/com/github/binarywang/wxpay/service/EcommerceService.java",
+      "lines": [
+        111,
+        112
+      ],
+      "category": "logic",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "The restored legacy closePartnerTransactions converts its request to WxPayPartnerOrderCloseV3Request by a Gson toJson/fromJson round trip, but outTradeNo is a transient path parameter on both classes, so it is dropped and the unified close is called without the order number.",
+      "trigger": "Any call to the deprecated EcommerceService.closePartnerTransactions with an outTradeNo set: the delegated closePartnerOrder receives outTradeNo null, so the order is not closed.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "weixin-java-pay/src/test/java/com/github/binarywang/wxpay/service/LegacyEcommerceApiCompatibilityTest.java"
+      ],
+      "hidden_test_cmd": "mvn -q -pl weixin-java-pay -am test-compile dependency:build-classpath -Dmdep.outputFile=target/test-classpath.txt -Dmdep.includeScope=test && cd weixin-java-pay && java -cp \"target/test-classes:target/classes:$(cat target/test-classpath.txt)\" org.testng.TestNG -d target/testng-hidden -testclass com.github.binarywang.wxpay.service.LegacyEcommerceApiCompatibilityTest"
+    }
+  ]
+}

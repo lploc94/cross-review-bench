@@ -1,0 +1,59 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T07",
+  "repo": "authz-py",
+  "kind": "buggy",
+  "title": "Audit log export (streaming)",
+  "description": "Compliance teams ask for the full audit log of an organisation as a file. Paging through `GET /v1/orgs/{org_id}/audit` 200 events at a time works but is slow for large logs and gives no consistent view while events keep arriving, and the events only carry `actor_id`.\n\n- New `GET /v1/orgs/{org_id}/audit/export?action=` (`audit:read`) streams the whole log, or one action, as NDJSON (`application/x-ndjson`, sent as an attachment): one event per line, newest first, with the fields of the list endpoint plus `actor_email`, the actor's current address (`null` for system events).\n- `AuditQueryService.export` reads the log in pages of `AUDIT_EXPORT_PAGE_SIZE` events (new setting, default 500, 10\u20135000) using the existing keyset `AuditRepository.page`, so memory stays flat however large the log is. All pages come from one read-only REPEATABLE READ snapshot (new `Database.snapshot()`), so events written while an export runs do not shift its pages.\n- `UserRepository.email_of` looks up an actor's address.\n\nTests: tests/api/test_audit_export.py (order across pages, content type and file name, actor emails and system events, action filter, empty export, 403 without `audit:read`, 404 for non-members), tests/infra/test_db.py (the snapshot keeps one state and refuses writes), tests/unit/test_config.py (page size bounds). README and .env.example updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/authz/services/audit.py",
+      "lines": [
+        146,
+        149
+      ],
+      "category": "resource-leak",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "export() opens a snapshot session (a pooled connection in an open transaction) inside the async generator and closes it only after the last page, with no try/finally or async with. When the client disconnects, Starlette cancels the streaming task: the CancelledError (or a later GeneratorExit) leaves the generator without running session.close(), so the connection stays checked out, inside its REPEATABLE READ transaction, until the garbage collector happens to collect the session (SQLAlchemy then drops it with a warning). Errors from a query leak it the same way. A few cancelled downloads exhaust the pool (pool_size + max_overflow) and every request that needs the database waits and times out.",
+      "trigger": "Start GET /v1/orgs/{org_id}/audit/export on a log larger than one page and close the connection after the first lines: engine.pool.checkedout() stays at 1 for each abandoned export; with DATABASE_POOL_SIZE=10, about 20 abandoned exports leave the service unable to serve requests.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_audit_export_disconnect.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_audit_export_disconnect.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The connection cannot leak: FastAPI closes the request's dependencies and resources when the response ends, and Database sessions are always closed by their context managers (src/authz/infra/db.py), so when a client disconnects the export's session is cleaned up together with the request.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/authz/services/audit.py",
+      "lines": [
+        162,
+        165
+      ],
+      "category": "performance",
+      "severity": "low",
+      "difficulty": "L2",
+      "summary": "The actor's email is looked up with one query per exported event (UserRepository.email_of inside the per-event loop), although the repository already has get_many for a batch lookup and the page is in hand: an export of N events issues N + pages queries instead of about two per page.",
+      "trigger": "Export a log of 50 events written by 12 different users with AUDIT_EXPORT_PAGE_SIZE=10: 55 SELECT statements instead of about 10.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_audit_export_queries.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_audit_export_queries.py",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "There is no N+1 here: the lookups run on the export's own session, and SQLAlchemy's identity map returns a user it has already loaded without another round trip, so each actor costs one query per export at most; besides, exports are rare compliance downloads, not a hot path.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

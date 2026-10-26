@@ -1,0 +1,23 @@
+diff --git a/src/main/java/com/innkeep/booking/service/ReservationService.java b/src/main/java/com/innkeep/booking/service/ReservationService.java
+index 5d27073..29ed3d0 100644
+--- a/src/main/java/com/innkeep/booking/service/ReservationService.java
++++ b/src/main/java/com/innkeep/booking/service/ReservationService.java
+@@ -259,11 +259,15 @@ public class ReservationService {
+ 
+   /**
+    * What cancelling at {@code at} refunds: the property's refund percentage for that moment applied
+-   * to the reservation's price. The cancellation and its quote both use it, so they always agree.
++   * to the reservation's price, but never more than has been paid. The cancellation and its quote
++   * both use it, so they always agree.
+    */
+   private Money refundDue(Reservation reservation, Instant at) {
+-    return CancellationPolicy.of(reservation.getProperty())
+-        .refund(reservation.getTotal(), reservation.getCheckIn(), at);
++    Money share =
++        CancellationPolicy.of(reservation.getProperty())
++            .refund(reservation.getTotal(), reservation.getCheckIn(), at);
++    Money paid = paid(reservation);
++    return share.amount().compareTo(paid.amount()) <= 0 ? share : paid;
+   }
+ 
+   /** The number of reservations in each status, zero for the statuses with none. */

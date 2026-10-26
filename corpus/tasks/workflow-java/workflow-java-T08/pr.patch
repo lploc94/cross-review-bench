@@ -1,0 +1,617 @@
+diff --git a/README.md b/README.md
+index fe11f01..ca6c979 100644
+--- a/README.md
++++ b/README.md
+@@ -22,7 +22,15 @@ Flyway and PostgreSQL.
+   reached. The remaining open tasks of a decided step are cancelled.
+ - **Documents.** Statuses are `DRAFT`, `IN_REVIEW`, `APPROVED`, `REJECTED` and `WITHDRAWN`. The
+   owner submits a draft, withdraws a document under review, and resubmits a rejected one, which
+-  starts a new round. Earlier rounds and their decisions stay on record.
++  starts a new round. Earlier rounds and their decisions stay on record. A rejected document can
++  be resubmitted within `workflow.retention.resubmit-window` (30 days) of the rejection; after
++  that the rejection is final and a resubmit is refused with 409 `invalid-transition`.
++- **Retention.** A document is finished once it is `APPROVED` or `WITHDRAWN`, or `REJECTED` and
++  past its resubmit window. A finished document whose last change is older than
++  `workflow.retention.finished-after` (365 days) is archived by a background job: its text is
++  replaced by a marker and `GET /documents/{id}` answers `"archived": true` with no `body`. The
++  title, tasks, decisions and audit trail are kept. Drafts and documents under review are never
++  archived.
+ - **Tasks.** One task per approver of the current step order. A task is due at its activation plus
+   the step's SLA, counted in working hours (Monday to Friday, 09:00 to 17:00 in the configured zone).
+   A decision on a task that is no longer open is a conflict. A decision that would move the
+@@ -85,8 +93,9 @@ curl -s -X POST localhost:8080/api/v1/admin/definitions/1/publish -H "Authorizat
+ 
+ Other settings sit under `workflow.*` in `src/main/resources/application.yml`:
+ `business-zone`, `working-start`, `working-end`, `outbox-batch-size`, `outbox-max-attempts`,
+-`outbox-retry-base`, `escalation-batch-size`, `job-interval` and `scheduling-enabled`. Invalid
+-values fail the startup.
++`outbox-retry-base`, `escalation-batch-size`, `job-interval`, `scheduling-enabled`, and under
++`retention`: `finished-after`, `resubmit-window` (ISO durations, not negative) and `batch-size`
++(documents per archive pass, 1 to 1000). Invalid values fail the startup.
+ 
+ ## Testing
+ 
+@@ -134,7 +143,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `GET /documents?status=&owner=&definition=&shared=&cursor=&size=` | visible documents, newest first; `shared=true` keeps only those granted to the caller |
+ | `GET /documents/count?status=&owner=&definition=` | visible documents, counted |
+ | `GET /documents/summary` | the caller's visible documents per status |
+-| `GET /documents/{id}` | one document with its tasks |
++| `GET /documents/{id}` | one document with its tasks; an archived one has `archived: true` and no body |
+ | `PUT /documents/{id}` | edit a draft (owner) |
+ | `POST /documents/{id}/submit`, `/resubmit`, `/withdraw` | lifecycle moves (owner) |
+ | `GET /documents/{id}/audit?cursor=&size=` | the document's audit trail, oldest first |
+diff --git a/src/main/java/com/papertrail/workflow/config/WorkflowConfig.java b/src/main/java/com/papertrail/workflow/config/WorkflowConfig.java
+index 2418859..48acfe2 100644
+--- a/src/main/java/com/papertrail/workflow/config/WorkflowConfig.java
++++ b/src/main/java/com/papertrail/workflow/config/WorkflowConfig.java
+@@ -1,5 +1,6 @@
+ package com.papertrail.workflow.config;
+ 
++import jakarta.validation.Valid;
+ import jakarta.validation.constraints.Max;
+ import jakarta.validation.constraints.Min;
+ import jakarta.validation.constraints.NotBlank;
+@@ -27,7 +28,8 @@ public record WorkflowConfig(
+     @DefaultValue("PT30S") Duration outboxRetryBase,
+     @DefaultValue("20") @Min(1) @Max(200) int escalationBatchSize,
+     @DefaultValue("PT1M") Duration jobInterval,
+-    @DefaultValue("true") boolean schedulingEnabled) {
++    @DefaultValue("true") boolean schedulingEnabled,
++    @DefaultValue @Valid Retention retention) {
+ 
+   private static final Duration MAX_RETRY_BASE = Duration.ofMinutes(10);
+ 
+@@ -48,4 +50,26 @@ public record WorkflowConfig(
+       throw new IllegalArgumentException("workflow.job-interval must be positive");
+     }
+   }
++
++  /**
++   * Settings under {@code workflow.retention}: how long a finished document keeps its text, how
++   * long the owner of a rejected document may resubmit it, and how many documents one archive pass
++   * takes.
++   */
++  public record Retention(
++      @DefaultValue("P365D") Duration finishedAfter,
++      @DefaultValue("P30D") Duration resubmitWindow,
++      @DefaultValue("100") @Min(1) @Max(1000) int batchSize) {
++
++    public Retention {
++      if (finishedAfter == null || finishedAfter.isNegative()) {
++        throw new IllegalArgumentException(
++            "workflow.retention.finished-after must not be negative");
++      }
++      if (resubmitWindow == null || resubmitWindow.isNegative()) {
++        throw new IllegalArgumentException(
++            "workflow.retention.resubmit-window must not be negative");
++      }
++    }
++  }
+ }
+diff --git a/src/main/java/com/papertrail/workflow/domain/Document.java b/src/main/java/com/papertrail/workflow/domain/Document.java
+index e861e47..f356162 100644
+--- a/src/main/java/com/papertrail/workflow/domain/Document.java
++++ b/src/main/java/com/papertrail/workflow/domain/Document.java
+@@ -26,6 +26,9 @@ public class Document extends AbstractEntity<Long> {
+   static final int MAX_TITLE = 200;
+   static final int MAX_BODY = 10_000;
+ 
++  /** What an archived document's body holds instead of its text. */
++  public static final String ARCHIVED_BODY = "(archived)";
++
+   @Id
+   @GeneratedValue(strategy = GenerationType.IDENTITY)
+   private Long id;
+@@ -60,6 +63,9 @@ public class Document extends AbstractEntity<Long> {
+   @Column(name = "updated_at", nullable = false)
+   private Instant updatedAt;
+ 
++  @Column(nullable = false)
++  private boolean archived;
++
+   @Version private Long version;
+ 
+   protected Document() {}
+@@ -130,6 +136,12 @@ public class Document extends AbstractEntity<Long> {
+     this.updatedAt = now;
+   }
+ 
++  /** Drops the text. The last change time stays, since archiving is not a change to the review. */
++  void archive() {
++    this.body = ARCHIVED_BODY;
++    this.archived = true;
++  }
++
+   public boolean isOwnedBy(long userId) {
+     return Objects.equals(owner.getId(), userId);
+   }
+@@ -167,6 +179,10 @@ public class Document extends AbstractEntity<Long> {
+     return currentOrder;
+   }
+ 
++  public boolean isArchived() {
++    return archived;
++  }
++
+   public Instant getCreatedAt() {
+     return createdAt;
+   }
+diff --git a/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java b/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
+index f8667a0..f3c7f6e 100644
+--- a/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
++++ b/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
+@@ -1,5 +1,6 @@
+ package com.papertrail.workflow.domain;
+ 
++import java.time.Duration;
+ import java.time.Instant;
+ 
+ /**
+@@ -18,10 +19,16 @@ public final class DocumentStateMachine {
+     document.startReview(now);
+   }
+ 
+-  /** The owner sends a rejected document for another round. Earlier decisions stay on record. */
+-  public static void resubmit(Document document, Principal actor, Instant now) {
++  /**
++   * The owner sends a rejected document for another round, within {@code window} of the rejection.
++   * Earlier decisions stay on record. After the window the rejection is final.
++   */
++  public static void resubmit(Document document, Principal actor, Duration window, Instant now) {
+     requireOwner(document, actor, "resubmit");
+     requireStatus(document, DocumentStatus.REJECTED, "resubmit");
++    if (!now.isBefore(document.getUpdatedAt().plus(window))) {
++      throw new InvalidTransitionException("the resubmit window of this document has closed");
++    }
+     document.startReview(now);
+   }
+ 
+@@ -58,6 +65,16 @@ public final class DocumentStateMachine {
+     document.moveToOrder(order, now);
+   }
+ 
++  /** Retention drops the text of a finished document; its record and audit trail stay. */
++  public static void archive(Document document) {
++    if (document.getStatus() == DocumentStatus.DRAFT
++        || document.getStatus() == DocumentStatus.IN_REVIEW) {
++      throw new InvalidTransitionException(
++          "cannot archive a document that is " + document.getStatus());
++    }
++    document.archive();
++  }
++
+   /** The owner or an admin manages who can see the document. */
+   public static void requireManager(Document document, Principal actor) {
+     if (!actor.admin() && !document.isOwnedBy(actor.userId())) {
+diff --git a/src/main/java/com/papertrail/workflow/integration/ArchiveJob.java b/src/main/java/com/papertrail/workflow/integration/ArchiveJob.java
+new file mode 100644
+index 0000000..08a8d78
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/integration/ArchiveJob.java
+@@ -0,0 +1,25 @@
++package com.papertrail.workflow.integration;
++
++import com.papertrail.workflow.service.ArchiveService;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/** Archives finished documents on a timer. The timer exists only when scheduling is enabled. */
++@Component
++public class ArchiveJob {
++
++  private final ArchiveService archives;
++
++  public ArchiveJob(ArchiveService archives) {
++    this.archives = archives;
++  }
++
++  @Scheduled(fixedDelayString = "${workflow.job-interval}")
++  public void run() {
++    runOnce();
++  }
++
++  public int runOnce() {
++    return archives.archiveFinished();
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java b/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java
+index 27c3ad9..091b891 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentRepository.java
+@@ -3,6 +3,9 @@ package com.papertrail.workflow.persistence;
+ import com.papertrail.workflow.domain.Document;
+ import com.papertrail.workflow.domain.DocumentStatus;
+ import jakarta.persistence.LockModeType;
++import java.time.Instant;
++import java.util.Collection;
++import java.util.List;
+ import java.util.Optional;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.data.jpa.repository.Lock;
+@@ -18,6 +21,21 @@ public interface DocumentRepository extends JpaRepository<Document, Long>, Docum
+   @Query("select d from Document d where d.id = :id")
+   Optional<Document> lockById(@Param("id") long id);
+ 
++  /**
++   * Documents in one of {@code statuses}, not archived, last changed at or before {@code cutoff},
++   * oldest first and locked for this transaction. Rows another instance holds are skipped.
++   */
++  @Query(
++      value =
++          "select * from document where status in (:statuses) and not archived"
++              + " and updated_at <= :cutoff order by updated_at, id limit :limit"
++              + " for update skip locked",
++      nativeQuery = true)
++  List<Document> lockArchivable(
++      @Param("statuses") Collection<String> statuses,
++      @Param("cutoff") Instant cutoff,
++      @Param("limit") int limit);
++
+   @Query("select d from Document d join fetch d.owner join fetch d.definition where d.id = :id")
+   Optional<Document> findDetailById(@Param("id") long id);
+ 
+diff --git a/src/main/java/com/papertrail/workflow/service/ArchiveService.java b/src/main/java/com/papertrail/workflow/service/ArchiveService.java
+new file mode 100644
+index 0000000..2d09fc4
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/service/ArchiveService.java
+@@ -0,0 +1,58 @@
++package com.papertrail.workflow.service;
++
++import com.papertrail.workflow.config.WorkflowConfig;
++import com.papertrail.workflow.domain.Document;
++import com.papertrail.workflow.domain.DocumentStateMachine;
++import com.papertrail.workflow.domain.DocumentStatus;
++import com.papertrail.workflow.persistence.DocumentRepository;
++import java.time.Clock;
++import java.time.Instant;
++import java.util.List;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Applies the retention rule: a finished document whose last change is older than {@code
++ * workflow.retention.finished-after} keeps its record, tasks and audit trail, but its text is
++ * replaced by {@link Document#ARCHIVED_BODY}. Each pass locks its batch with {@code FOR UPDATE SKIP
++ * LOCKED}, so several instances share the work without archiving a document twice.
++ */
++@Service
++public class ArchiveService {
++
++  private static final Logger LOG = LoggerFactory.getLogger(ArchiveService.class);
++
++  /** The statuses a review ends in. */
++  private static final List<String> FINISHED =
++      List.of(
++          DocumentStatus.APPROVED.name(),
++          DocumentStatus.WITHDRAWN.name(),
++          DocumentStatus.REJECTED.name());
++
++  private final DocumentRepository documents;
++  private final WorkflowConfig config;
++  private final Clock clock;
++
++  public ArchiveService(DocumentRepository documents, WorkflowConfig config, Clock clock) {
++    this.documents = documents;
++    this.config = config;
++    this.clock = clock;
++  }
++
++  /** Archives up to one batch of finished documents; returns how many this call archived. */
++  @Transactional
++  public int archiveFinished() {
++    WorkflowConfig.Retention retention = config.retention();
++    Instant cutoff = clock.instant().minus(retention.finishedAfter());
++    List<Document> due = documents.lockArchivable(FINISHED, cutoff, retention.batchSize());
++    for (Document document : due) {
++      DocumentStateMachine.archive(document);
++    }
++    if (!due.isEmpty()) {
++      LOG.info("archived {} finished documents", due.size());
++    }
++    return due.size();
++  }
++}
+diff --git a/src/main/java/com/papertrail/workflow/service/DocumentService.java b/src/main/java/com/papertrail/workflow/service/DocumentService.java
+index f8315e3..fc8f2f9 100644
+--- a/src/main/java/com/papertrail/workflow/service/DocumentService.java
++++ b/src/main/java/com/papertrail/workflow/service/DocumentService.java
+@@ -1,5 +1,6 @@
+ package com.papertrail.workflow.service;
+ 
++import com.papertrail.workflow.config.WorkflowConfig;
+ import com.papertrail.workflow.domain.AppUser;
+ import com.papertrail.workflow.domain.AuditEvent;
+ import com.papertrail.workflow.domain.Document;
+@@ -47,6 +48,7 @@ public class DocumentService {
+   private final DocumentAccess access;
+   private final ApprovalService approvals;
+   private final EventLog events;
++  private final WorkflowConfig config;
+   private final Clock clock;
+ 
+   public DocumentService(
+@@ -59,6 +61,7 @@ public class DocumentService {
+       DocumentAccess access,
+       ApprovalService approvals,
+       EventLog events,
++      WorkflowConfig config,
+       Clock clock) {
+     this.documents = documents;
+     this.definitions = definitions;
+@@ -69,6 +72,7 @@ public class DocumentService {
+     this.access = access;
+     this.approvals = approvals;
+     this.events = events;
++    this.config = config;
+     this.clock = clock;
+   }
+ 
+@@ -101,7 +105,8 @@ public class DocumentService {
+     Document document = access.visible(actor, documentId);
+     List<TaskView> taskViews =
+         tasks.findForDocument(documentId).stream().map(TaskView::of).toList();
+-    return new DocumentDetail(DocumentSummary.of(document), document.getBody(), taskViews);
++    String body = document.isArchived() ? null : document.getBody();
++    return new DocumentDetail(DocumentSummary.of(document), body, document.isArchived(), taskViews);
+   }
+ 
+   /** Lists the documents the caller can see, newest first, after {@code cursor}. */
+@@ -143,7 +148,7 @@ public class DocumentService {
+   public void resubmit(Principal actor, long documentId) {
+     Document document = access.lockVisible(actor, documentId);
+     Instant now = clock.instant();
+-    DocumentStateMachine.resubmit(document, actor, now);
++    DocumentStateMachine.resubmit(document, actor, config.retention().resubmitWindow(), now);
+     approvals.activate(document, now);
+     events.audit(
+         document, actor.userId(), "RESUBMITTED", Map.of("round", document.getRound()), now);
+diff --git a/src/main/java/com/papertrail/workflow/service/Views.java b/src/main/java/com/papertrail/workflow/service/Views.java
+index 9d0fd86..37899ec 100644
+--- a/src/main/java/com/papertrail/workflow/service/Views.java
++++ b/src/main/java/com/papertrail/workflow/service/Views.java
+@@ -61,7 +61,9 @@ public final class Views {
+     }
+   }
+ 
+-  public record DocumentDetail(DocumentSummary summary, String body, List<TaskView> tasks) {}
++  /** A document with its text; an archived document has no body any more. */
++  public record DocumentDetail(
++      DocumentSummary summary, String body, boolean archived, List<TaskView> tasks) {}
+ 
+   public record TaskView(
+       long id,
+diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
+index 96fef7a..f03ab83 100644
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -37,3 +37,7 @@ workflow:
+   escalation-batch-size: 20
+   job-interval: PT1M
+   scheduling-enabled: true
++  retention:
++    finished-after: P365D
++    resubmit-window: P30D
++    batch-size: 100
+diff --git a/src/main/resources/db/migration/V3__document_archiving.sql b/src/main/resources/db/migration/V3__document_archiving.sql
+new file mode 100644
+index 0000000..2431c83
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__document_archiving.sql
+@@ -0,0 +1,3 @@
++-- A finished document past the retention period keeps its record and audit trail but loses its text.
++ALTER TABLE document ADD COLUMN archived BOOLEAN NOT NULL DEFAULT FALSE;
++CREATE INDEX document_archivable ON document (updated_at, id) WHERE NOT archived;
+diff --git a/src/test/java/com/papertrail/workflow/config/WorkflowConfigTest.java b/src/test/java/com/papertrail/workflow/config/WorkflowConfigTest.java
+index bd6620f..6aa088d 100644
+--- a/src/test/java/com/papertrail/workflow/config/WorkflowConfigTest.java
++++ b/src/test/java/com/papertrail/workflow/config/WorkflowConfigTest.java
+@@ -24,7 +24,8 @@ class WorkflowConfigTest {
+         retryBase,
+         20,
+         jobInterval,
+-        true);
++        true,
++        new WorkflowConfig.Retention(Duration.ofDays(365), Duration.ofDays(30), 100));
+   }
+ 
+   @Test
+@@ -61,6 +62,14 @@ class WorkflowConfigTest {
+         .isInstanceOf(IllegalArgumentException.class);
+   }
+ 
++  @Test
++  void retentionPeriodsMayNotBeNegative() {
++    assertThatThrownBy(() -> new WorkflowConfig.Retention(Duration.ofDays(-1), Duration.ZERO, 100))
++        .isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(() -> new WorkflowConfig.Retention(Duration.ZERO, Duration.ofDays(-1), 100))
++        .isInstanceOf(IllegalArgumentException.class);
++  }
++
+   @Test
+   void theJobIntervalMustBePositive() {
+     assertThatThrownBy(
+diff --git a/src/test/java/com/papertrail/workflow/domain/DocumentStateMachineTest.java b/src/test/java/com/papertrail/workflow/domain/DocumentStateMachineTest.java
+index bb5aa53..07b579f 100644
+--- a/src/test/java/com/papertrail/workflow/domain/DocumentStateMachineTest.java
++++ b/src/test/java/com/papertrail/workflow/domain/DocumentStateMachineTest.java
+@@ -3,6 +3,7 @@ package com.papertrail.workflow.domain;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ 
++import java.time.Duration;
+ import java.time.Instant;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+@@ -11,6 +12,7 @@ import org.springframework.test.util.ReflectionTestUtils;
+ class DocumentStateMachineTest {
+ 
+   private static final Instant NOW = Instant.parse("2027-05-03T10:00:00Z");
++  private static final Duration WINDOW = Duration.ofDays(30);
+   private static final long OWNER = 1L;
+   private static final long APPROVER = 2L;
+   private static final long STRANGER = 3L;
+@@ -63,7 +65,7 @@ class DocumentStateMachineTest {
+   @Test
+   void resubmitIsOnlyAllowedAfterRejection() {
+     assertThatThrownBy(
+-            () -> DocumentStateMachine.resubmit(document, new Principal(OWNER, false), NOW))
++            () -> DocumentStateMachine.resubmit(document, new Principal(OWNER, false), WINDOW, NOW))
+         .isInstanceOf(InvalidTransitionException.class);
+   }
+ 
+@@ -72,12 +74,24 @@ class DocumentStateMachineTest {
+     DocumentStateMachine.submit(document, new Principal(OWNER, false), NOW);
+     DocumentStateMachine.reject(document, NOW);
+ 
+-    DocumentStateMachine.resubmit(document, new Principal(OWNER, false), NOW);
++    DocumentStateMachine.resubmit(document, new Principal(OWNER, false), WINDOW, NOW);
+ 
+     assertThat(document.getStatus()).isEqualTo(DocumentStatus.IN_REVIEW);
+     assertThat(document.getRound()).isEqualTo(2);
+   }
+ 
++  @Test
++  void aRejectionIsFinalOnceTheResubmitWindowHasClosed() {
++    DocumentStateMachine.submit(document, new Principal(OWNER, false), NOW);
++    DocumentStateMachine.reject(document, NOW);
++
++    assertThatThrownBy(
++            () ->
++                DocumentStateMachine.resubmit(
++                    document, new Principal(OWNER, false), WINDOW, NOW.plus(WINDOW)))
++        .isInstanceOf(InvalidTransitionException.class);
++  }
++
+   @Test
+   void withdrawNeedsTheOwnerAndAReviewInProgress() {
+     assertThatThrownBy(
+diff --git a/src/test/java/com/papertrail/workflow/service/ArchiveServiceTest.java b/src/test/java/com/papertrail/workflow/service/ArchiveServiceTest.java
+new file mode 100644
+index 0000000..ce779c1
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/service/ArchiveServiceTest.java
+@@ -0,0 +1,121 @@
++package com.papertrail.workflow.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++
++import com.papertrail.workflow.domain.Decision;
++import com.papertrail.workflow.domain.Document;
++import com.papertrail.workflow.domain.InvalidTransitionException;
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.integration.ArchiveJob;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.time.Duration;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class ArchiveServiceTest extends IntegrationTestBase {
++
++  private static final Duration YEAR = Duration.ofDays(365);
++
++  @Autowired private DocumentService documents;
++  @Autowired private ApprovalService approvals;
++  @Autowired private ArchiveJob job;
++
++  private long owner;
++  private long approver;
++
++  @BeforeEach
++  void setUp() {
++    owner = data.user("Ines Berg");
++    approver = data.user("Tomas Vale");
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++  }
++
++  private long submitted(String title) {
++    long id = data.draft(data.principal(owner), "Contract", title);
++    documents.submit(data.principal(owner), id);
++    return id;
++  }
++
++  private long decided(String title, Decision decision) {
++    long id = submitted(title);
++    approvals.decide(data.principal(approver), taskOf(id, approver), decision, null);
++    return id;
++  }
++
++  private String body(long id) {
++    return jdbc.queryForObject("select body from document where id = ?", String.class, id);
++  }
++
++  @Test
++  void finishedDocumentsAreArchivedOnceTheRetentionPeriodHasPassed() {
++    long approved = decided("Supplier contract", Decision.APPROVE);
++    long withdrawn = submitted("Office lease");
++    documents.withdraw(data.principal(owner), withdrawn);
++    long underReview = submitted("Travel policy");
++    long draft = data.draft(data.principal(owner), "Contract", "Draft memo");
++
++    clock.advance(YEAR.minusMinutes(1));
++    assertThat(job.runOnce()).isZero();
++
++    clock.advance(Duration.ofMinutes(1));
++    assertThat(job.runOnce()).isEqualTo(2);
++
++    assertThat(body(approved)).isEqualTo(Document.ARCHIVED_BODY);
++    assertThat(body(withdrawn)).isEqualTo(Document.ARCHIVED_BODY);
++    assertThat(body(underReview)).isEqualTo("Invented body text for Travel policy");
++    assertThat(body(draft)).isEqualTo("Invented body text for Draft memo");
++    assertThat(job.runOnce()).isZero();
++  }
++
++  @Test
++  void anArchivedDocumentKeepsItsRecordButNotItsText() throws Exception {
++    long approved = decided("Supplier contract", Decision.APPROVE);
++    int auditRows =
++        jdbc.queryForObject(
++            "select count(*) from audit_event where document_id = ?", Integer.class, approved);
++
++    clock.advance(YEAR.plusDays(1));
++    job.runOnce();
++
++    mvc.perform(get("/api/v1/documents/" + approved).header("Authorization", data.bearer(owner)))
++        .andExpect(jsonPath("$.archived").value(true))
++        .andExpect(jsonPath("$.body").doesNotExist())
++        .andExpect(jsonPath("$.summary.title").value("Supplier contract"))
++        .andExpect(jsonPath("$.tasks[0].status").value("APPROVED"));
++    assertThat(
++            jdbc.queryForObject(
++                "select count(*) from audit_event where document_id = ?", Integer.class, approved))
++        .isEqualTo(auditRows);
++  }
++
++  @Test
++  void aRejectedDocumentCanBeResubmittedOnlyWithinTheWindow() {
++    long early = decided("Supplier contract", Decision.REJECT);
++    long late = decided("Office lease", Decision.REJECT);
++
++    clock.advance(Duration.ofDays(29));
++    documents.resubmit(data.principal(owner), early);
++
++    clock.advance(Duration.ofDays(1));
++    assertThatThrownBy(() -> documents.resubmit(data.principal(owner), late))
++        .isInstanceOf(InvalidTransitionException.class);
++  }
++
++  @Test
++  void aFinalRejectionIsArchivedAfterTheRetentionPeriod() {
++    long rejected = decided("Supplier contract", Decision.REJECT);
++
++    clock.advance(YEAR.plusDays(1));
++    assertThat(job.runOnce()).isEqualTo(1);
++
++    assertThat(body(rejected)).isEqualTo(Document.ARCHIVED_BODY);
++    assertThat(
++            jdbc.queryForObject("select status from document where id = ?", String.class, rejected))
++        .isEqualTo("REJECTED");
++  }
++}

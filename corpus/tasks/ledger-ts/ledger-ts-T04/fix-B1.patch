@@ -1,0 +1,40 @@
+diff --git a/src/repositories/entries.ts b/src/repositories/entries.ts
+index 5f78d4b..9ad6a0f 100644
+--- a/src/repositories/entries.ts
++++ b/src/repositories/entries.ts
+@@ -108,6 +108,21 @@ export async function listEntriesInPeriod(
+   return result.rows.map(mapEntry);
+ }
+ 
++/** The sum of an account's entries with created_at >= since. */
++export async function sumEntriesSince(
++  db: Queryable,
++  tenantId: string,
++  accountId: string,
++  since: Date,
++): Promise<bigint> {
++  const result = await db.query<{ total: string }>(
++    `SELECT coalesce(sum(amount_minor), 0) AS total FROM entries
++     WHERE tenant_id = $1 AND account_id = $2 AND created_at >= $3`,
++    [tenantId, accountId, since],
++  );
++  return toBigInt(result.rows[0]?.total ?? "0");
++}
++
+ /** The legs of one transfer: the debit first, then the credit. */
+ export async function listEntriesForTransfer(
+   db: Queryable,
+diff --git a/src/services/statementService.ts b/src/services/statementService.ts
+index 5a98154..30707d8 100644
+--- a/src/services/statementService.ts
++++ b/src/services/statementService.ts
+@@ -59,7 +59,8 @@ export class StatementService {
+           );
+         }
+         const movement = entriesTotal(rows);
+-        const openingBalance = account.balanceMinor - movement;
++        const since = await entries.sumEntriesSince(client, tenantId, accountId, period.start);
++        const openingBalance = account.balanceMinor - since;
+         return {
+           account,
+           period,

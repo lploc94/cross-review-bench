@@ -1,0 +1,402 @@
+diff --git a/packages/client/src/store/docsStore.ts b/packages/client/src/store/docsStore.ts
+index 0706b20..4bf7a65 100644
+--- a/packages/client/src/store/docsStore.ts
++++ b/packages/client/src/store/docsStore.ts
+@@ -1,73 +1,113 @@
+-import type { DocState } from "@sync/shared";
++import type { DocState, FieldWrite } from "@sync/shared";
+ import type { Statement } from "better-sqlite3";
+ import type { SqliteDatabase } from "./database.js";
+-import { parseJsonObject } from "./errors.js";
++import { CorruptStoreError } from "./errors.js";
+ 
+ export interface StoredDoc extends DocState {
+   readonly collection: string;
+   readonly id: string;
+ }
+ 
+-interface DocRow {
++/** A document joined with its fields: one row per field, or one row of nulls without fields. */
++interface FieldRow {
+   collection: string;
+   id: string;
+-  fields: string;
+-  field_hlcs: string;
++  field: string | null;
++  value: string | null;
++  hlc: string | null;
+ }
+ 
+-function toDoc(row: DocRow): StoredDoc {
+-  const where = `document ${row.collection}/${row.id}`;
+-  return {
+-    collection: row.collection,
+-    id: row.id,
+-    fields: parseJsonObject<unknown>(row.fields, `fields of ${where}`),
+-    fieldHlcs: parseJsonObject<string>(row.field_hlcs, `field timestamps of ${where}`),
+-  };
++/** The documents `docs` (a table or a subquery) selects, with their fields. */
++function joined(docs: string): string {
++  return `SELECT d.collection, d.id, f.field, f.value, f.hlc
++            FROM ${docs} d LEFT JOIN doc_fields f ON f.collection = d.collection AND f.doc_id = d.id`;
+ }
+ 
+-/** The `docs` table: the local replica of every document. */
++function parseValue(row: FieldRow & { field: string; value: string }): unknown {
++  try {
++    return JSON.parse(row.value);
++  } catch (err) {
++    throw new CorruptStoreError(`field ${row.field} of document ${row.collection}/${row.id} is not valid JSON`, {
++      cause: err,
++    });
++  }
++}
++
++/** Fold joined rows, ordered by document, into documents. */
++function toDocs(rows: readonly FieldRow[]): StoredDoc[] {
++  const docs: StoredDoc[] = [];
++  let current: { collection: string; id: string; fields: Record<string, unknown>; fieldHlcs: Record<string, string> } | undefined;
++  for (const row of rows) {
++    if (current?.collection !== row.collection || current.id !== row.id) {
++      current = { collection: row.collection, id: row.id, fields: {}, fieldHlcs: {} };
++      docs.push(current);
++    }
++    if (row.field === null || row.value === null || row.hlc === null) continue;
++    current.fields[row.field] = parseValue({ ...row, field: row.field, value: row.value });
++    current.fieldHlcs[row.field] = row.hlc;
++  }
++  return docs;
++}
++
++/**
++ * The local replica: `docs` lists the documents and `doc_fields` holds one row per field with
++ * its value (JSON) and the HLC of the write that set it, so a merge rewrites only the fields
++ * that changed.
++ */
+ export class DocsStore {
+-  private readonly selectOne: Statement<[string, string], DocRow>;
+-  private readonly selectCollection: Statement<[string], DocRow>;
+-  private readonly selectPage: Statement<[string, string, number], DocRow>;
+-  private readonly upsert: Statement<[string, string, string, string]>;
++  private readonly db: SqliteDatabase;
++  private readonly selectOne: Statement<[string, string], FieldRow>;
++  private readonly selectCollection: Statement<[string], FieldRow>;
++  private readonly selectPage: Statement<[string, string, number], FieldRow>;
++  private readonly insertDoc: Statement<[string, string]>;
++  private readonly upsertField: Statement<[string, string, string, string, string]>;
+   private readonly countCollection: Statement<[string], { count: number }>;
+ 
+   constructor(db: SqliteDatabase) {
+-    this.selectOne = db.prepare(
+-      "SELECT collection, id, fields, field_hlcs FROM docs WHERE collection = ? AND id = ?",
+-    );
+-    this.selectCollection = db.prepare(
+-      "SELECT collection, id, fields, field_hlcs FROM docs WHERE collection = ? ORDER BY id",
+-    );
++    this.db = db;
++    this.selectOne = db.prepare(`${joined("docs")} WHERE d.collection = ? AND d.id = ? ORDER BY f.field`);
++    this.selectCollection = db.prepare(`${joined("docs")} WHERE d.collection = ? ORDER BY d.id, f.field`);
+     this.selectPage = db.prepare(
+-      "SELECT collection, id, fields, field_hlcs FROM docs WHERE collection = ? AND id > ? ORDER BY id LIMIT ?",
++      `${joined("(SELECT collection, id FROM docs WHERE collection = ? AND id > ? ORDER BY id LIMIT ?)")}
++        ORDER BY d.id, f.field`,
+     );
+-    this.upsert = db.prepare(
+-      `INSERT INTO docs (collection, id, fields, field_hlcs) VALUES (?, ?, ?, ?)
+-       ON CONFLICT (collection, id) DO UPDATE SET fields = excluded.fields, field_hlcs = excluded.field_hlcs`,
++    this.insertDoc = db.prepare("INSERT INTO docs (collection, id) VALUES (?, ?) ON CONFLICT DO NOTHING");
++    this.upsertField = db.prepare(
++      `INSERT INTO doc_fields (collection, doc_id, field, value, hlc) VALUES (?, ?, ?, ?, ?)
++       ON CONFLICT (collection, doc_id, field) DO UPDATE SET value = excluded.value, hlc = excluded.hlc`,
+     );
+     this.countCollection = db.prepare("SELECT count(*) AS count FROM docs WHERE collection = ?");
+   }
+ 
+   get(collection: string, id: string): StoredDoc | null {
+-    const row = this.selectOne.get(collection, id);
+-    return row ? toDoc(row) : null;
++    return toDocs(this.selectOne.all(collection, id))[0] ?? null;
+   }
+ 
+   /** Every document of the collection, by id. */
+   list(collection: string): StoredDoc[] {
+-    return this.selectCollection.all(collection).map(toDoc);
++    return toDocs(this.selectCollection.all(collection));
+   }
+ 
+   /** At most `limit` documents of the collection with ids after `afterId`, by id. */
+   listPage(collection: string, afterId: string | null, limit: number): StoredDoc[] {
+     // Every id sorts after the empty string.
+-    return this.selectPage.all(collection, afterId ?? "", limit).map(toDoc);
++    return toDocs(this.selectPage.all(collection, afterId ?? "", limit));
+   }
+ 
++  /** Store every field of `state` (creating the document if needed). */
+   put(collection: string, id: string, state: DocState): void {
+-    this.upsert.run(collection, id, JSON.stringify(state.fields), JSON.stringify(state.fieldHlcs));
++    const writes = Object.entries(state.fieldHlcs).map(([field, hlc]) => ({ field, value: state.fields[field], hlc }));
++    this.writeFields(collection, id, writes);
++  }
++
++  /** Store the field writes that won a merge (creating the document if needed). */
++  writeFields(collection: string, id: string, writes: readonly FieldWrite[]): void {
++    this.db.transaction(() => {
++      this.insertDoc.run(collection, id);
++      for (const write of writes) {
++        this.upsertField.run(collection, id, write.field, JSON.stringify(write.value), write.hlc);
++      }
++    })();
+   }
+ 
+   count(collection: string): number {
+diff --git a/packages/client/src/store/migrator.ts b/packages/client/src/store/migrator.ts
+index db26dd3..2a0b463 100644
+--- a/packages/client/src/store/migrator.ts
++++ b/packages/client/src/store/migrator.ts
+@@ -28,8 +28,9 @@ function checkSequence(migrations: readonly SchemaMigration[]): void {
+ /**
+  * Bring the database to the latest schema. Each migration runs in its own IMMEDIATE transaction
+  * together with the new `user_version`, so a failed migration leaves the previous version intact
+- * and two processes opening the same file cannot both apply it. A database from a newer client
+- * is refused rather than written to.
++ * and two processes opening the same file cannot both apply it; a migration that is not
++ * `transactional` runs outside one, and the new version is set when it has finished. A database
++ * from a newer client is refused rather than written to.
+  */
+ export function migrate(
+   db: SqliteDatabase,
+@@ -40,6 +41,12 @@ export function migrate(
+   const from = schemaVersion(db);
+   if (from > latest) throw new SchemaVersionError(from, latest);
+   for (const migration of migrations.slice(from)) {
++    if (migration.transactional === false) {
++      if (schemaVersion(db) >= migration.version) continue;
++      migration.up(db);
++      db.pragma(`user_version = ${migration.version}`);
++      continue;
++    }
+     db.transaction(() => {
+       // Another connection may have migrated since the version was read.
+       if (schemaVersion(db) >= migration.version) return;
+diff --git a/packages/client/src/store/schema.ts b/packages/client/src/store/schema.ts
+index 7ffd9ff..7b22da0 100644
+--- a/packages/client/src/store/schema.ts
++++ b/packages/client/src/store/schema.ts
+@@ -1,4 +1,5 @@
+ import type { SqliteDatabase } from "./database.js";
++import { CorruptStoreError, parseJsonObject } from "./errors.js";
+ 
+ /**
+  * The client's schema, versioned with `PRAGMA user_version`. Each migration moves the database
+@@ -7,6 +8,12 @@ import type { SqliteDatabase } from "./database.js";
+ export interface SchemaMigration {
+   readonly version: number;
+   readonly description: string;
++  /**
++   * Whether `up` runs inside the migrator's transaction (the default). A migration that runs a
++   * statement SQLite refuses inside a transaction, such as VACUUM, sets it to false: the
++   * migrator then calls `up` on its own and sets `user_version` once it has returned.
++   */
++  readonly transactional?: boolean;
+   up(db: SqliteDatabase): void;
+ }
+ 
+@@ -39,12 +46,61 @@ const V1 = `
+   ) WITHOUT ROWID;
+ `;
+ 
++const V2_FIELDS = `
++  -- One row per field of a document: its value as JSON and the HLC of the write that set it.
++  CREATE TABLE doc_fields (
++    collection TEXT NOT NULL,
++    doc_id     TEXT NOT NULL,
++    field      TEXT NOT NULL,
++    value      TEXT NOT NULL,
++    hlc        TEXT NOT NULL,
++    PRIMARY KEY (collection, doc_id, field)
++  ) WITHOUT ROWID;
++`;
++
++interface V1DocRow {
++  collection: string;
++  id: string;
++  fields: string;
++  field_hlcs: string;
++}
++
++/** Copy every field of the version 1 JSON columns of `docs` into `doc_fields`. */
++function copyFieldsToRows(db: SqliteDatabase): void {
++  const rows = db.prepare<[], V1DocRow>("SELECT collection, id, fields, field_hlcs FROM docs ORDER BY collection, id").all();
++  const insert = db.prepare<[string, string, string, string, string]>(
++    "INSERT INTO doc_fields (collection, doc_id, field, value, hlc) VALUES (?, ?, ?, ?, ?)",
++  );
++  for (const row of rows) {
++    const where = `document ${row.collection}/${row.id}`;
++    const fields = parseJsonObject<unknown>(row.fields, `fields of ${where}`);
++    const hlcs = parseJsonObject<unknown>(row.field_hlcs, `field timestamps of ${where}`);
++    for (const [field, value] of Object.entries(fields)) {
++      const hlc = Object.hasOwn(hlcs, field) ? hlcs[field] : undefined;
++      if (typeof hlc !== "string") throw new CorruptStoreError(`${where} has no timestamp for field ${field}`);
++      insert.run(row.collection, row.id, field, JSON.stringify(value), hlc);
++    }
++  }
++}
++
+ export const CLIENT_MIGRATIONS: readonly SchemaMigration[] = [
+   {
+     version: 1,
+     description: "docs, outbox and meta",
+     up: (db) => db.exec(V1),
+   },
++  {
++    version: 2,
++    description: "one row per document field",
++    // VACUUM, which gives the space of the dropped columns back, cannot run in a transaction.
++    transactional: false,
++    up: (db) => {
++      db.exec(V2_FIELDS);
++      copyFieldsToRows(db);
++      db.exec("ALTER TABLE docs DROP COLUMN fields; ALTER TABLE docs DROP COLUMN field_hlcs;");
++      db.exec("VACUUM");
++    },
++  },
+ ];
+ 
+ export const CLIENT_SCHEMA_VERSION = CLIENT_MIGRATIONS.length;
+diff --git a/packages/client/src/sync/applyRemote.ts b/packages/client/src/sync/applyRemote.ts
+index 7e200fb..ba74af9 100644
+--- a/packages/client/src/sync/applyRemote.ts
++++ b/packages/client/src/sync/applyRemote.ts
+@@ -57,7 +57,7 @@ export function applyRemoteEvents(docs: DocsStore, hlc: Hlc, events: readonly Sy
+     const current = docs.get(doc.collection, doc.id) ?? EMPTY_DOC_STATE;
+     const merged = mergeWrites(current, doc.writes);
+     if (merged.applied.length === 0) continue;
+-    docs.put(doc.collection, doc.id, merged.state);
++    docs.writeFields(doc.collection, doc.id, merged.applied);
+     applied += merged.applied.length;
+     changes.push({
+       collection: doc.collection,
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 694c08a..59b740e 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -229,7 +229,7 @@ export class SyncClient {
+           hlc: formatHlc(ts),
+         };
+         const merged = mergeWrites(docs.get(write.collection, write.id) ?? EMPTY_DOC_STATE, fieldWritesOf(mutation));
+-        docs.put(write.collection, write.id, merged.state);
++        docs.writeFields(write.collection, write.id, merged.applied);
+         outbox.append(mutation);
+         meta.setLastHlc(ts);
+         const change: DocumentChange = {
+diff --git a/packages/client/test/store/migrator.test.ts b/packages/client/test/store/migrator.test.ts
+index ac02670..a24b430 100644
+--- a/packages/client/test/store/migrator.test.ts
++++ b/packages/client/test/store/migrator.test.ts
+@@ -1,4 +1,5 @@
+ import {
++  CLIENT_MIGRATIONS,
+   CLIENT_SCHEMA_VERSION,
+   IN_MEMORY,
+   SchemaVersionError,
+@@ -8,6 +9,7 @@ import {
+   type SchemaMigration,
+ } from "@sync/client";
+ import { describe, expect, it } from "vitest";
++import { DocsStore } from "../../src/store/docsStore.js";
+ import { tempDbPath } from "../helpers/tempFiles.js";
+ 
+ function tables(db: ReturnType<typeof openDatabase>): string[] {
+@@ -21,8 +23,8 @@ describe("client schema migrator", () => {
+   it("creates the schema on a new database", () => {
+     const db = openDatabase(IN_MEMORY);
+     expect(migrate(db)).toEqual({ from: 0, to: CLIENT_SCHEMA_VERSION });
+-    expect(tables(db)).toEqual(["docs", "meta", "outbox"]);
+-    expect(schemaVersion(db)).toBe(1);
++    expect(tables(db)).toEqual(["doc_fields", "docs", "meta", "outbox"]);
++    expect(schemaVersion(db)).toBe(CLIENT_SCHEMA_VERSION);
+     db.close();
+   });
+ 
+@@ -32,13 +34,13 @@ describe("client schema migrator", () => {
+     migrate(first);
+     first.close();
+     const again = openDatabase(path);
+-    expect(migrate(again)).toEqual({ from: 1, to: 1 });
++    expect(migrate(again)).toEqual({ from: CLIENT_SCHEMA_VERSION, to: CLIENT_SCHEMA_VERSION });
+     again.close();
+   });
+ 
+   it("applies later migrations in order", () => {
+     const db = openDatabase(IN_MEMORY);
+-    migrate(db);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
+     const steps: SchemaMigration[] = [
+       { version: 1, description: "base", up: () => expect.unreachable() },
+       { version: 2, description: "add a table", up: (d) => d.exec("CREATE TABLE extra (id TEXT)") },
+@@ -51,7 +53,7 @@ describe("client schema migrator", () => {
+ 
+   it("leaves the previous version intact when a migration fails", () => {
+     const db = openDatabase(IN_MEMORY);
+-    migrate(db);
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
+     const steps: SchemaMigration[] = [
+       { version: 1, description: "base", up: () => undefined },
+       {
+@@ -69,6 +71,27 @@ describe("client schema migrator", () => {
+     db.close();
+   });
+ 
++  it("moves the fields of a version 1 database to one row each", () => {
++    const db = openDatabase(tempDbPath());
++    migrate(db, CLIENT_MIGRATIONS.slice(0, 1));
++    const insert = db.prepare("INSERT INTO docs (collection, id, fields, field_hlcs) VALUES (?, ?, ?, ?)");
++    insert.run("notes", "n1", JSON.stringify({ title: "Trip", tags: ["a", "b"] }), JSON.stringify({ title: "h1", tags: "h2" }));
++    insert.run("tasks", "t1", JSON.stringify({ done: false, dueDate: null }), JSON.stringify({ done: "h3", dueDate: "h4" }));
++    expect(migrate(db)).toEqual({ from: 1, to: 2 });
++
++    const columns = db.prepare<[], { name: string }>("SELECT name FROM pragma_table_info('docs')").all();
++    expect(columns.map((c) => c.name)).toEqual(["collection", "id"]);
++    const docs = new DocsStore(db);
++    expect(docs.get("notes", "n1")).toEqual({
++      collection: "notes",
++      id: "n1",
++      fields: { title: "Trip", tags: ["a", "b"] },
++      fieldHlcs: { title: "h1", tags: "h2" },
++    });
++    expect(docs.get("tasks", "t1")?.fields).toEqual({ done: false, dueDate: null });
++    db.close();
++  });
++
+   it("refuses a database written by a newer client", () => {
+     const db = openDatabase(IN_MEMORY);
+     db.pragma("user_version = 7");
+diff --git a/packages/client/test/store/stores.test.ts b/packages/client/test/store/stores.test.ts
+index 5302942..7a0e452 100644
+--- a/packages/client/test/store/stores.test.ts
++++ b/packages/client/test/store/stores.test.ts
+@@ -88,6 +88,14 @@ describe("DocsStore", () => {
+     expect(docs.count("notes")).toBe(2);
+   });
+ 
++  it("writes only the fields given and keeps the others", () => {
++    const docs = new DocsStore(db);
++    docs.put("notes", "a", { fields: { title: "A", pinned: false }, fieldHlcs: { title: hlc, pinned: hlc } });
++    const later = formatHlc({ wallMs: 1_894_701_600_001, counter: 0, node: "n1" });
++    docs.writeFields("notes", "a", [{ field: "pinned", value: true, hlc: later }]);
++    expect(docs.get("notes", "a")).toMatchObject({ fields: { title: "A", pinned: true }, fieldHlcs: { title: hlc, pinned: later } });
++  });
++
+   it("pages by id", () => {
+     const docs = new DocsStore(db);
+     for (const id of ["d", "a", "c", "b"]) docs.put("notes", id, { fields: {}, fieldHlcs: {} });
+@@ -97,7 +105,8 @@ describe("DocsStore", () => {
+   });
+ 
+   it("reports a corrupt row instead of returning it", () => {
+-    db.prepare("INSERT INTO docs (collection, id, fields, field_hlcs) VALUES ('notes', 'bad', '[1]', '{}')").run();
++    db.exec("INSERT INTO docs (collection, id) VALUES ('notes', 'bad')");
++    db.exec(`INSERT INTO doc_fields (collection, doc_id, field, value, hlc) VALUES ('notes', 'bad', 'title', '{"x', '${hlc}')`);
+     expect(() => new DocsStore(db).get("notes", "bad")).toThrow(CorruptStoreError);
+   });
+ });

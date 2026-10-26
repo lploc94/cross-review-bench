@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T13",
+  "repo": "uploads-ts",
+  "kind": "clean",
+  "title": "Per-tenant upload size limits",
+  "description": "`MAX_UPLOAD_BYTES` is one value for the whole service, so it has to fit the tenant with the largest files. Several tenants on small plans asked for a lower ceiling of their own (to stop a misconfigured client from uploading video into a document store), and support wants to give them one without a deployment.\n\n- Migration 0004 adds `tenants.max_upload_bytes bigint` (NULL means `MAX_UPLOAD_BYTES`, `CHECK > 0`).\n- `PATCH /v1/tenant` (scope `tenant:admin`) now takes `{ quotaBytes?, maxUploadBytes? }`, at least one of them, in one UPDATE. `maxUploadBytes` is 1 to `MAX_UPLOAD_BYTES`, or `null` to go back to the service's limit. `TenantService.setQuota` becomes `update`. Tenants are returned with `maxUploadBytes`.\n- The limit that applies is `uploadLimitOf(tenant, MAX_UPLOAD_BYTES)`: the tenant's own value, but never more than `MAX_UPLOAD_BYTES`, in case that setting is lowered after a tenant's limit was set.\n- It is enforced exactly where the global limit was: PUT checks an announced size (Content-Length) up front, and PUT and multipart both give the `UploadMeter` the tenant's limit, so a body of unknown length fails as soon as it passes it; resumable sessions are checked when they are created. Errors are the usual 413 `payload_too_large` with `details.limitBytes` set to the limit that applied. Sessions created before a limit was lowered keep their size.\n- README: a section on the upload size limit, the PATCH body and the tenant shape.\n\nTests in `test/api/uploadLimits.test.ts`: setting, reporting and clearing the limit, validation and scope, PUT with and without Content-Length, multipart, resumable session creation, other tenants keeping the service's limit, and the service's limit winning when it is lower.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["test/hidden/tenantUploadLimit.test.ts"],
+  "clean_hidden_test_cmd": "npx vitest run test/hidden/tenantUploadLimit.test.ts"
+}

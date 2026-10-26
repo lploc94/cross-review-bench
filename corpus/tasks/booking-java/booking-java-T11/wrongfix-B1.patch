@@ -1,0 +1,12 @@
+diff --git a/src/main/java/com/innkeep/booking/domain/DisplayRate.java b/src/main/java/com/innkeep/booking/domain/DisplayRate.java
+index 63c6587..fc1add2 100644
+--- a/src/main/java/com/innkeep/booking/domain/DisplayRate.java
++++ b/src/main/java/com/innkeep/booking/domain/DisplayRate.java
+@@ -18,6 +18,6 @@ public record DisplayRate(Currency from, Currency to, BigDecimal rate) {
+ 
+   /** An amount in the {@code from} currency, converted and rounded to the display currency. */
+   public BigDecimal convert(BigDecimal amount) {
+-    return amount.multiply(rate).setScale(to.getDefaultFractionDigits(), RoundingMode.HALF_UP);
++    return amount.multiply(rate).setScale(2, RoundingMode.HALF_EVEN);
+   }
+ }

@@ -1,0 +1,23 @@
+diff --git a/src/services/balanceCache.ts b/src/services/balanceCache.ts
+index 0b30ab7..f7b2585 100644
+--- a/src/services/balanceCache.ts
++++ b/src/services/balanceCache.ts
+@@ -20,7 +20,7 @@ type CachedAccount = Omit<Account, "balanceMinor" | "heldMinor" | "createdAt" |
+  *   from before it; the TTL bounds how long such a copy is served.
+  * - `balance:<tenant>:<account>:as_of:<ms>`: the balance at a past instant, computed from
+  *   entries. Once no transaction can still write an entry before that instant the value never
+- *   changes, so it is written once and kept.
++ *   changes, but clients choose the instant, so these expire after `ttlSeconds` too.
+  *
+  * Redis problems never fail a request: a failed read falls back to Postgres and a failed write
+  * or delete is logged.
+@@ -74,7 +74,8 @@ export class BalanceCache {
+   ): Promise<void> {
+     if (!this.enabled) return;
+     const key = this.asOfKey(tenantId, accountId, asOf);
+-    await this.write("put as_of", () => this.redis.set(key, balanceMinor.toString()));
++    const value = balanceMinor.toString();
++    await this.write("put as_of", () => this.redis.set(key, value, "EX", this.ttlSeconds));
+   }
+ 
+   private accountKey(tenantId: string, accountId: string): string {

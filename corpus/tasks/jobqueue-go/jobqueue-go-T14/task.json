@@ -1,0 +1,14 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T14",
+  "repo": "jobqueue-go",
+  "kind": "clean",
+  "title": "Per-queue worker concurrency (WORKER_QUEUE_CONCURRENCY)",
+  "description": "Every queue an instance works on gets the same `WORKER_CONCURRENCY` goroutines. That does not fit queues whose handlers call a rate-limited service (we want `reports` one at a time) next to queues that should go wide.\n\n- New `WORKER_QUEUE_CONCURRENCY`, a comma-separated list of `queue=n` entries such as `emails=2,reports=1`, overrides `WORKER_CONCURRENCY` for the queues it names; the others keep the default. With `WORKER_CONCURRENCY=0` only the named queues get workers.\n- Validated at startup with the other settings: each queue must be one of `WORKER_QUEUES`, each value an integer from 1 to 256 (the same bound as `WORKER_CONCURRENCY`), each queue listed once, and each entry must look like `queue=n`.\n- `worker.Options.QueueConcurrency` carries the overrides; `NewPool` rejects an override for a queue the pool does not work on or a value below 1, and keeps its own copy of the map. `Start` launches the right number of goroutines per queue (lease owner names stay `<ID>/<queue>/<n>`) and logs the per-queue counts.\n- New gauge `jobqueue_workers{queue}`: the goroutines started for each queue.\n- `cmd/jobqueue` passes the setting through; README documents it.\n\nTests: config parsing and every error, `NewPool` validation, and a pool with three queues where blocking handlers show how many goroutines each queue runs at once, plus the gauge.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": ["internal/config/queue_overrides_test.go", "internal/worker/queue_overrides_test.go"],
+  "clean_hidden_test_cmd": "go test -count=1 -run '^(TestQueueOverridesAtStartup|TestPoolOverrideWithoutDefaultWorkers)$' ./internal/config/ ./internal/worker/"
+}

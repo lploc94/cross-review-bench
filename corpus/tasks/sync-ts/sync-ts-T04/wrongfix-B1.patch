@@ -1,0 +1,29 @@
+diff --git a/packages/server/src/services/pushService.ts b/packages/server/src/services/pushService.ts
+index 47604fd..00f9e23 100644
+--- a/packages/server/src/services/pushService.ts
++++ b/packages/server/src/services/pushService.ts
+@@ -19,6 +19,7 @@ import { withTransaction } from "../db/tx.js";
+ import type { AuthContext } from "../domain/accounts.js";
+ import {
+   ClockDriftRejectedError,
++  ConflictError,
+   InvalidMutationError,
+   UnauthorizedError,
+   UnavailableError,
+@@ -87,6 +88,16 @@ export class PushService {
+       if (!(await lockUser(client, auth.userId))) {
+         throw new UnauthorizedError("the device's user no longer exists");
+       }
++      // A push of the same increments may have committed while this one waited for the lock:
++      // refuse it rather than add the deltas a second time.
++      const recordedMeanwhile = await findRecordedMutations(
++        client,
++        auth.userId,
++        increments.map((m) => m.mutationId),
++      );
++      if (recordedMeanwhile.size > 0) {
++        throw new ConflictError("increments of this push were recorded by another request");
++      }
+       const claimed = await claimMutations(client, auth.userId, auth.deviceId, checked, receivedAt);
+       const freshMutations = checked.filter((m) => m.op === "set" && claimed.has(m.mutationId));
+       const refs = uniqueDocs(freshMutations);

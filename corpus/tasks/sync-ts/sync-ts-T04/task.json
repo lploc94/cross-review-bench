@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "sync-ts-T04",
+  "repo": "sync-ts",
+  "kind": "buggy",
+  "title": "Counter fields: increments that add up across devices",
+  "description": "Time tracking on tasks needs a value that several devices change at once. With per-field last-writer-wins, two devices that each add 10 minutes to the same task end up with one of the two totals. This adds counter fields, starting with `tasks.timeSpentSec`.\n\n- Shared: `COUNTER_FIELDS` declares the counters of each collection. A mutation's `op` may now be `increment`, whose `fields` hold the delta of each counter (a non-zero integer, at most 10^9 either way). `checkFieldWrites` takes the op: a `set` cannot write a counter and an `increment` cannot write anything else. `addToCounters` adds deltas to a document state.\n- Server: increments are not merged by timestamp. Each one adds its delta to the stored total (`repositories/counters.ts`, creating the document when needed) and becomes one event whose value is the delta. Increments the server has already recorded are left out, so a batch sent again after a lost answer is not counted twice; sets keep their existing dedup through the mutation claim. `verify` replays counter events by adding them up.\n- Client: `SyncClient.increment(collection, id, field, delta)` adds to the local total at once and queues the mutation; the outbox stores the op (client schema version 2). A pull adds the deltas of other devices' increments to the local total; the echo of the replica's own increment (recognised by the node id in its timestamp) is skipped because it was counted when it was made.\n- `syncctl` knows the new field; README describes counters.\n\nTests: server (increments of two devices add up, events carry deltas, an increment pushed again is counted once, sets and increments of the wrong fields are refused, `verify` stays clean), client e2e (local increments, two devices converging, an increment whose push answer was lost), shared validation, and the migrator tests updated for version 2.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "packages/server/src/services/pushService.ts",
+      "lines": [75, 82],
+      "category": "data-integrity",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "Which increments are new is decided by a lookup in `mutations` made on the pool before the transaction and before `lockUser`, and the transaction then adds the delta of every increment in that list whatever `claimMutations` returned (the event insert in `applyIncrements` ignores the conflict with ON CONFLICT DO NOTHING, but the document total is updated regardless). Two pushes carrying the same increment that overlap (a retry sent while the first attempt is still running, e.g. after a client-side timeout, or the same batch from two connections) both see it as unrecorded, so the second one adds the delta again once it gets the lock: the stored total is counted twice while the change feed has the delta once, and `verify` reports the document.",
+      "trigger": "Push the same increment twice concurrently so that both requests do their lookup before either commits (e.g. while another transaction holds the user's row): both answer 200 and the document's timeSpentSec holds twice the delta.",
+      "testable": true,
+      "hidden_tests": ["packages/server/test/hidden/counterRetryRace.test.ts"],
+      "hidden_test_cmd": "npx vitest run packages/server/test/hidden/counterRetryRace.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A replay cannot slip in: pushes of one user are serialised by `lockUser` (repositories/users.ts takes SELECT ... FOR UPDATE on the user row, and PushService.push says so), so a retried push only runs after the first one has committed, its lookup in `mutations` then finds the increment, and it is left out. Even if it were not, events are UNIQUE (user_id, mutation_id, field), so an increment cannot be written twice.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

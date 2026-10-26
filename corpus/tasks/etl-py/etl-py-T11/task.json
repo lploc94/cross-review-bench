@@ -1,0 +1,81 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T11",
+  "repo": "etl-py",
+  "kind": "buggy",
+  "title": "Run metrics for the Prometheus textfile collector",
+  "description": "Operations want to alert on the ETL from Prometheus (a source that has not succeeded for a day, reject spikes, slow runs) without scraping logs. The hosts already run the node exporter, so the service now writes a file for its textfile collector.\n\n- New optional setting `METRICS_FILE` (a `*.prom` path whose directory must exist; unset: no metrics), shown by `etl settings`.\n- After every run, succeeded or failed, `Pipeline.run` rewrites the file (`pipeline/metrics.py`):\n  - `etl_runs_total{source,status}` (counter): finished runs;\n  - `etl_rows_total{source,kind}` (counter): rows read, loaded, rejected and skipped;\n  - `etl_last_success_timestamp_seconds{source}` (gauge): when the latest successful run finished;\n  - `etl_run_duration_seconds{source}` (gauge): how long the latest finished run took;\n  each with `# HELP` and `# TYPE` lines. The values are read from `etl.runs`, so the file is right whichever process ran the earlier runs.\n- The file is written atomically: a temporary file in the same directory (`.etl.prom.….tmp`, which the collector ignores), made readable by everyone (0644, since the exporter usually runs as another user; `atomic_write_text` creates 0600 files), then renamed into place. Runs of different sources can finish at the same time, so writers take a transaction-level advisory lock and a file rendered earlier never replaces a newer one.\n- A failure to write the metrics is logged (`metrics.not_written`) and never fails the run.\n\nTests in tests/pipeline/test_metrics.py: no file without the setting, the samples after a successful and after a failed run, the file mode and no temporary file left behind, an unwritable directory not failing the run, and the setting's validation. README and .env.example updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/etl/pipeline/metrics.py",
+      "lines": [
+        98,
+        101
+      ],
+      "category": "logic",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "etl_rows_total is declared a counter but render_metrics writes it from `latest` (the newest finished run per source), not from the sum over etl.runs. After a run of 3 rows and then one of 2 rows the counter goes from 3 to 2: Prometheus counters must only increase, so rate()/increase() see a reset and report wrong row rates, and the total is never the cumulative number the description promises.",
+      "trigger": "Two successful products runs loading 3 and then 2 rows: the file says etl_rows_total{source=\"products\",kind=\"loaded\"} 2 instead of 5 (etl_runs_total is 2).",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_metrics_counters.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_metrics_counters.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The counters are cumulative: render_metrics reads them from etl.runs, which keeps every run, and etl_runs_total is a COUNT(*) grouped by source and status, so nothing is lost between runs or processes; tests/pipeline/test_metrics.py checks the values after a run.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/etl/pipeline/metrics.py",
+      "lines": [
+        54,
+        69
+      ],
+      "category": "resource-leak",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "write_metrics creates the temporary file with mkstemp before it connects, locks and renders from the database. When any of that raises (database unavailable, lock or query error), the handler only logs: the temporary file is never removed, and when engine.connect() or the lock fails the descriptor from mkstemp is never closed either. Every failed metrics write leaves another `.etl.prom.*.tmp` file (and possibly an open descriptor in the long-running process) in the collector directory.",
+      "trigger": "Rendering fails after the temporary file was created (e.g. a query error) on three runs: the runs succeed, but the collector directory holds three stray .tmp files next to etl.prom.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_metrics_temporary_files.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_metrics_temporary_files.py",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "Nothing can be left behind: the file is written inside `with os.fdopen(...)`, so the handle is closed on every path, and the temporary name ends in .tmp, which the textfile collector ignores; test_the_file_is_readable_by_the_collector_and_nothing_else_is_left checks that the directory holds only etl.prom.",
+      "justification": null
+    },
+    {
+      "id": "B3",
+      "file": "src/etl/pipeline/metrics.py",
+      "lines": [
+        127,
+        128
+      ],
+      "category": "spec-deviation",
+      "severity": "low",
+      "difficulty": "L1",
+      "summary": "etl_run_duration_seconds is computed as the run's timedelta divided by timedelta(milliseconds=1), i.e. in milliseconds, while the metric name, its HELP text and the description say seconds (Prometheus base unit). A 2.5 s run is reported as 2500.",
+      "trigger": "A finished run that took 2.5 s: the file says etl_run_duration_seconds{source=\"products\"} 2500.0.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_metrics_duration.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_metrics_duration.py",
+      "fix_patch": "fix-B3.patch",
+      "wrong_fix_patch": "wrongfix-B3.patch",
+      "false_rebuttal": "The duration is right: tests/pipeline/test_metrics.py checks etl_run_duration_seconds after a real run, and the value matches the run's started_at and finished_at in etl.runs.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

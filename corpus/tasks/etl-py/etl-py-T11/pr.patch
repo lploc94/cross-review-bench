@@ -1,0 +1,384 @@
+diff --git a/.env.example b/.env.example
+index 3fc7578..122f9c1 100644
+--- a/.env.example
++++ b/.env.example
+@@ -9,3 +9,5 @@ REPORTING_ZONE=Europe/Berlin
+ MAX_REJECT_RATIO=0.05
+ BATCH_SIZE=1000
+ MAX_FUTURE_SKEW_SECONDS=300
++# Prometheus textfile-collector file, rewritten after every run (unset: no metrics).
++# METRICS_FILE=/var/lib/node_exporter/textfile/etl.prom
+diff --git a/README.md b/README.md
+index 2ae945d..bf7f531 100644
+--- a/README.md
++++ b/README.md
+@@ -89,6 +89,21 @@ previous successful run. They run inside the load transaction; a failing `error`
+ the run and rolls the load back, a failing `warn` check is recorded. Results land in
+ `etl.check_results`, failed runs included. Check details name columns and counts, never values.
+ 
++**Metrics.** With `METRICS_FILE` set, every run rewrites that file, whether it succeeds or
++fails, for the Prometheus node exporter's textfile collector. The values are read from
++`etl.runs`, so they cover every finished run, whichever process ran it:
++
++| Metric | Type | Labels | |
++|---|---|---|---|
++| `etl_runs_total` | counter | `source`, `status` | finished runs |
++| `etl_rows_total` | counter | `source`, `kind` (`read`, `loaded`, `rejected`, `skipped`) | rows of finished runs |
++| `etl_last_success_timestamp_seconds` | gauge | `source` | when the latest successful run finished |
++| `etl_run_duration_seconds` | gauge | `source` | how long the latest finished run took |
++
++The file is written next to its final name (`.etl.prom.….tmp`, which the collector ignores),
++made readable by everyone (mode 0644, as the exporter usually runs as another user) and renamed
++into place. A failure to write it is logged (`metrics.not_written`) and never fails the run.
++
+ **Reports.** Days are calendar days in `REPORTING_ZONE`, so an order placed at 23:30 UTC in
+ summer belongs to the next day in Berlin, and the day of a DST change has 23 or 25 hours.
+ 
+@@ -184,6 +199,7 @@ tests/                 pytest suites; tests/helpers has the clock, file builders
+ | `MAX_REJECT_RATIO` | `0.05` | 0–1; a run fails above it |
+ | `BATCH_SIZE` | `1000` | rows per staging insert and per reject write |
+ | `MAX_FUTURE_SKEW_SECONDS` | `300` | rows further in the future are rejected |
++| `METRICS_FILE` | unset | `*.prom` file for the node exporter's textfile collector; its directory must exist |
+ 
+ The command refuses to start, listing every problem, when a variable is missing or invalid.
+ See `.env.example`. Logs are JSON lines on stderr; values of keys such as `email`, `full_name`,
+diff --git a/src/etl/api/settings.py b/src/etl/api/settings.py
+index 424e52d..afddcb5 100644
+--- a/src/etl/api/settings.py
++++ b/src/etl/api/settings.py
+@@ -18,4 +18,5 @@ def show_settings(context: AppContext) -> SettingsView:
+         max_reject_ratio=settings.max_reject_ratio,
+         batch_size=settings.batch_size,
+         max_future_skew_seconds=settings.max_future_skew_seconds,
++        metrics_file=str(settings.metrics_file) if settings.metrics_file is not None else None,
+     )
+diff --git a/src/etl/config.py b/src/etl/config.py
+index 4c9b259..c191b3a 100644
+--- a/src/etl/config.py
++++ b/src/etl/config.py
+@@ -38,6 +38,8 @@ class Settings(BaseSettings):
+     max_reject_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
+     batch_size: int = Field(default=1000, ge=1, le=50_000)
+     max_future_skew_seconds: int = Field(default=300, ge=0, le=86_400)
++    # Prometheus textfile-collector file rewritten after every run; None: no metrics.
++    metrics_file: Path | None = None
+ 
+     @field_validator("database_url")
+     @classmethod
+@@ -60,6 +62,19 @@ class Settings(BaseSettings):
+             raise ValueError(f"{value} exists and is not a directory")
+         return value
+ 
++    @field_validator("metrics_file")
++    @classmethod
++    def _check_metrics_file(cls, value: Path | None) -> Path | None:
++        if value is None:
++            return None
++        if value.suffix != ".prom":
++            raise ValueError("must end in .prom (the textfile collector reads only those)")
++        if not value.parent.is_dir():
++            raise ValueError(f"{value.parent} is not a directory")
++        if value.is_dir():
++            raise ValueError(f"{value} is a directory")
++        return value
++
+     @property
+     def reporting_tz(self) -> ZoneInfo:
+         return load_zone(self.reporting_zone)
+diff --git a/src/etl/pipeline/metrics.py b/src/etl/pipeline/metrics.py
+new file mode 100644
+index 0000000..dfdac00
+--- /dev/null
++++ b/src/etl/pipeline/metrics.py
+@@ -0,0 +1,128 @@
++"""Run metrics for the Prometheus node exporter's textfile collector.
++
++After every run the metrics file (`METRICS_FILE`) is rewritten from `etl.runs`, so it always
++describes every finished run, whichever process ran it. The file is replaced atomically: the
++collector reads only `*.prom` files, and the temporary file next to it ends in `.tmp`.
++"""
++
++from __future__ import annotations
++
++import os
++import tempfile
++from collections.abc import Mapping
++from datetime import timedelta
++from pathlib import Path
++from typing import TextIO
++
++from sqlalchemy import Connection, Engine, func, select, text
++from sqlalchemy.dialects.postgresql import distinct_on
++
++from etl.errors import describe_error
++from etl.infra.locks import LOCK_NAMESPACE, lock_key
++from etl.infra.tables import runs
++from etl.logging import get_logger
++from etl.store.runs import RunStatus
++
++log = get_logger(__name__)
++
++# Row counts of a run, as the `kind` label of etl_rows_total.
++ROW_KINDS = ("read", "loaded", "rejected", "skipped")
++
++# The node exporter usually runs as another user: the file must be readable by everyone.
++FILE_MODE = 0o644
++
++# Held until the writer's transaction ends.
++WRITER_LOCK = text("SELECT pg_advisory_xact_lock(CAST(:ns AS integer), CAST(:key AS integer))")
++
++
++def _escape(value: str) -> str:
++    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
++
++
++def _family(out: TextIO, name: str, kind: str, description: str) -> None:
++    out.write(f"# HELP {name} {description}\n# TYPE {name} {kind}\n")
++
++
++def _sample(out: TextIO, name: str, labels: Mapping[str, str], value: float) -> None:
++    rendered = ",".join(f'{key}="{_escape(label)}"' for key, label in labels.items())
++    out.write(f"{name}{{{rendered}}} {value!r}\n")
++
++
++def write_metrics(engine: Engine, path: Path) -> None:
++    """Replace the metrics file with the current metrics. Never raises: a failure is logged
++    and the previous file stays as it was, since metrics must never fail a run."""
++    try:
++        descriptor, temporary = tempfile.mkstemp(
++            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
++        )
++        with engine.connect() as connection:
++            # Runs of different sources can finish together: one writer at a time, so a file
++            # rendered earlier never replaces one rendered later.
++            connection.execute(WRITER_LOCK, {"ns": LOCK_NAMESPACE, "key": lock_key("etl.metrics")})
++            with os.fdopen(descriptor, "w", encoding="utf-8") as out:
++                render_metrics(connection, out)
++                out.flush()
++                os.fsync(out.fileno())
++            os.chmod(temporary, FILE_MODE)
++            os.replace(temporary, path)
++    except Exception as error:
++        log.error("metrics.not_written", path=str(path), error=describe_error(error))
++
++
++def render_metrics(connection: Connection, out: TextIO) -> None:
++    """Write the metrics of every source with a finished run."""
++    finished = runs.c.status != RunStatus.RUNNING
++
++    _family(out, "etl_runs_total", "counter", "Finished runs per source and status.")
++    per_status = connection.execute(
++        select(runs.c.source, runs.c.status, func.count())
++        .where(finished)
++        .group_by(runs.c.source, runs.c.status)
++        .order_by(runs.c.source, runs.c.status)
++    )
++    for source, status, total in per_status:
++        _sample(out, "etl_runs_total", {"source": source, "status": status}, int(total))
++
++    latest = (
++        connection.execute(
++            select(runs)
++            .where(finished)
++            .ext(distinct_on(runs.c.source))
++            .order_by(runs.c.source, runs.c.id.desc())
++        )
++        .mappings()
++        .all()
++    )
++
++    _family(out, "etl_rows_total", "counter", "Rows of finished runs per source and kind.")
++    for run in latest:
++        for kind in ROW_KINDS:
++            labels = {"source": run["source"], "kind": kind}
++            _sample(out, "etl_rows_total", labels, int(run[f"rows_{kind}"]))
++
++    _family(
++        out,
++        "etl_last_success_timestamp_seconds",
++        "gauge",
++        "When the latest successful run of the source finished (Unix time).",
++    )
++    last_success = connection.execute(
++        select(runs.c.source, func.max(runs.c.finished_at))
++        .where(runs.c.status == RunStatus.SUCCEEDED)
++        .group_by(runs.c.source)
++        .order_by(runs.c.source)
++    )
++    for source, finished_at in last_success:
++        _sample(
++            out, "etl_last_success_timestamp_seconds", {"source": source}, finished_at.timestamp()
++        )
++
++    _family(
++        out,
++        "etl_run_duration_seconds",
++        "gauge",
++        "How long the latest finished run of the source took.",
++    )
++    for run in latest:
++        duration = (run["finished_at"] - run["started_at"]) / timedelta(milliseconds=1)
++        _sample(out, "etl_run_duration_seconds", {"source": run["source"]}, duration)
+diff --git a/src/etl/pipeline/runner.py b/src/etl/pipeline/runner.py
+index 5f697fe..b842e58 100644
+--- a/src/etl/pipeline/runner.py
++++ b/src/etl/pipeline/runner.py
+@@ -10,6 +10,7 @@
+    and the finished run; commit.
+ 4. On any failure the warehouse writes roll back, and the run is recorded as failed with its
+    counts, check results and error.
++5. Either way, with METRICS_FILE set, the run metrics file is rewritten (pipeline.metrics).
+ """
+ 
+ from __future__ import annotations
+@@ -38,6 +39,7 @@ from etl.load.base import LoadContext
+ from etl.logging import get_logger
+ from etl.pipeline.datasets import DATASETS, DatasetBinding
+ from etl.pipeline.extract import ExtractCounts, extract
++from etl.pipeline.metrics import write_metrics
+ from etl.pipeline.sink import RejectSink
+ from etl.pipeline.window import IncrementalWindow
+ from etl.quality.checks import Check
+@@ -135,6 +137,9 @@ class Pipeline:
+                 if isinstance(error, EtlError):
+                     error.run_id = run_id
+                 raise
++            finally:
++                if self._settings.metrics_file is not None:
++                    write_metrics(self._engine, self._settings.metrics_file)
+         counts = attempt.counts(loaded=attempt.loaded)
+         log.info(
+             "run.succeeded",
+diff --git a/src/etl/schemas/views.py b/src/etl/schemas/views.py
+index c5592cf..2b296eb 100644
+--- a/src/etl/schemas/views.py
++++ b/src/etl/schemas/views.py
+@@ -158,3 +158,4 @@ class SettingsView(View):
+     max_reject_ratio: float
+     batch_size: int
+     max_future_skew_seconds: int
++    metrics_file: str | None
+diff --git a/tests/pipeline/test_metrics.py b/tests/pipeline/test_metrics.py
+new file mode 100644
+index 0000000..57f7bb0
+--- /dev/null
++++ b/tests/pipeline/test_metrics.py
+@@ -0,0 +1,118 @@
++"""The Prometheus textfile-collector file written after every run."""
++
++from __future__ import annotations
++
++import stat
++from pathlib import Path
++
++import pytest
++
++from etl.config import load_settings
++from etl.errors import ConfigError, TooManyRejects
++from etl.pipeline.runner import Pipeline
++from tests.helpers.clock import DEFAULT_NOW
++from tests.helpers.factories import product_row, write_products
++
++URL = "postgresql://etl:secret@db.internal:5432/warehouse"
++
++
++@pytest.fixture
++def metrics_file(tmp_path: Path) -> Path:
++    directory = tmp_path / "textfile"
++    directory.mkdir()
++    return directory / "etl.prom"
++
++
++@pytest.fixture
++def metered(db, settings, clock, metrics_file) -> Pipeline:
++    return Pipeline(db, settings.model_copy(update={"metrics_file": metrics_file}), clock)
++
++
++def samples(path: Path) -> dict[str, float]:
++    values = {}
++    for line in path.read_text(encoding="utf-8").splitlines():
++        if line and not line.startswith("#"):
++            name, value = line.rsplit(" ", 1)
++            values[name] = float(value)
++    return values
++
++
++def test_without_a_metrics_file_nothing_is_written(pipeline, tmp_path):
++    pipeline.run("products", write_products(tmp_path, [product_row()]))
++
++    assert list(tmp_path.rglob("*.prom")) == []
++
++
++def test_a_successful_run_is_described(metered, metrics_file, tmp_path):
++    rows = [product_row(sku="A"), product_row(sku="B")]
++    metered.run("products", write_products(tmp_path, rows))
++
++    assert samples(metrics_file) == {
++        'etl_runs_total{source="products",status="succeeded"}': 1,
++        'etl_rows_total{source="products",kind="read"}': 2,
++        'etl_rows_total{source="products",kind="loaded"}': 2,
++        'etl_rows_total{source="products",kind="rejected"}': 0,
++        'etl_rows_total{source="products",kind="skipped"}': 0,
++        'etl_last_success_timestamp_seconds{source="products"}': DEFAULT_NOW.timestamp(),
++        'etl_run_duration_seconds{source="products"}': 0,
++    }
++    text = metrics_file.read_text(encoding="utf-8")
++    assert "# TYPE etl_runs_total counter\n" in text
++    assert "# TYPE etl_rows_total counter\n" in text
++    assert "# TYPE etl_last_success_timestamp_seconds gauge\n" in text
++    assert "# HELP etl_run_duration_seconds " in text
++
++
++def test_a_failed_run_is_described_too(metered, metrics_file, tmp_path):
++    rows = [product_row(sku="A", price="x"), product_row(sku="B")]
++
++    with pytest.raises(TooManyRejects):
++        metered.run("products", write_products(tmp_path, rows))
++
++    values = samples(metrics_file)
++    assert values['etl_runs_total{source="products",status="failed"}'] == 1
++    assert values['etl_rows_total{source="products",kind="rejected"}'] == 1
++    assert values['etl_rows_total{source="products",kind="loaded"}'] == 0
++    assert not any(name.startswith("etl_last_success") for name in values)
++
++
++def test_the_file_is_readable_by_the_collector_and_nothing_else_is_left(
++    metered, metrics_file, tmp_path
++):
++    metered.run("products", write_products(tmp_path, [product_row()]))
++
++    assert stat.S_IMODE(metrics_file.stat().st_mode) == 0o644
++    assert [path.name for path in metrics_file.parent.iterdir()] == ["etl.prom"]
++
++
++def test_a_metrics_file_that_cannot_be_written_does_not_fail_the_run(
++    metered, metrics_file, tmp_path
++):
++    metrics_file.parent.rmdir()
++
++    result = metered.run("products", write_products(tmp_path, [product_row()]))
++
++    assert result.counts.loaded == 1
++    assert not metrics_file.parent.exists()
++
++
++@pytest.fixture
++def environment(monkeypatch):
++    monkeypatch.setenv("DATABASE_URL", URL)
++    monkeypatch.delenv("METRICS_FILE", raising=False)
++    return monkeypatch
++
++
++def test_the_metrics_file_setting_is_checked(environment, metrics_file):
++    assert load_settings().metrics_file is None
++
++    environment.setenv("METRICS_FILE", str(metrics_file))
++    assert load_settings().metrics_file == metrics_file
++
++    environment.setenv("METRICS_FILE", str(metrics_file.with_suffix(".txt")))
++    with pytest.raises(ConfigError, match=r"METRICS_FILE: must end in \.prom"):
++        load_settings()
++
++    environment.setenv("METRICS_FILE", str(metrics_file.parent / "missing" / "etl.prom"))
++    with pytest.raises(ConfigError, match="is not a directory"):
++        load_settings()

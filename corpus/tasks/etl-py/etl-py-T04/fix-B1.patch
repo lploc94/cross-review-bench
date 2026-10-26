@@ -1,0 +1,49 @@
+diff --git a/src/etl/reports/daily_sales.py b/src/etl/reports/daily_sales.py
+index d7aa87b..b5688d0 100644
+--- a/src/etl/reports/daily_sales.py
++++ b/src/etl/reports/daily_sales.py
+@@ -8,10 +8,9 @@ EUR at the reference rate of each order's day.
+ 
+ from __future__ import annotations
+ 
+-import math
+ from collections import defaultdict
+ from datetime import date
+-from decimal import ROUND_HALF_EVEN, Decimal
++from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
+ from zoneinfo import ZoneInfo
+ 
+ from sqlalchemy import Connection, Date, cast, func, select
+@@ -87,12 +86,14 @@ def daily_sales_in(
+         raise FxRateMissing(missing)
+ 
+     orders_per_cell: dict[tuple[date, str], int] = defaultdict(int)
+-    amounts_per_cell: dict[tuple[date, str], list[float]] = defaultdict(list)
+-    for row in groups:
+-        rate = rates.get((row.day, row.currency), Decimal(1))
+-        cell = (row.day, row.country)
+-        orders_per_cell[cell] += row.orders
+-        amounts_per_cell[cell].append(float(row.revenue) * float(rate))
++    amounts_per_cell: dict[tuple[date, str], Decimal] = defaultdict(Decimal)
++    # Exact: enough digits for any amount NUMERIC(18, 3) sums can reach times a rate.
++    with localcontext(Context(prec=60)):
++        for row in groups:
++            rate = rates.get((row.day, row.currency), Decimal(1))
++            cell = (row.day, row.country)
++            orders_per_cell[cell] += row.orders
++            amounts_per_cell[cell] += row.revenue * rate
+     unit = currency(BASE_CURRENCY)
+     return [
+         DailySalesRow(
+@@ -100,9 +101,7 @@ def daily_sales_in(
+             country=country,
+             currency=unit.code,
+             orders=orders_per_cell[(day, country)],
+-            revenue=Decimal(str(math.fsum(amounts))).quantize(
+-                unit.quantum, rounding=ROUND_HALF_EVEN
+-            ),
++            revenue=amount.quantize(unit.quantum, rounding=ROUND_HALF_EVEN),
+         )
+-        for (day, country), amounts in sorted(amounts_per_cell.items())
++        for (day, country), amount in sorted(amounts_per_cell.items())
+     ]

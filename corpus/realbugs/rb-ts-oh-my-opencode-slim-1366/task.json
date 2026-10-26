@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-ts-oh-my-opencode-slim-1366",
+  "repo": "rb-ts-oh-my-opencode-slim-1366",
+  "kind": "realbug",
+  "title": "fix(v2): tolerate deferred MCP transforms",
+  "description": "## Summary\n- Do not assume the v2 MCP transform callback runs synchronously during plugin setup.\n- Capture a deferred MCP draft when the host invokes the callback; startup and ordinary prompts remain available before then.\n- Add deferred-callback coverage and validate a packed artifact with a real OpenCode v2 prompt run.\n\n## Verification\n- `bun run check:ci`\n- `bun run typecheck`\n- `bun test` — 4,323 passed, 2 skipped, 0 failed\n- `bun run build`\n- `bun run verify:release`\n- Packed-artifact OpenCode v2 prompt smoke (`opencode run --log-level debug`) — exit 0, no MCP snapshot crash\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/v2/setup.ts",
+      "lines": [
+        1933,
+        1941
+      ],
+      "category": "data-integrity",
+      "severity": "medium",
+      "difficulty": "L3",
+      "summary": "captureAgentDraft stores the agent editor in pendingAgentDraft, and finalizeAgentDraft never clears it after applying the registry projection. Every later MCP transform callback (the host replays it on MCP-only rebuilds) calls finalizeAgentDraft(pendingAgentDraft) again, re-applying the cached projection to already published agents: downstream model, permission and default-agent changes are silently overwritten through a stale editor, without an agent update notification.",
+      "trigger": "Finalize agents (agent and MCP transforms both ran), let downstream code change an agent's model/permissions or the default agent, then have the host replay the MCP transform callback: the explorer agent's model and permissions are reset to the plugin's projection.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "src/v2/setup.e2e.test.ts"
+      ],
+      "hidden_test_cmd": "npx -y bun@1.3.14 test src/v2/setup.e2e.test.ts"
+    }
+  ]
+}

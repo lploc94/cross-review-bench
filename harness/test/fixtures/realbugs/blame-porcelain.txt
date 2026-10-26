@@ -1,0 +1,28 @@
+1111111111111111111111111111111111111111 40 40 2
+author Dev A
+author-mail <a@example.com>
+author-time 1755000000
+author-tz +0000
+committer Dev A
+committer-mail <a@example.com>
+committer-time 1755000000
+committer-tz +0000
+summary add lease renewal
+filename internal/lease/lease.go
+	if l.expired(now) {
+1111111111111111111111111111111111111111 41 41
+	    l.retries = 0
+2222222222222222222222222222222222222222 12 42 1
+author Dev B
+author-mail <b@example.com>
+author-time 1700000000
+author-tz +0000
+committer Dev B
+committer-mail <b@example.com>
+committer-time 1700000000
+committer-tz +0000
+summary initial import
+filename internal/lease/lease.go
+	}
+1111111111111111111111111111111111111111 43 43 1
+	return l

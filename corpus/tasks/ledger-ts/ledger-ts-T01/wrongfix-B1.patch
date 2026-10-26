@@ -1,0 +1,23 @@
+diff --git a/src/services/transferService.ts b/src/services/transferService.ts
+index 24caf44..fa15b29 100644
+--- a/src/services/transferService.ts
++++ b/src/services/transferService.ts
+@@ -104,6 +104,9 @@ export class TransferService {
+     request: ReverseTransferRequest = {},
+   ): Promise<PostingResult> {
+     const now = this.clock.now();
++    // Repeatable read: the already-reversed check and the posting work on one snapshot, so two
++    // reversals of the same transfer conflict instead of both posting.
++    const options = { isolation: "repeatable read" } as const;
+     return withTransaction(this.pool, async (client) => {
+       const original = await transfers.findTransfer(client, tenantId, id);
+       if (!original) throw NotFoundError.resource("transfer", id);
+@@ -143,7 +146,7 @@ export class TransferService {
+       });
+       await outbox.insertEvent(client, transferReversed(original, result.transfer), now);
+       return result;
+-    });
++    }, options);
+   }
+ 
+   async getTransfer(tenantId: string, id: string): Promise<TransferWithEntries> {

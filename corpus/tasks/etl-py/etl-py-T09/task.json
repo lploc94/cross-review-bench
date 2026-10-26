@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T09",
+  "repo": "etl-py",
+  "kind": "buggy",
+  "title": "Anomaly check on daily order totals",
+  "description": "The checks we have catch broken rows, but not a broken day: last month a shop export lost most of a day's orders and every check passed, because each row on its own was fine. This adds a warn-level check, `orders.daily_total.anomaly`, that runs after every orders load (and with `etl checks run`).\n\n- It takes yesterday's order total per currency, with days as calendar days in `REPORTING_ZONE` and cancelled orders left out, like the daily sales report, and compares it with the mean daily total of the 28 days before. A total more than `ANOMALY_FACTOR` times above or below the mean fails the check; a day without orders in a currency that had them counts as 0. Yesterday rather than today, so a run in the morning does not compare half a day with whole ones.\n- The mean is taken over the days that had orders; a currency with fewer than 7 such days has no baseline yet and passes, so a new installation does not warn for its first week. Details list each currency outside the range with its total as a multiple of the mean.\n- New setting `ANOMALY_FACTOR` (Decimal, default 3, must be above 1), shown by `etl settings`.\n- The check needs the settings and the clock, so it is not in the static `CHECKS` tuple: `quality.registry.build_checks(settings, clock)` returns `CHECKS` plus the configured checks. `Pipeline` and `AppContext` use it when no explicit checks are given (`AppContext.declared_checks()`); the check is one grouped query over the 29 days, like the other checks inside the load transaction.\n\nTests: tests/quality/test_daily_total_anomaly.py (no baseline, the factor's edges above and below, a day without orders, currencies compared separately, local days around midnight and the DST change, cancelled orders, the factor from the settings, the result recorded by an orders run), the setting in tests/unit/test_config.py, and `etl checks list` showing the check. README and .env.example updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/etl/quality/checks.py",
+      "lines": [
+        268,
+        274
+      ],
+      "category": "performance",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "DailyTotalAnomaly._daily_totals selects the 29 days with `cast(timezone(zone, ordered_at), Date) BETWEEN first AND last` in the WHERE clause. That expression is not indexed, so ix_orders_ordered_at cannot serve the query and PostgreSQL scans the whole orders fact table (all years of orders) on every orders run, inside the load transaction. The base's daily sales report computes a sargable ordered_at range with day_bounds and uses the local-date expression only in the select list and grouping.",
+      "trigger": "Any orders run (or `etl checks run`): EXPLAIN of the check's query shows `Seq Scan on orders` even with enable_seqscan off; with a large orders table every load pays a full scan.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_anomaly_plan.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_anomaly_plan.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The query is index-backed: warehouse.orders has ix_orders_ordered_at (src/etl/infra/tables.py, migration 0003), and the check restricts ordered_at to 29 days, so PostgreSQL reads only those days through the index; the daily sales report in src/etl/reports/daily_sales.py uses the same timezone(zone, ordered_at) expression.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

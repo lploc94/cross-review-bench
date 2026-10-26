@@ -1,0 +1,38 @@
+diff --git a/packages/server/src/services/pushService.ts b/packages/server/src/services/pushService.ts
+index 47604fd..7cb0360 100644
+--- a/packages/server/src/services/pushService.ts
++++ b/packages/server/src/services/pushService.ts
+@@ -27,7 +27,7 @@ import type { Logger } from "../infra/logger.js";
+ import { applyIncrements, type CounterDelta } from "../repositories/counters.js";
+ import { saveDocuments, loadDocuments, type DocRef, type DocumentWrite } from "../repositories/documents.js";
+ import { insertEvents, type NewEvent } from "../repositories/events.js";
+-import { claimMutations, findRecordedMutations } from "../repositories/mutations.js";
++import { claimMutations } from "../repositories/mutations.js";
+ import { lockUser } from "../repositories/users.js";
+ 
+ export interface PushResult {
+@@ -72,14 +72,6 @@ export class PushService {
+     // Taken before the transaction, so nothing can fail between the commit and the answer.
+     const serverHlc = formatHlc(this.tick(() => this.hlc.now()));
+     const receivedAt = new Date(this.clock.now());
+-    // Unlike a set, an increment applied twice counts twice: leave out the increments already
+-    // recorded (a batch sent again after its answer was lost).
+-    const recorded = await findRecordedMutations(
+-      this.pool,
+-      auth.userId,
+-      checked.filter((m) => m.op === "increment").map((m) => m.mutationId),
+-    );
+-    const increments = checked.filter((m) => m.op === "increment" && !recorded.has(m.mutationId));
+ 
+     const { fresh, events } = await withTransaction(this.pool, async (client) => {
+       // Pushes of one user run one at a time: their events get sequence numbers in commit
+@@ -89,6 +81,9 @@ export class PushService {
+       }
+       const claimed = await claimMutations(client, auth.userId, auth.deviceId, checked, receivedAt);
+       const freshMutations = checked.filter((m) => m.op === "set" && claimed.has(m.mutationId));
++      // Unlike a set, an increment applied twice counts twice: only those this transaction
++      // claimed, under the user's lock, are added.
++      const increments = checked.filter((m) => m.op === "increment" && claimed.has(m.mutationId));
+       const refs = uniqueDocs(freshMutations);
+       const stored = await loadDocuments(client, auth.userId, refs);
+       const states = new Map<string, DocState>(

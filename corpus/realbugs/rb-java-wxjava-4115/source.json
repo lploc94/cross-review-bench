@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/binarywang/WxJava",
+  "intro_pr": 4087,
+  "intro_merged_at": "2026-08-11T05:40:21Z",
+  "fix_pr": 4115,
+  "fix_merged_at": "2026-08-25T07:58:31Z",
+  "license": "Apache-2.0",
+  "base_commit": "c315d083aa05f05cfd84221e5aae4345bdc7cf50",
+  "intro_commit": "eb42a331b312db53f69f8bf9ba6c758237d35834",
+  "fix_commit": "ce51e0331b0f32200ddef92047e2bebe12ef428c",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

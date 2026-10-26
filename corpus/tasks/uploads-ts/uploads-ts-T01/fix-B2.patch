@@ -1,0 +1,18 @@
+diff --git a/src/api/range.ts b/src/api/range.ts
+index 7f0753b..01fe637 100644
+--- a/src/api/range.ts
++++ b/src/api/range.ts
+@@ -29,7 +29,12 @@ export function parseRange(header: string | undefined, size: number): RangeReque
+   const first = match[1] ?? "";
+   const last = match[2] ?? "";
+   if (first === "" && last === "") return FULL;
+-  const start = first === "" ? 0 : Number(first);
++  if (first === "") {
++    const length = Number(last);
++    if (length === 0) return UNSATISFIABLE;
++    return { kind: "partial", range: { start: Math.max(size - length, 0), end: size - 1 } };
++  }
++  const start = Number(first);
+   const end = last === "" ? size - 1 : Math.min(Number(last), size - 1);
+   if (last !== "" && Number(last) < start) return FULL;
+   if (start >= size) return UNSATISFIABLE;

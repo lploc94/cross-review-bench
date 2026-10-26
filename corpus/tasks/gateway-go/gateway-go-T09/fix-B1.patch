@@ -1,0 +1,27 @@
+diff --git a/internal/proxy/mirror.go b/internal/proxy/mirror.go
+index af777ce..4854fa9 100644
+--- a/internal/proxy/mirror.go
++++ b/internal/proxy/mirror.go
+@@ -11,6 +11,10 @@ import (
+ // it is dropped and counted, so a slow shadow upstream cannot grow the gateway's memory.
+ const maxMirrorsInFlight = 64
+ 
++// maxMirrorDrain bounds how much of a shadow's answer is read to keep its connection for the
++// next copy; a longer answer's connection is closed instead.
++const maxMirrorDrain = 64 << 10
++
+ // mirror starts a copy of the request for the route's shadow upstream, when the route samples
+ // it and its body is held in memory. The copy runs in its own goroutine: the client's response
+ // neither waits for it nor depends on it.
+@@ -60,6 +64,11 @@ func (h *Handler) mirror(ex *exchange, body *requestBody) {
+ 			h.log.Debug("mirror request failed", "route", ex.route.ID, "error", err, "request_id", ex.id)
+ 			return
+ 		}
++		// The answer is thrown away, but read to its end first: the transport puts a connection
++		// back in its pool only after its response body has been read, and the context's
++		// cancellation closes one that is still busy.
++		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxMirrorDrain))
++		resp.Body.Close()
+ 		if resp.StatusCode >= 500 {
+ 			h.metrics.mirrors.Inc("failed")
+ 			return

@@ -1,0 +1,14 @@
+diff --git a/src/main/java/com/papertrail/workflow/service/ApprovalService.java b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+index 6184a28..1506daf 100644
+--- a/src/main/java/com/papertrail/workflow/service/ApprovalService.java
++++ b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+@@ -182,7 +182,8 @@ public class ApprovalService {
+     return reasons.stream()
+         .filter(reason -> reason.code().equals(wanted))
+         .findFirst()
+-        .orElseThrow(() -> new IllegalArgumentException("no rejection reason " + wanted));
++        .orElseThrow(
++            () -> new InvalidReasonException("the reason is not one the definition lists"));
+   }
+ 
+   /** A single step names its approver; a group step takes its active members, by id. */

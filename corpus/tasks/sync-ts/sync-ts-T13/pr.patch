@@ -1,0 +1,794 @@
+diff --git a/README.md b/README.md
+index 603ec06..c97d247 100644
+--- a/README.md
++++ b/README.md
+@@ -1,7 +1,7 @@
+ # sync-ts
+ 
+-Offline-first document sync. Each device keeps a full replica of its user's documents in SQLite,
+-writes to it without a network, and syncs with a server that keeps the shared state in PostgreSQL.
++Offline-first document sync. Each device keeps a replica of its user's documents (of every
++collection, or of the ones it chooses) in SQLite, writes to it without a network, and syncs with a server that keeps the shared state in PostgreSQL.
+ Concurrent edits merge field by field: the write with the greater hybrid logical clock timestamp
+ wins, so every replica that has seen the same writes holds the same documents.
+ 
+@@ -68,6 +68,18 @@ every unacknowledged mutation and the cursor points after the last applied page.
+ 5xx answers) or not (4xx answers, a protocol mismatch, an answer that breaks the protocol). The
+ client does not retry by itself. Calls to `sync()` while one runs share it.
+ 
++**Selective sync.** `SyncClient.open({ collections: ["tasks"] })` keeps a replica of some
++collections only; the set is stored with the replica, and opening it without the option keeps the
++stored set (a replica created without it keeps everything). Reading or writing another collection
++throws `CollectionNotKeptError` (`collection_not_kept`). The server still sends every collection:
++the client skips the others' events and its cursor moves past them. Opening an existing replica
++with a different set deletes the local documents of the collections left out (their unpushed
++writes stay in the outbox and are still pushed) and makes the added ones pending (see
++`collections()`): their earlier events were skipped, so they stay unreadable until `resync()`, a
++sync that first pulls the feed again from 0 up to the cursor for those collections only, page by
++page, resuming after a failure. That re-pull does not call change listeners, and while it runs
++the device's cursor on the server (the `after` of its latest pull) goes back.
++
+ **Devices and tokens.** A user has up to 50 devices. Each device authenticates with
+ `Authorization: Bearer sd_<device id>_<secret>`; only the sha256 of the secret is stored, and
+ the token is shown once, when the device is registered. Any device of a user can register
+diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
+index c10ba7b..6bf3c8b 100644
+--- a/packages/client/src/index.ts
++++ b/packages/client/src/index.ts
+@@ -2,6 +2,7 @@ export { ClientClosedError, PULL_LIMIT, PUSH_BATCH, SyncClient } from "./sync/sy
+ export type { ListPage, LocalWrite, SyncClientOptions, SyncResult, TypedDocument } from "./sync/syncClient.js";
+ export { INITIAL_SYNC_STATE, describeSyncError, type SyncState, type SyncStateListener } from "./sync/syncState.js";
+ export { ChangeEmitter, rethrowLater, type ChangeListener, type DocumentChange } from "./sync/changes.js";
++export { CollectionNotKeptError, type CollectionSet } from "./sync/collections.js";
+ export { checkPage } from "./sync/pullPhase.js";
+ export { IN_MEMORY, openDatabase, type SqliteDatabase } from "./store/database.js";
+ export { CorruptStoreError, SchemaVersionError } from "./store/errors.js";
+diff --git a/packages/client/src/store/docsStore.ts b/packages/client/src/store/docsStore.ts
+index 0706b20..eb97f64 100644
+--- a/packages/client/src/store/docsStore.ts
++++ b/packages/client/src/store/docsStore.ts
+@@ -32,6 +32,7 @@ export class DocsStore {
+   private readonly selectPage: Statement<[string, string, number], DocRow>;
+   private readonly upsert: Statement<[string, string, string, string]>;
+   private readonly countCollection: Statement<[string], { count: number }>;
++  private readonly deleteAll: Statement<[string]>;
+ 
+   constructor(db: SqliteDatabase) {
+     this.selectOne = db.prepare(
+@@ -48,6 +49,7 @@ export class DocsStore {
+        ON CONFLICT (collection, id) DO UPDATE SET fields = excluded.fields, field_hlcs = excluded.field_hlcs`,
+     );
+     this.countCollection = db.prepare("SELECT count(*) AS count FROM docs WHERE collection = ?");
++    this.deleteAll = db.prepare("DELETE FROM docs WHERE collection = ?");
+   }
+ 
+   get(collection: string, id: string): StoredDoc | null {
+@@ -73,4 +75,9 @@ export class DocsStore {
+   count(collection: string): number {
+     return this.countCollection.get(collection)?.count ?? 0;
+   }
++
++  /** Delete every document of the collection. */
++  deleteCollection(collection: string): void {
++    this.deleteAll.run(collection);
++  }
+ }
+diff --git a/packages/client/src/store/metaStore.ts b/packages/client/src/store/metaStore.ts
+index 889df59..baac18f 100644
+--- a/packages/client/src/store/metaStore.ts
++++ b/packages/client/src/store/metaStore.ts
+@@ -1,4 +1,12 @@
+-import { InvalidHlcError, formatHlc, isValidNodeId, parseHlc, type HlcTimestamp } from "@sync/shared";
++import {
++  InvalidHlcError,
++  formatHlc,
++  isCollectionName,
++  isValidNodeId,
++  parseHlc,
++  type CollectionName,
++  type HlcTimestamp,
++} from "@sync/shared";
+ import type { Statement } from "better-sqlite3";
+ import type { SqliteDatabase } from "./database.js";
+ import { CorruptStoreError } from "./errors.js";
+@@ -11,6 +19,12 @@ export const META_KEYS = {
+   lastHlc: "last_hlc",
+   /** This replica's HLC node id, chosen once when the database is created. */
+   nodeId: "node_id",
++  /** The collections this replica keeps, as a JSON array; absent: every collection. */
++  collections: "collections",
++  /** Collections added to the replica whose history `resync()` has not pulled yet (JSON array). */
++  pendingCollections: "pending_collections",
++  /** The `after` of the next page of the re-pull of the pending collections. */
++  resyncAfter: "resync_after",
+ } as const;
+ 
+ /** Typed access to the client's small persistent state. */
+@@ -34,16 +48,36 @@ export class MetaStore {
+   }
+ 
+   pullAfter(): number {
+-    const value = this.get(META_KEYS.pullAfter);
+-    if (value === null) return 0;
+-    const after = /^\d{1,16}$/.test(value) ? Number(value) : Number.NaN;
+-    if (!Number.isSafeInteger(after)) throw new CorruptStoreError(`stored pull cursor ${value} is invalid`);
+-    return after;
++    return this.cursor(META_KEYS.pullAfter);
+   }
+ 
+   setPullAfter(after: number): void {
+-    if (!Number.isSafeInteger(after) || after < 0) throw new RangeError(`invalid pull cursor ${after}`);
+-    this.set(META_KEYS.pullAfter, String(after));
++    this.setCursor(META_KEYS.pullAfter, after);
++  }
++
++  resyncAfter(): number {
++    return this.cursor(META_KEYS.resyncAfter);
++  }
++
++  setResyncAfter(after: number): void {
++    this.setCursor(META_KEYS.resyncAfter, after);
++  }
++
++  /** The collections the replica keeps, or null when it keeps every collection. */
++  collections(): CollectionName[] | null {
++    return this.collectionList(META_KEYS.collections);
++  }
++
++  setCollections(collections: readonly CollectionName[]): void {
++    this.set(META_KEYS.collections, JSON.stringify(collections));
++  }
++
++  pendingCollections(): CollectionName[] {
++    return this.collectionList(META_KEYS.pendingCollections) ?? [];
++  }
++
++  setPendingCollections(collections: readonly CollectionName[]): void {
++    this.set(META_KEYS.pendingCollections, JSON.stringify(collections));
+   }
+ 
+   lastHlc(): HlcTimestamp | null {
+@@ -75,4 +109,32 @@ export class MetaStore {
+     if (!isValidNodeId(nodeId)) throw new RangeError(`invalid node id ${JSON.stringify(nodeId)}`);
+     this.set(META_KEYS.nodeId, nodeId);
+   }
++
++  private cursor(key: string): number {
++    const value = this.get(key);
++    if (value === null) return 0;
++    const after = /^\d{1,16}$/.test(value) ? Number(value) : Number.NaN;
++    if (!Number.isSafeInteger(after)) throw new CorruptStoreError(`stored ${key} cursor ${value} is invalid`);
++    return after;
++  }
++
++  private setCursor(key: string, after: number): void {
++    if (!Number.isSafeInteger(after) || after < 0) throw new RangeError(`invalid ${key} cursor ${after}`);
++    this.set(key, String(after));
++  }
++
++  private collectionList(key: string): CollectionName[] | null {
++    const value = this.get(key);
++    if (value === null) return null;
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(value);
++    } catch {
++      parsed = null;
++    }
++    if (!Array.isArray(parsed) || !parsed.every((name) => typeof name === "string" && isCollectionName(name))) {
++      throw new CorruptStoreError(`stored ${key} ${value} is not a list of collections`);
++    }
++    return parsed;
++  }
+ }
+diff --git a/packages/client/src/sync/collections.ts b/packages/client/src/sync/collections.ts
+new file mode 100644
+index 0000000..06bd73d
+--- /dev/null
++++ b/packages/client/src/sync/collections.ts
+@@ -0,0 +1,134 @@
++import { COLLECTION_NAMES, SyncError, isCollectionName, type CollectionName, type Hlc } from "@sync/shared";
++import type { SqliteDatabase } from "../store/database.js";
++import type { DocsStore } from "../store/docsStore.js";
++import type { MetaStore } from "../store/metaStore.js";
++import type { SyncTransport } from "../transport/transport.js";
++import { applyRemoteEvents } from "./applyRemote.js";
++import { checkPage } from "./pullPhase.js";
++
++/** A read or write of a collection the replica does not keep, or has not re-pulled yet. */
++export class CollectionNotKeptError extends SyncError {
++  readonly collection: string;
++
++  constructor(collection: string, pending: boolean) {
++    super(
++      "collection_not_kept",
++      pending
++        ? `${collection} was added to this replica but its history is not pulled yet; call resync() first`
++        : `this replica does not keep ${collection}; open it with collections that include it`,
++      { details: { collection, pending } },
++    );
++    this.collection = collection;
++  }
++}
++
++/** The collections a replica keeps, and those added to it that wait for `resync()`. */
++export interface CollectionSet {
++  readonly kept: readonly CollectionName[];
++  readonly pending: readonly CollectionName[];
++}
++
++/** Check the `collections` option: known names, each once, at least one; in canonical order. */
++export function checkCollectionsOption(collections: readonly string[]): CollectionName[] {
++  if (collections.length === 0) throw new RangeError("collections must name at least one collection");
++  const seen = new Set<string>();
++  for (const name of collections) {
++    if (!isCollectionName(name)) throw new RangeError(`unknown collection ${JSON.stringify(name)}`);
++    if (seen.has(name)) throw new RangeError(`collection ${name} is listed twice`);
++    seen.add(name);
++  }
++  return COLLECTION_NAMES.filter((name) => seen.has(name));
++}
++
++/**
++ * Apply the `collections` option to the stored set; run inside the transaction of `open`. A new
++ * database keeps what is requested. An existing replica keeps the requested collections it
++ * already holds and deletes the documents of those left out; the others become pending: their
++ * events before the pull cursor were skipped, so they wait until `resync()` pulls them again.
++ * Without the option nothing changes.
++ */
++export function applyCollectionsOption(
++  meta: MetaStore,
++  docs: DocsStore,
++  requested: readonly CollectionName[] | undefined,
++  isNew: boolean,
++): void {
++  if (requested === undefined) return;
++  if (isNew) {
++    meta.setCollections(requested);
++    return;
++  }
++  const stored: CollectionSet = { kept: meta.collections() ?? COLLECTION_NAMES, pending: meta.pendingCollections() };
++  const kept = stored.kept.filter((name) => requested.includes(name));
++  const pending = requested.filter((name) => !stored.kept.includes(name));
++  for (const name of [...stored.kept, ...stored.pending]) {
++    if (!requested.includes(name)) docs.deleteCollection(name);
++  }
++  // A different pending set starts its re-pull over from the beginning of the feed.
++  if (pending.join() !== stored.pending.join()) meta.setResyncAfter(0);
++  meta.setCollections(kept);
++  meta.setPendingCollections(pending);
++}
++
++export interface RepullContext {
++  readonly db: SqliteDatabase;
++  readonly docs: DocsStore;
++  readonly meta: MetaStore;
++  readonly hlc: Hlc;
++  readonly transport: SyncTransport;
++  readonly limit: number;
++}
++
++/**
++ * Pull the feed again from its start up to the pull cursor, applying only the events of the
++ * pending collections, then keep those collections. The stored state drives every step, so other
++ * connections may sync, resync or reopen the replica meanwhile:
++ * - each page starts at the stored re-pull cursor, and is applied (in one transaction with the
++ *   cursor) only if that cursor and the pending set are still what they were when it was asked
++ *   for; otherwise it is dropped and the loop reads the stored state again;
++ * - every event of the pending collections in a page is applied, also past the pull cursor:
++ *   another connection's sync skips them, and applying them again later changes nothing;
++ * - the collections are kept in the transaction that reaches the pull cursor as it is then.
++ * A failure is resumed by the next call; it returns when nothing is pending any more. Document
++ * changes of the re-pull are not reported to change listeners.
++ */
++export async function repullPending(ctx: RepullContext): Promise<{ pulled: number; applied: number }> {
++  let pulled = 0;
++  let applied = 0;
++  for (;;) {
++    const pending = ctx.meta.pendingCollections();
++    if (pending.length === 0) return { pulled, applied };
++    const after = ctx.meta.resyncAfter();
++    const unchanged = (): boolean =>
++      ctx.meta.resyncAfter() === after && ctx.meta.pendingCollections().join() === pending.join();
++    if (after >= ctx.meta.pullAfter()) {
++      ctx.db.transaction(() => {
++        if (unchanged() && after >= ctx.meta.pullAfter()) keepPending(ctx.meta, pending);
++      }).immediate();
++      continue;
++    }
++    const page = await ctx.transport.pull({ after, limit: ctx.limit });
++    checkPage(page, after, ctx.limit);
++    const names: ReadonlySet<string> = new Set(pending);
++    const events = page.events.filter((event) => names.has(event.collection));
++    const result = ctx.db.transaction(() => {
++      if (!unchanged()) return null;
++      const outcome = applyRemoteEvents(ctx.docs, ctx.hlc, events);
++      ctx.meta.setResyncAfter(page.nextAfter);
++      ctx.meta.setLastHlc(ctx.hlc.last);
++      if (!page.hasMore || page.nextAfter >= ctx.meta.pullAfter()) keepPending(ctx.meta, pending);
++      return outcome;
++    }).immediate();
++    if (result) {
++      pulled += events.length;
++      applied += result.applied;
++    }
++  }
++}
++
++function keepPending(meta: MetaStore, pending: readonly CollectionName[]): void {
++  const kept = meta.collections() ?? COLLECTION_NAMES;
++  meta.setCollections(COLLECTION_NAMES.filter((name) => kept.includes(name) || pending.includes(name)));
++  meta.setPendingCollections([]);
++  meta.setResyncAfter(0);
++}
+diff --git a/packages/client/src/sync/pullPhase.ts b/packages/client/src/sync/pullPhase.ts
+index 1c1f78f..ae0e909 100644
+--- a/packages/client/src/sync/pullPhase.ts
++++ b/packages/client/src/sync/pullPhase.ts
+@@ -1,4 +1,4 @@
+-import type { Hlc, PullResponse } from "@sync/shared";
++import { isCollectionName, type Hlc, type PullResponse } from "@sync/shared";
+ import type { DocsStore } from "../store/docsStore.js";
+ import type { SqliteDatabase } from "../store/database.js";
+ import type { MetaStore } from "../store/metaStore.js";
+@@ -59,7 +59,13 @@ export async function pullChanges(ctx: PullContext): Promise<PullOutcome> {
+     const page = await ctx.transport.pull({ after, limit: ctx.limit });
+     checkPage(page, after, ctx.limit);
+     const result = ctx.db.transaction(() => {
+-      const outcome = applyRemoteEvents(ctx.docs, ctx.hlc, page.events);
++      // Events of collections the replica does not keep are skipped; the cursor moves past them.
++      // An unknown collection still fails the page.
++      const kept = ctx.meta.collections();
++      const events = page.events.filter(
++        (event) => kept === null || !isCollectionName(event.collection) || kept.includes(event.collection),
++      );
++      const outcome = applyRemoteEvents(ctx.docs, ctx.hlc, events);
+       ctx.meta.setPullAfter(page.nextAfter);
+       ctx.meta.setLastHlc(ctx.hlc.last);
+       return outcome;
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 694c08a..b2d158e 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -1,4 +1,5 @@
+ import {
++  COLLECTION_NAMES,
+   DEFAULT_MAX_DRIFT_MS,
+   EMPTY_DOC_STATE,
+   Hlc,
+@@ -27,6 +28,13 @@ import { migrate } from "../store/migrator.js";
+ import { OutboxStore } from "../store/outboxStore.js";
+ import type { SyncTransport } from "../transport/transport.js";
+ import { ChangeEmitter, rethrowLater, type ChangeListener, type DocumentChange } from "./changes.js";
++import {
++  CollectionNotKeptError,
++  applyCollectionsOption,
++  checkCollectionsOption,
++  repullPending,
++  type CollectionSet,
++} from "./collections.js";
+ import { pullChanges } from "./pullPhase.js";
+ import { pushOutbox } from "./pushPhase.js";
+ import { SingleFlight } from "./singleFlight.js";
+@@ -58,6 +66,13 @@ export interface SyncClientOptions {
+   readonly pullLimit?: number;
+   /** Receives errors thrown by change listeners; by default they are rethrown asynchronously. */
+   readonly onListenerError?: (err: unknown) => void;
++  /**
++   * The collections this replica keeps; every collection by default. Other collections cannot be
++   * read or written, and their pulled events are skipped. Stored with the replica: omit it to keep
++   * the stored set. Collections added to an existing replica wait for `resync()`; the local
++   * documents of collections left out are deleted (their unpushed writes are still pushed).
++   */
++  readonly collections?: readonly CollectionName[];
+ }
+ 
+ export interface TypedDocument<C extends CollectionName> {
+@@ -156,12 +171,14 @@ export class SyncClient {
+     if (options.nodeId !== undefined && !isValidNodeId(options.nodeId)) {
+       throw new RangeError(`invalid node id ${JSON.stringify(options.nodeId)}`);
+     }
++    const requested = options.collections && checkCollectionsOption(options.collections);
+     const random = options.random ?? cryptoRandom;
+     const onListenerError = options.onListenerError ?? rethrowLater;
+     const db = openDatabase(options.dbPath);
+     try {
+       migrate(db);
+       const meta = new MetaStore(db);
++      const docs = new DocsStore(db);
+       const node = db.transaction(() => {
+         const stored = meta.nodeId();
+         if (stored !== null && options.nodeId !== undefined && stored !== options.nodeId) {
+@@ -172,6 +189,8 @@ export class SyncClient {
+         }
+         const nodeId = stored ?? options.nodeId ?? randomNodeId(random);
+         if (stored === null) meta.setNodeId(nodeId);
++        // The node id is stored when the database is created, in this same transaction.
++        applyCollectionsOption(meta, docs, requested, stored === null);
+         return nodeId;
+       }).immediate();
+       const hlc = new Hlc({ node, clock: options.clock, maxDriftMs: options.maxDriftMs ?? DEFAULT_MAX_DRIFT_MS });
+@@ -180,7 +199,7 @@ export class SyncClient {
+       if (lastHlc) hlc.restore(lastHlc);
+       return new SyncClient({
+         db,
+-        docs: new DocsStore(db),
++        docs,
+         outbox: new OutboxStore(db),
+         meta,
+         hlc,
+@@ -215,7 +234,11 @@ export class SyncClient {
+    */
+   setMany(writes: readonly LocalWrite[]): Mutation[] {
+     this.assertOpen();
+-    const checked = writes.map((write) => ({ ...write, fields: checkLocalWrite(write) }));
++    const checked = writes.map((write) => {
++      const fields = checkLocalWrite(write);
++      this.assertKept(write.collection);
++      return { ...write, fields };
++    });
+     const { db, docs, outbox, meta, hlc, random } = this.parts;
+     const results = db.transaction(() =>
+       checked.map((write) => {
+@@ -248,6 +271,7 @@ export class SyncClient {
+ 
+   get<C extends CollectionName>(collection: C, id: string): TypedDocument<C> | null {
+     this.assertOpen();
++    this.assertKept(collection);
+     const doc = this.parts.docs.get(collection, id);
+     return doc ? toTyped(collection, doc) : null;
+   }
+@@ -258,6 +282,7 @@ export class SyncClient {
+    */
+   list<C extends CollectionName>(collection: C, page?: ListPage): TypedDocument<C>[] {
+     this.assertOpen();
++    this.assertKept(collection);
+     const docs = page
+       ? this.parts.docs.listPage(collection, page.afterId ?? null, checkRange("limit", page.limit, 1, 10_000))
+       : this.parts.docs.list(collection);
+@@ -276,6 +301,13 @@ export class SyncClient {
+     return this.parts.meta.pullAfter();
+   }
+ 
++  /** The collections the replica keeps, and those added to it that wait for `resync()`. */
++  collections(): CollectionSet {
++    this.assertOpen();
++    const { meta } = this.parts;
++    return { kept: meta.collections() ?? COLLECTION_NAMES, pending: meta.pendingCollections() };
++  }
++
+   /** Be told about every committed change, local or remote. Returns the unsubscribe function. */
+   onChange(listener: ChangeListener): () => void {
+     return this.parts.emitter.on(listener);
+@@ -299,7 +331,23 @@ export class SyncClient {
+    */
+   sync(): Promise<SyncResult> {
+     if (this.closed) return Promise.reject(new ClientClosedError());
+-    return this.flight.run(() => this.runSync());
++    return this.flight.run(() => this.runSync(false));
++  }
++
++  /**
++   * A sync that also pulls the history of the collections added to the replica: after pushing,
++   * it reads the feed again from the start up to the pull cursor, applying only their events,
++   * and then keeps them; `pulled` and `applied` include what the re-pull read and changed. Runs
++   * after a sync in progress has settled. Without pending collections it is a plain sync. After
++   * a failure, the next `resync()` continues the re-pull where it stopped.
++   */
++  async resync(): Promise<SyncResult> {
++    for (;;) {
++      if (this.closed) throw new ClientClosedError();
++      const running = this.flight.current;
++      if (!running) return this.flight.run(() => this.runSync(true));
++      await running.catch(() => undefined);
++    }
+   }
+ 
+   /** Close the replica, after the running sync (if any) has settled. */
+@@ -310,11 +358,11 @@ export class SyncClient {
+     this.parts.db.close();
+   }
+ 
+-  private async runSync(): Promise<SyncResult> {
++  private async runSync(resync: boolean): Promise<SyncResult> {
+     const { syncState, clock } = this.parts;
+     syncState.started();
+     try {
+-      const result = await this.pushThenPull();
++      const result = await this.pushThenPull(resync);
+       syncState.succeeded(clock.now());
+       return result;
+     } catch (err) {
+@@ -323,24 +371,38 @@ export class SyncClient {
+     }
+   }
+ 
+-  private async pushThenPull(): Promise<SyncResult> {
++  private async pushThenPull(resync: boolean): Promise<SyncResult> {
+     const { db, docs, outbox, meta, hlc, transport, emitter } = this.parts;
++    const limit = this.parts.pullLimit;
+     const pushed = await pushOutbox({ db, outbox, meta, hlc, transport, batchSize: this.parts.pushBatchSize });
++    const repulled = resync
++      ? await repullPending({ db, docs, meta, hlc, transport, limit })
++      : { pulled: 0, applied: 0 };
+     const pulled = await pullChanges({
+       db,
+       docs,
+       meta,
+       hlc,
+       transport,
+-      limit: this.parts.pullLimit,
++      limit,
+       onChanges: (changes) => emitter.emit(changes),
+     });
+-    return { pushed: pushed.pushed, pulled: pulled.pulled, applied: pulled.applied };
++    return {
++      pushed: pushed.pushed,
++      pulled: repulled.pulled + pulled.pulled,
++      applied: repulled.applied + pulled.applied,
++    };
+   }
+ 
+   private assertOpen(): void {
+     if (this.closed) throw new ClientClosedError();
+   }
++
++  private assertKept(collection: string): void {
++    const { kept, pending } = this.collections();
++    if (kept.some((name) => name === collection)) return;
++    throw new CollectionNotKeptError(collection, pending.some((name) => name === collection));
++  }
+ }
+ 
+ function toTyped<C extends CollectionName>(collection: C, doc: StoredDoc): TypedDocument<C> {
+diff --git a/packages/client/test/e2e/selectiveSync.test.ts b/packages/client/test/e2e/selectiveSync.test.ts
+new file mode 100644
+index 0000000..060d9fe
+--- /dev/null
++++ b/packages/client/test/e2e/selectiveSync.test.ts
+@@ -0,0 +1,50 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { openClient, type TestClient } from "../helpers/clients.js";
++import { tempDbPath } from "../helpers/tempFiles.js";
++import { startTestServer, type TestAccount, type TestServer } from "../helpers/testServer.js";
++
++let server: TestServer;
++let laptop: TestAccount;
++let phone: TestAccount;
++const opened: TestClient[] = [];
++
++beforeEach(async () => {
++  server = await startTestServer();
++  laptop = await server.createUser("Ada");
++  phone = await server.addDevice(laptop);
++});
++
++afterEach(async () => {
++  for (const c of opened.splice(0)) await c.client.close();
++  await server.close();
++});
++
++describe("a phone that keeps only tasks", () => {
++  it("syncs its tasks, then the notes once they are added and re-pulled", async () => {
++    const a = openClient(server, laptop);
++    opened.push(a);
++    a.client.set("notes", "n1", { title: "Trip" });
++    a.client.set("tasks", "t1", { title: "Book train" });
++    await a.client.sync();
++
++    const dbPath = tempDbPath();
++    const tasksOnly = openClient(server, phone, { dbPath, collections: ["tasks"], pullLimit: 1 });
++    await tasksOnly.client.sync();
++    expect(tasksOnly.client.get("tasks", "t1")?.fields).toEqual({ title: "Book train" });
++    tasksOnly.client.set("tasks", "t1", { done: true });
++    await tasksOnly.client.close();
++
++    const b = openClient(server, phone, { dbPath, collections: ["notes", "tasks"], pullLimit: 1 });
++    opened.push(b);
++    expect(b.client.collections().pending).toEqual(["notes"]);
++    a.client.set("notes", "n2", { title: "Menu" });
++    await a.client.sync();
++    await b.client.resync();
++    expect(b.client.list("notes").map((doc) => doc.fields)).toEqual([{ title: "Trip" }, { title: "Menu" }]);
++    expect(b.client.pendingCount()).toBe(0);
++
++    await a.client.sync();
++    expect(a.client.get("tasks", "t1")?.fields).toEqual({ title: "Book train", done: true });
++    expect(b.client.pullCursor()).toBe(a.client.pullCursor());
++  });
++});
+diff --git a/packages/client/test/sync/selectiveSync.test.ts b/packages/client/test/sync/selectiveSync.test.ts
+new file mode 100644
+index 0000000..661030d
+--- /dev/null
++++ b/packages/client/test/sync/selectiveSync.test.ts
+@@ -0,0 +1,189 @@
++import { CollectionNotKeptError, SyncClient, type SyncClientOptions } from "@sync/client";
++import { ManualClock, formatHlc, seededRandom, type CollectionName, type PullResponse, type SyncEvent } from "@sync/shared";
++import { describe, expect, it } from "vitest";
++import { ScriptedTransport } from "../helpers/clients.js";
++import { tempDbPath } from "../helpers/tempFiles.js";
++
++const clock = new ManualClock();
++const DEVICE = "0b6f4a52-8d0e-4c43-9a51-6d2f0e7a9c11";
++
++function event(seq: number, collection: CollectionName, docId: string, value: string): SyncEvent {
++  return {
++    seq,
++    mutationId: `00000000-0000-4000-8000-${String(seq).padStart(12, "0")}`,
++    deviceId: DEVICE,
++    collection,
++    docId,
++    field: "title",
++    value,
++    hlc: formatHlc({ wallMs: clock.now() - 1_000, counter: seq, node: "phone" }),
++    serverReceivedAt: new Date(clock.now()).toISOString(),
++  };
++}
++
++function page(events: SyncEvent[], nextAfter: number, hasMore = false): PullResponse {
++  return { events, nextAfter, hasMore };
++}
++
++/** The feed of these tests: notes and tasks interleaved. */
++const FEED = [event(1, "notes", "n1", "Trip"), event(2, "tasks", "t1", "Pack"), event(3, "notes", "n2", "Menu"), event(4, "tasks", "t2", "Shop")];
++
++function open(transport: ScriptedTransport, options: Partial<SyncClientOptions> = {}): SyncClient {
++  return SyncClient.open({ dbPath: ":memory:", transport, clock, random: seededRandom(3), pullLimit: 2, ...options });
++}
++
++/** Run `action` (another connection's work) when the transport is asked for its pull number `index`. */
++function beforePull(transport: ScriptedTransport, index: number, action: () => Promise<unknown>): void {
++  const pull = transport.pull.bind(transport);
++  transport.pull = async (request) => {
++    if (transport.pulls.length === index) await action();
++    return pull(request);
++  };
++}
++
++/** A replica of tasks only, at the end of a feed of [notes n1, tasks t1, notes n2]. */
++async function tasksOnlyReplica(): Promise<{ dbPath: string; feed: SyncEvent[] }> {
++  const feed = [event(1, "notes", "n1", "Trip"), event(2, "tasks", "t1", "Pack"), event(3, "notes", "n2", "Menu")];
++  const dbPath = tempDbPath();
++  const first = open(new ScriptedTransport().answerPull(page(feed, 3)), { dbPath, collections: ["tasks"], pullLimit: 3 });
++  await first.sync();
++  await first.close();
++  return { dbPath, feed };
++}
++
++describe("a replica of some collections", () => {
++  it("skips the other collections' events but moves its cursor past them", async () => {
++    const transport = new ScriptedTransport().answerPull(page(FEED.slice(0, 2), 2, true), page(FEED.slice(2), 4));
++    const client = open(transport, { collections: ["tasks"] });
++    expect(await client.sync()).toEqual({ pushed: 0, pulled: 4, applied: 2 });
++    expect(client.list("tasks").map((doc) => doc.fields.title)).toEqual(["Pack", "Shop"]);
++    expect(client.pullCursor()).toBe(4);
++    expect(client.collections()).toEqual({ kept: ["tasks"], pending: [] });
++    await client.close();
++  });
++
++  it("refuses to read or write the other collections", async () => {
++    const client = open(new ScriptedTransport(), { collections: ["tasks"] });
++    expect(() => client.set("notes", "n1", { title: "x" })).toThrow(CollectionNotKeptError);
++    expect(() => client.setMany([{ collection: "tasks", id: "t1", fields: { title: "ok" } }, { collection: "notes", id: "n1", fields: { title: "x" } }])).toThrow(
++      /does not keep notes/,
++    );
++    expect(() => client.get("notes", "n1")).toThrow(CollectionNotKeptError);
++    expect(() => client.list("notes")).toThrow(CollectionNotKeptError);
++    expect(client.pendingCount()).toBe(0);
++    await client.close();
++  });
++
++  it("rejects an empty, unknown or repeated collections option", () => {
++    for (const collections of [[], ["contacts"], ["notes", "notes"]]) {
++      expect(() => open(new ScriptedTransport(), { collections: collections as CollectionName[] })).toThrow(RangeError);
++    }
++  });
++
++  it("re-pulls an added collection only on resync(), resuming after a failure", async () => {
++    const dbPath = tempDbPath();
++    const transport = new ScriptedTransport().answerPull(page(FEED.slice(0, 2), 2, true), page(FEED.slice(2), 4));
++    const first = open(transport, { dbPath, collections: ["tasks"] });
++    await first.sync();
++    await first.close();
++
++    const client = open(transport, { dbPath, collections: ["notes", "tasks"] });
++    expect(client.collections()).toEqual({ kept: ["tasks"], pending: ["notes"] });
++    expect(() => client.get("notes", "n1")).toThrow(/call resync\(\) first/);
++    transport.answerPull(page([], 4));
++    await client.sync();
++    expect(() => client.list("notes")).toThrow(CollectionNotKeptError);
++
++    transport.answerPull(page(FEED.slice(0, 2), 2, true), new Error("connection reset"));
++    await expect(client.resync()).rejects.toThrow("connection reset");
++    expect(client.collections().pending).toEqual(["notes"]);
++
++    transport.answerPull(page(FEED.slice(2), 4), page([event(6, "notes", "n3", "Later")], 6));
++    expect(await client.resync()).toEqual({ pushed: 0, pulled: 2, applied: 2 });
++    expect(transport.pulls.slice(-4)).toEqual([
++      { after: 0, limit: 2 },
++      { after: 2, limit: 2 },
++      { after: 2, limit: 2 },
++      { after: 4, limit: 2 },
++    ]);
++    expect(client.list("notes").map((doc) => doc.fields.title)).toEqual(["Trip", "Menu", "Later"]);
++    expect(client.list("tasks")).toHaveLength(2);
++    expect(client.collections()).toEqual({ kept: ["notes", "tasks"], pending: [] });
++    await client.close();
++  });
++
++  it("re-pulls everything another connection skipped while the re-pull was running", async () => {
++    const feed = [event(1, "notes", "n1", "Trip"), event(2, "notes", "n2", "Menu"), event(3, "tasks", "t1", "Pack")];
++    const dbPath = tempDbPath();
++    const first = open(new ScriptedTransport().answerPull(page(feed.slice(0, 1), 1)), { dbPath, collections: ["tasks"] });
++    await first.sync();
++    await first.close();
++
++    // A adds notes and re-pulls; B, another connection to the file, syncs while A waits for its
++    // first page, which runs past A's cursor.
++    const transport = new ScriptedTransport().answerPull(page(feed.slice(0, 2), 2, true), page(feed.slice(2), 3), page([], 3));
++    const a = open(transport, { dbPath, collections: ["notes", "tasks"] });
++    const b = open(new ScriptedTransport().answerPull(page(feed.slice(1), 3)), { dbPath });
++    beforePull(transport, 0, () => b.sync());
++    await a.resync();
++    expect(b.pullCursor()).toBe(3);
++    expect(a.list("notes").map((doc) => doc.fields.title)).toEqual(["Trip", "Menu"]);
++    expect(a.list("tasks").map((doc) => doc.fields.title)).toEqual(["Pack"]);
++    await a.close();
++    await b.close();
++  });
++
++  it("starts over when another connection drops and adds the collection again mid-way", async () => {
++    const { dbPath, feed } = await tasksOnlyReplica();
++    const transport = new ScriptedTransport().answerPull(
++      page(feed.slice(0, 2), 2, true),
++      page(feed.slice(2), 3),
++      page(feed.slice(0, 2), 2, true),
++      page(feed.slice(2), 3),
++      page([], 3),
++    );
++    const a = open(transport, { dbPath, collections: ["notes", "tasks"] });
++    beforePull(transport, 1, async () => {
++      // Another process: notes left out (its documents deleted), then added back.
++      await open(new ScriptedTransport(), { dbPath, collections: ["tasks"] }).close();
++      await open(new ScriptedTransport(), { dbPath, collections: ["notes", "tasks"] }).close();
++    });
++    await a.resync();
++    expect(transport.pulls.map((request) => request.after)).toEqual([0, 2, 0, 2, 3]);
++    expect(a.list("notes").map((doc) => doc.fields.title)).toEqual(["Trip", "Menu"]);
++    await a.close();
++  });
++
++  it("lets a resync() finish quietly when another connection completed the same re-pull", async () => {
++    const { dbPath, feed } = await tasksOnlyReplica();
++    const transport = new ScriptedTransport().answerPull(page(feed.slice(0, 2), 2, true), page([], 3));
++    const a = open(transport, { dbPath, collections: ["notes", "tasks"] });
++    const b = open(new ScriptedTransport().answerPull(page(feed.slice(0, 2), 2, true), page(feed.slice(2), 3), page([], 3)), { dbPath });
++    beforePull(transport, 0, () => b.resync());
++    expect(await a.resync()).toEqual({ pushed: 0, pulled: 0, applied: 0 });
++    for (const client of [a, b]) {
++      expect(client.collections()).toEqual({ kept: ["notes", "tasks"], pending: [] });
++      expect(client.list("notes").map((doc) => doc.fields.title)).toEqual(["Trip", "Menu"]);
++    }
++    await a.close();
++    await b.close();
++  });
++
++  it("deletes the documents of a collection left out, keeping its unpushed writes", async () => {
++    const dbPath = tempDbPath();
++    const first = open(new ScriptedTransport(), { dbPath });
++    first.set("notes", "n1", { title: "Draft" });
++    first.set("tasks", "t1", { title: "Call" });
++    await first.close();
++
++    const client = open(new ScriptedTransport(), { dbPath, collections: ["tasks"] });
++    expect(() => client.get("notes", "n1")).toThrow(CollectionNotKeptError);
++    expect(client.get("tasks", "t1")?.fields).toEqual({ title: "Call" });
++    expect(client.pendingCount()).toBe(2);
++    await client.close();
++
++    const reopened = open(new ScriptedTransport(), { dbPath });
++    expect(reopened.collections()).toEqual({ kept: ["tasks"], pending: [] });
++    await reopened.close();
++  });
++});

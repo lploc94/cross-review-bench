@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/infiniflow/ragflow",
+  "intro_pr": 21003,
+  "intro_merged_at": "2026-10-16T01:44:40Z",
+  "fix_pr": 21119,
+  "fix_merged_at": "2026-10-19T05:07:23Z",
+  "license": "Apache-2.0",
+  "base_commit": "26ec6912865fa0553f0d3ad2f30b887c7966c873",
+  "intro_commit": "78faa36bd69523e8bc5864f3fc6bc485c2e6702c",
+  "fix_commit": "1d2d0497024b2dbfaed31aab761aa019e08b11ec",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

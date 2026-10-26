@@ -1,0 +1,427 @@
+diff --git a/README.md b/README.md
+index 5f08d14..d6772dd 100644
+--- a/README.md
++++ b/README.md
+@@ -27,7 +27,9 @@ over the limit the API answers 429 with `Retry-After`.
+ 
+ **Money.** Amounts are integers of the currency's minor unit, carried as decimal strings on the
+ wire (`"amount": "1050"` is 10.50 USD) and as `bigint` in the code. Exponents follow ISO 4217:
+-USD, EUR, GBP, CHF 2; JPY, VND 0; KWD, BHD 3.
++USD, EUR, GBP, CHF 2; JPY, VND 0; KWD, BHD 3. `GET /currencies` lists them with their names, the
++smallest amount in major units (`minor_unit`, `"0.01"` for USD) and a formatted `sample`
++(`"1,234,567.89"`), so clients need not hard-code exponents.
+ 
+ **Accounts.** `wallet` accounts never go below zero available; `system` accounts (funding,
+ settlement) may. `available = balance − held`.
+@@ -76,6 +78,7 @@ Delivery guarantees:
+ | Method | Path | Scope |
+ |---|---|---|
+ | GET | `/health/live` | none |
++| GET | `/currencies`, `/currencies/:code` | `accounts:read` |
+ | POST | `/accounts` | `accounts:write` |
+ | GET | `/accounts`, `/accounts/:id` | `accounts:read` |
+ | POST | `/accounts/:id/close` | `accounts:write` |
+diff --git a/src/api/routes/currencies.ts b/src/api/routes/currencies.ts
+new file mode 100644
+index 0000000..923a371
+--- /dev/null
++++ b/src/api/routes/currencies.ts
+@@ -0,0 +1,22 @@
++import type { FastifyPluginAsync } from "fastify";
++import { requireScope } from "../plugins/auth.js";
++import { currencyParamsSchema } from "../schemas/currencies.js";
++import { serializeCurrency } from "../serializers.js";
++import { parse } from "../validation.js";
++import type { RouteOptions } from "./types.js";
++
++/**
++ * The currency catalogue: reference data shared by every tenant, so these routes read no tenant.
++ * They need `accounts:read`, which every client that shows balances already holds.
++ */
++export const currencyRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services }) => {
++  app.get("/currencies", { preHandler: requireScope("accounts:read") }, async () => {
++    const currencies = await services.currencies.listCurrencies();
++    return { data: currencies.map(serializeCurrency) };
++  });
++
++  app.get("/currencies/:code", { preHandler: requireScope("accounts:read") }, async (request) => {
++    const { code } = parse(currencyParamsSchema, request.params, "params");
++    return serializeCurrency(await services.currencies.getCurrency(code));
++  });
++};
+diff --git a/src/api/routes/types.ts b/src/api/routes/types.ts
+index f1e489a..bb28f64 100644
+--- a/src/api/routes/types.ts
++++ b/src/api/routes/types.ts
+@@ -1,4 +1,5 @@
+ import type { AccountService } from "../../services/accountService.js";
++import type { CurrencyService } from "../../services/currencyService.js";
+ import type { EventService } from "../../services/eventService.js";
+ import type { FxService } from "../../services/fxService.js";
+ import type { HoldService } from "../../services/holdService.js";
+@@ -8,6 +9,7 @@ import type { WebhookService } from "../../services/webhookService.js";
+ /** The services the authenticated routes call, handed to each route plugin as its options. */
+ export interface RouteServices {
+   readonly accounts: AccountService;
++  readonly currencies: CurrencyService;
+   readonly transfers: TransferService;
+   readonly holds: HoldService;
+   readonly fx: FxService;
+diff --git a/src/api/schemas/currencies.ts b/src/api/schemas/currencies.ts
+new file mode 100644
+index 0000000..a3b2b04
+--- /dev/null
++++ b/src/api/schemas/currencies.ts
+@@ -0,0 +1,6 @@
++import { z } from "zod";
++
++/** A currency code in the path: three upper-case letters, as ISO 4217 writes them. */
++export const currencyParamsSchema = z.object({
++  code: z.string().regex(/^[A-Z]{3}$/, { error: "must be an ISO 4217 code in upper case" }),
++});
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index bf6b718..946d08f 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -1,8 +1,10 @@
+ import { availableBalance, type Account } from "../domain/account.js";
++import type { Currency } from "../domain/currency.js";
+ import type { OutboxEvent } from "../domain/events.js";
+ import { formatRate, type FxRate } from "../domain/fx.js";
+ import type { Hold } from "../domain/hold.js";
+ import type { JsonObject } from "../domain/json.js";
++import { formatMinor } from "../domain/money.js";
+ import type { Page } from "../domain/pagination.js";
+ import type { Entry, Transfer } from "../domain/transfer.js";
+ import type { WebhookEndpoint } from "../domain/webhook.js";
+@@ -28,6 +30,23 @@ export function serializeAccount(account: Account): JsonObject {
+   };
+ }
+ 
++// Shown formatted in each currency, so clients can check how they render amounts.
++const SAMPLE_AMOUNT_MINOR = 123_456_789n;
++
++/**
++ * `minor_unit` is the smallest amount as a decimal of major units ("0.01" for USD, "1" for JPY);
++ * `sample` is 123456789 minor units formatted with digit grouping.
++ */
++export function serializeCurrency(currency: Currency): JsonObject {
++  return {
++    code: currency.code,
++    name: currency.name,
++    exponent: currency.exponent,
++    minor_unit: formatMinor(1n, currency.code),
++    sample: formatMinor(SAMPLE_AMOUNT_MINOR, currency.code, { grouping: true }),
++  };
++}
++
+ export function serializeTransfer(transfer: Transfer): JsonObject {
+   return {
+     id: transfer.id,
+diff --git a/src/app.ts b/src/app.ts
+index 45c3ca5..80b1075 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -3,6 +3,7 @@ import { registerErrorHandling } from "./api/plugins/errorHandler.js";
+ import { authenticate } from "./api/plugins/auth.js";
+ import { rateLimit } from "./api/plugins/rateLimit.js";
+ import { accountRoutes } from "./api/routes/accounts.js";
++import { currencyRoutes } from "./api/routes/currencies.js";
+ import { eventRoutes } from "./api/routes/events.js";
+ import { fxRoutes } from "./api/routes/fx.js";
+ import { healthRoutes } from "./api/routes/health.js";
+@@ -17,6 +18,7 @@ import type { Logger } from "./infra/logger.js";
+ import { FixedWindowRateLimiter, type RateLimiter } from "./infra/rateLimiter.js";
+ import type { Redis } from "./infra/redis.js";
+ import { AccountService } from "./services/accountService.js";
++import { CurrencyService } from "./services/currencyService.js";
+ import { EventService } from "./services/eventService.js";
+ import { ApiKeyService } from "./services/apiKeyService.js";
+ import { FxService } from "./services/fxService.js";
+@@ -45,6 +47,7 @@ export function buildServices(deps: Pick<AppDeps, "pool" | "clock">): RouteServi
+   const { pool, clock } = deps;
+   return {
+     accounts: new AccountService({ pool, clock }),
++    currencies: new CurrencyService({ pool }),
+     transfers: new TransferService({ pool, clock }),
+     holds: new HoldService({ pool, clock }),
+     fx: new FxService({ pool, clock }),
+@@ -83,6 +86,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
+     api.addHook("onRequest", authenticate(services.apiKeys));
+     api.addHook("onRequest", rateLimit(limiter));
+     await api.register(accountRoutes, { services });
++    await api.register(currencyRoutes, { services });
+     await api.register(transferRoutes, { services });
+     await api.register(holdRoutes, { services });
+     await api.register(fxRoutes, { services });
+diff --git a/src/domain/money.ts b/src/domain/money.ts
+index 8ddeb8e..a60bea0 100644
+--- a/src/domain/money.ts
++++ b/src/domain/money.ts
+@@ -75,18 +75,34 @@ export function parseDecimal(input: string, currency: CurrencyCode): bigint {
+   return sign ? -minor : minor;
+ }
+ 
+-/** Format minor units as a decimal string in major units: 1234 USD → "12.34", -5 USD → "-0.05". */
+-export function formatMinor(amountMinor: bigint, currency: CurrencyCode): string {
++export interface FormatOptions {
++  /**
++   * Separate groups of three digits in the whole part with commas ("1,234,567.89"). The output
++   * never depends on the host's locale, unlike Number.prototype.toLocaleString.
++   */
++  readonly grouping?: boolean;
++}
++
++// A position inside a run of digits that is followed by a multiple of three digits.
++const THOUSANDS_BOUNDARY = /\B(?=(?:\d{3})+$)/g;
++
++/**
++ * Format minor units as a decimal string in major units: 1234 USD → "12.34", -5 USD → "-0.05",
++ * and with `{ grouping: true }` 123456789 USD → "1,234,567.89".
++ */
++export function formatMinor(
++  amountMinor: bigint,
++  currency: CurrencyCode,
++  options: FormatOptions = {},
++): string {
+   const exponent = exponentOf(currency);
+-  const negative = amountMinor < 0n;
+-  const digits = (negative ? -amountMinor : amountMinor).toString();
+-  if (exponent === 0) {
+-    return `${negative ? "-" : ""}${digits}`;
+-  }
+-  const padded = digits.padStart(exponent + 1, "0");
+-  const whole = padded.slice(0, -exponent);
+-  const fraction = padded.slice(-exponent);
+-  return `${negative ? "-" : ""}${whole}.${fraction}`;
++  const sign = amountMinor < 0n ? "-" : "";
++  const digits = (amountMinor < 0n ? -amountMinor : amountMinor)
++    .toString()
++    .padStart(exponent + 1, "0");
++  const whole = exponent === 0 ? digits : digits.slice(0, -exponent);
++  const fraction = exponent === 0 ? "" : `.${digits.slice(-exponent)}`;
++  return `${sign}${options.grouping ? whole.replace(THOUSANDS_BOUNDARY, ",") : whole}${fraction}`;
+ }
+ 
+ /** Parse a decimal integer string of minor units as stored or sent on the wire. */
+diff --git a/src/repositories/currencies.ts b/src/repositories/currencies.ts
+new file mode 100644
+index 0000000..b61f115
+--- /dev/null
++++ b/src/repositories/currencies.ts
+@@ -0,0 +1,30 @@
++import type { Queryable } from "../db/pool.js";
++import { toCurrencyCode, type Currency, type CurrencyCode } from "../domain/currency.js";
++import { firstRow } from "./mapping.js";
++
++interface CurrencyRow {
++  code: string;
++  exponent: number;
++  name: string;
++}
++
++const COLUMNS = "code, exponent, name";
++
++function mapCurrency(row: CurrencyRow): Currency {
++  return { code: toCurrencyCode(row.code), exponent: row.exponent, name: row.name };
++}
++
++/** Every currency of the reference table, by code. */
++export async function listCurrencies(db: Queryable): Promise<Currency[]> {
++  const result = await db.query<CurrencyRow>(`SELECT ${COLUMNS} FROM currencies ORDER BY code`);
++  return result.rows.map(mapCurrency);
++}
++
++export async function findCurrency(db: Queryable, code: CurrencyCode): Promise<Currency | null> {
++  const result = await db.query<CurrencyRow>(
++    `SELECT ${COLUMNS} FROM currencies WHERE code = $1`,
++    [code],
++  );
++  const row = firstRow(result.rows);
++  return row ? mapCurrency(row) : null;
++}
+diff --git a/src/scripts/showTransfer.ts b/src/scripts/showTransfer.ts
+index 2fc4faf..6156836 100644
+--- a/src/scripts/showTransfer.ts
++++ b/src/scripts/showTransfer.ts
+@@ -1,4 +1,5 @@
+ import { parseArgs } from "node:util";
++import type { CurrencyCode } from "../domain/currency.js";
+ import { formatMinor } from "../domain/money.js";
+ import * as accounts from "../repositories/accounts.js";
+ import * as entries from "../repositories/entries.js";
+@@ -8,7 +9,8 @@ import { UsageError, runScript } from "./cli.js";
+ const USAGE = `usage: npm run show-transfer -- <transfer id>
+ 
+ Prints a transfer of any tenant with its entries and the names of both accounts, as JSON, for
+-support investigations. Exits 1 when no transfer has that id.`;
++support investigations. Amounts are in major units with digit grouping ("1,250.00"). Exits 1
++when no transfer has that id.`;
+ 
+ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+ 
+@@ -30,19 +32,21 @@ await runScript(USAGE, async ({ pool }) => {
+     accounts.findAccountById(pool, found.toAccountId),
+     entries.listEntriesForTransfer(pool, found.tenantId, found.id),
+   ]);
++  const display = (amountMinor: bigint, currency: CurrencyCode) =>
++    formatMinor(amountMinor, currency, { grouping: true });
+   const view = {
+     id: found.id,
+     tenant_id: found.tenantId,
+     created_at: found.createdAt.toISOString(),
+-    amount: formatMinor(found.amountMinor, found.currency),
++    amount: display(found.amountMinor, found.currency),
+     currency: found.currency,
+     description: found.description,
+     from: { id: found.fromAccountId, name: from?.name ?? null },
+     to: { id: found.toAccountId, name: to?.name ?? null },
+     entries: legs.map((leg) => ({
+       account_id: leg.accountId,
+-      amount: formatMinor(leg.amountMinor, leg.currency),
+-      balance_after: formatMinor(leg.balanceAfter, leg.currency),
++      amount: display(leg.amountMinor, leg.currency),
++      balance_after: display(leg.balanceAfter, leg.currency),
+     })),
+   };
+   process.stdout.write(`${JSON.stringify(view, null, 2)}\n`);
+diff --git a/src/services/currencyService.ts b/src/services/currencyService.ts
+new file mode 100644
+index 0000000..65d79aa
+--- /dev/null
++++ b/src/services/currencyService.ts
+@@ -0,0 +1,23 @@
++import type { Pool } from "../db/pool.js";
++import { isCurrencyCode, type Currency } from "../domain/currency.js";
++import { NotFoundError } from "../domain/errors.js";
++import * as currencies from "../repositories/currencies.js";
++
++/** The currencies accounts can be opened in, as the `currencies` table lists them. */
++export class CurrencyService {
++  private readonly pool: Pool;
++
++  constructor(deps: { pool: Pool }) {
++    this.pool = deps.pool;
++  }
++
++  async listCurrencies(): Promise<Currency[]> {
++    return currencies.listCurrencies(this.pool);
++  }
++
++  async getCurrency(code: string): Promise<Currency> {
++    const currency = isCurrencyCode(code) ? await currencies.findCurrency(this.pool, code) : null;
++    if (!currency) throw NotFoundError.resource("currency", code);
++    return currency;
++  }
++}
+diff --git a/test/api/currencies.test.ts b/test/api/currencies.test.ts
+new file mode 100644
+index 0000000..f783f3d
+--- /dev/null
++++ b/test/api/currencies.test.ts
+@@ -0,0 +1,74 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { listCurrencies } from "../../src/domain/currency.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import { createTenant, issueKey, type ErrorResponse, type TestTenant } from "../helpers/fixtures.js";
++
++interface CurrencyBody {
++  code: string;
++  name: string;
++  exponent: number;
++  minor_unit: string;
++  sample: string;
++}
++
++describe("currencies", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeAll(async () => {
++    t = await buildTestApp();
++  });
++
++  afterAll(async () => {
++    await t.close();
++  });
++
++  beforeEach(async () => {
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  function get(url: string, as: TestTenant = tenant) {
++    return t.app.inject({ method: "GET", url, headers: as.headers });
++  }
++
++  it("lists every supported currency by code", async () => {
++    const response = await get("/currencies");
++    expect(response.statusCode).toBe(200);
++    const { data } = response.json<{ data: CurrencyBody[] }>();
++    expect(data.map((c) => c.code)).toEqual(["BHD", "CHF", "EUR", "GBP", "JPY", "KWD", "USD", "VND"]);
++    expect(data.map((c) => [c.code, c.exponent])).toEqual(
++      listCurrencies()
++        .map((c) => [c.code, c.exponent])
++        .sort(([a], [b]) => String(a).localeCompare(String(b))),
++    );
++  });
++
++  it("describes one currency with its minor unit and a formatted sample", async () => {
++    const cases: [string, Omit<CurrencyBody, "code">][] = [
++      ["USD", { name: "US Dollar", exponent: 2, minor_unit: "0.01", sample: "1,234,567.89" }],
++      ["JPY", { name: "Yen", exponent: 0, minor_unit: "1", sample: "123,456,789" }],
++      ["KWD", { name: "Kuwaiti Dinar", exponent: 3, minor_unit: "0.001", sample: "123,456.789" }],
++    ];
++    for (const [code, expected] of cases) {
++      const response = await get(`/currencies/${code}`);
++      expect(response.statusCode, code).toBe(200);
++      expect(response.json<CurrencyBody>()).toEqual({ code, ...expected });
++    }
++  });
++
++  it("answers 404 for an unknown code and 400 for a malformed one", async () => {
++    const unknown = await get("/currencies/XAU");
++    expect(unknown.statusCode).toBe(404);
++    expect(unknown.json<ErrorResponse>().error.code).toBe("not_found");
++    for (const code of ["usd", "US", "USDT", "U1D"]) {
++      expect((await get(`/currencies/${code}`)).statusCode, code).toBe(400);
++    }
++  });
++
++  it("needs an API key with accounts:read", async () => {
++    const fxOnly = await issueKey(t.pool, t.clock, tenant.tenantId, ["fx:read"]);
++    expect((await get("/currencies", fxOnly)).statusCode).toBe(403);
++    const anonymous = await t.app.inject({ method: "GET", url: "/currencies/USD" });
++    expect(anonymous.statusCode).toBe(401);
++  });
++});
+diff --git a/test/domain/money.test.ts b/test/domain/money.test.ts
+index cd3655f..e62a923 100644
+--- a/test/domain/money.test.ts
++++ b/test/domain/money.test.ts
+@@ -48,6 +48,26 @@ describe("formatMinor", () => {
+     expect(formatMinor(0n, "BHD")).toBe("0.000");
+   });
+ 
++  it("groups the whole part in threes when asked, whatever the exponent", () => {
++    const grouped = (minor: bigint, currency: "USD" | "JPY" | "KWD" | "VND") =>
++      formatMinor(minor, currency, { grouping: true });
++    expect(grouped(123456789n, "USD")).toBe("1,234,567.89");
++    expect(grouped(100000n, "USD")).toBe("1,000.00");
++    expect(grouped(99999n, "USD")).toBe("999.99");
++    expect(grouped(5n, "USD")).toBe("0.05");
++    expect(grouped(-123456789n, "USD")).toBe("-1,234,567.89");
++    expect(grouped(1000n, "JPY")).toBe("1,000");
++    expect(grouped(999n, "JPY")).toBe("999");
++    expect(grouped(-1234567890n, "VND")).toBe("-1,234,567,890");
++    expect(grouped(1234567n, "KWD")).toBe("1,234.567");
++  });
++
++  it("does not group by default", () => {
++    expect(formatMinor(123456789n, "USD")).toBe("1234567.89");
++    expect(formatMinor(123456789n, "USD", {})).toBe("1234567.89");
++    expect(formatMinor(123456789n, "USD", { grouping: false })).toBe("1234567.89");
++  });
++
+   it("round-trips through parseDecimal", () => {
+     for (const minor of [0n, 1n, 99n, 100n, 123456789n, -42n]) {
+       expect(parseDecimal(formatMinor(minor, "KWD"), "KWD")).toBe(minor);

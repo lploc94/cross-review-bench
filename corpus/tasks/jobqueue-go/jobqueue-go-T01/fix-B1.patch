@@ -1,0 +1,37 @@
+diff --git a/internal/store/batch.go b/internal/store/batch.go
+index 7353f51..38ea940 100644
+--- a/internal/store/batch.go
++++ b/internal/store/batch.go
+@@ -5,6 +5,8 @@ import (
+ 	"errors"
+ 	"fmt"
+ 
++	"github.com/jackc/pgx/v5"
++
+ 	"github.com/relaywork/jobqueue/internal/domain"
+ )
+ 
+@@ -22,12 +24,18 @@ func (s *Store) EnqueueBatch(ctx context.Context, jobs []domain.NewJob) ([]domai
+ 	}
+ 	now := s.now()
+ 	out := make([]domain.Job, 0, len(jobs))
+-	for i, nj := range jobs {
+-		job, err := enqueue(ctx, s.pool, now, nj)
+-		if err != nil {
+-			return nil, batchError(i, err)
++	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
++		for i, nj := range jobs {
++			job, err := enqueue(ctx, tx, now, nj)
++			if err != nil {
++				return batchError(i, err)
++			}
++			out = append(out, job)
+ 		}
+-		out = append(out, job)
++		return nil
++	})
++	if err != nil {
++		return nil, err
+ 	}
+ 	return out, nil
+ }

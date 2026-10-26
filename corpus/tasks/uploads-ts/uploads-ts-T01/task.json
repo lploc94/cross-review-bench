@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T01",
+  "repo": "uploads-ts",
+  "kind": "buggy",
+  "title": "Range requests on downloads",
+  "description": "Video players, PDF viewers and download managers ask for parts of a file with `Range`, and today they always get the whole thing. Downloads by path, by id and through signed links now honour a single byte range (RFC 9110 §14).\n\n- New `src/api/range.ts`: `parseRange(header, size)` reads `bytes=first-last`, `bytes=first-` and the suffix form `bytes=-length` (the last `length` bytes), cuts a `last` past the end of the file, and returns an inclusive range, `unsatisfiable`, or `full` for anything it does not serve (several ranges, another unit, malformed values, `last` before `first`). `ifRangeHolds` compares `If-Range` strongly with the file's ETag.\n- `sendFile` answers `Accept-Ranges: bytes` on every download, 206 with `Content-Range: bytes <first>-<last>/<size>` and the matching `Content-Length` for a range, and 416 `range_not_satisfiable` with `Content-Range: bytes */<size>` (new `RangeNotSatisfiableError`, header set by the error handler like `Upload-Offset`) when the range starts at or after the end. `If-None-Match` is still checked first; a stale `If-Range` gets the whole file.\n- `StorageDriver.get(key, range?)` reads only the requested bytes: the local driver passes `start`/`end` to `createReadStream` (both inclusive), the S3 client sends a `Range` header and refuses a 200 answer to a ranged GET. `FileService.openContent` passes the range through.\n- README: new Range requests paragraph and API table.\n\nTests: `test/api/range.test.ts` (parser and If-Range), `test/api/rangeDownloads.test.ts` (206 by path, id and signed link, open ranges, 416, several ranges, If-Range, If-None-Match), and a ranged read in the storage contract run against both drivers.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/api/routes/sendFile.ts",
+      "lines": [50, 50],
+      "category": "boundary",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "The 206 response's Content-Length is `end - start`, but the range is inclusive (the Content-Range line just above and parseRange's contract say so, and the stream sends end - start + 1 bytes), so every partial response declares one byte fewer than it sends: clients truncate the part or see the extra byte as the start of the next response on a keep-alive connection.",
+      "trigger": "GET /v1/files/<path> with `Range: bytes=0-9` on a 100-byte file: Content-Range 0-9/100 and 10 body bytes, but Content-Length 9.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/rangeLength.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/rangeLength.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "`end - start` is the right length: parseRange in src/api/range.ts returns an exclusive end, like `Buffer.subarray` and `String.slice`, so `bytes=0-9` comes back as start 0, end 10 and the response carries exactly 10 bytes.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/api/range.ts",
+      "lines": [32, 34],
+      "category": "logic",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "A suffix range `bytes=-N` means the last N bytes (RFC 9110 §14.1.1, and the PR's own doc comment and README), but parseRange treats the missing first position as 0 and N as the last position, so `bytes=-10` serves bytes 0-10 (the first 11 bytes) labelled `0-10/<size>`. Players that read a file's trailer this way (MP4 moov atoms, ZIP central directories, PDF xref tables) get the wrong bytes.",
+      "trigger": "GET with `Range: bytes=-10` on a 100-byte file: expected 206 `bytes 90-99/100` with the last 10 bytes, got `bytes 0-10/100` with the first 11.",
+      "testable": true,
+      "hidden_tests": ["test/hidden/suffixRange.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/suffixRange.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "A suffix range never reaches that line: SINGLE_BYTE_RANGE in src/api/range.ts requires a first position, so `bytes=-10` does not match and parseRange returns `full`; suffix ranges are answered with the whole file, which the RFC allows.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

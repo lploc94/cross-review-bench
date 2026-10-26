@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "jobqueue-go-T01",
+  "repo": "jobqueue-go",
+  "kind": "buggy",
+  "title": "Batch enqueue",
+  "description": "Importers that turn a CSV file into jobs currently make one HTTP request per row, which is slow and leaves half an import behind when the client dies midway. This adds a batch endpoint.\n\n- `POST /v1/queues/{queue}/jobs/batch` takes `{\"jobs\": [...]}`, 1 to 500 objects with the same fields as the single enqueue (`type`, `payload`, `priority`, `max_attempts`, `run_at`), and answers 201 with `{\"jobs\": [...]}` in request order. The batch is all-or-nothing: if any job is invalid the response is 422 naming its index (`jobs[2].type`) and no job of the batch is enqueued, so a client can fix the input and resend the whole batch.\n- `store.EnqueueBatch` normalizes and validates each job with the existing `enqueue` helper; every job of a batch gets the same `created_at`. Validation errors are re-reported with the job's position as the field prefix.\n- The request body limit for this route is 8 MiB (`decodeJSONLimit`); each payload keeps the 256 KiB limit.\n- `client.EnqueueBatch` and `jobctl enqueue-batch -queue Q [-file F]`, which reads NDJSON (one job object per line, blank lines skipped, stdin by default) and prints the created ids.\n\nTests: store (order, defaults, position in validation errors, size limits), API (201 body, 422 fields, auth), client request body, jobctl with a file and with stdin. README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/store/batch.go",
+      "lines": [25, 31],
+      "category": "data-integrity",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "EnqueueBatch calls enqueue for each job on the connection pool, so every INSERT commits on its own; when a later job is invalid (or the database rejects it) the method returns an error but the jobs before it stay enqueued. The promised all-or-nothing batch is not; a client that fixes and resends the batch enqueues those jobs twice.",
+      "trigger": "POST a batch of three jobs whose third job has an empty type (422 jobs[2].type), or whose third payload jsonb rejects ({\"note\":\"\\u0000\"}): the first two jobs are in the queue afterwards.",
+      "testable": true,
+      "hidden_tests": ["internal/store/batch_atomicity_test.go"],
+      "hidden_test_cmd": "go test -count=1 -run '^TestEnqueueBatchIsAllOrNothing$' ./internal/store/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Nothing is left behind: enqueue in internal/store/jobs.go is a single INSERT … RETURNING, and pgx runs every statement in its own transaction, so a job that fails to insert is rolled back and validation rejects an invalid job before any statement is sent for it.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

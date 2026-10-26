@@ -1,0 +1,481 @@
+diff --git a/README.md b/README.md
+index fe7e007..9e12cee 100644
+--- a/README.md
++++ b/README.md
+@@ -79,7 +79,9 @@ a file; before that it is 409 `upload_incomplete`. Sessions expire `UPLOAD_SESSI
+ they are created; an expired or aborted session releases its bytes and its staged chunks.
+ 
+ **Deletion and cleanup.** Deleting a file marks its row deleted, releases its bytes and removes
+-its storage object right away. A background cleanup job (every `CLEANUP_INTERVAL_S`) expires
++its storage object right away. `DELETE /v1/files?prefix=reports/2025/` does the same for the live
++files under a folder prefix (it ends with `/`; `%` and `_` in it are plain characters), at most
++`LIST_MAX_LIMIT` files per request. A background cleanup job (every `CLEANUP_INTERVAL_S`) expires
+ sessions past their expiry, removes the objects of deleted files whose removal failed once
+ `DELETED_GRACE_S` has passed, and removes staged chunks that belong to no open session. Several
+ instances can run the scan worker and the cleanup job at once: rows are claimed with
+@@ -95,6 +97,7 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | POST | `/v1/files[?overwrite=true]` (multipart) | `files:write` | 201, or 200 when it replaced a file |
+ | GET | `/v1/files/<path>` | `files:read` | 200 (304 on a matching `If-None-Match`) |
+ | DELETE | `/v1/files/<path>` | `files:delete` | 204 |
++| DELETE | `/v1/files?prefix=<folder>/` | `files:delete` | 200 |
+ | GET | `/v1/files/by-id/:id` | `files:read` | 200 (304) |
+ | GET | `/v1/files/by-id/:id/meta` | `files:read` | 200 |
+ | POST | `/v1/files/by-id/:id/signed-url` | `files:read` | 200 |
+@@ -120,6 +123,9 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+ - **`GET /v1/files`** lists live files in byte order of their paths: `limit` 1 to
+   `LIST_MAX_LIMIT` (default 100, or `LIST_MAX_LIMIT` when lower), and `after` the `nextCursor` of
+   the previous page. It answers `{ "data": [...], "nextCursor": "<opaque>" | null }`.
++- **`DELETE /v1/files?prefix=`** answers `{ "prefix", "deleted", "bytes", "more" }`: how many
++  files were deleted and how many bytes released. `more: true` means files are left under the
++  prefix; repeat the request until it is false. A prefix with no files answers `deleted: 0`.
+ - **`POST /v1/uploads`** takes `{ "path", "size", "contentType"? }` and returns the session
+   `{ id, path, size, offset, state, declaredType, overwrite, fileId, createdAt, expiresAt }`.
+   `overwrite` is checked when the session is created and again when it completes.
+@@ -192,7 +198,7 @@ test/                vitest suites; test/helpers has the app builder, fixtures a
+ | `UPLOAD_SESSION_TTL_S` | `86400` | lifetime of a resumable session |
+ | `UPLOAD_CHUNK_LEASE_S` | `600` | longest time one chunk may take |
+ | `SIGNED_URL_MAX_TTL_S` | `604800` | longest signed-link lifetime |
+-| `LIST_MAX_LIMIT` | `1000` | largest listing page |
++| `LIST_MAX_LIMIT` | `1000` | largest listing page; most files one folder delete removes |
+ | `SCANNER` | `noop` | `noop` or `http` |
+ | `SCANNER_URL` | required for `http` | |
+ | `SCANNER_TIMEOUT_MS` | `30000` | per scan |
+@@ -229,9 +235,10 @@ Operational scripts:
+ 
+ - `npm run admin -- issue-key|list-keys|revoke-key --tenant <id> …` manages API keys
+   (`--scopes files:read,files:write`; all scopes by default).
+-- `npm run uploadctl -- put|upload|get|list|delete|signed-url|usage …` talks to a running
+-  service as one tenant, with `UPLOADS_URL` and `UPLOADS_TOKEN` set. `upload` uses a resumable
+-  session and continues one with `--session <id>`; `get` never overwrites a local file.
++- `npm run uploadctl -- put|upload|get|list|delete|delete-folder|signed-url|usage …` talks to a
++  running service as one tenant, with `UPLOADS_URL` and `UPLOADS_TOKEN` set. `upload` uses a
++  resumable session and continues one with `--session <id>`; `get` never overwrites a local file;
++  `delete-folder` deletes one batch and prints `more`.
+ 
+ ## Testing
+ 
+diff --git a/scripts/uploadctl.ts b/scripts/uploadctl.ts
+index 290d0fb..00c798b 100644
+--- a/scripts/uploadctl.ts
++++ b/scripts/uploadctl.ts
+@@ -16,6 +16,7 @@ const USAGE = `usage: uploadctl <command> [options]
+   get <remote path> <local file>
+   list [--after <cursor>] [--limit <n>] [--all]
+   delete <remote path>
++  delete-folder <remote prefix>                  files under a prefix ending with /, one batch
+   signed-url <file id> [--expires-in <seconds>]
+   usage
+ 
+@@ -128,6 +129,9 @@ async function run(argv: string[]): Promise<void> {
+     case "delete":
+       await client().deleteFile(arg(0, "remote path"));
+       return;
++    case "delete-folder":
++      print(await client().deleteFolder(arg(0, "remote prefix")));
++      return;
+     case "signed-url":
+       print(
+         await client().createSignedUrl(
+diff --git a/src/api/routes/files.ts b/src/api/routes/files.ts
+index a921a3a..1657db8 100644
+--- a/src/api/routes/files.ts
++++ b/src/api/routes/files.ts
+@@ -1,13 +1,13 @@
+ import type { FastifyPluginAsync } from "fastify";
+ import { authOf, requireScope } from "../plugins/auth.js";
+ import { idParamsSchema, wildcardParamsSchema } from "../schemas/common.js";
+-import { listFilesQuerySchema, signedUrlBodySchema } from "../schemas/files.js";
++import { deleteFolderQuerySchema, listFilesQuerySchema, signedUrlBodySchema } from "../schemas/files.js";
+ import { serializeFile } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import { sendFile } from "./sendFile.js";
+ import type { RouteOptions } from "./types.js";
+ 
+-/** Listing, metadata, downloads, deletion and signed links of stored files. */
++/** Listing, metadata, downloads, deletion (one file or a folder) and signed links of stored files. */
+ export const fileRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services, limits }) => {
+   const listQuery = listFilesQuerySchema(limits.listMaxLimit);
+   const signedUrlBody = signedUrlBodySchema(limits.signedUrlMaxTtlSeconds);
+@@ -52,6 +52,13 @@ export const fileRoutes: FastifyPluginAsync<RouteOptions> = async (app, { servic
+     return sendFile(request, reply, services.files, await services.files.getByPath(tenantId, params["*"]));
+   });
+ 
++  app.delete("/files", { preHandler: requireScope("files:delete") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const query = parse(deleteFolderQuerySchema, request.query, "query");
++    const result = await services.files.deleteFolder(tenantId, query.prefix);
++    return { prefix: result.prefix, deleted: result.deleted, bytes: result.bytes, more: result.more };
++  });
++
+   app.delete("/files/*", { preHandler: requireScope("files:delete") }, async (request, reply) => {
+     const { tenantId } = authOf(request);
+     const params = parse(wildcardParamsSchema, request.params, "params");
+diff --git a/src/api/schemas/files.ts b/src/api/schemas/files.ts
+index 4f4361d..f9c6774 100644
+--- a/src/api/schemas/files.ts
++++ b/src/api/schemas/files.ts
+@@ -1,5 +1,6 @@
+ import { z } from "zod";
+ import { MAX_CURSOR_LENGTH } from "../../domain/cursor.js";
++import { MAX_PATH_BYTES } from "../../domain/paths.js";
+ import { integerParam } from "./common.js";
+ 
+ /** Default page size of the listing, capped by LIST_MAX_LIMIT. */
+@@ -22,3 +23,8 @@ export const publicDownloadQuerySchema = z.object({
+   exp: z.string().max(32),
+   sig: z.string().max(128),
+ });
++
++/** `DELETE /v1/files?prefix=`: the folder; checked further by normalizeFolderPrefix. */
++export const deleteFolderQuerySchema = z.object({
++  prefix: z.string().min(1).max(MAX_PATH_BYTES + 1),
++});
+diff --git a/src/client/uploadsClient.ts b/src/client/uploadsClient.ts
+index 2eb4e3b..7189432 100644
+--- a/src/client/uploadsClient.ts
++++ b/src/client/uploadsClient.ts
+@@ -49,6 +49,14 @@ export interface TenantUsage {
+   readonly createdAt: string;
+ }
+ 
++export interface FolderDeletion {
++  readonly prefix: string;
++  readonly deleted: number;
++  readonly bytes: number;
++  /** Live files are left under the prefix; call again to delete the next batch. */
++  readonly more: boolean;
++}
++
+ export interface SignedUrlInfo {
+   /** Path and query; resolve it against the API's base URL. */
+   readonly url: string;
+@@ -258,6 +266,13 @@ export class UploadsClient {
+     await this.expect(await this.request("DELETE", `/v1/files/${encodeFilePath(path)}`), 204);
+   }
+ 
++  /** Delete one batch of the files under a folder prefix (`reports/2025/`). */
++  async deleteFolder(prefix: string): Promise<FolderDeletion> {
++    const query = new URLSearchParams({ prefix });
++    const response = await this.expect(await this.request("DELETE", `/v1/files?${query.toString()}`), 200);
++    return (await response.json()) as FolderDeletion;
++  }
++
+   async createSignedUrl(id: string, expiresIn: number): Promise<SignedUrlInfo> {
+     const response = await this.expect(
+       await this.json("POST", `/v1/files/by-id/${encodeURIComponent(id)}/signed-url`, { expiresIn }),
+diff --git a/src/domain/paths.ts b/src/domain/paths.ts
+index ee0481a..1b5cbed 100644
+--- a/src/domain/paths.ts
++++ b/src/domain/paths.ts
+@@ -89,6 +89,17 @@ export function normalizePath(input: string): string {
+   return path;
+ }
+ 
++/**
++ * Validate a folder prefix (`reports/2025/`) and return its canonical form: a valid path followed
++ * by `/`, so `reports/2025/` never matches `reports/2025-old/…`.
++ */
++export function normalizeFolderPrefix(input: string): string {
++  if (!input.endsWith("/")) {
++    throw new ValidationError("invalid prefix: must end with /", { prefix: input });
++  }
++  return `${normalizePath(input.slice(0, -1))}/`;
++}
++
+ /** The last segment of a normalized path. */
+ export function baseName(path: string): string {
+   const slash = path.lastIndexOf("/");
+diff --git a/src/repositories/fileRepo.ts b/src/repositories/fileRepo.ts
+index cf9a0cc..084f101 100644
+--- a/src/repositories/fileRepo.ts
++++ b/src/repositories/fileRepo.ts
+@@ -193,6 +193,54 @@ export async function markDeleted(
+   return row ? mapFile(row) : null;
+ }
+ 
++/** A LIKE pattern for every path that starts with `prefix`, with `\`, `%` and `_` escaped by `\`. */
++export function likePrefixPattern(prefix: string): string {
++  return `${prefix.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
++}
++
++/**
++ * Soft-delete up to `limit` live files whose path starts with `prefix`, in path order. Returns
++ * the rows this statement deleted.
++ */
++export async function markDeletedUnderPrefix(
++  db: Queryable,
++  tenantId: string,
++  prefix: string,
++  now: Date,
++  limit: number,
++): Promise<FileRecord[]> {
++  const result = await db.query<FileRow>(
++    `WITH batch AS (
++       SELECT id FROM files
++       WHERE tenant_id = $1 AND path LIKE $2 ESCAPE '\\' AND status <> 'deleted'
++       ORDER BY path
++       LIMIT $4
++     )
++     UPDATE files SET status = 'deleted', deleted_at = $3, updated_at = $3, next_scan_at = NULL
++     FROM batch
++     WHERE files.id = batch.id AND files.status <> 'deleted'
++     RETURNING ${QUALIFIED_COLUMNS}`,
++    [tenantId, likePrefixPattern(prefix), now, limit],
++  );
++  return result.rows.map(mapFile);
++}
++
++/** Whether the tenant has a live file whose path starts with `prefix`. */
++export async function hasLiveFileUnderPrefix(
++  db: Queryable,
++  tenantId: string,
++  prefix: string,
++): Promise<boolean> {
++  const result = await db.query<{ found: boolean }>(
++    `SELECT EXISTS (
++       SELECT 1 FROM files
++       WHERE tenant_id = $1 AND path LIKE $2 ESCAPE '\\' AND status <> 'deleted'
++     ) AS found`,
++    [tenantId, likePrefixPattern(prefix)],
++  );
++  return firstRow(result.rows)?.found === true;
++}
++
+ /** Record that the storage object of a deleted file is gone. */
+ export async function markObjectsDeleted(db: Queryable, ids: string[], now: Date): Promise<void> {
+   if (ids.length === 0) return;
+diff --git a/src/services/fileService.ts b/src/services/fileService.ts
+index 02088ef..fb61537 100644
+--- a/src/services/fileService.ts
++++ b/src/services/fileService.ts
+@@ -10,7 +10,7 @@ import {
+   ValidationError,
+ } from "../domain/errors.js";
+ import { isDownloadable, type FileRecord } from "../domain/file.js";
+-import { normalizePath } from "../domain/paths.js";
++import { normalizeFolderPrefix, normalizePath } from "../domain/paths.js";
+ import type { Clock } from "../infra/clock.js";
+ import type { Logger } from "../infra/logger.js";
+ import * as files from "../repositories/fileRepo.js";
+@@ -30,6 +30,16 @@ export interface FileServiceDeps {
+   readonly listMaxLimit: number;
+ }
+ 
++export interface FolderDeletion {
++  /** The canonical prefix, ending with `/`. */
++  readonly prefix: string;
++  readonly deleted: number;
++  /** Bytes given back to the quota. */
++  readonly bytes: number;
++  /** Whether live files are still under the prefix after this batch. */
++  readonly more: boolean;
++}
++
+ export interface SignedUrl {
+   /** Path and query of the public download route; prefix it with the service's base URL. */
+   readonly url: string;
+@@ -89,6 +99,33 @@ export class FileService {
+     return deleted;
+   }
+ 
++  /**
++   * Soft-delete the tenant's live files under a folder prefix, at most `listMaxLimit` of them per
++   * call, and release their bytes in the same transaction; then remove their storage objects as
++   * `deleteByPath` does. `more` tells the caller to repeat the call.
++   */
++  async deleteFolder(tenantId: string, rawPrefix: string): Promise<FolderDeletion> {
++    const prefix = normalizeFolderPrefix(rawPrefix);
++    const { deleted, bytes, more } = await withTransaction(this.deps.pool, async (client) => {
++      const rows = await files.markDeletedUnderPrefix(
++        client,
++        tenantId,
++        prefix,
++        this.deps.clock.now(),
++        this.deps.listMaxLimit,
++      );
++      const released = rows.reduce((sum, row) => sum + row.size, 0);
++      await tenants.releaseBytes(client, tenantId, released, this.deps.logger);
++      const remaining = await files.hasLiveFileUnderPrefix(client, tenantId, prefix);
++      return { deleted: rows, bytes: released, more: remaining };
++    });
++    for (const file of deleted) {
++      await this.deps.catalog.removeObjectOf(file);
++    }
++    this.deps.logger.info({ tenantId, prefix, files: deleted.length, bytes }, "folder deleted");
++    return { prefix, deleted: deleted.length, bytes, more };
++  }
++
+   /** The file's bytes, for a download. Only available (scanned, clean) files are served. */
+   async openContent(file: FileRecord): Promise<Readable> {
+     this.assertDownloadable(file);
+diff --git a/test/api/folderDelete.test.ts b/test/api/folderDelete.test.ts
+new file mode 100644
+index 0000000..d87f995
+--- /dev/null
++++ b/test/api/folderDelete.test.ts
+@@ -0,0 +1,139 @@
++import { access } from "node:fs/promises";
++import path from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  expectStatus,
++  issueKey,
++  storeFile,
++  tenantUsage,
++  type ErrorResponse,
++  type FileBody,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++interface FolderDeletion {
++  prefix: string;
++  deleted: number;
++  bytes: number;
++  more: boolean;
++}
++
++describe("deleting a folder", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeEach(async () => {
++    t = await buildTestApp({ env: { LIST_MAX_LIMIT: "3" } });
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  function deleteFolder(prefix: string, who: TestTenant = tenant) {
++    return t.app.inject({
++      method: "DELETE",
++      url: `/v1/files?prefix=${encodeURIComponent(prefix)}`,
++      headers: who.headers,
++    });
++  }
++
++  async function livePaths(who: TestTenant = tenant): Promise<string[]> {
++    const response = await t.app.inject({ url: "/v1/files", headers: who.headers });
++    expectStatus(response, 200);
++    return response.json<{ data: FileBody[] }>().data.map((file) => file.path);
++  }
++
++  function objectPath(file: FileBody): string {
++    return path.join(t.storageRoot ?? "", "objects", "t", tenant.tenantId, file.id);
++  }
++
++  it("deletes the files under the prefix, releases their bytes and removes their objects", async () => {
++    const a = await storeFile(t.app, tenant, "reports/2025/a.csv", "a".repeat(10));
++    const b = await storeFile(t.app, tenant, "reports/2025/q1/b.csv", "b".repeat(20));
++    await storeFile(t.app, tenant, "reports/2025-old/c.csv", "c".repeat(40));
++    await storeFile(t.app, tenant, "reports/2024/d.csv", "d".repeat(80));
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(150);
++
++    const response = await deleteFolder("reports/2025/");
++    expectStatus(response, 200);
++    expect(response.json<FolderDeletion>()).toEqual({
++      prefix: "reports/2025/",
++      deleted: 2,
++      bytes: 30,
++      more: false,
++    });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(120);
++    expect(await livePaths()).toEqual(["reports/2024/d.csv", "reports/2025-old/c.csv"]);
++    await expect(access(objectPath(a))).rejects.toThrow();
++    await expect(access(objectPath(b))).rejects.toThrow();
++    const rows = await t.pool.query<{ object_deleted_at: Date | null }>(
++      "SELECT object_deleted_at FROM files WHERE id = ANY($1::uuid[])",
++      [[a.id, b.id]],
++    );
++    expect(rows.rows.every((row) => row.object_deleted_at !== null)).toBe(true);
++  });
++
++  it("deletes at most LIST_MAX_LIMIT files per request and says when more are left", async () => {
++    for (const name of ["1", "2", "3", "4"]) await storeFile(t.app, tenant, `tmp/${name}.txt`, name);
++
++    const first = await deleteFolder("tmp/");
++    expectStatus(first, 200);
++    expect(first.json<FolderDeletion>()).toMatchObject({ deleted: 3, bytes: 3, more: true });
++    expect(await livePaths()).toEqual(["tmp/4.txt"]);
++
++    const second = await deleteFolder("tmp/");
++    expect(second.json<FolderDeletion>()).toMatchObject({ deleted: 1, bytes: 1, more: false });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(0);
++  });
++
++  it("treats % and _ in the prefix as plain characters", async () => {
++    await storeFile(t.app, tenant, "a_b/x.txt", "x");
++    await storeFile(t.app, tenant, "axb/y.txt", "y");
++    await storeFile(t.app, tenant, "100%/z.txt", "z");
++    await storeFile(t.app, tenant, "1000/w.txt", "w");
++
++    expect((await deleteFolder("a_b/")).json<FolderDeletion>().deleted).toBe(1);
++    expect((await deleteFolder("100%/")).json<FolderDeletion>().deleted).toBe(1);
++    expect(await livePaths()).toEqual(["1000/w.txt", "axb/y.txt"]);
++  });
++
++  it("answers deleted 0 for a folder without files", async () => {
++    await storeFile(t.app, tenant, "keep/a.txt", "a");
++    const response = await deleteFolder("empty/");
++    expectStatus(response, 200);
++    expect(response.json<FolderDeletion>()).toEqual({ prefix: "empty/", deleted: 0, bytes: 0, more: false });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(1);
++  });
++
++  it("leaves other tenants' files alone", async () => {
++    const other = await createTenant(t.pool, t.clock, { name: "Harbor Logistics" });
++    await storeFile(t.app, other, "shared/theirs.txt", "theirs");
++    await storeFile(t.app, tenant, "shared/mine.txt", "mine");
++
++    expect((await deleteFolder("shared/")).json<FolderDeletion>().deleted).toBe(1);
++    expect(await livePaths(other)).toEqual(["shared/theirs.txt"]);
++    expect(await tenantUsage(t.pool, other.tenantId)).toBe(6);
++  });
++
++  it("rejects prefixes that are not folders", async () => {
++    for (const prefix of ["reports", "/reports/", "../reports/", "a//", "a/./"]) {
++      const response = await deleteFolder(prefix);
++      expectStatus(response, 400);
++      expect(response.json<ErrorResponse>().error.code).toBe("validation_error");
++    }
++    const missing = await t.app.inject({ method: "DELETE", url: "/v1/files", headers: tenant.headers });
++    expectStatus(missing, 400);
++  });
++
++  it("needs the files:delete scope", async () => {
++    await storeFile(t.app, tenant, "docs/a.txt", "a");
++    const reader = await issueKey(t.pool, t.clock, tenant.tenantId, ["files:read", "files:write"]);
++    const response = await deleteFolder("docs/", reader);
++    expectStatus(response, 403);
++    expect(await livePaths()).toEqual(["docs/a.txt"]);
++  });
++});
+diff --git a/test/client/uploadsClient.test.ts b/test/client/uploadsClient.test.ts
+index 220b5f7..2385099 100644
+--- a/test/client/uploadsClient.test.ts
++++ b/test/client/uploadsClient.test.ts
+@@ -66,6 +66,21 @@ describe("UploadsClient against a listening server", () => {
+     expect((await client.getTenant()).usedBytes).toBe(9);
+   });
+ 
++  it("deletes a folder", async () => {
++    await client.putFile("exports/a.json", Buffer.from("[1]"));
++    await client.putFile("exports/b.json", Buffer.from("[2, 3]"));
++    await client.putFile("keep.json", Buffer.from("{}"));
++    expect(await client.deleteFolder("exports/")).toEqual({
++      prefix: "exports/",
++      deleted: 2,
++      bytes: 9,
++      more: false,
++    });
++    const bad = await client.deleteFolder("exports").catch((err: unknown) => err);
++    expect((bad as ApiError).code).toBe("validation_error");
++    expect((await client.getTenant()).usedBytes).toBe(2);
++  });
++
+   it("downloads through a signed link without the API key", async () => {
+     const stored = await client.putFile("share.txt", Buffer.from("public now"));
+     await markAvailable(t.pool, stored.file.id);

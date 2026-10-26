@@ -1,0 +1,698 @@
+diff --git a/README.md b/README.md
+index c9415f9..e534c38 100644
+--- a/README.md
++++ b/README.md
+@@ -44,7 +44,10 @@ internal/testredis/ per-test Redis key spaces for tests
+ 4. The route's `rate_limit` counts the request per consumer (per client address on routes without
+    auth) in a fixed window. Every limited response carries `RateLimit-Limit`, `RateLimit-Remaining`
+    and `RateLimit-Reset`; a rejection is `429` with `Retry-After`. When Redis fails the request goes
+-   through and `gateway_rate_limit_errors_total` counts it.
++   through and `gateway_rate_limit_errors_total` counts it. A consumer with a `daily_quota` (0 means
++   unlimited) is then counted per calendar day in `QUOTA_TIME_ZONE`: a request over the quota is
++   `429 quota_exceeded` with `Retry-After` until the next day starts, and `X-Quota-Limit` and
++   `X-Quota-Remaining` report the day's count.
+ 5. The request is forwarded to a healthy upstream whose circuit breaker admits it, chosen by
+    smooth weighted round-robin. Hop-by-hop headers are removed in both directions;
+    `X-Forwarded-For`, `-Proto` and `-Host` are extended only when the peer is in `TRUSTED_PROXIES`
+@@ -165,6 +168,7 @@ go run ./cmd/gatewayctl sign -key-id hk_… -secret … -method POST -path /orde
+ | `TRUSTED_PROXIES` | none | comma-separated CIDRs whose `X-Forwarded-*` and `X-Real-Ip` headers are believed |
+ | `BODY_BUFFER_LIMIT` | `1048576` | bytes of request body held for retries and HMAC; HMAC routes reject longer bodies with `413` |
+ | `HMAC_CLOCK_SKEW` | `5m` | how far an HMAC timestamp may be from the gateway's clock (at most `1h`) |
++| `QUOTA_TIME_ZONE` | `UTC` | IANA time zone whose calendar days daily quotas run on |
+ 
+ Logs are JSON lines on stdout. Credentials (`Authorization`, API keys, secrets, signatures, the
+ admin token) are never logged; the access log records the path without the query string.
+@@ -190,7 +194,7 @@ All `/admin/v1` endpoints require `Authorization: Bearer $ADMIN_TOKEN` and answe
+ | `GET /admin/v1/health` | Redis and upstream health; `503` when Redis is down |
+ | `GET /admin/v1/routes`, `GET /admin/v1/routes/{id}` | live routes with upstream health and breaker state |
+ | `POST /admin/v1/routes/reload` | reload the routes file; `422` with the problems when it is invalid |
+-| `POST /admin/v1/consumers` | `{"name": "billing", "enabled": true}` |
++| `POST /admin/v1/consumers` | `{"name": "billing", "enabled": true, "daily_quota": 10000}` |
+ | `GET /admin/v1/consumers?offset=0&limit=100` | page of consumers |
+ | `GET`, `PATCH`, `DELETE /admin/v1/consumers/{id}` | read, rename/enable/disable, delete with credentials |
+ | `POST`, `GET /admin/v1/consumers/{id}/keys` | issue a key (shown once), list keys |
+diff --git a/cmd/gateway/main.go b/cmd/gateway/main.go
+index 70abc3f..2f53a7b 100644
+--- a/cmd/gateway/main.go
++++ b/cmd/gateway/main.go
+@@ -87,6 +87,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 
+ 	clk := clock.Real{}
+ 	st := store.New(rdb, cfg.Redis.KeyPrefix, clk)
++	st.SetQuotaZone(cfg.QuotaZone)
+ 	reg := metrics.NewRegistry()
+ 	reg.NewGauge("gateway_build_info", "Always 1; the labels identify the running build.",
+ 		"version", "revision", "go_version").Set(1, build.Version, build.Revision, build.GoVersion)
+@@ -108,6 +109,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
+ 			config.AuthHMAC:   &auth.HMACAuthenticator{Store: st, Clock: clk, MaxSkew: cfg.HMACClockSkew},
+ 		},
+ 		RateLimiter:     st.FixedWindow(),
++		Quota:           st,
+ 		Transport:       newUpstreamTransport(cfg),
+ 		Clock:           clk,
+ 		Logger:          logger,
+diff --git a/internal/api/consumers.go b/internal/api/consumers.go
+index c970f4b..2b9dcc9 100644
+--- a/internal/api/consumers.go
++++ b/internal/api/consumers.go
+@@ -7,13 +7,15 @@ import (
+ )
+ 
+ type createConsumerRequest struct {
+-	Name    string `json:"name"`
+-	Enabled *bool  `json:"enabled"` // default true
++	Name       string `json:"name"`
++	Enabled    *bool  `json:"enabled"`     // default true
++	DailyQuota *int64 `json:"daily_quota"` // default 0, unlimited
+ }
+ 
+ type updateConsumerRequest struct {
+-	Name    *string `json:"name"`
+-	Enabled *bool   `json:"enabled"`
++	Name       *string `json:"name"`
++	Enabled    *bool   `json:"enabled"`
++	DailyQuota *int64  `json:"daily_quota"`
+ }
+ 
+ type consumerList struct {
+@@ -46,6 +48,9 @@ func (s *Server) createConsumer(w http.ResponseWriter, r *http.Request) {
+ 	if req.Enabled != nil {
+ 		in.Enabled = *req.Enabled
+ 	}
++	if req.DailyQuota != nil {
++		in.DailyQuota = *req.DailyQuota
++	}
+ 	c, err := s.store.CreateConsumer(r.Context(), in)
+ 	if err != nil {
+ 		s.writeError(w, r, err)
+@@ -84,7 +89,7 @@ func (s *Server) updateConsumer(w http.ResponseWriter, r *http.Request) {
+ 		s.writeError(w, r, err)
+ 		return
+ 	}
+-	c, err := s.store.UpdateConsumer(r.Context(), r.PathValue("id"), model.ConsumerPatch{Name: req.Name, Enabled: req.Enabled})
++	c, err := s.store.UpdateConsumer(r.Context(), r.PathValue("id"), model.ConsumerPatch{Name: req.Name, Enabled: req.Enabled, DailyQuota: req.DailyQuota})
+ 	if err != nil {
+ 		s.writeError(w, r, err)
+ 		return
+diff --git a/internal/config/config.go b/internal/config/config.go
+index b5fcdbe..3403493 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -48,6 +48,8 @@ type Config struct {
+ 	BodyBufferLimit int64
+ 	// HMACClockSkew is how far a signature's timestamp may be from the gateway's clock.
+ 	HMACClockSkew time.Duration
++	// QuotaZone is the time zone whose calendar days daily quotas run on.
++	QuotaZone *time.Location
+ }
+ 
+ // Load reads the configuration from the process environment.
+@@ -77,6 +79,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
+ 		TrustedProxies:  r.prefixes("TRUSTED_PROXIES"),
+ 		BodyBufferLimit: int64(r.int("BODY_BUFFER_LIMIT", 1<<20, 0, 64<<20)),
+ 		HMACClockSkew:   r.duration("HMAC_CLOCK_SKEW", 5*time.Minute),
++		QuotaZone:       r.location("QUOTA_TIME_ZONE"),
+ 	}
+ 	cfg.validate(&r)
+ 	if len(r.errs) > 0 {
+@@ -190,6 +193,20 @@ func (r *reader) duration(name string, def time.Duration) time.Duration {
+ 	return d
+ }
+ 
++// location reads an IANA time zone name, UTC when the variable is not set.
++func (r *reader) location(name string) *time.Location {
++	v, ok := r.get(name)
++	if !ok {
++		return time.UTC
++	}
++	loc, err := time.LoadLocation(v)
++	if err != nil {
++		r.fail(name, "must be an IANA time zone name, got %q", v)
++		return time.UTC
++	}
++	return loc
++}
++
+ func (r *reader) level(name string, def slog.Level) slog.Level {
+ 	v, ok := r.get(name)
+ 	if !ok {
+diff --git a/internal/config/quota_zone_test.go b/internal/config/quota_zone_test.go
+new file mode 100644
+index 0000000..9a4effe
+--- /dev/null
++++ b/internal/config/quota_zone_test.go
+@@ -0,0 +1,24 @@
++package config
++
++import (
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestQuotaTimeZone(t *testing.T) {
++	cfg, err := LoadFrom(lookupFrom(validEnv()))
++	if err != nil || cfg.QuotaZone != time.UTC {
++		t.Fatalf("default zone: %v, %v", cfg.QuotaZone, err)
++	}
++	env := validEnv()
++	env["QUOTA_TIME_ZONE"] = "Asia/Tokyo"
++	cfg, err = LoadFrom(lookupFrom(env))
++	if err != nil || cfg.QuotaZone.String() != "Asia/Tokyo" {
++		t.Fatalf("Asia/Tokyo: %v, %v", cfg.QuotaZone, err)
++	}
++	env["QUOTA_TIME_ZONE"] = "Mars/Olympus"
++	if _, err := LoadFrom(lookupFrom(env)); err == nil || !strings.Contains(err.Error(), "QUOTA_TIME_ZONE") {
++		t.Errorf("unknown zone: %v", err)
++	}
++}
+diff --git a/internal/core/quota.go b/internal/core/quota.go
+new file mode 100644
+index 0000000..d4167cc
+--- /dev/null
++++ b/internal/core/quota.go
+@@ -0,0 +1,19 @@
++package core
++
++import (
++	"context"
++	"time"
++)
++
++// QuotaDecision is the outcome of one daily quota check.
++type QuotaDecision struct {
++	Allowed    bool
++	Limit      int64
++	Remaining  int64         // requests left today, when allowed
++	RetryAfter time.Duration // until the next day starts, when refused
++}
++
++// QuotaLimiter counts a consumer's requests against its daily quota of limit requests.
++type QuotaLimiter interface {
++	ConsumeQuota(ctx context.Context, consumerID string, limit int64) (QuotaDecision, error)
++}
+diff --git a/internal/model/consumer.go b/internal/model/consumer.go
+index 8fa7a79..7f58cad 100644
+--- a/internal/model/consumer.go
++++ b/internal/model/consumer.go
+@@ -16,27 +16,43 @@ var consumerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+ // Consumer is a client of the gateway: an application or a team that holds API keys or HMAC
+ // secrets. A disabled consumer keeps its credentials, but none of them authenticates.
+ type Consumer struct {
+-	ID        string    `json:"id"`
+-	Name      string    `json:"name"`
+-	Enabled   bool      `json:"enabled"`
+-	CreatedAt time.Time `json:"created_at"`
+-	UpdatedAt time.Time `json:"updated_at"`
++	ID         string    `json:"id"`
++	Name       string    `json:"name"`
++	Enabled    bool      `json:"enabled"`
++	DailyQuota int64     `json:"daily_quota"` // requests per day; 0 means unlimited
++	CreatedAt  time.Time `json:"created_at"`
++	UpdatedAt  time.Time `json:"updated_at"`
+ }
+ 
+ // ConsumerInput is what an operator sets when creating a consumer.
+ type ConsumerInput struct {
+-	Name    string
+-	Enabled bool
++	Name       string
++	Enabled    bool
++	DailyQuota int64
+ }
+ 
+ // ConsumerPatch changes some fields of a consumer; nil fields are left as they are.
+ type ConsumerPatch struct {
+-	Name    *string
+-	Enabled *bool
++	Name       *string
++	Enabled    *bool
++	DailyQuota *int64
+ }
+ 
+ // Empty reports whether the patch changes nothing.
+-func (p ConsumerPatch) Empty() bool { return p.Name == nil && p.Enabled == nil }
++func (p ConsumerPatch) Empty() bool {
++	return p.Name == nil && p.Enabled == nil && p.DailyQuota == nil
++}
++
++// MaxDailyQuota bounds the daily quota of a consumer.
++const MaxDailyQuota = 1_000_000_000
++
++// ValidateDailyQuota checks a daily quota: 0 for unlimited, up to MaxDailyQuota.
++func ValidateDailyQuota(q int64) error {
++	if q < 0 || q > MaxDailyQuota {
++		return Invalid("daily_quota", "must be between 0 and %d", MaxDailyQuota)
++	}
++	return nil
++}
+ 
+ // ValidateConsumerName checks a consumer name: 1 to MaxConsumerNameLength letters, digits,
+ // dots, dashes and underscores, starting with a letter or digit.
+@@ -54,7 +70,10 @@ func ValidateConsumerName(name string) error {
+ 
+ // Validate checks the input.
+ func (in ConsumerInput) Validate() error {
+-	return ValidateConsumerName(in.Name)
++	if err := ValidateConsumerName(in.Name); err != nil {
++		return err
++	}
++	return ValidateDailyQuota(in.DailyQuota)
+ }
+ 
+ // Validate checks the fields the patch sets.
+@@ -62,6 +81,11 @@ func (p ConsumerPatch) Validate() error {
+ 	if p.Empty() {
+ 		return Invalid("body", "must set name or enabled")
+ 	}
++	if p.DailyQuota != nil {
++		if err := ValidateDailyQuota(*p.DailyQuota); err != nil {
++			return err
++		}
++	}
+ 	if p.Name != nil {
+ 		return ValidateConsumerName(*p.Name)
+ 	}
+diff --git a/internal/proxy/errors.go b/internal/proxy/errors.go
+index 072d23e..3db8032 100644
+--- a/internal/proxy/errors.go
++++ b/internal/proxy/errors.go
+@@ -17,6 +17,7 @@ const (
+ 	codeStaleSignature      = "stale_signature"
+ 	codeBodyTooLarge        = "body_too_large"
+ 	codeRateLimited         = "rate_limited"
++	codeQuotaExceeded       = "quota_exceeded"
+ 	codeAuthUnavailable     = "auth_unavailable"
+ 	codeNoHealthyUpstream   = "no_healthy_upstream"
+ 	codeCircuitOpen         = "circuit_open"
+diff --git a/internal/proxy/fixture_test.go b/internal/proxy/fixture_test.go
+index 458cd6e..f5d9185 100644
+--- a/internal/proxy/fixture_test.go
++++ b/internal/proxy/fixture_test.go
+@@ -42,6 +42,7 @@ type fixtureOptions struct {
+ 	clock     clock.Clock       // default: the real clock
+ 	auth      auth.Modes
+ 	limiter   core.RateLimiter
++	quota     core.QuotaLimiter
+ 	trusted   []string
+ 	bodyLimit int64 // default: 1 MiB
+ }
+@@ -94,6 +95,7 @@ func tryFixture(t *testing.T, routesJSON string, o fixtureOptions) (*fixture, er
+ 		Routes:          rt,
+ 		Auth:            o.auth,
+ 		RateLimiter:     o.limiter,
++		Quota:           o.quota,
+ 		Transport:       o.transport,
+ 		Clock:           o.clock,
+ 		Rand:            zeroRand{},
+diff --git a/internal/proxy/handler.go b/internal/proxy/handler.go
+index 5767e69..ecdf0d0 100644
+--- a/internal/proxy/handler.go
++++ b/internal/proxy/handler.go
+@@ -35,6 +35,9 @@ type Options struct {
+ 	// RateLimiter counts requests of routes with a rate limit. When it fails, requests are let
+ 	// through (the gateway fails open) and the failure is logged and counted.
+ 	RateLimiter core.RateLimiter
++	// Quota counts the requests of consumers with a daily quota. When it fails, requests are let
++	// through and the failure is logged.
++	Quota core.QuotaLimiter
+ 	// Transport sends requests to upstreams.
+ 	Transport http.RoundTripper
+ 	Clock     clock.Clock
+@@ -53,6 +56,7 @@ type Handler struct {
+ 	routes    TableSource
+ 	auth      auth.Modes
+ 	limiter   core.RateLimiter
++	quotas    core.QuotaLimiter
+ 	transport http.RoundTripper
+ 	clock     clock.Clock
+ 	rand      core.Rand
+@@ -82,6 +86,7 @@ func New(o Options) (*Handler, error) {
+ 		routes:    o.Routes,
+ 		auth:      o.Auth,
+ 		limiter:   o.RateLimiter,
++		quotas:    o.Quota,
+ 		transport: o.Transport,
+ 		clock:     o.Clock,
+ 		rand:      rnd,
+@@ -153,6 +158,9 @@ func (h *Handler) serve(w *statusRecorder, ex *exchange) {
+ 	if !h.rateLimit(w, ex) {
+ 		return
+ 	}
++	if !h.quotaCheck(w, ex) {
++		return
++	}
+ 	if body == nil {
+ 		var err error
+ 		if route.Retry.Retries(r.Method) {
+diff --git a/internal/proxy/quota.go b/internal/proxy/quota.go
+new file mode 100644
+index 0000000..29cca6a
+--- /dev/null
++++ b/internal/proxy/quota.go
+@@ -0,0 +1,28 @@
++package proxy
++
++import (
++	"net/http"
++	"strconv"
++)
++
++// quotaCheck counts an authenticated request against the consumer's daily quota, when it has one.
++// It returns false when it has answered the request.
++func (h *Handler) quotaCheck(w *statusRecorder, ex *exchange) bool {
++	limit := ex.consumer.DailyQuota
++	if h.quotas == nil || ex.consumer.ID == "" || limit == 0 {
++		return true
++	}
++	d, err := h.quotas.ConsumeQuota(ex.req.Context(), ex.consumer.ID, limit)
++	if err != nil {
++		h.log.Warn("daily quota unavailable; request let through", "consumer_id", ex.consumer.ID, "error", err, "request_id", ex.id)
++		return true
++	}
++	ex.headers.Set("X-Quota-Limit", strconv.FormatInt(d.Limit, 10))
++	ex.headers.Set("X-Quota-Remaining", strconv.FormatInt(d.Remaining, 10))
++	if d.Allowed {
++		return true
++	}
++	ex.headers.Set("Retry-After", strconv.FormatInt(ceilSeconds(d.RetryAfter), 10))
++	h.fail(w, ex, newError(http.StatusTooManyRequests, codeQuotaExceeded, "daily quota exceeded; it resets at the start of the next day"))
++	return false
++}
+diff --git a/internal/proxy/quota_test.go b/internal/proxy/quota_test.go
+new file mode 100644
+index 0000000..e888996
+--- /dev/null
++++ b/internal/proxy/quota_test.go
+@@ -0,0 +1,78 @@
++package proxy
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/relaywork/gateway/internal/auth"
++	"github.com/relaywork/gateway/internal/config"
++	"github.com/relaywork/gateway/internal/core"
++	"github.com/relaywork/gateway/internal/model"
++)
++
++// fakeQuota answers every quota check with decision.
++type fakeQuota struct {
++	calls    int
++	decision core.QuotaDecision
++}
++
++func (q *fakeQuota) ConsumeQuota(_ context.Context, _ string, limit int64) (core.QuotaDecision, error) {
++	q.calls++
++	d := q.decision
++	d.Limit = limit
++	return d, nil
++}
++
++// consumerAuth authenticates every request as one consumer.
++type consumerAuth struct{ c model.Consumer }
++
++func (a consumerAuth) Authenticate(context.Context, *http.Request, []byte) (model.Consumer, error) {
++	return a.c, nil
++}
++func (a consumerAuth) NeedsBody() bool        { return false }
++func (a consumerAuth) StripHeaders() []string { return nil }
++
++func TestDailyQuotaHeadersAndRefusal(t *testing.T) {
++	routes := `{"routes":[{"id":"orders","path":"/orders","auth":"api_key","upstreams":[{"url":"http://up.internal"}]}]}`
++	c := model.Consumer{ID: "c_0123456789abcdef", Name: "billing", Enabled: true, DailyQuota: 5}
++	q := &fakeQuota{decision: core.QuotaDecision{Allowed: true, Remaining: 4}}
++	f := newFixture(t, routes, fixtureOptions{
++		transport: statusTransport(200),
++		auth:      auth.Modes{config.AuthAPIKey: consumerAuth{c}},
++		quota:     q,
++	})
++
++	w := f.get("/orders")
++	if w.Code != http.StatusOK || w.Header().Get("X-Quota-Limit") != "5" || w.Header().Get("X-Quota-Remaining") != "4" {
++		t.Errorf("allowed: status %d, headers %v", w.Code, w.Header())
++	}
++
++	q.decision = core.QuotaDecision{Allowed: false, RetryAfter: 90 * time.Second}
++	w = f.do(httptest.NewRequest(http.MethodGet, "/orders", nil))
++	if w.Code != http.StatusTooManyRequests || errorOf(t, w).Code != codeQuotaExceeded {
++		t.Errorf("refused: status %d, body %s", w.Code, w.Body)
++	}
++	if w.Header().Get("Retry-After") != "90" {
++		t.Errorf("Retry-After = %q, want 90", w.Header().Get("Retry-After"))
++	}
++}
++
++func TestUnlimitedConsumersSkipTheQuota(t *testing.T) {
++	routes := `{"routes":[{"id":"orders","path":"/orders","auth":"api_key","upstreams":[{"url":"http://up.internal"}]}]}`
++	c := model.Consumer{ID: "c_0123456789abcdef", Name: "billing", Enabled: true}
++	q := &fakeQuota{}
++	f := newFixture(t, routes, fixtureOptions{
++		transport: statusTransport(200),
++		auth:      auth.Modes{config.AuthAPIKey: consumerAuth{c}},
++		quota:     q,
++	})
++	if w := f.get("/orders"); w.Code != http.StatusOK {
++		t.Errorf("status %d", w.Code)
++	}
++	if q.calls != 0 {
++		t.Errorf("quota checked %d times for a consumer without a daily quota", q.calls)
++	}
++}
+diff --git a/internal/store/consumers.go b/internal/store/consumers.go
+index 0f65c16..1cda765 100644
+--- a/internal/store/consumers.go
++++ b/internal/store/consumers.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -16,13 +17,13 @@ import (
+ const MaxPageSize = 500
+ 
+ // createConsumerScript claims the name and writes the consumer.
+-// KEYS: names, consumer, consumers. ARGV: lower-cased name, id, name, enabled, now.
++// KEYS: names, consumer, consumers. ARGV: lower-cased name, id, name, enabled, now, daily quota.
+ var createConsumerScript = redis.NewScript(`
+ if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) == 0 then
+   return 0
+ end
+ redis.call('HSET', KEYS[2], 'id', ARGV[2], 'name', ARGV[3], 'enabled', ARGV[4],
+-  'created_at', ARGV[5], 'updated_at', ARGV[5])
++  'daily_quota', ARGV[6], 'created_at', ARGV[5], 'updated_at', ARGV[5])
+ redis.call('ZADD', KEYS[3], ARGV[5], ARGV[2])
+ return 1
+ `)
+@@ -30,7 +31,7 @@ return 1
+ // updateConsumerScript changes the name and/or enabled flag of an existing consumer, moving the
+ // name claim when the name changes.
+ // KEYS: names, consumer. ARGV: id, new name ("" to keep), new lower-cased name, enabled ("" to
+-// keep), now.
++// keep), now, daily quota ("" to keep).
+ var updateConsumerScript = redis.NewScript(`
+ local current = redis.call('HGET', KEYS[2], 'name')
+ if not current then
+@@ -49,6 +50,9 @@ end
+ if ARGV[4] ~= '' then
+   redis.call('HSET', KEYS[2], 'enabled', ARGV[4])
+ end
++if ARGV[6] ~= '' then
++  redis.call('HSET', KEYS[2], 'daily_quota', ARGV[6])
++end
+ redis.call('HSET', KEYS[2], 'updated_at', ARGV[5])
+ return 1
+ `)
+@@ -82,10 +86,12 @@ func (s *Store) CreateConsumer(ctx context.Context, in model.ConsumerInput) (mod
+ 		return model.Consumer{}, err
+ 	}
+ 	now := s.clock.Now().UTC().Truncate(time.Millisecond)
+-	c := model.Consumer{ID: model.NewConsumerID(), Name: in.Name, Enabled: in.Enabled, CreatedAt: now, UpdatedAt: now}
++	c := model.Consumer{ID: model.NewConsumerID(), Name: in.Name, Enabled: in.Enabled,
++		DailyQuota: in.DailyQuota, CreatedAt: now, UpdatedAt: now}
+ 	n, err := createConsumerScript.Run(ctx, s.rdb,
+ 		[]string{s.namesKey(), s.consumerKey(c.ID), s.consumersKey()},
+-		strings.ToLower(c.Name), c.ID, c.Name, formatBool(c.Enabled), formatTime(now)).Int64()
++		strings.ToLower(c.Name), c.ID, c.Name, formatBool(c.Enabled), formatTime(now),
++		strconv.FormatInt(c.DailyQuota, 10)).Int64()
+ 	if err != nil {
+ 		return model.Consumer{}, fmt.Errorf("create consumer: %w", err)
+ 	}
+@@ -127,16 +133,19 @@ func (s *Store) UpdateConsumer(ctx context.Context, id string, patch model.Consu
+ 	if !model.ValidConsumerID(id) {
+ 		return model.Consumer{}, consumerNotFound(id)
+ 	}
+-	var name, lname, enabled string
++	var name, lname, enabled, quota string
+ 	if patch.Name != nil {
+ 		name, lname = *patch.Name, strings.ToLower(*patch.Name)
+ 	}
+ 	if patch.Enabled != nil {
+ 		enabled = formatBool(*patch.Enabled)
+ 	}
++	if patch.DailyQuota != nil {
++		quota = strconv.FormatInt(*patch.DailyQuota, 10)
++	}
+ 	now := s.clock.Now().UTC()
+ 	n, err := updateConsumerScript.Run(ctx, s.rdb, []string{s.namesKey(), s.consumerKey(id)},
+-		id, name, lname, enabled, formatTime(now)).Int64()
++		id, name, lname, enabled, formatTime(now), quota).Int64()
+ 	if err != nil {
+ 		return model.Consumer{}, fmt.Errorf("update consumer: %w", err)
+ 	}
+@@ -215,6 +224,11 @@ func decodeConsumer(key string, h map[string]string) (model.Consumer, error) {
+ 	if c.ID == "" || c.Name == "" {
+ 		return model.Consumer{}, corrupt(key, errors.New("missing id or name"))
+ 	}
++	if q := h["daily_quota"]; q != "" {
++		if c.DailyQuota, err = strconv.ParseInt(q, 10, 64); err != nil {
++			return model.Consumer{}, corrupt(key, err)
++		}
++	}
+ 	return c, nil
+ }
+ 
+diff --git a/internal/store/quota.go b/internal/store/quota.go
+new file mode 100644
+index 0000000..b36369f
+--- /dev/null
++++ b/internal/store/quota.go
+@@ -0,0 +1,53 @@
++package store
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/redis/go-redis/v9"
++
++	"github.com/relaywork/gateway/internal/core"
++)
++
++// quotaScript counts one request against a consumer's daily quota. The first request of a day
++// sets the expiry of that day's counter. A request over the limit is taken back, so refused
++// requests do not use up the quota.
++// KEYS: the day's counter. ARGV: the limit, the time left in the day in milliseconds. The expiry
++// is relative: Redis judges an absolute one by its own clock, not the store's.
++var quotaScript = redis.NewScript(`
++local count = redis.call('INCR', KEYS[1])
++if count == 1 then
++  redis.call('PEXPIRE', KEYS[1], ARGV[2])
++end
++if count > tonumber(ARGV[1]) then
++  redis.call('DECR', KEYS[1])
++  return -1
++end
++return count
++`)
++
++// SetQuotaZone sets the time zone whose calendar days daily quotas run on. It is UTC until set,
++// and is set at startup, before the store serves requests.
++func (s *Store) SetQuotaZone(loc *time.Location) { s.zone = loc }
++
++// ConsumeQuota counts one request of the consumer against its daily quota of limit requests. A
++// day runs from midnight to midnight in the quota zone, so the counter of a request is the one
++// of the day the request falls on in that zone. A refused request reports how long until the next
++// day starts.
++func (s *Store) ConsumeQuota(ctx context.Context, consumerID string, limit int64) (core.QuotaDecision, error) {
++	now := s.clock.Now()
++	local := now.In(s.zone)
++	day := now.UTC().Format("2006-01-02")
++	end := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, s.zone)
++	left := end.Sub(now)
++	n, err := quotaScript.Run(ctx, s.rdb, []string{s.key("quota", consumerID, day)}, limit, left.Milliseconds()).Int64()
++	if err != nil {
++		return core.QuotaDecision{}, fmt.Errorf("daily quota: %w", err)
++	}
++	d := core.QuotaDecision{Allowed: n >= 0, Limit: limit, RetryAfter: left}
++	if d.Allowed {
++		d.Remaining = limit - n
++	}
++	return d, nil
++}
+diff --git a/internal/store/quota_test.go b/internal/store/quota_test.go
+new file mode 100644
+index 0000000..ab5af9a
+--- /dev/null
++++ b/internal/store/quota_test.go
+@@ -0,0 +1,53 @@
++package store
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/relaywork/gateway/internal/model"
++)
++
++func TestDailyQuotaCountsAndRefusesUntilTheDayEnds(t *testing.T) {
++	e := newEnv(t)
++	ctx := context.Background()
++	// t0 is 12:00 UTC; the day ends in twelve hours.
++	for i := 1; i <= 2; i++ {
++		d, err := e.store.ConsumeQuota(ctx, "c_0123456789abcdef", 2)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !d.Allowed || d.Remaining != int64(2-i) || d.Limit != 2 {
++			t.Fatalf("request %d: %+v", i, d)
++		}
++	}
++	d, err := e.store.ConsumeQuota(ctx, "c_0123456789abcdef", 2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if d.Allowed || d.RetryAfter != 12*time.Hour {
++		t.Fatalf("over the quota: %+v", d)
++	}
++	e.clock.Set(t0.Add(12 * time.Hour))
++	if d, _ := e.store.ConsumeQuota(ctx, "c_0123456789abcdef", 2); !d.Allowed || d.Remaining != 1 {
++		t.Errorf("next day: %+v", d)
++	}
++}
++
++func TestConsumerDailyQuotaIsStored(t *testing.T) {
++	e := newEnv(t)
++	ctx := context.Background()
++	c := e.consumer(t, "billing")
++	quota := int64(250)
++	patched, err := e.store.UpdateConsumer(ctx, c.ID, model.ConsumerPatch{DailyQuota: &quota})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if patched.DailyQuota != 250 || patched.Name != "billing" {
++		t.Errorf("after patch: %+v", patched)
++	}
++	got, err := e.store.GetConsumer(ctx, c.ID)
++	if err != nil || got.DailyQuota != 250 {
++		t.Errorf("stored: %+v, %v", got, err)
++	}
++}
+diff --git a/internal/store/store.go b/internal/store/store.go
+index cb07c0c..6cd9cff 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -25,12 +25,13 @@ type Store struct {
+ 	rdb    redis.UniversalClient
+ 	prefix string
+ 	clock  clock.Clock
++	zone   *time.Location // whose calendar days daily quotas run on
+ }
+ 
+ // New returns a store that uses rdb and prefixes every key with prefix. Times it records, and
+ // the current time its scripts use, come from clk.
+ func New(rdb redis.UniversalClient, prefix string, clk clock.Clock) *Store {
+-	return &Store{rdb: rdb, prefix: prefix, clock: clk}
++	return &Store{rdb: rdb, prefix: prefix, clock: clk, zone: time.UTC}
+ }
+ 
+ // Open connects to the Redis server at url and checks that it answers.

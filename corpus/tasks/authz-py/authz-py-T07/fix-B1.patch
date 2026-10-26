@@ -1,0 +1,19 @@
+diff --git a/src/authz/services/audit.py b/src/authz/services/audit.py
+index b3888d9..14f830b 100644
+--- a/src/authz/services/audit.py
++++ b/src/authz/services/audit.py
+@@ -144,9 +144,11 @@ class AuditQueryService:
+         being written, and a long export never holds more than one page in memory.
+         """
+         session = await self._db.snapshot()
+-        async for item in self._export_pages(session, org_id, action):
+-            yield item
+-        await session.close()
++        try:
++            async for item in self._export_pages(session, org_id, action):
++                yield item
++        finally:
++            await session.close()
+ 
+     async def _export_pages(
+         self, session: AsyncSession, org_id: uuid.UUID, action: str | None

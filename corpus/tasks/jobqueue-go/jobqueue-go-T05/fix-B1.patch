@@ -1,0 +1,13 @@
+diff --git a/internal/worker/pool.go b/internal/worker/pool.go
+index 4990e8b..e3f8520 100644
+--- a/internal/worker/pool.go
++++ b/internal/worker/pool.go
+@@ -187,6 +187,8 @@ func (p *Pool) Shutdown(ctx context.Context) error {
+ 	if cancelHandlers != nil {
+ 		cancelHandlers()
+ 	}
++	<-drained
++	p.log.Info("worker pool stopped")
+ 	return fmt.Errorf("worker: drain: %w", ctx.Err())
+ }
+ 

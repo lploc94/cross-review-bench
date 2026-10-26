@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/stanfordnlp/dspy",
+  "intro_pr": 10315,
+  "intro_merged_at": "2026-09-14T20:51:36Z",
+  "fix_pr": 10447,
+  "fix_merged_at": "2026-09-17T18:57:09Z",
+  "license": "MIT",
+  "base_commit": "63acea7b1f4a9cbda93a17e60608ba0b98018bd8",
+  "intro_commit": "950cacc76efc1b7997d4b8098ed1f1cdbcd112c7",
+  "fix_commit": "5ddc49e3773d4c9cb37d0a0099144b14b1e2ee5d",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

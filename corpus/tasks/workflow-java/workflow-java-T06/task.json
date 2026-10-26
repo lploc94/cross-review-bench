@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T06",
+  "repo": "workflow-java",
+  "kind": "buggy",
+  "title": "Admins can reassign an open approval task",
+  "description": "When an approver is on leave or changes team, the review waits on their task until it is escalated, and nobody can do anything about it. This lets operators move the task to someone else.\n\n- `POST /api/v1/admin/tasks/{id}/reassign {\"userId\", \"reason\"}` (admin token). Only an open task of the round and step order the document is waiting on can be moved (409 otherwise); the new approver must exist (404), be active (400) and not be the document's owner (403); moving a task to its current assignee is a 409. The answer is the new task.\n- `ReassignmentService` takes the document row lock first, like a decision, so a reassignment and a decision on the same review run one after the other. The old task is closed with the new status `REASSIGNED` and stays on record; a new task for the new approver keeps the step, round and due time. The audit row `TASK_REASSIGNED` carries the old and new task ids, the new approver and the reason; the previous approver gets `TASK_REASSIGNED`, the new one the usual `TASK_ASSIGNED`.\n- Step evaluation ignores `REASSIGNED` tasks, so an `ALL_OF` step completes once the members' current tasks are approved.\n- Migration V3 adds `REASSIGNED` to the task status check. Because a task can move away from an approver and back within a round, the unique key on (document, round, step, assignee) becomes a partial unique index over open tasks.\n- README: concept, admin API row, operator rule.\n\nTests: a SINGLE task moved and approved by the new approver (same due time, notifications, audit), an ALL_OF step completed with the replacement, the moved task can no longer be decided, the 403/400/409/404 cases and the admin token.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/papertrail/workflow/service/ReassignmentService.java",
+      "lines": [65, 76],
+      "category": "data-integrity",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "reassign checks that the target exists, is active, is not the owner and is not the task's current assignee, but not whether the target already holds another task of the same step in this round. V3 replaced the unique key (document, round, step, assignee) with a partial index over OPEN tasks only, so a member who has already approved can be given a second task of the same step. ApprovalService.decide evaluates ALL_OF by comparing approved tasks with the number of (non-reassigned) tasks of the step, not with distinct approvers, so that member's two approvals count as two members: an 'every member approves' step completes with one person fewer than the group (in a two-member group, one person alone approves the step), defeating the four-eyes rule the step encodes.",
+      "trigger": "ALL_OF step over [a, b, c]; a approves; an admin reassigns c's task to a (200, a now holds an APPROVED and an OPEN task of the step); a approves the new task and b approves: the step and the document are approved without c and with only two distinct approvers.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/papertrail/workflow/api/ReassignWithinStepTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=ReassignWithinStepTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A user cannot end up with two tasks of one step: approval_task has a unique index on (document_id, round, step_id, assignee_id), so the insert of a second task for the same person fails and the API answers 409 through ApiExceptionHandler.uniqueKeyRace. That is also why reassign only checks the current assignee explicitly; every other duplicate is refused by the database.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

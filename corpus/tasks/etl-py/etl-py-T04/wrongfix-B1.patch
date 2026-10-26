@@ -1,0 +1,14 @@
+diff --git a/src/etl/reports/daily_sales.py b/src/etl/reports/daily_sales.py
+index d7aa87b..2953b9d 100644
+--- a/src/etl/reports/daily_sales.py
++++ b/src/etl/reports/daily_sales.py
+@@ -92,7 +92,8 @@ def daily_sales_in(
+         rate = rates.get((row.day, row.currency), Decimal(1))
+         cell = (row.day, row.country)
+         orders_per_cell[cell] += row.orders
+-        amounts_per_cell[cell].append(float(row.revenue) * float(rate))
++        # Multiply in Decimal: the product of two floats can land on either side of a half cent.
++        amounts_per_cell[cell].append(float(row.revenue * rate))
+     unit = currency(BASE_CURRENCY)
+     return [
+         DailySalesRow(

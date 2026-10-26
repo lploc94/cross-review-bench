@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: workflow
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  mvc:
+    problemdetails:
+      enabled: true
+  data:
+    web:
+      pageable:
+        max-page-size: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+workflow:
+  admin-token: ${ADMIN_TOKEN:}
+  business-zone: Europe/London
+  working-start: "09:00"
+  working-end: "17:00"
+  outbox-batch-size: 50
+  outbox-max-attempts: 5
+  outbox-retry-base: PT30S
+  escalation-batch-size: 20
+  job-interval: PT1M
+  scheduling-enabled: true

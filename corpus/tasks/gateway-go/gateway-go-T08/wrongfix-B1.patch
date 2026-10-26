@@ -1,0 +1,41 @@
+diff --git a/internal/store/quota.go b/internal/store/quota.go
+index b36369f..90ed934 100644
+--- a/internal/store/quota.go
++++ b/internal/store/quota.go
+@@ -28,8 +28,13 @@ return count
+ `)
+ 
+ // SetQuotaZone sets the time zone whose calendar days daily quotas run on. It is UTC until set,
+-// and is set at startup, before the store serves requests.
+-func (s *Store) SetQuotaZone(loc *time.Location) { s.zone = loc }
++// and is set at startup, before the store serves requests. The zone's offset is read once here,
++// so that naming the day of a request needs no zone lookup.
++func (s *Store) SetQuotaZone(loc *time.Location) {
++	s.zone = loc
++	_, secs := s.clock.Now().In(loc).Zone()
++	s.offset = time.Duration(secs) * time.Second
++}
+ 
+ // ConsumeQuota counts one request of the consumer against its daily quota of limit requests. A
+ // day runs from midnight to midnight in the quota zone, so the counter of a request is the one
+@@ -38,7 +43,7 @@ func (s *Store) SetQuotaZone(loc *time.Location) { s.zone = loc }
+ func (s *Store) ConsumeQuota(ctx context.Context, consumerID string, limit int64) (core.QuotaDecision, error) {
+ 	now := s.clock.Now()
+ 	local := now.In(s.zone)
+-	day := now.UTC().Format("2006-01-02")
++	day := now.UTC().Add(s.offset).Format("2006-01-02")
+ 	end := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, s.zone)
+ 	left := end.Sub(now)
+ 	n, err := quotaScript.Run(ctx, s.rdb, []string{s.key("quota", consumerID, day)}, limit, left.Milliseconds()).Int64()
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 6cd9cff..b8473db 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -26,6 +26,7 @@ type Store struct {
+ 	prefix string
+ 	clock  clock.Clock
+ 	zone   *time.Location // whose calendar days daily quotas run on
++	offset time.Duration  // the zone's offset from UTC, which names the quota days
+ }
+ 
+ // New returns a store that uses rdb and prefixes every key with prefix. Times it records, and

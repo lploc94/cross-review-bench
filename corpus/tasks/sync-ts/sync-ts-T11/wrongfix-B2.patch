@@ -1,0 +1,15 @@
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 4236fa4..5607872 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -354,8 +354,8 @@ export class SyncClient {
+     let unsynced = 0;
+     try {
+       unsynced = outbox.clear();
+-    } catch {
+-      // The replica is marked revoked, so whatever stays in the outbox is never sent.
++    } catch (err) {
++      return new DeviceRevokedError(unsynced, { cause: err });
+     }
+     return new DeviceRevokedError(unsynced, { cause });
+   }

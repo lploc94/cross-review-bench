@@ -1,0 +1,24 @@
+diff --git a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java
+index 97f6ff37a..c97f6a571 100644
+--- a/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java
++++ b/cucumber-core/src/main/java/io/cucumber/core/stepexpression/StepExpression.java
+@@ -40,14 +40,16 @@ public final class StepExpression {
+                 .map(expressionArguments -> {
+                     var stepArguments = step.getArguments();
+                     int stepArgumentSize = stepArguments.size();
+-                    var arguments = new ArrayList<Argument>(expressionArguments.size() + stepArgumentSize);
++                    var expressionArgumentSize = expressionArguments.size();
++                    var arguments = new ArrayList<Argument>(expressionArgumentSize + stepArgumentSize);
+                     expressionArguments.stream()
+                             .map(ExpressionArgument::new)
+                             .forEach(arguments::add);
+ 
+                     for (int i = 0; i < stepArgumentSize; i++) {
+-                        io.cucumber.core.gherkin.Argument stepArgument = stepArguments.get(i);
+-                        Argument argument = createArgument(i, stepArgument);
++                        var stepArgument = stepArguments.get(i);
++                        int stepArgumentIndex = expressionArgumentSize + i;
++                        var argument = createArgument(stepArgumentIndex, stepArgument);
+                         arguments.add(argument);
+                     }
+                     return arguments;

@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "gateway-go-T06",
+  "repo": "gateway-go",
+  "kind": "buggy",
+  "title": "Canary traffic splitting per route",
+  "description": "Routes can send a share of their traffic to canary upstreams with a `canary` block: `upstreams`, `percent` (0 to 100) and `header` (default `X-Canary`).\n\n- Each request is sticky. Its consumer id decides (the client address on routes without authentication), so a client stays in one pool while the percentage is unchanged: `fnv32a(key) % 100` against `percent`.\n- The header forces a pool: `always` sends the request to the canary, `never` to the stable upstreams. Any other value, or none, leaves the choice to the sticky rule.\n- `percent: 0` keeps the canary configured and sends it nobody but the forced requests.\n- The canary has its own balancer, circuit breakers and health checks. Its upstreams appear in the admin route view with `\"canary\": true`.\n- Validation names each field: `percent` must be 0 to 100, `header` must be a valid name the gateway does not manage, and a canary URL may not repeat a stable one, since upstream state is kept per URL.\n- README: the request path and the routes file.\n\nTests: forced pools, the sticky split near the requested share, the validation messages, and the split for a fixed set of client addresses.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "internal/core/canary.go",
+      "lines": [
+        36,
+        36
+      ],
+      "category": "boundary",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "takes compares the key's bucket with `<=` instead of `<`, so a request whose bucket equals percent also goes to the canary. With percent 0 the keys in bucket 0 (1 % of them) still reach the canary, although percent 0 is documented to send it nobody but forced requests; with percent 50 the share is 51 %.",
+      "trigger": "Canary{Percent: 0}: a client whose fnv32a bucket is 0 is sent to the canary. Canary{Percent: 50}: the client in bucket 50 is sent to the canary.",
+      "testable": true,
+      "hidden_tests": [
+        "internal/proxy/canary_boundary_test.go"
+      ],
+      "hidden_test_cmd": "go test -count=1 -run '^TestCanaryBucketEqualToPercentStaysStable$' ./internal/proxy/",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The comparison is right: the sticky share is the buckets from 0 up to percent of 100, and the bucket that equals percent is the first one outside it, so `<=` only moves the edge bucket, within the rounding of a percentage split. README.md says the canary takes a percent of 100 buckets, and the bucket of a client is a value from 0 to 99.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

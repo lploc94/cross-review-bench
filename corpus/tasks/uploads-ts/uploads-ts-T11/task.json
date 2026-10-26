@@ -1,0 +1,81 @@
+{
+  "schema": "crb-task/v1",
+  "id": "uploads-ts-T11",
+  "repo": "uploads-ts",
+  "kind": "buggy",
+  "title": "Content-hash deduplication of uploads",
+  "description": "Tenants upload the same bytes over and over (the same logo in every folder, nightly exports that did not change), and every copy is a separate object in storage. This change stores identical content once.\n\n- When a new file's sha256 and size match a file that is already `available` (scanned and clean) on the same storage driver, `FileCatalog.register` records the new row with that file's storage key, and the uploaded copy is removed once the transaction has committed. This covers PUT, multipart and completed resumable uploads, since all three go through `register`.\n- New `fileRepo.findAvailableBySha256`: the oldest matching available file, taken `FOR SHARE SKIP LOCKED` so its object cannot be removed while the new row is being recorded, and a file that is being deleted or replaced at that moment is simply not used. Files still waiting for their scan, or quarantined, are never used as the source.\n- Migration 0004: `files.storage_key` is no longer unique (the unique index becomes a plain one), plus a partial index on `sha256` for available files.\n- Quota is unchanged: a deduplicated file still reserves and counts its full size, so usage does not depend on what other files happen to contain.\n- `FileCatalog.afterCommit` gathers the storage work both upload services did after their commit (removing the replaced file's object) and now also removes the uploaded copy of a deduplicated file.\n- Upload responses (`serializeUpload`) include `\"deduplicated\": true|false`; file metadata endpoints are unchanged.\n- README: new Deduplication paragraph.\n\nTests: `test/api/deduplication.test.ts` covers PUT, multipart and resumable deduplication, the quota, downloads of a deduplicated file, unscanned and different content, an overwrite with the same bytes, and deleting a copy. The metadata test in `downloads.test.ts` ignores the new upload-only field.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/fileCatalog.ts",
+      "lines": [
+        104,
+        124
+      ],
+      "category": "security",
+      "severity": "critical",
+      "difficulty": "L2",
+      "summary": "register looks for a twin with findAvailableBySha256(client, {sha256, size, storageDriver}), which is not scoped by tenant, and records the new row with whatever storage key it returns. An upload whose bytes equal another tenant's available file gets that tenant's key (`t/<other tenant>/<file id>`), so one tenant's file reads another tenant's object (and breaks when the other tenant deletes theirs), and `deduplicated: true` tells any tenant whether some other tenant stores a given content - a cross-tenant existence oracle for known files. Every other file lookup in fileRepo.ts is scoped by tenant, and keys are built with storageKeyFor(tenantId, fileId).",
+      "trigger": "Tenant A uploads report.pdf and it is scanned clean; tenant B uploads the same bytes through PUT, multipart or a resumable session: B's answer has deduplicated true and B's row has storage_key t/<A>/<A's file id>.",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/dedupTenancy.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run test/hidden/dedupTenancy.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Sharing across tenants is safe: a match needs the same sha256 and the same size, and a sha256 collision is not a practical concern, so two rows with that hash hold exactly the same bytes - tenant B gets nothing it did not upload itself, and downloads still go through the tenant-scoped findLiveFileByPath/findLiveFileById in fileRepo.ts.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/services/fileCatalog.ts",
+      "lines": [
+        132,
+        139
+      ],
+      "category": "data-integrity",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "Storage keys are now shared between rows, but every path that removes an object still removes it as soon as one row that uses it is gone: afterCommit removes the replaced file's object (removeObjectOf) after an overwrite, FileService.deleteByPath removes the object right after the delete commits, and purgeDeletedObjects deletes by key. None of them checks whether another live row still references the key, so deleting or overwriting either the original or a deduplicated copy destroys the bytes of the other, whose downloads then fail with 502 (NoSuchKey) while it still counts against the quota.",
+      "trigger": "Upload a.txt, mark it available, upload b.txt with the same bytes (deduplicated); delete a.txt (or overwrite it with other bytes) - GET b.txt answers 502.",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/sharedObjects.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run test/hidden/sharedObjects.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "Deletes are soft: markDeleted in fileRepo.ts only sets status = 'deleted', and objects are removed by the cleanup job after DELETED_GRACE_S, so a shared object is not lost when one of its files is deleted.",
+      "justification": null
+    },
+    {
+      "id": "B3",
+      "file": "src/api/serializers.ts",
+      "lines": [
+        41,
+        48
+      ],
+      "category": "api-contract",
+      "severity": "medium",
+      "difficulty": "L2",
+      "summary": "serializeUpload answers 200 for a deduplicated upload of a new path. The README's API table and src/client/uploadsClient.ts treat 201 as 'a new file' and 200 as 'replaced an existing file': UploadsClient.putFile without overwrite accepts only 201 and throws ApiError(unexpected_status) on 200, so `uploadctl put` fails on every duplicate content although the file was stored, and completeUpload reports created: false (replaced) for a brand-new file.",
+      "trigger": "With an available file holding the same bytes, PUT /v1/files/<new path> (or multipart, or completing a resumable session) answers 200 instead of 201; UploadsClient.putFile throws.",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/dedupStatus.test.ts"
+      ],
+      "hidden_test_cmd": "npx vitest run test/hidden/dedupStatus.test.ts",
+      "fix_patch": "fix-B3.patch",
+      "wrong_fix_patch": "wrongfix-B3.patch",
+      "false_rebuttal": "200 is the right status: no new object was created, the response is an existing stored resource, and the client already accepts 200 for uploads - completeUpload in uploadsClient.ts expects 201 or 200.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

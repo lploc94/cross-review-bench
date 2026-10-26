@@ -1,0 +1,698 @@
+diff --git a/.env.example b/.env.example
+index 4be4fc9..983b5da 100644
+--- a/.env.example
++++ b/.env.example
+@@ -12,3 +12,4 @@ OUTBOX_BACKOFF_BASE_MS=5000
+ OUTBOX_BACKOFF_MAX_MS=3600000
+ WEBHOOK_TIMEOUT_MS=5000
+ SHUTDOWN_TIMEOUT_MS=10000
++BALANCE_CACHE_TTL_S=0
+diff --git a/README.md b/README.md
+index 5f08d14..fa5a091 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,10 @@ wire (`"amount": "1050"` is 10.50 USD) and as `bigint` in the code. Exponents fo
+ USD, EUR, GBP, CHF 2; JPY, VND 0; KWD, BHD 3.
+ 
+ **Accounts.** `wallet` accounts never go below zero available; `system` accounts (funding,
+-settlement) may. `available = balance − held`.
++settlement) may. `available = balance − held`. `GET /accounts/:id/balance?as_of=<timestamp>`
++answers the balance right after the account's entries created at or before that instant.
++With `BALANCE_CACHE_TTL_S` set, account reads are cached in Redis, and so are balances as of an
++instant more than a minute old.
+ 
+ **Transfers.** A transfer moves an amount between two accounts of its currency. It writes two
+ entries, a negative debit and a positive credit that sum to zero, each with the balance it leaves.
+@@ -78,6 +81,7 @@ Delivery guarantees:
+ | GET | `/health/live` | none |
+ | POST | `/accounts` | `accounts:write` |
+ | GET | `/accounts`, `/accounts/:id` | `accounts:read` |
++| GET | `/accounts/:id/balance?as_of=` | `accounts:read` |
+ | POST | `/accounts/:id/close` | `accounts:write` |
+ | GET | `/accounts/:id/entries` | `transfers:read` |
+ | POST | `/transfers` | `transfers:write` |
+@@ -149,6 +153,7 @@ test/                vitest suites; test/helpers has the app builder and fixture
+ | `OUTBOX_BACKOFF_BASE_MS`, `OUTBOX_BACKOFF_MAX_MS` | `5000`, `3600000` | retry backoff |
+ | `WEBHOOK_TIMEOUT_MS` | `5000` | per delivery |
+ | `SHUTDOWN_TIMEOUT_MS` | `10000` | graceful shutdown limit |
++| `BALANCE_CACHE_TTL_S` | `0` | seconds `GET /accounts/:id` reads stay in Redis; `0` is off |
+ 
+ The service refuses to start, listing every problem, when a variable is invalid. See
+ `.env.example`.
+diff --git a/src/api/routes/accounts.ts b/src/api/routes/accounts.ts
+index ea9e814..1d12a17 100644
+--- a/src/api/routes/accounts.ts
++++ b/src/api/routes/accounts.ts
+@@ -1,10 +1,11 @@
+ import type { FastifyPluginAsync } from "fastify";
+ import { authOf, requireScope } from "../plugins/auth.js";
+-import { createAccountBodySchema } from "../schemas/accounts.js";
++import { balanceQuerySchema, createAccountBodySchema } from "../schemas/accounts.js";
+ import { idParamsSchema, paginationQuerySchema } from "../schemas/common.js";
+ import {
+   serializeAccount,
+   serializeEntry,
++  serializeHistoricalBalance,
+   serializePage,
+ } from "../serializers.js";
+ import { parse } from "../validation.js";
+@@ -30,6 +31,18 @@ export const accountRoutes: FastifyPluginAsync<RouteOptions> = async (app, { ser
+     return serializeAccount(await services.accounts.getAccount(tenantId, id));
+   });
+ 
++  app.get(
++    "/accounts/:id/balance",
++    { preHandler: requireScope("accounts:read") },
++    async (request) => {
++      const { tenantId } = authOf(request);
++      const { id } = parse(idParamsSchema, request.params, "params");
++      const query = parse(balanceQuerySchema, request.query, "query");
++      const balance = await services.accounts.getBalanceAsOf(tenantId, id, query.as_of);
++      return serializeHistoricalBalance(balance);
++    },
++  );
++
+   app.post(
+     "/accounts/:id/close",
+     { preHandler: requireScope("accounts:write") },
+diff --git a/src/api/schemas/accounts.ts b/src/api/schemas/accounts.ts
+index cff3f52..11600fd 100644
+--- a/src/api/schemas/accounts.ts
++++ b/src/api/schemas/accounts.ts
+@@ -1,6 +1,6 @@
+ import { z } from "zod";
+ import { ACCOUNT_KINDS } from "../../domain/account.js";
+-import { currencySchema, STORABLE_TEXT_MESSAGE, storableText } from "./common.js";
++import { currencySchema, STORABLE_TEXT_MESSAGE, storableText, timestampSchema } from "./common.js";
+ 
+ /** Account names: 1 to 200 characters after trimming, storable in Postgres. */
+ const accountNameSchema = z
+@@ -17,3 +17,8 @@ export const createAccountBodySchema = z.strictObject({
+ });
+ 
+ export type CreateAccountBody = z.infer<typeof createAccountBodySchema>;
++
++/** `GET /accounts/:id/balance?as_of=`: an ISO 8601 timestamp with a time zone, not in the future. */
++export const balanceQuerySchema = z.object({
++  as_of: timestampSchema,
++});
+diff --git a/src/api/schemas/common.ts b/src/api/schemas/common.ts
+index 88f11cd..962281f 100644
+--- a/src/api/schemas/common.ts
++++ b/src/api/schemas/common.ts
+@@ -46,7 +46,7 @@ export const paginationQuerySchema = z.object({
+   offset: integerParam({ min: 0, max: 1_000_000, fallback: 0 }),
+ });
+ 
+-const timestampSchema = z
++export const timestampSchema = z
+   .string()
+   .pipe(z.iso.datetime({ offset: true, error: "must be an ISO 8601 timestamp with a time zone" }))
+   .transform((value) => new Date(value));
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index bf6b718..08d0229 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -6,6 +6,7 @@ import type { JsonObject } from "../domain/json.js";
+ import type { Page } from "../domain/pagination.js";
+ import type { Entry, Transfer } from "../domain/transfer.js";
+ import type { WebhookEndpoint } from "../domain/webhook.js";
++import type { HistoricalBalance } from "../services/accountService.js";
+ import type { FxQuote } from "../services/fxService.js";
+ 
+ /*
+@@ -28,6 +29,15 @@ export function serializeAccount(account: Account): JsonObject {
+   };
+ }
+ 
++export function serializeHistoricalBalance(balance: HistoricalBalance): JsonObject {
++  return {
++    account_id: balance.account.id,
++    currency: balance.account.currency,
++    as_of: balance.asOf.toISOString(),
++    balance: balance.balanceMinor.toString(),
++  };
++}
++
+ export function serializeTransfer(transfer: Transfer): JsonObject {
+   return {
+     id: transfer.id,
+diff --git a/src/app.ts b/src/app.ts
+index 45c3ca5..3c09833 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -17,6 +17,7 @@ import type { Logger } from "./infra/logger.js";
+ import { FixedWindowRateLimiter, type RateLimiter } from "./infra/rateLimiter.js";
+ import type { Redis } from "./infra/redis.js";
+ import { AccountService } from "./services/accountService.js";
++import { BalanceCache } from "./services/balanceCache.js";
+ import { EventService } from "./services/eventService.js";
+ import { ApiKeyService } from "./services/apiKeyService.js";
+ import { FxService } from "./services/fxService.js";
+@@ -39,14 +40,21 @@ export interface AppDeps {
+ 
+ const BODY_LIMIT_BYTES = 256 * 1024;
+ 
+-export function buildServices(deps: Pick<AppDeps, "pool" | "clock">): RouteServices & {
++export function buildServices(
++  deps: Pick<AppDeps, "pool" | "clock" | "redis" | "logger" | "config">,
++): RouteServices & {
+   apiKeys: ApiKeyService;
+ } {
+   const { pool, clock } = deps;
++  const balances = new BalanceCache({
++    redis: deps.redis,
++    logger: deps.logger.child({ component: "balance-cache" }),
++    ttlSeconds: deps.config.balanceCacheTtlSeconds,
++  });
+   return {
+-    accounts: new AccountService({ pool, clock }),
+-    transfers: new TransferService({ pool, clock }),
+-    holds: new HoldService({ pool, clock }),
++    accounts: new AccountService({ pool, clock, balances }),
++    transfers: new TransferService({ pool, clock, balances }),
++    holds: new HoldService({ pool, clock, balances }),
+     fx: new FxService({ pool, clock }),
+     webhooks: new WebhookService({ pool, clock }),
+     events: new EventService({ pool }),
+diff --git a/src/config/env.ts b/src/config/env.ts
+index 4b4611c..6ccda30 100644
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -32,6 +32,7 @@ const envShape = {
+   OUTBOX_BACKOFF_MAX_MS: integer(3_600_000, 1, 86_400_000),
+   WEBHOOK_TIMEOUT_MS: integer(5_000, 100, 120_000),
+   SHUTDOWN_TIMEOUT_MS: integer(10_000, 100, 300_000),
++  BALANCE_CACHE_TTL_S: integer(0, 0, 86_400),
+ };
+ 
+ const envSchema = z
+@@ -60,6 +61,8 @@ export interface Config {
+   };
+   readonly webhookTimeoutMs: number;
+   readonly shutdownTimeoutMs: number;
++  /** How long account reads stay in Redis; 0 turns the balance cache off. */
++  readonly balanceCacheTtlSeconds: number;
+ }
+ 
+ export class ConfigError extends Error {
+@@ -106,6 +109,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
+     },
+     webhookTimeoutMs: env.WEBHOOK_TIMEOUT_MS,
+     shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS,
++    balanceCacheTtlSeconds: env.BALANCE_CACHE_TTL_S,
+   };
+ }
+ 
+diff --git a/src/repositories/entries.ts b/src/repositories/entries.ts
+index 15b95d2..49041fb 100644
+--- a/src/repositories/entries.ts
++++ b/src/repositories/entries.ts
+@@ -2,7 +2,7 @@ import type { Queryable } from "../db/pool.js";
+ import { toCurrencyCode, type CurrencyCode } from "../domain/currency.js";
+ import type { OffsetPage } from "../domain/pagination.js";
+ import type { Entry } from "../domain/transfer.js";
+-import { toBigInt } from "./mapping.js";
++import { requireRow, toBigInt } from "./mapping.js";
+ 
+ interface EntryRow {
+   id: string;
+@@ -102,3 +102,18 @@ export async function listEntriesForTransfer(
+   );
+   return result.rows.map(mapEntry);
+ }
++
++/** The sum of an account's entries created at or before `asOf`: its balance at that instant. */
++export async function balanceAsOf(
++  db: Queryable,
++  tenantId: string,
++  accountId: string,
++  asOf: Date,
++): Promise<bigint> {
++  const result = await db.query<{ balance: string }>(
++    `SELECT COALESCE(sum(amount_minor), 0)::text AS balance FROM entries
++     WHERE tenant_id = $1 AND account_id = $2 AND created_at <= $3`,
++    [tenantId, accountId, asOf],
++  );
++  return toBigInt(requireRow(result.rows, "balanceAsOf").balance);
++}
+diff --git a/src/services/accountService.ts b/src/services/accountService.ts
+index d5809e1..ce40b5e 100644
+--- a/src/services/accountService.ts
++++ b/src/services/accountService.ts
+@@ -2,10 +2,12 @@ import type { Pool } from "../db/pool.js";
+ import { withTransaction } from "../db/tx.js";
+ import { assertClosable, type Account, type AccountKind } from "../domain/account.js";
+ import type { CurrencyCode } from "../domain/currency.js";
+-import { NotFoundError } from "../domain/errors.js";
++import { NotFoundError, ValidationError } from "../domain/errors.js";
+ import { toPage, type OffsetPage, type Page } from "../domain/pagination.js";
+ import type { Clock } from "../infra/clock.js";
+ import * as accounts from "../repositories/accounts.js";
++import * as entries from "../repositories/entries.js";
++import type { BalanceCache } from "./balanceCache.js";
+ 
+ export interface OpenAccountInput {
+   readonly name: string;
+@@ -13,13 +15,27 @@ export interface OpenAccountInput {
+   readonly kind: AccountKind;
+ }
+ 
++export interface HistoricalBalance {
++  readonly account: Account;
++  readonly asOf: Date;
++  readonly balanceMinor: bigint;
++}
++
++/**
++ * Balances at least this old are cached: a transaction reads its timestamp from the clock before
++ * it commits, so a younger instant may still receive entries from transactions in flight.
++ */
++export const AS_OF_SETTLE_MS = 60_000;
++
+ export class AccountService {
+   private readonly pool: Pool;
+   private readonly clock: Clock;
++  private readonly balances: BalanceCache;
+ 
+-  constructor(deps: { pool: Pool; clock: Clock }) {
++  constructor(deps: { pool: Pool; clock: Clock; balances: BalanceCache }) {
+     this.pool = deps.pool;
+     this.clock = deps.clock;
++    this.balances = deps.balances;
+   }
+ 
+   async openAccount(tenantId: string, input: OpenAccountInput): Promise<Account> {
+@@ -33,11 +49,30 @@ export class AccountService {
+   }
+ 
+   async getAccount(tenantId: string, id: string): Promise<Account> {
++    const cached = await this.balances.getAccount(tenantId, id);
++    if (cached) return cached;
+     const account = await accounts.findAccount(this.pool, tenantId, id);
+     if (!account) throw NotFoundError.resource("account", id);
++    await this.balances.putAccount(account);
+     return account;
+   }
+ 
++  /** The account's balance right after its entries created at or before `asOf`. */
++  async getBalanceAsOf(tenantId: string, id: string, asOf: Date): Promise<HistoricalBalance> {
++    const now = this.clock.now();
++    if (asOf.getTime() > now.getTime()) {
++      throw new ValidationError("as_of must not be in the future", { as_of: asOf.toISOString() });
++    }
++    const account = await this.getAccount(tenantId, id);
++    const settled = asOf.getTime() <= now.getTime() - AS_OF_SETTLE_MS;
++    const cached = settled ? await this.balances.getBalanceAsOf(tenantId, account.id, asOf) : null;
++    if (cached !== null) return { account, asOf, balanceMinor: cached };
++
++    const balanceMinor = await entries.balanceAsOf(this.pool, tenantId, account.id, asOf);
++    if (settled) await this.balances.putBalanceAsOf(tenantId, account.id, asOf, balanceMinor);
++    return { account, asOf, balanceMinor };
++  }
++
+   async listAccounts(tenantId: string, page: OffsetPage): Promise<Page<Account>> {
+     const rows = await accounts.listAccounts(this.pool, tenantId, page);
+     return toPage(rows, page);
+@@ -49,12 +84,14 @@ export class AccountService {
+    * returns it unchanged.
+    */
+   async closeAccount(tenantId: string, id: string): Promise<Account> {
+-    return withTransaction(this.pool, async (client) => {
++    const closed = await withTransaction(this.pool, async (client) => {
+       const account = await accounts.lockAccount(client, tenantId, id);
+       if (!account) throw NotFoundError.resource("account", id);
+       if (account.status === "closed") return account;
+       assertClosable(account);
+       return accounts.setAccountStatus(client, tenantId, id, "closed", this.clock.now());
+     });
++    await this.balances.invalidate(tenantId, [closed.id]);
++    return closed;
+   }
+ }
+diff --git a/src/services/balanceCache.ts b/src/services/balanceCache.ts
+new file mode 100644
+index 0000000..0b30ab7
+--- /dev/null
++++ b/src/services/balanceCache.ts
+@@ -0,0 +1,123 @@
++import type { Account } from "../domain/account.js";
++import type { Logger } from "../infra/logger.js";
++import type { Redis } from "../infra/redis.js";
++
++/** An account as stored in Redis: JSON, with amounts as strings and dates as ISO strings. */
++type CachedAccount = Omit<Account, "balanceMinor" | "heldMinor" | "createdAt" | "updatedAt"> & {
++  readonly balanceMinor: string;
++  readonly heldMinor: string;
++  readonly createdAt: string;
++  readonly updatedAt: string;
++};
++
++/**
++ * Redis copies of account reads, so clients that poll `GET /accounts/:id` do not each cost a
++ * Postgres query. Two kinds of entries:
++ *
++ * - `balance:<tenant>:<account>`: the account as last read, kept for `ttlSeconds`. The
++ *   services drop it after every posting that moves money on the account (transfers, hold
++ *   captures) and when the account is closed. A read that raced a posting can put back a copy
++ *   from before it; the TTL bounds how long such a copy is served.
++ * - `balance:<tenant>:<account>:as_of:<ms>`: the balance at a past instant, computed from
++ *   entries. Once no transaction can still write an entry before that instant the value never
++ *   changes, so it is written once and kept.
++ *
++ * Redis problems never fail a request: a failed read falls back to Postgres and a failed write
++ * or delete is logged.
++ */
++export class BalanceCache {
++  private readonly redis: Redis;
++  private readonly logger: Logger;
++  private readonly ttlSeconds: number;
++
++  /** `ttlSeconds` is the lifetime of a cached account read; 0 turns the cache off. */
++  constructor(options: { redis: Redis; logger: Logger; ttlSeconds: number }) {
++    this.redis = options.redis;
++    this.logger = options.logger;
++    this.ttlSeconds = options.ttlSeconds;
++  }
++
++  get enabled(): boolean {
++    return this.ttlSeconds > 0;
++  }
++
++  async getAccount(tenantId: string, accountId: string): Promise<Account | null> {
++    if (!this.enabled) return null;
++    const raw = await this.read(this.accountKey(tenantId, accountId));
++    return raw === null ? null : fromCached(raw);
++  }
++
++  async putAccount(account: Account): Promise<void> {
++    if (!this.enabled) return;
++    const key = this.accountKey(account.tenantId, account.id);
++    await this.write("put", () => this.redis.set(key, toCached(account), "EX", this.ttlSeconds));
++  }
++
++  /** Drop the cached reads of accounts whose balance, held amount or status just changed. */
++  async invalidate(tenantId: string, accountIds: readonly string[]): Promise<void> {
++    if (!this.enabled || accountIds.length === 0) return;
++    const keys = accountIds.map((id) => this.accountKey(tenantId, id));
++    await this.write("invalidate", () => this.redis.del(...keys));
++  }
++
++  async getBalanceAsOf(tenantId: string, accountId: string, asOf: Date): Promise<bigint | null> {
++    if (!this.enabled) return null;
++    const raw = await this.read(this.asOfKey(tenantId, accountId, asOf));
++    return raw === null ? null : BigInt(raw);
++  }
++
++  async putBalanceAsOf(
++    tenantId: string,
++    accountId: string,
++    asOf: Date,
++    balanceMinor: bigint,
++  ): Promise<void> {
++    if (!this.enabled) return;
++    const key = this.asOfKey(tenantId, accountId, asOf);
++    await this.write("put as_of", () => this.redis.set(key, balanceMinor.toString()));
++  }
++
++  private accountKey(tenantId: string, accountId: string): string {
++    return `balance:${tenantId}:${accountId.toLowerCase()}`;
++  }
++
++  private asOfKey(tenantId: string, accountId: string, asOf: Date): string {
++    return `${this.accountKey(tenantId, accountId)}:as_of:${asOf.getTime()}`;
++  }
++
++  private async read(key: string): Promise<string | null> {
++    try {
++      return await this.redis.get(key);
++    } catch (err) {
++      this.logger.warn({ err, key }, "balance cache read failed");
++      return null;
++    }
++  }
++
++  private async write(operation: string, run: () => Promise<unknown>): Promise<void> {
++    try {
++      await run();
++    } catch (err) {
++      this.logger.warn({ err, operation }, "balance cache write failed");
++    }
++  }
++}
++
++function toCached(account: Account): string {
++  return JSON.stringify({
++    ...account,
++    balanceMinor: account.balanceMinor.toString(),
++    heldMinor: account.heldMinor.toString(),
++  });
++}
++
++function fromCached(raw: string): Account {
++  const cached = JSON.parse(raw) as CachedAccount;
++  return {
++    ...cached,
++    balanceMinor: BigInt(cached.balanceMinor),
++    heldMinor: BigInt(cached.heldMinor),
++    createdAt: new Date(cached.createdAt),
++    updatedAt: new Date(cached.updatedAt),
++  };
++}
+diff --git a/src/services/holdService.ts b/src/services/holdService.ts
+index c2a3788..ded488e 100644
+--- a/src/services/holdService.ts
++++ b/src/services/holdService.ts
+@@ -19,6 +19,7 @@ import * as accounts from "../repositories/accounts.js";
+ import * as holds from "../repositories/holds.js";
+ import type { HoldFilter } from "../repositories/holds.js";
+ import * as outbox from "../repositories/outbox.js";
++import type { BalanceCache } from "./balanceCache.js";
+ import { postTransfer } from "./ledgerPosting.js";
+ 
+ export interface CreateHoldInput {
+@@ -41,10 +42,12 @@ export interface CaptureResult {
+ export class HoldService {
+   private readonly pool: Pool;
+   private readonly clock: Clock;
++  private readonly balances: BalanceCache;
+ 
+-  constructor(deps: { pool: Pool; clock: Clock }) {
++  constructor(deps: { pool: Pool; clock: Clock; balances: BalanceCache }) {
+     this.pool = deps.pool;
+     this.clock = deps.clock;
++    this.balances = deps.balances;
+   }
+ 
+   async createHold(tenantId: string, input: CreateHoldInput): Promise<Hold> {
+@@ -104,7 +107,7 @@ export class HoldService {
+    */
+   async captureHold(tenantId: string, holdId: string, toAccountId: string): Promise<CaptureResult> {
+     const now = this.clock.now();
+-    return withTransaction(this.pool, async (client) => {
++    const result = await withTransaction(this.pool, async (client) => {
+       const hold = await this.findOrThrow(client, tenantId, holdId);
+       if (hold.accountId === toAccountId.toLowerCase()) {
+         throw new ValidationError("a hold cannot be captured into the account it is held on");
+@@ -143,6 +146,9 @@ export class HoldService {
+       await outbox.insertEvent(client, holdCaptured(settled, posting.transfer), now);
+       return { hold: settled, transfer: posting.transfer };
+     });
++    const { transfer } = result;
++    await this.balances.invalidate(tenantId, [transfer.fromAccountId, transfer.toAccountId]);
++    return result;
+   }
+ 
+   /**
+diff --git a/src/services/transferService.ts b/src/services/transferService.ts
+index f4bdf2f..7c7f96e 100644
+--- a/src/services/transferService.ts
++++ b/src/services/transferService.ts
+@@ -9,6 +9,7 @@ import * as accounts from "../repositories/accounts.js";
+ import * as entries from "../repositories/entries.js";
+ import * as transfers from "../repositories/transfers.js";
+ import type { TransferFilter } from "../repositories/transfers.js";
++import type { BalanceCache } from "./balanceCache.js";
+ import { hashRequest, runIdempotent, type IdempotentResult } from "./idempotency.js";
+ import { postTransfer, type PostingResult } from "./ledgerPosting.js";
+ 
+@@ -40,10 +41,12 @@ function transferFingerprint(input: TransferInput): JsonValue {
+ export class TransferService {
+   private readonly pool: Pool;
+   private readonly clock: Clock;
++  private readonly balances: BalanceCache;
+ 
+-  constructor(deps: { pool: Pool; clock: Clock }) {
++  constructor(deps: { pool: Pool; clock: Clock; balances: BalanceCache }) {
+     this.pool = deps.pool;
+     this.clock = deps.clock;
++    this.balances = deps.balances;
+   }
+ 
+   /**
+@@ -59,7 +62,7 @@ export class TransferService {
+       key: request.idempotencyKey,
+       requestHash: hashRequest("POST /transfers", transferFingerprint(input)),
+     };
+-    return withTransaction(this.pool, (client) =>
++    const result = await withTransaction(this.pool, (client) =>
+       runIdempotent(client, scope, now, async () => {
+         const locked = await accounts.lockAccounts(client, tenantId, [
+           input.fromAccountId,
+@@ -83,6 +86,8 @@ export class TransferService {
+         return { status: 201, body: request.present(result) };
+       }),
+     );
++    await this.balances.invalidate(tenantId, [input.fromAccountId, input.toAccountId]);
++    return result;
+   }
+ 
+   async getTransfer(tenantId: string, id: string): Promise<TransferWithEntries> {
+diff --git a/test/api/balanceCache.test.ts b/test/api/balanceCache.test.ts
+new file mode 100644
+index 0000000..4c321fe
+--- /dev/null
++++ b/test/api/balanceCache.test.ts
+@@ -0,0 +1,130 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createHold,
++  createTenant,
++  fundedWallet,
++  getAccount,
++  openAccount,
++  transfer,
++  type ErrorResponse,
++  type HoldBody,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++interface BalanceBody {
++  account_id: string;
++  currency: string;
++  as_of: string;
++  balance: string;
++}
++
++describe("account balance cache", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeAll(async () => {
++    t = await buildTestApp({ env: { BALANCE_CACHE_TTL_S: "30" } });
++  });
++
++  afterAll(async () => {
++    await t.close();
++  });
++
++  beforeEach(async () => {
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  async function balanceAsOf(accountId: string, asOf: string) {
++    return t.app.inject({
++      method: "GET",
++      url: `/accounts/${accountId}/balance?as_of=${encodeURIComponent(asOf)}`,
++      headers: tenant.headers,
++    });
++  }
++
++  it("serves repeated reads of an account from Redis for BALANCE_CACHE_TTL_S", async () => {
++    const account = await openAccount(t.app, tenant, { name: "Before" });
++    await getAccount(t.app, tenant, account.id);
++    await t.pool.query("UPDATE accounts SET name = 'After' WHERE id = $1", [account.id]);
++
++    expect((await getAccount(t.app, tenant, account.id)).name).toBe("Before");
++    const ttl = await t.redis.pttl(`balance:${tenant.tenantId}:${account.id}`);
++    expect(ttl).toBeGreaterThan(0);
++    expect(ttl).toBeLessThanOrEqual(30_000);
++  });
++
++  it("drops both accounts' cached reads after a transfer", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const merchant = await openAccount(t.app, tenant);
++    await getAccount(t.app, tenant, merchant.id);
++
++    await transfer(t.app, tenant, wallet.id, merchant.id, "250");
++    expect((await getAccount(t.app, tenant, wallet.id)).balance).toBe("750");
++    expect((await getAccount(t.app, tenant, merchant.id)).balance).toBe("250");
++  });
++
++  it("drops the cached reads after a hold capture", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const merchant = await openAccount(t.app, tenant);
++    await getAccount(t.app, tenant, merchant.id);
++
++    const created = await createHold(t.app, tenant, { account_id: wallet.id, amount: "400" });
++    const hold = created.json<HoldBody>();
++    const captured = await t.app.inject({
++      method: "POST",
++      url: `/holds/${hold.id}/capture`,
++      headers: tenant.headers,
++      payload: { to_account_id: merchant.id },
++    });
++    expect(captured.statusCode).toBe(200);
++    expect(await getAccount(t.app, tenant, wallet.id)).toMatchObject({ balance: "600", held: "0" });
++    expect((await getAccount(t.app, tenant, merchant.id)).balance).toBe("400");
++  });
++
++  it("computes the balance as of an instant from the account's entries", async () => {
++    const start = t.clock.now();
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const merchant = await openAccount(t.app, tenant);
++    t.clock.advanceSeconds(60);
++    const second = t.clock.now();
++    await transfer(t.app, tenant, wallet.id, merchant.id, "300");
++    t.clock.advanceSeconds(3600);
++
++    const at = async (instant: Date) => {
++      const response = await balanceAsOf(wallet.id, instant.toISOString());
++      expect(response.statusCode, response.body).toBe(200);
++      return response.json<BalanceBody>();
++    };
++    expect(await at(new Date(start.getTime() - 1))).toMatchObject({ balance: "0", currency: "USD" });
++    expect((await at(start)).balance).toBe("1000");
++    expect((await at(new Date(second.getTime() - 1))).balance).toBe("1000");
++    expect(await at(second)).toEqual({ account_id: wallet.id, currency: "USD", as_of: second.toISOString(), balance: "700" });
++    expect((await at(t.clock.now())).balance).toBe("700");
++  });
++
++  it("caches a balance once the instant is a minute old, and not before", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const recent = t.clock.now();
++    t.clock.advanceSeconds(30);
++    expect((await balanceAsOf(wallet.id, recent.toISOString())).json<BalanceBody>().balance).toBe("1000");
++    expect(await t.redis.keys("balance:*:as_of:*")).toEqual([]);
++
++    t.clock.advanceSeconds(30);
++    expect((await balanceAsOf(wallet.id, recent.toISOString())).json<BalanceBody>().balance).toBe("1000");
++    expect(await t.redis.keys("balance:*:as_of:*")).toHaveLength(1);
++  });
++
++  it("validates as_of and hides other tenants' accounts", async () => {
++    const wallet = await fundedWallet(t.app, tenant, "1000");
++    const future = new Date(t.clock.now().getTime() + 1000).toISOString();
++    for (const asOf of [future, "yesterday", "2030-01-15T10:00:00"]) {
++      const response = await balanceAsOf(wallet.id, asOf);
++      expect(response.statusCode, asOf).toBe(400);
++      expect(response.json<ErrorResponse>().error.code).toBe("validation_error");
++    }
++    const other = await createTenant(t.pool, t.clock, { name: "Other" });
++    tenant = other;
++    expect((await balanceAsOf(wallet.id, t.clock.now().toISOString())).statusCode).toBe(404);
++  });
++});
+diff --git a/test/config/env.test.ts b/test/config/env.test.ts
+index 1834fbe..cc1bce2 100644
+--- a/test/config/env.test.ts
++++ b/test/config/env.test.ts
+@@ -15,6 +15,7 @@ describe("loadConfig", () => {
+       rateLimitPerMinute: 600,
+       outbox: { batchSize: 50, pollIntervalMs: 1000, backoffBaseMs: 5000, backoffMaxMs: 3_600_000 },
+       webhookTimeoutMs: 5000,
++      balanceCacheTtlSeconds: 0,
+     });
+   });
+ 

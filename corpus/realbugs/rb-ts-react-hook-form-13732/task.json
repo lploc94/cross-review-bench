@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-ts-react-hook-form-13732",
+  "repo": "rb-ts-react-hook-form-13732",
+  "kind": "realbug",
+  "title": "fix: don't set parent error when trigger target has only nested errors",
+  "description": "When a resolver returns errors only below a field (e.g. `{ test: { nested: {...} } }`), calling `trigger('test')` sets the whole container object as `errors.test`, even though it has no `type`/`message`. Same class of bug as #13727, but in the `executeSchemaAndUpdateState` path that `trigger()` uses.\n\nThe fix only sets the error when it has a `type`/`message` (or is an array, for field-array value errors) and unsets otherwise, mirroring #13727.\n\nRepro: new test in `trigger.test.tsx` — resolver returns only a nested error for `test`, `trigger('test')` is clicked, `errors.test` must stay `undefined`. Fails before, passes after. Full suite 1347/1347 green, `tsc` and eslint clean.\n",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/logic/createFormControl.ts",
+      "lines": [
+        662,
+        664
+      ],
+      "category": "logic",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "The new condition keeps a trigger target's error only when it has its own type or message (or is an array) and otherwise unsets the whole subtree, so when a resolver reports errors only on registered nested fields (address.street) and the app triggers the parent name, those nested errors are wiped: trigger returns false while formState.errors shows nothing.",
+      "trigger": "A resolver returns an error only for a registered nested field (e.g. address.street) and the app calls trigger(\"address\") on the parent name.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "src/__tests__/useForm/trigger.test.tsx"
+      ],
+      "hidden_test_cmd": "node_modules/.bin/jest --config ./scripts/jest/jest.config.js src/__tests__/useForm/trigger.test.tsx"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "language": "ts",
+  "test_cmd": "npx vitest run",
+  "typecheck_cmd": "npx tsc -b",
+  "lint_cmd": "npx eslint .",
+  "deps_cmd": "test -d node_modules || npm ci $( [ -n \"$CRB_ONLINE\" ] || echo --offline )",
+  "warm_cmd": "npx vitest run",
+  "services": ["postgres"],
+  "allow_words": []
+}

@@ -1,0 +1,37 @@
+diff --git a/internal/store/purge.go b/internal/store/purge.go
+index 34558eb..d4aeb0f 100644
+--- a/internal/store/purge.go
++++ b/internal/store/purge.go
+@@ -24,24 +24,16 @@ type PurgedJob struct {
+ // PurgeFinished deletes up to PurgeBatchSize jobs that reached a terminal state (succeeded,
+ // failed, cancelled or dead) before cutoff, oldest first, and returns what it deleted.
+ func (s *Store) PurgeFinished(ctx context.Context, cutoff time.Time) ([]PurgedJob, error) {
++	// One statement, so that no job can change between finding the batch and deleting it.
+ 	rows, err := s.pool.Query(ctx, `
+-		SELECT id FROM jobs
+-		WHERE state IN ('succeeded', 'failed', 'cancelled', 'dead') AND finished_at < $1
+-		ORDER BY finished_at, id
+-		LIMIT $2`,
++		DELETE FROM jobs
++		WHERE id IN (
++			SELECT id FROM jobs
++			WHERE state IN ('succeeded', 'failed', 'cancelled', 'dead') AND finished_at < $1
++			ORDER BY finished_at, id
++			LIMIT $2)
++		RETURNING id, queue, state`,
+ 		dbTime(cutoff), PurgeBatchSize)
+-	if err != nil {
+-		return nil, fmt.Errorf("find finished jobs: %w", err)
+-	}
+-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+-	if err != nil {
+-		return nil, fmt.Errorf("find finished jobs: %w", err)
+-	}
+-	if len(ids) == 0 {
+-		return nil, nil
+-	}
+-
+-	rows, err = s.pool.Query(ctx, `DELETE FROM jobs WHERE id = ANY($1) RETURNING id, queue, state`, ids)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("delete finished jobs: %w", err)
+ 	}

@@ -1,0 +1,26 @@
+diff --git a/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java b/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
+index 8e32b5a..a5b6a8a 100644
+--- a/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
++++ b/src/main/java/com/papertrail/workflow/persistence/DocumentQueriesImpl.java
+@@ -77,11 +77,16 @@ public class DocumentQueriesImpl implements DocumentQueries {
+       matches.add(
+           new TitleMatch(((Number) columns[0]).longValue(), ((Number) columns[1]).floatValue()));
+     }
+-    Number total =
+-        (Number)
+-            em.createNativeQuery("select count(*) from document d where " + TITLE_MATCHES)
+-                .setParameter("query", query)
+-                .getSingleResult();
++    StringBuilder count = new StringBuilder("select count(*) from document d where ");
++    count.append(TITLE_MATCHES);
++    if (!admin) {
++      count.append(" and ").append(DocumentQueries.VISIBLE_TO_USER_SQL);
++    }
++    Query countQuery = em.createNativeQuery(count.toString()).setParameter("query", query);
++    if (!admin) {
++      countQuery.setParameter("userId", userId);
++    }
++    Number total = (Number) countQuery.getSingleResult();
+     return new TitleMatch.Page(matches, total.longValue());
+   }
+ 

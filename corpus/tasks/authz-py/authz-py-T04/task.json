@@ -1,0 +1,37 @@
+{
+  "schema": "crb-task/v1",
+  "id": "authz-py-T04",
+  "repo": "authz-py",
+  "kind": "buggy",
+  "title": "TOTP two-factor login",
+  "description": "Adds an optional second factor to password login: a TOTP authenticator app (RFC 6238 with HMAC-SHA1, 30-second steps, 6 digits), implemented with hmac/hashlib so no new dependency is needed.\n\n- Enrolment: `POST /v1/me/totp {password}` re-checks the password (counted against the login rate limit) and returns a new 20-byte base32 secret, with `digits` and `period`, under `Cache-Control: no-store`. Calling it again before confirming replaces the secret. `POST /v1/me/totp/confirm {code}` turns two-factor on once the app shows a valid code (422 for a wrong code, 409 when nothing is pending or it is already on).\n- Login: for a user with two-factor on, `POST /v1/auth/login` answers `{\"mfa_required\": true, \"mfa_token\", \"expires_in\"}` instead of tokens. `POST /v1/auth/login/totp {mfa_token, code, device_label?}` completes it and returns the usual token pair. The `mfa_token` is a random token kept (hashed) in Redis by the new `PendingLoginStore`, expires after `MFA_TOKEN_TTL_SECONDS` (default 300) by the service clock, and is taken with GETDEL, so it works once whether the code was right or not. The second step is also rate limited per user.\n- Codes of the step before and after the current one are accepted, for phones whose clocks drift a little.\n- Migration 0006 adds `users.totp_secret` and `users.totp_enabled_at`. `UserRepository.get` can lock the row (`for_update`), and `RandomSource` gains `token_bytes`.\n\nTests: tests/unit/test_totp.py checks the codes against the RFC 6238 SHA-1 test vectors and rejects malformed codes; tests/api/test_totp.py covers enrolment, the password check, the two-step login, a wrong code spending the mfa_token, expiry, and the drift window. Turning two-factor off will come in a follow-up together with recovery codes. README and .env.example updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/authz/services/auth.py",
+      "lines": [
+        147,
+        155
+      ],
+      "category": "security",
+      "severity": "high",
+      "difficulty": "L4",
+      "summary": "login_with_totp accepts any code that matches a step within the ±1 window but never records which step was used (there is no last-used step on the user and the row is not locked), so the same one-time code can complete any number of logins for as long as it stays in the 90-second acceptance window. RFC 6238 §5.2 requires the verifier to refuse the second attempt of an accepted OTP; without it, an attacker who has the password and observes or phishes one code (shoulder surfing, a proxy that relays it) can open their own session with it right after the user did, defeating the second factor.",
+      "trigger": "Enrol, then log in with the password and complete with the current code (200); log in with the password again and send the same code at the same time, or 30 seconds later: a second session is opened (200) instead of 401.",
+      "testable": true,
+      "hidden_tests": [
+        "tests/hidden/test_totp_code_reuse.py"
+      ],
+      "hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_totp_code_reuse.py",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A code cannot be replayed: the second step only works with an mfa_token, and PendingLoginStore.take (src/authz/infra/pending_logins.py) removes it with GETDEL on first use, as test_a_wrong_code_spends_the_mfa_token shows. Each code is therefore bound to exactly one pending login and is spent with it.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

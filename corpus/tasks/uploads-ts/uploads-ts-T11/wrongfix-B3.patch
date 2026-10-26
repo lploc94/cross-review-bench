@@ -1,0 +1,42 @@
+diff --git a/README.md b/README.md
+index 48dd65a..8c13da3 100644
+--- a/README.md
++++ b/README.md
+@@ -98,8 +98,8 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ |---|---|---|---|
+ | GET | `/health/live`, `/health/ready` | none | 200 (`/health/ready` 503 without the database) |
+ | GET | `/v1/files?limit=&after=` | `files:read` | 200 |
+-| PUT | `/v1/files/<path>[?overwrite=true]` | `files:write` | 201, or 200 when it replaced a file |
+-| POST | `/v1/files[?overwrite=true]` (multipart) | `files:write` | 201, or 200 when it replaced a file |
++| PUT | `/v1/files/<path>[?overwrite=true]` | `files:write` | 201, or 200 when it replaced a file or was deduplicated |
++| POST | `/v1/files[?overwrite=true]` (multipart) | `files:write` | 201, or 200 when it replaced a file or was deduplicated |
+ | GET | `/v1/files/<path>` | `files:read` | 200 (304 on a matching `If-None-Match`) |
+ | DELETE | `/v1/files/<path>` | `files:delete` | 204 |
+ | GET | `/v1/files/by-id/:id` | `files:read` | 200 (304) |
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index 2ebe76f..1af0115 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -41,7 +41,7 @@ export interface UploadBody extends FileBody {
+ /**
+  * The answer to a finished upload (PUT, multipart or a completed session): 201 when the upload
+  * stored a new object for a new path, 200 when it replaced the file at the path or reused the
+- * object of an identical file.
++ * object of an identical file. UploadsClient.putFile accepts both.
+  */
+ export function serializeUpload(outcome: UploadOutcome): { status: 200 | 201; body: UploadBody } {
+   return {
+diff --git a/src/client/uploadsClient.ts b/src/client/uploadsClient.ts
+index 2eb4e3b..16ae732 100644
+--- a/src/client/uploadsClient.ts
++++ b/src/client/uploadsClient.ts
+@@ -199,7 +199,8 @@ export class UploadsClient {
+         body: new Uint8Array(body),
+       });
+     }
+-    await this.expect(response, ...(options.overwrite ? [201, 200] : [201]));
++    // 200 without overwrite: the bytes were already stored and the new file shares them.
++    await this.expect(response, 201, 200);
+     return { file: (await response.json()) as FileInfo, created: response.status === 201 };
+   }
+ 

@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "etl-py-T14",
+  "repo": "etl-py",
+  "kind": "clean",
+  "title": "Run history pruning: etl runs prune",
+  "description": "`etl.runs` grows by a few hundred rows a day, and with them the rejects and check results of each run; `rejects prune` handles the rejects by age, but the run history itself is never cleaned up. This adds a retention command for it.\n\n- `etl runs prune --older-than DAYS [--dry-run] [--yes]` deletes the runs that finished more than DAYS × 24 hours ago (DAYS from 1 to 36500), with their rejects and check results, and prints how many of each it deleted (`--dry-run`: would delete, nothing is written). Like `rejects prune`, it asks for confirmation before deleting unless `--yes` is given; a dry run does not ask.\n- It keeps: runs a warehouse row still names (`products`, `customers` and `orders` keep `run_id`; closed customer versions keep theirs), the latest succeeded run of each source (the row-count delta checks compare with what it observed, see `SucceededRunHistory`), and runs in progress. The referencing columns are found from the foreign keys to `etl.runs` that do not cascade, so a new warehouse table with `run_id` is covered.\n- One transaction: the candidate runs are selected `FOR UPDATE`, then their rejects and check results are deleted (the foreign keys cascade anyway; deleting them first gives the counts), then the runs. Loads only ever write their own, running, run id, so a concurrent load cannot start referencing a candidate.\n- Migration 0005 adds `ix_products_run_id` and `ix_customers_run_id` (orders already have `ix_orders_run_id`), so the reference checks and the server's foreign-key checks on delete use an index.\n\nTests: `tests/pipeline/test_run_pruning.py` (superseded and failed runs deleted with their rejects and checks, recent runs kept, dry run, bad retention) and `tests/cli/test_runs_commands.py` (output, confirmation). README updated.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "tests/hidden/test_run_retention.py"
+  ],
+  "clean_hidden_test_cmd": "uv run --frozen pytest -q tests/hidden/test_run_retention.py"
+}

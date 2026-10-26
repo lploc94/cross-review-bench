@@ -1,0 +1,919 @@
+diff --git a/README.md b/README.md
+index 62a4ff0..e6973d4 100644
+--- a/README.md
++++ b/README.md
+@@ -26,6 +26,13 @@ Boot 3, Spring Data JPA, Flyway and PostgreSQL.
+   takes is waited for at most that long. So a release can answer 503 `busy` (see Errors) while an
+   admin write holds an inventory row. The expiry sweep skips a hold it cannot lock and pages past
+   it, so the other due holds still expire; the skipped hold is found again by the next run.
++- **Channel allotments.** An allotment keeps some rooms of a type for a sales channel (`channel`:
++  lowercase letters, digits and dashes) on given nights, up to the night's inventory total. Until
++  its release day, `releaseDays` before the night (property-local date), those rooms are out of
++  public sale: the availability search, the calendar and public holds do not count them as free.
++  From the release day on they are sold like any other room. A hold made for the channel (admin
++  route) takes the channel's unreleased allotment first and public rooms for the rest; rooms it
++  took return to public sale, not to the allotment, when the hold is released or expires.
+ - **Pricing.** The rules run in a fixed order, and the price lines are stored with the reservation so
+   later rule changes do not alter it: nightly rate (seasonal rate, else base), weekend surcharge on
+   Friday and Saturday nights by property-local date, length-of-stay discount, extra-guest fee. Money
+@@ -138,6 +145,8 @@ src/test/java/com/innkeep/booking/  tests, grouped as api, config, persistence,
+ | `POST .../room-types`, `PUT .../room-types/{roomType}/rates` | admin | add a room type, change its rates |
+ | `POST/GET/PUT/DELETE .../room-types/{roomType}/seasonal-rates[/{id}]` | admin | seasonal rates (same priority may not overlap) |
+ | `GET/PUT .../room-types/{roomType}/inventory`, `PUT .../inventory/range` | admin | inventory per night and for a range |
++| `PUT .../room-types/{roomType}/allotments/{channel}` | admin | keep `rooms` for a channel from `from` to `to` (exclusive), released `releaseDays` before each night |
++| `POST /api/v1/admin/properties/{code}/channels/{channel}/holds` | admin | create a hold for a channel (body as a public hold) |
+ | `GET /api/v1/admin/holds`, `GET /api/v1/admin/holds/summary`, `POST /api/v1/admin/holds/{id}/expire` | admin | hold list, counts, manual expiry |
+ | `POST /api/v1/admin/maintenance/run` | admin | expire holds and complete stays now |
+ 
+diff --git a/src/main/java/com/innkeep/booking/api/AdminAllotmentController.java b/src/main/java/com/innkeep/booking/api/AdminAllotmentController.java
+new file mode 100644
+index 0000000..ed52145
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/AdminAllotmentController.java
+@@ -0,0 +1,65 @@
++package com.innkeep.booking.api;
++
++import com.innkeep.booking.api.dto.AllotmentRequest;
++import com.innkeep.booking.api.dto.HoldRequest;
++import com.innkeep.booking.api.dto.HoldResponse;
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.GuestDetails;
++import com.innkeep.booking.domain.Hold;
++import com.innkeep.booking.service.AllotmentService;
++import com.innkeep.booking.service.HoldService;
++import jakarta.validation.Valid;
++import java.net.URI;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/** Channel allotments and the holds channels make against them. */
++@RestController
++@RequestMapping("/api/v1/admin/properties/{code}")
++public class AdminAllotmentController {
++
++  private final AllotmentService allotments;
++  private final HoldService holds;
++
++  public AdminAllotmentController(AllotmentService allotments, HoldService holds) {
++    this.allotments = allotments;
++    this.holds = holds;
++  }
++
++  @PutMapping("/room-types/{roomType}/allotments/{channel}")
++  public ResponseEntity<Void> set(
++      @PathVariable String code,
++      @PathVariable String roomType,
++      @PathVariable String channel,
++      @Valid @RequestBody AllotmentRequest request) {
++    allotments.set(
++        code, roomType, channel, request.range(), request.rooms(), request.releaseDays());
++    return ResponseEntity.noContent().build();
++  }
++
++  @PostMapping("/channels/{channel}/holds")
++  public ResponseEntity<HoldResponse> hold(
++      @PathVariable String code,
++      @PathVariable String channel,
++      @Valid @RequestBody HoldRequest request) {
++    var stay = new DateRange(request.stay().checkIn(), request.stay().checkOut());
++    var guest =
++        new GuestDetails(request.guest().name(), request.guest().email(), request.guest().phone());
++    Hold hold =
++        holds.createForChannel(
++            channel,
++            code,
++            request.stay().roomType(),
++            stay,
++            request.stay().rooms(),
++            request.stay().guests(),
++            guest);
++    return ResponseEntity.created(URI.create("/api/v1/holds/" + hold.getId()))
++        .body(HoldResponse.from(hold));
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/api/dto/AllotmentRequest.java b/src/main/java/com/innkeep/booking/api/dto/AllotmentRequest.java
+new file mode 100644
+index 0000000..6261007
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/api/dto/AllotmentRequest.java
+@@ -0,0 +1,18 @@
++package com.innkeep.booking.api.dto;
++
++import com.innkeep.booking.domain.DateRange;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotNull;
++import java.time.LocalDate;
++
++/**
++ * Rooms kept for a channel on every night from {@code from} up to {@code to} (exclusive), released
++ * to public sale {@code releaseDays} before each night.
++ */
++public record AllotmentRequest(
++    @NotNull LocalDate from, @NotNull LocalDate to, @Min(0) int rooms, @Min(0) int releaseDays) {
++
++  public DateRange range() {
++    return new DateRange(from, to);
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/domain/Allotment.java b/src/main/java/com/innkeep/booking/domain/Allotment.java
+new file mode 100644
+index 0000000..f5ccdaa
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/domain/Allotment.java
+@@ -0,0 +1,79 @@
++package com.innkeep.booking.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.FetchType;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.JoinColumn;
++import jakarta.persistence.ManyToOne;
++import jakarta.persistence.Table;
++import jakarta.persistence.Version;
++import java.time.LocalDate;
++
++/**
++ * Rooms of one type kept for a sales channel on one night. Until the release day ({@code
++ * releaseDays} before the night, property-local) the rooms are out of public sale; from that day on
++ * they are sold like any other room. The release day is stored so queries can compare it.
++ */
++@Entity
++@Table(name = "allotment")
++public class Allotment extends AbstractEntity<Long> {
++
++  @Id
++  @GeneratedValue(strategy = GenerationType.IDENTITY)
++  private Long id;
++
++  @ManyToOne(fetch = FetchType.LAZY, optional = false)
++  @JoinColumn(name = "room_type_id", nullable = false)
++  private RoomType roomType;
++
++  @Column(nullable = false, length = 32)
++  private String channel;
++
++  @Column(nullable = false)
++  private LocalDate night;
++
++  @Column(nullable = false)
++  private int rooms;
++
++  @Column(name = "release_on", nullable = false)
++  private LocalDate releaseOn;
++
++  @Version private Long version;
++
++  protected Allotment() {}
++
++  public Allotment(RoomType roomType, String channel, LocalDate night, int rooms, int releaseDays) {
++    this.roomType = roomType;
++    this.channel = channel;
++    this.night = night;
++    set(rooms, releaseDays);
++  }
++
++  @Override
++  public Long getId() {
++    return id;
++  }
++
++  public void set(int rooms, int releaseDays) {
++    if (rooms < 0 || releaseDays < 0) {
++      throw new ValidationException("rooms and release days cannot be negative");
++    }
++    this.rooms = rooms;
++    this.releaseOn = night.minusDays(releaseDays);
++  }
++
++  /** Released from the release day on: the rooms are then for public sale. */
++  public boolean isReleased(LocalDate today) {
++    return !today.isBefore(releaseOn);
++  }
++
++  /** Takes up to {@code wanted} of the kept rooms and returns how many it took. */
++  public int take(int wanted) {
++    int taken = Math.min(wanted, rooms);
++    rooms -= taken;
++    return taken;
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/persistence/AllotmentRepository.java b/src/main/java/com/innkeep/booking/persistence/AllotmentRepository.java
+new file mode 100644
+index 0000000..e265372
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/persistence/AllotmentRepository.java
+@@ -0,0 +1,43 @@
++package com.innkeep.booking.persistence;
++
++import com.innkeep.booking.domain.Allotment;
++import jakarta.persistence.LockModeType;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.Optional;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Lock;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++public interface AllotmentRepository extends JpaRepository<Allotment, Long> {
++
++  Optional<Allotment> findByRoomTypeIdAndChannelAndNight(
++      long roomTypeId, String channel, LocalDate night);
++
++  /** The channel's allotment for the night under a row lock, for a hold that takes from it. */
++  @Lock(LockModeType.PESSIMISTIC_WRITE)
++  @Query(
++      """
++      select a from Allotment a
++       where a.roomType.id = :roomTypeId and a.channel = :channel and a.night = :night""")
++  Optional<Allotment> findLocked(
++      @Param("roomTypeId") long roomTypeId,
++      @Param("channel") String channel,
++      @Param("night") LocalDate night);
++
++  /** Rooms kept per room type and night by allotments whose release day is after {@code today}. */
++  @Query(
++      """
++      select new com.innkeep.booking.persistence.KeptRooms(a.roomType.id, a.night, sum(a.rooms))
++        from Allotment a
++       where a.roomType.property.code = :code
++         and a.night between :first and :last
++         and a.releaseOn > :today
++       group by a.roomType.id, a.night""")
++  List<KeptRooms> keptForProperty(
++      @Param("code") String code,
++      @Param("first") LocalDate first,
++      @Param("last") LocalDate last,
++      @Param("today") LocalDate today);
++}
+diff --git a/src/main/java/com/innkeep/booking/persistence/InventoryRepository.java b/src/main/java/com/innkeep/booking/persistence/InventoryRepository.java
+index e77b087..41ca56c 100644
+--- a/src/main/java/com/innkeep/booking/persistence/InventoryRepository.java
++++ b/src/main/java/com/innkeep/booking/persistence/InventoryRepository.java
+@@ -28,6 +28,28 @@ public interface InventoryRepository extends JpaRepository<Inventory, Long> {
+       @Param("night") LocalDate night,
+       @Param("rooms") int rooms);
+ 
++  /**
++   * {@link #holdRooms} for rooms on sale: rooms kept by allotments whose release day is after
++   * {@code today} do not count as free.
++   */
++  @Modifying(flushAutomatically = true)
++  @Query(
++      nativeQuery = true,
++      value =
++          """
++          update inventory i
++             set held = i.held + :rooms, version = i.version + 1
++           where i.room_type_id = :roomTypeId and i.night = :night
++             and i.total - i.held - i.booked
++                 - coalesce((select sum(a.rooms) from allotment a
++                              where a.room_type_id = i.room_type_id and a.night = i.night
++                                and a.release_on > :today), 0) >= :rooms""")
++  int holdRoomsForSale(
++      @Param("roomTypeId") long roomTypeId,
++      @Param("night") LocalDate night,
++      @Param("rooms") int rooms,
++      @Param("today") LocalDate today);
++
+   @Modifying(flushAutomatically = true)
+   @Query(
+       """
+@@ -66,19 +88,6 @@ public interface InventoryRepository extends JpaRepository<Inventory, Long> {
+   List<Inventory> findByRoomTypeIdAndNightBetweenOrderByNightAsc(
+       long roomTypeId, LocalDate firstNight, LocalDate lastNight);
+ 
+-  @Query(
+-      """
+-      select new com.innkeep.booking.persistence.RoomAvailability(
+-          i.roomType.id, min(i.total - i.held - i.booked), count(i))
+-        from Inventory i
+-       where i.roomType.property.code = :propertyCode
+-         and i.night between :firstNight and :lastNight
+-       group by i.roomType.id""")
+-  List<RoomAvailability> summarize(
+-      @Param("propertyCode") String propertyCode,
+-      @Param("firstNight") LocalDate firstNight,
+-      @Param("lastNight") LocalDate lastNight);
+-
+   /**
+    * Inventory of every room type of the property for the nights from {@code first} to {@code last}.
+    */
+diff --git a/src/main/java/com/innkeep/booking/persistence/KeptRooms.java b/src/main/java/com/innkeep/booking/persistence/KeptRooms.java
+new file mode 100644
+index 0000000..69b8a56
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/persistence/KeptRooms.java
+@@ -0,0 +1,6 @@
++package com.innkeep.booking.persistence;
++
++import java.time.LocalDate;
++
++/** Rooms of one type that unreleased allotments keep out of public sale on one night. */
++public record KeptRooms(long roomTypeId, LocalDate night, long rooms) {}
+diff --git a/src/main/java/com/innkeep/booking/persistence/RoomAvailability.java b/src/main/java/com/innkeep/booking/persistence/RoomAvailability.java
+deleted file mode 100644
+index d56852d..0000000
+--- a/src/main/java/com/innkeep/booking/persistence/RoomAvailability.java
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package com.innkeep.booking.persistence;
+-
+-/**
+- * Per room type over a date range: the fewest rooms free on any night and how many nights have an
+- * inventory row at all. A room type with fewer rows than nights has no rooms for some night.
+- */
+-public record RoomAvailability(long roomTypeId, int minAvailable, long nightCount) {}
+diff --git a/src/main/java/com/innkeep/booking/service/AllotmentService.java b/src/main/java/com/innkeep/booking/service/AllotmentService.java
+new file mode 100644
+index 0000000..c477aff
+--- /dev/null
++++ b/src/main/java/com/innkeep/booking/service/AllotmentService.java
+@@ -0,0 +1,144 @@
++package com.innkeep.booking.service;
++
++import com.innkeep.booking.domain.Allotment;
++import com.innkeep.booking.domain.ConflictException;
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.InsufficientAvailabilityException;
++import com.innkeep.booking.domain.Inventory;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.domain.ValidationException;
++import com.innkeep.booking.persistence.AllotmentRepository;
++import com.innkeep.booking.persistence.InventoryRepository;
++import com.innkeep.booking.persistence.KeptRooms;
++import java.time.Clock;
++import java.time.LocalDate;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.regex.Pattern;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.support.TransactionTemplate;
++
++/**
++ * Rooms kept for sales channels. An allotment takes its rooms out of public sale until its release
++ * day; a hold made for the channel uses them first.
++ */
++@Service
++public class AllotmentService {
++
++  static final int MAX_NIGHTS = 366;
++  static final int MAX_RELEASE_DAYS = 365;
++  private static final Pattern CHANNEL = Pattern.compile("[a-z0-9][a-z0-9-]{0,31}");
++
++  private final CatalogService catalog;
++  private final AllotmentRepository allotments;
++  private final InventoryRepository inventory;
++  private final Clock clock;
++  private final TransactionTemplate tx;
++  private final OptimisticRetry retry;
++
++  public AllotmentService(
++      CatalogService catalog,
++      AllotmentRepository allotments,
++      InventoryRepository inventory,
++      Clock clock,
++      TransactionTemplate tx,
++      OptimisticRetry retry) {
++    this.catalog = catalog;
++    this.allotments = allotments;
++    this.inventory = inventory;
++    this.clock = clock;
++    this.tx = tx;
++    this.retry = retry;
++  }
++
++  /**
++   * Keeps {@code rooms} rooms for the channel on every night of the range, replacing what it kept
++   * before. Each night needs inventory with at least that many rooms in total.
++   */
++  public long set(
++      String propertyCode,
++      String roomTypeCode,
++      String channel,
++      DateRange range,
++      int rooms,
++      int releaseDays) {
++    requireChannel(channel);
++    if (range.nights() > MAX_NIGHTS) {
++      throw new ValidationException("at most " + MAX_NIGHTS + " nights at a time");
++    }
++    if (releaseDays > MAX_RELEASE_DAYS) {
++      throw new ValidationException("release days must be at most " + MAX_RELEASE_DAYS);
++    }
++    return retry.run(
++        () ->
++            tx.execute(
++                status -> {
++                  RoomType type = catalog.roomType(propertyCode, roomTypeCode);
++                  for (LocalDate night : range.nightDates()) {
++                    Inventory row =
++                        inventory
++                            .findByRoomTypeIdAndNight(type.getId(), night)
++                            .orElseThrow(() -> new ConflictException("no inventory on " + night));
++                    if (rooms > row.getTotal()) {
++                      throw new ConflictException(
++                          "only " + row.getTotal() + " rooms in total on " + night);
++                    }
++                    Allotment existing =
++                        allotments
++                            .findByRoomTypeIdAndChannelAndNight(type.getId(), channel, night)
++                            .orElse(null);
++                    if (existing == null) {
++                      allotments.save(new Allotment(type, channel, night, rooms, releaseDays));
++                    } else {
++                      existing.set(rooms, releaseDays);
++                    }
++                  }
++                  return range.nights();
++                }));
++  }
++
++  /**
++   * Holds the rooms on every night of the stay, in ascending night order, inside the caller's
++   * transaction. With a channel, the hold first takes what is left of that channel's unreleased
++   * allotment; the rest, like a public hold, must fit in the rooms no allotment keeps.
++   */
++  void holdNights(RoomType type, DateRange stay, int rooms, String channel) {
++    LocalDate today = today();
++    for (LocalDate night : stay.nightDates()) {
++      if (channel != null) {
++        allotments
++            .findLocked(type.getId(), channel, night)
++            .filter(allotment -> !allotment.isReleased(today))
++            .ifPresent(allotment -> allotment.take(rooms));
++      }
++      if (inventory.holdRoomsForSale(type.getId(), night, rooms, today) == 0) {
++        throw new InsufficientAvailabilityException(type.getCode(), night);
++      }
++    }
++  }
++
++  /**
++   * Rooms kept out of public sale, by room type id and night, from {@code first} to {@code last}.
++   */
++  Map<Long, Map<LocalDate, Integer>> kept(Property property, LocalDate first, LocalDate last) {
++    var kept = new HashMap<Long, Map<LocalDate, Integer>>();
++    for (KeptRooms row : allotments.keptForProperty(property.getCode(), first, last, today())) {
++      kept.computeIfAbsent(row.roomTypeId(), id -> new HashMap<>())
++          .put(row.night(), (int) row.rooms());
++    }
++    return kept;
++  }
++
++  static void requireChannel(String channel) {
++    if (channel == null || !CHANNEL.matcher(channel).matches()) {
++      throw new ValidationException(
++          "channel must be 1 to 32 lowercase letters, digits or dashes, starting with a letter or"
++              + " digit");
++    }
++  }
++
++  private LocalDate today() {
++    return LocalDate.now(clock);
++  }
++}
+diff --git a/src/main/java/com/innkeep/booking/service/AvailabilityService.java b/src/main/java/com/innkeep/booking/service/AvailabilityService.java
+index b36779d..f1bc1f9 100644
+--- a/src/main/java/com/innkeep/booking/service/AvailabilityService.java
++++ b/src/main/java/com/innkeep/booking/service/AvailabilityService.java
+@@ -2,30 +2,32 @@ package com.innkeep.booking.service;
+ 
+ import com.innkeep.booking.config.BookingConfig;
+ import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.Inventory;
+ import com.innkeep.booking.domain.PricingEngine;
+ import com.innkeep.booking.domain.Property;
+ import com.innkeep.booking.domain.Quote;
+ import com.innkeep.booking.domain.RoomType;
+ import com.innkeep.booking.domain.SeasonalRate;
+ import com.innkeep.booking.persistence.InventoryRepository;
+-import com.innkeep.booking.persistence.RoomAvailability;
+ import com.innkeep.booking.persistence.RoomTypeRepository;
+ import com.innkeep.booking.persistence.SeasonalRateRepository;
++import java.time.LocalDate;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.function.Function;
+ import java.util.stream.Collectors;
+ import org.springframework.stereotype.Service;
+ 
+ /**
+  * Lists the room types of a property that can take the requested rooms on every night of the stay,
+- * with the quoted total. Three queries serve the whole property, whatever its size.
++ * with the quoted total. Rooms kept by unreleased channel allotments are not offered. Four queries
++ * serve the whole property, whatever its size.
+  */
+ @Service
+ public class AvailabilityService {
+ 
+   private final CatalogService catalog;
++  private final AllotmentService allotments;
+   private final RoomTypeRepository roomTypes;
+   private final InventoryRepository inventory;
+   private final SeasonalRateRepository seasonalRates;
+@@ -33,11 +35,13 @@ public class AvailabilityService {
+ 
+   public AvailabilityService(
+       CatalogService catalog,
++      AllotmentService allotments,
+       RoomTypeRepository roomTypes,
+       InventoryRepository inventory,
+       SeasonalRateRepository seasonalRates,
+       BookingConfig config) {
+     this.catalog = catalog;
++    this.allotments = allotments;
+     this.roomTypes = roomTypes;
+     this.inventory = inventory;
+     this.seasonalRates = seasonalRates;
+@@ -48,9 +52,11 @@ public class AvailabilityService {
+     config.requireWithinLimits(stay, rooms);
+     Property property = catalog.property(propertyCode);
+     List<RoomType> types = roomTypes.findByPropertyCodeOrderByCodeAsc(propertyCode);
+-    Map<Long, RoomAvailability> summary =
+-        inventory.summarize(propertyCode, stay.checkIn(), stay.lastNight()).stream()
+-            .collect(Collectors.toMap(RoomAvailability::roomTypeId, Function.identity()));
++    Map<Long, List<Inventory>> nightsByType =
++        inventory.findForProperty(propertyCode, stay.checkIn(), stay.lastNight()).stream()
++            .collect(Collectors.groupingBy(row -> row.getRoomType().getId()));
++    Map<Long, Map<LocalDate, Integer>> kept =
++        allotments.kept(property, stay.checkIn(), stay.lastNight());
+     List<Long> ids = types.stream().map(RoomType::getId).toList();
+     Map<Long, List<SeasonalRate>> ratesByType =
+         seasonalRates.findOverlapping(ids, stay.checkIn(), stay.lastNight()).stream()
+@@ -58,8 +64,14 @@ public class AvailabilityService {
+ 
+     var rows = new ArrayList<AvailabilityRow>();
+     for (RoomType type : types) {
+-      RoomAvailability free = summary.get(type.getId());
+-      if (free == null || free.nightCount() != stay.nights() || free.minAvailable() < rooms) {
++      List<Inventory> nights = nightsByType.getOrDefault(type.getId(), List.of());
++      Map<LocalDate, Integer> keptNights = kept.getOrDefault(type.getId(), Map.of());
++      int free =
++          nights.stream()
++              .mapToInt(row -> row.available() - keptNights.getOrDefault(row.getNight(), 0))
++              .min()
++              .orElse(0);
++      if (nights.size() != stay.nights() || free < rooms) {
+         continue;
+       }
+       if (guests > rooms * (type.getCapacity() + PricingEngine.MAX_EXTRA_GUESTS_PER_ROOM)) {
+@@ -73,8 +85,7 @@ public class AvailabilityService {
+               stay,
+               rooms,
+               guests);
+-      rows.add(
+-          new AvailabilityRow(type.getCode(), type.getName(), free.minAvailable(), quote.total()));
++      rows.add(new AvailabilityRow(type.getCode(), type.getName(), free, quote.total()));
+     }
+     return rows;
+   }
+diff --git a/src/main/java/com/innkeep/booking/service/CalendarService.java b/src/main/java/com/innkeep/booking/service/CalendarService.java
+index 7898e1e..58b998a 100644
+--- a/src/main/java/com/innkeep/booking/service/CalendarService.java
++++ b/src/main/java/com/innkeep/booking/service/CalendarService.java
+@@ -19,7 +19,8 @@ import org.springframework.stereotype.Service;
+ 
+ /**
+  * A night-by-night view of one room type for the guest site: rooms still free and the price of a
+- * single room for that night, weekend surcharge and seasonal rates included.
++ * single room for that night, weekend surcharge and seasonal rates included. Rooms kept by
++ * unreleased channel allotments are not counted as free.
+  */
+ @Service
+ public class CalendarService {
+@@ -27,12 +28,17 @@ public class CalendarService {
+   private static final int MAX_NIGHTS = 366;
+ 
+   private final CatalogService catalog;
++  private final AllotmentService allotments;
+   private final InventoryRepository inventory;
+   private final SeasonalRateRepository seasonalRates;
+ 
+   public CalendarService(
+-      CatalogService catalog, InventoryRepository inventory, SeasonalRateRepository seasonalRates) {
++      CatalogService catalog,
++      AllotmentService allotments,
++      InventoryRepository inventory,
++      SeasonalRateRepository seasonalRates) {
+     this.catalog = catalog;
++    this.allotments = allotments;
+     this.inventory = inventory;
+     this.seasonalRates = seasonalRates;
+   }
+@@ -47,13 +53,15 @@ public class CalendarService {
+     Map<LocalDate, Inventory> rows =
+         inventory.findByRoomTypeIdAndNightBetweenOrderByNightAsc(type.getId(), first, last).stream()
+             .collect(Collectors.toMap(Inventory::getNight, Function.identity()));
++    Map<LocalDate, Integer> kept =
++        allotments.kept(type.getProperty(), first, last).getOrDefault(type.getId(), Map.of());
+     List<SeasonalRate> rates = seasonalRates.findOverlapping(List.of(type.getId()), first, last);
+ 
+     int weekendSurchargePercent = type.getProperty().getWeekendSurchargePercent();
+     var days = new ArrayList<CalendarDay>();
+     for (LocalDate night : range.nightDates()) {
+       Inventory row = rows.get(night);
+-      int available = row == null ? 0 : row.available();
++      int available = row == null ? 0 : Math.max(0, row.available() - kept.getOrDefault(night, 0));
+       // one room, guests at capacity: the quote is the nightly price with no extra-guest fee
+       Quote price =
+           PricingEngine.quote(
+diff --git a/src/main/java/com/innkeep/booking/service/HoldService.java b/src/main/java/com/innkeep/booking/service/HoldService.java
+index 9751a26..d430c05 100644
+--- a/src/main/java/com/innkeep/booking/service/HoldService.java
++++ b/src/main/java/com/innkeep/booking/service/HoldService.java
+@@ -7,7 +7,6 @@ import com.innkeep.booking.domain.GuestDetails;
+ import com.innkeep.booking.domain.Hold;
+ import com.innkeep.booking.domain.HoldExpiredException;
+ import com.innkeep.booking.domain.HoldStatus;
+-import com.innkeep.booking.domain.InsufficientAvailabilityException;
+ import com.innkeep.booking.domain.LedgerEntry;
+ import com.innkeep.booking.domain.LedgerKind;
+ import com.innkeep.booking.domain.NotFoundException;
+@@ -53,6 +52,7 @@ import org.springframework.transaction.support.TransactionTemplate;
+ public class HoldService {
+ 
+   private final CatalogService catalog;
++  private final AllotmentService allotments;
+   private final InventoryRepository inventory;
+   private final HoldRepository holds;
+   private final ReservationRepository reservations;
+@@ -68,6 +68,7 @@ public class HoldService {
+ 
+   public HoldService(
+       CatalogService catalog,
++      AllotmentService allotments,
+       InventoryRepository inventory,
+       HoldRepository holds,
+       ReservationRepository reservations,
+@@ -80,6 +81,7 @@ public class HoldService {
+       OptimisticRetry retry,
+       EntityManager entities) {
+     this.catalog = catalog;
++    this.allotments = allotments;
+     this.inventory = inventory;
+     this.holds = holds;
+     this.reservations = reservations;
+@@ -101,6 +103,30 @@ public class HoldService {
+       int roomCount,
+       int guests,
+       GuestDetails guest) {
++    return create(propertyCode, roomTypeCode, stay, roomCount, guests, guest, null);
++  }
++
++  /** {@link #create} for a sales channel: the channel's allotment is used first. */
++  public Hold createForChannel(
++      String channel,
++      String propertyCode,
++      String roomTypeCode,
++      DateRange stay,
++      int roomCount,
++      int guests,
++      GuestDetails guest) {
++    AllotmentService.requireChannel(channel);
++    return create(propertyCode, roomTypeCode, stay, roomCount, guests, guest, channel);
++  }
++
++  private Hold create(
++      String propertyCode,
++      String roomTypeCode,
++      DateRange stay,
++      int roomCount,
++      int guests,
++      GuestDetails guest,
++      String channel) {
+     config.requireWithinLimits(stay, roomCount);
+     return tx.execute(
+         status -> {
+@@ -115,11 +141,7 @@ public class HoldService {
+                   List.of(type.getId()), stay.checkIn(), stay.lastNight());
+           Quote quote =
+               PricingEngine.quote(type.getProperty(), type, rates, stay, roomCount, guests);
+-          for (LocalDate night : stay.nightDates()) {
+-            if (inventory.holdRooms(type.getId(), night, roomCount) == 0) {
+-              throw new InsufficientAvailabilityException(type.getCode(), night);
+-            }
+-          }
++          allotments.holdNights(type, stay, roomCount, channel);
+           return holds.save(
+               new Hold(
+                   type.getProperty(),
+diff --git a/src/main/resources/db/migration/V2__allotments.sql b/src/main/resources/db/migration/V2__allotments.sql
+new file mode 100644
+index 0000000..bbb33f4
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__allotments.sql
+@@ -0,0 +1,12 @@
++CREATE TABLE allotment (
++    id           BIGSERIAL PRIMARY KEY,
++    room_type_id BIGINT      NOT NULL REFERENCES room_type (id),
++    channel      VARCHAR(32) NOT NULL,
++    night        DATE        NOT NULL,
++    rooms        INTEGER     NOT NULL CHECK (rooms >= 0),
++    release_on   DATE        NOT NULL,
++    version      BIGINT      NOT NULL DEFAULT 0,
++    UNIQUE (room_type_id, channel, night)
++);
++
++CREATE INDEX allotment_room_type_night ON allotment (room_type_id, night, release_on);
+diff --git a/src/test/java/com/innkeep/booking/api/AllotmentApiTest.java b/src/test/java/com/innkeep/booking/api/AllotmentApiTest.java
+new file mode 100644
+index 0000000..8b70445
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/api/AllotmentApiTest.java
+@@ -0,0 +1,85 @@
++package com.innkeep.booking.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++class AllotmentApiTest extends IntegrationTestBase {
++
++  private static final String BODY =
++      """
++      {"from": "2027-06-01", "to": "2027-06-03", "rooms": 2, "releaseDays": 14}""";
++
++  @BeforeEach
++  void setUp() {
++    Property property = data.harbourHouse();
++    RoomType room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, LocalDate.parse("2027-06-01"), LocalDate.parse("2027-06-03"), 4);
++  }
++
++  private ResultActions putAllotment(String channel, String body) throws Exception {
++    return mvc.perform(
++        put("/api/v1/admin/properties/harbour-house/room-types/double/allotments/" + channel)
++            .header("Authorization", ADMIN_AUTH)
++            .contentType(MediaType.APPLICATION_JSON)
++            .content(body));
++  }
++
++  @Test
++  void anAllotmentIsKeptPerNightWithItsReleaseDay() throws Exception {
++    putAllotment("atlas-travel", BODY).andExpect(status().isNoContent());
++
++    assertThat(
++            jdbc.queryForList(
++                "select channel || ' ' || night || ' ' || rooms || ' ' || release_on"
++                    + " from allotment order by night",
++                String.class))
++        .containsExactly(
++            "atlas-travel 2027-06-01 2 2027-05-18", "atlas-travel 2027-06-02 2 2027-05-19");
++  }
++
++  @Test
++  void aBadChannelMoreRoomsThanTheTotalOrANightWithoutInventoryIsRefused() throws Exception {
++    putAllotment("Atlas Travel", BODY).andExpect(status().isBadRequest());
++    putAllotment("atlas-travel", BODY.replace("\"rooms\": 2", "\"rooms\": 5"))
++        .andExpect(status().isConflict());
++    putAllotment("atlas-travel", BODY.replace("2027-06-03", "2027-06-04"))
++        .andExpect(status().isConflict());
++    assertThat(jdbc.queryForObject("select count(*) from allotment", Integer.class)).isZero();
++  }
++
++  @Test
++  void onlyTheChannelRouteCanHoldKeptRooms() throws Exception {
++    putAllotment("atlas-travel", BODY.replace("\"rooms\": 2", "\"rooms\": 4"))
++        .andExpect(status().isNoContent());
++    String hold =
++        """
++        {"stay": {"roomType": "double", "checkIn": "2027-06-01", "checkOut": "2027-06-03",
++                  "rooms": 1, "guests": 2},
++         "guest": {"name": "Ilse Varga", "email": "guest@example.com", "phone": "+351 000"}}""";
++
++    mvc.perform(
++            post("/api/v1/properties/harbour-house/holds")
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(hold))
++        .andExpect(status().isConflict());
++    mvc.perform(
++            post("/api/v1/admin/properties/harbour-house/channels/atlas-travel/holds")
++                .header("Authorization", ADMIN_AUTH)
++                .contentType(MediaType.APPLICATION_JSON)
++                .content(hold))
++        .andExpect(status().isCreated())
++        .andExpect(jsonPath("$.rooms").value(1));
++  }
++}
+diff --git a/src/test/java/com/innkeep/booking/service/AllotmentServiceTest.java b/src/test/java/com/innkeep/booking/service/AllotmentServiceTest.java
+new file mode 100644
+index 0000000..6dd1ff1
+--- /dev/null
++++ b/src/test/java/com/innkeep/booking/service/AllotmentServiceTest.java
+@@ -0,0 +1,94 @@
++package com.innkeep.booking.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.innkeep.booking.domain.DateRange;
++import com.innkeep.booking.domain.GuestDetails;
++import com.innkeep.booking.domain.InsufficientAvailabilityException;
++import com.innkeep.booking.domain.Property;
++import com.innkeep.booking.domain.RoomType;
++import com.innkeep.booking.support.IntegrationTestBase;
++import java.time.Instant;
++import java.time.LocalDate;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class AllotmentServiceTest extends IntegrationTestBase {
++
++  private static final LocalDate MAY_10 = LocalDate.parse("2027-05-10");
++  private static final LocalDate MAY_12 = LocalDate.parse("2027-05-12");
++  private static final DateRange STAY = new DateRange(MAY_10, MAY_12);
++  private static final GuestDetails GUEST =
++      new GuestDetails("Ilse Varga", "guest@example.com", "+351 000 000 001");
++
++  @Autowired private AllotmentService allotments;
++  @Autowired private AvailabilityService availability;
++  @Autowired private CalendarService calendar;
++  @Autowired private HoldService holds;
++
++  private Property property;
++  private RoomType room;
++
++  @BeforeEach
++  void setUp() {
++    property = data.harbourHouse();
++    room = data.roomType(property, "double", 2, "100.00");
++    data.rooms(property, room, MAY_10, MAY_12, 3);
++    allotments.set(property.getCode(), room.getCode(), "atlas-travel", STAY, 2, 3);
++  }
++
++  private Integer[] free() {
++    return calendar.calendar(property.getCode(), room.getCode(), STAY).stream()
++        .map(CalendarDay::available)
++        .toArray(Integer[]::new);
++  }
++
++  @Test
++  void keptRoomsAreNotOfferedBeforeTheReleaseDay() {
++    assertThat(availability.search(property.getCode(), STAY, 1, 2))
++        .extracting(AvailabilityRow::availableRooms)
++        .containsExactly(1);
++    assertThat(availability.search(property.getCode(), STAY, 2, 2)).isEmpty();
++    assertThat(free()).containsExactly(1, 1);
++    assertThatThrownBy(() -> data.hold(property, room, MAY_10, MAY_12, 2))
++        .isInstanceOf(InsufficientAvailabilityException.class);
++  }
++
++  @Test
++  void fromTheReleaseDayTheRoomsAreForSale() {
++    // three days before each night: May 7 for the first, May 8 for the second
++    clock.set(Instant.parse("2027-05-07T09:00:00Z"));
++    assertThat(free()).containsExactly(3, 1);
++
++    clock.set(Instant.parse("2027-05-08T09:00:00Z"));
++    assertThat(availability.search(property.getCode(), STAY, 3, 2)).hasSize(1);
++    data.hold(property, room, MAY_10, MAY_12, 3);
++    assertThat(held(room, MAY_10)).isEqualTo(3);
++  }
++
++  @Test
++  void aChannelHoldUsesItsOwnAllotmentFirstThenPublicRooms() {
++    assertThatThrownBy(
++            () ->
++                holds.createForChannel(
++                    "north-coast", property.getCode(), room.getCode(), STAY, 2, 2, GUEST))
++        .isInstanceOf(InsufficientAvailabilityException.class);
++
++    holds.createForChannel("atlas-travel", property.getCode(), room.getCode(), STAY, 3, 4, GUEST);
++    assertThat(held(room, MAY_10)).isEqualTo(3);
++    assertThat(jdbc.queryForObject("select sum(rooms) from allotment", Integer.class)).isZero();
++  }
++
++  @Test
++  void settingAgainReplacesRoomsAndReleaseDay() {
++    allotments.set(property.getCode(), room.getCode(), "atlas-travel", STAY, 1, 0);
++
++    assertThat(free()).containsExactly(2, 2);
++    assertThat(
++            jdbc.queryForList(
++                "select release_on::text from allotment order by night", String.class))
++        .containsExactly("2027-05-10", "2027-05-11");
++  }
++}

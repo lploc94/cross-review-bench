@@ -1,0 +1,23 @@
+diff --git a/src/etl/pipeline/runner.py b/src/etl/pipeline/runner.py
+index a1c5135..5f1c715 100644
+--- a/src/etl/pipeline/runner.py
++++ b/src/etl/pipeline/runner.py
+@@ -134,18 +134,6 @@ class Pipeline:
+             )
+             try:
+                 high_water = self._load(spec, binding, path, attempt)
+-            except SchemaDrift as drift:
+-                # The drift policy refused the file before anything was staged: the run is
+-                # recorded as failed together with its drift, which `etl runs show` lists.
+-                self._record_failure(spec, attempt, drift)
+-                return RunResult(
+-                    run_id=run_id,
+-                    source=spec.name,
+-                    counts=attempt.counts(loaded=0),
+-                    high_water=None,
+-                    checks=[],
+-                    abandoned_runs=abandoned,
+-                )
+             except BaseException as error:
+                 self._record_failure(spec, attempt, error)
+                 if isinstance(error, EtlError):

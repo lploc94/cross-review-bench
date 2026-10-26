@@ -1,0 +1,56 @@
+diff --git a/src/repositories/fileRepo.ts b/src/repositories/fileRepo.ts
+index bc3aaeb..958e625 100644
+--- a/src/repositories/fileRepo.ts
++++ b/src/repositories/fileRepo.ts
+@@ -224,6 +224,15 @@ export async function markObjectsDeleted(db: Queryable, ids: string[], now: Date
+   );
+ }
+ 
++/** Whether a file that is not deleted still uses this storage key (deduplicated files share keys). */
++export async function isStorageKeyInUse(db: Queryable, storageKey: string): Promise<boolean> {
++  const result = await db.query(
++    "SELECT 1 FROM files WHERE storage_key = $1 AND status <> 'deleted' LIMIT 1",
++    [storageKey],
++  );
++  return result.rows.length > 0;
++}
++
+ /**
+  * Deleted files whose storage object may still exist and whose grace period is over, locked for
+  * the caller's transaction. Rows another cleanup run holds are skipped.
+diff --git a/src/services/fileCatalog.ts b/src/services/fileCatalog.ts
+index 7e95679..5709c9e 100644
+--- a/src/services/fileCatalog.ts
++++ b/src/services/fileCatalog.ts
+@@ -138,6 +138,18 @@ export class FileCatalog {
+     if (registered.deduplicated) await this.discardObject(uploadedKey);
+   }
+ 
++  /**
++   * Remove the object of a deleted file unless a deduplicated file still uses it; then only
++   * record that the deleted row no longer owns it.
++   */
++  async removeObjectIfUnused(file: FileRecord): Promise<void> {
++    if (await files.isStorageKeyInUse(this.deps.pool, file.storageKey)) {
++      await files.markObjectsDeleted(this.deps.pool, [file.id], this.deps.clock.now());
++      return;
++    }
++    await this.removeObjectOf(file);
++  }
++
+   /**
+    * Remove the storage object of a file whose row is already soft-deleted and committed, and
+    * record that it is gone. A failure is logged and left for the cleanup job, never thrown: the
+diff --git a/src/services/fileService.ts b/src/services/fileService.ts
+index 02088ef..f68ec6d 100644
+--- a/src/services/fileService.ts
++++ b/src/services/fileService.ts
+@@ -84,7 +84,7 @@ export class FileService {
+       await tenants.releaseBytes(client, tenantId, row.size, this.deps.logger);
+       return row;
+     });
+-    await this.deps.catalog.removeObjectOf(deleted);
++    await this.deps.catalog.removeObjectIfUnused(deleted);
+     this.deps.logger.info({ tenantId, fileId: deleted.id, bytes: deleted.size }, "file deleted");
+     return deleted;
+   }

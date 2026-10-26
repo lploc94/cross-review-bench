@@ -1,0 +1,469 @@
+diff --git a/README.md b/README.md
+index fe11f01..043a4a2 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,11 @@ Flyway and PostgreSQL.
+   document keep their state, and no notification is written. An overdue task is escalated once,
+   and a decision made while the escalation runs is kept; the escalation timestamp is written
+   without touching the decision's version.
++- **Reassignment.** An admin can move an open task of the current step to another active user,
++  for example while an approver is away. The old task is closed as `REASSIGNED` and stays on
++  record; the new approver gets a new task with the same due time. Both are notified
++  (`TASK_REASSIGNED`, `TASK_ASSIGNED`), and the audit row `TASK_REASSIGNED` names the previous
++  approver, the new one and the reason. The document's owner cannot be made an approver of it.
+ - **Permissions.** A user sees a document as its owner, as an approver of one of its tasks (current
+   or past), or as someone the owner granted `VIEW` or `COMMENT`. Admins see everything. Lists and
+   counts apply the same rule, so titles of documents a user cannot see never appear. A document
+@@ -170,6 +175,7 @@ the response is `{"items": [...], "nextCursor": ...}`, and `nextCursor` is null
+ | `GET /admin/outbox?status=&cursor=&size=`, `GET /admin/outbox/{id}` | notification rows for operators (recipient and payload left out) |
+ | `POST /admin/outbox/{id}/requeue`, `POST /admin/outbox/requeue-failed` | put a given-up event back in line; a pending event is refused (409) |
+ | `DELETE /admin/outbox/{id}` | discard a given-up event (409 unless it failed) |
++| `POST /admin/tasks/{id}/reassign` | move an open task to another user (`{"userId", "reason"}`); 409 once the task is closed, 403 for the document's owner |
+ | `GET /admin/tasks/overdue?cursor=&size=`, `GET /admin/users/{id}/tasks` | open tasks past their due time; one person's open tasks (404 for an unknown user) |
+ | `GET /admin/audit?cursor=&size=` | the audit trail of every document |
+ | `GET /admin/summary` | counts of users, documents per status, open and overdue tasks, outbox per status |
+@@ -191,5 +197,7 @@ reported as not found. The slugs a client can meet are `invalid-request`, `malfo
+ - Drafts are for admins until published. Users cannot read a draft by id, and a draft created on the
+   admin route is read from `Location`, which is the admin path.
+ - A group that a step assigns to cannot be deleted, and a group cannot take the name of another group.
++- Only an open task of the step a document is waiting on can be reassigned, and only to an active
++  user other than the document's owner. A reassigned task cannot be decided; its replacement can.
+ - A given-up outbox event is requeued or discarded only once it has failed; a requeue takes the row lock,
+   so two operators requeuing the same event apply it once.
+diff --git a/src/main/java/com/papertrail/workflow/api/AdminController.java b/src/main/java/com/papertrail/workflow/api/AdminController.java
+index 59fd529..0f1c5ff 100644
+--- a/src/main/java/com/papertrail/workflow/api/AdminController.java
++++ b/src/main/java/com/papertrail/workflow/api/AdminController.java
+@@ -4,6 +4,7 @@ import com.papertrail.workflow.api.dto.Requests.CreateDefinitionRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateGroupRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateStepRequest;
+ import com.papertrail.workflow.api.dto.Requests.CreateUserRequest;
++import com.papertrail.workflow.api.dto.Requests.ReassignTaskRequest;
+ import com.papertrail.workflow.api.dto.Requests.UpdateUserRequest;
+ import com.papertrail.workflow.api.dto.Responses.CountResponse;
+ import com.papertrail.workflow.api.dto.Responses.IdResponse;
+@@ -17,6 +18,7 @@ import com.papertrail.workflow.service.DefinitionService;
+ import com.papertrail.workflow.service.IdentityService;
+ import com.papertrail.workflow.service.OperatorSummary;
+ import com.papertrail.workflow.service.OutboxService;
++import com.papertrail.workflow.service.ReassignmentService;
+ import com.papertrail.workflow.service.StepSpec;
+ import com.papertrail.workflow.service.TaskQueries;
+ import com.papertrail.workflow.service.Views.AuditView;
+@@ -55,6 +57,7 @@ public class AdminController {
+   private final OperatorSummary summary;
+   private final SlaEscalationJob escalation;
+   private final OutboxDispatchJob dispatch;
++  private final ReassignmentService reassignments;
+ 
+   public AdminController(
+       IdentityService identity,
+@@ -63,7 +66,8 @@ public class AdminController {
+       TaskQueries tasks,
+       OperatorSummary summary,
+       SlaEscalationJob escalation,
+-      OutboxDispatchJob dispatch) {
++      OutboxDispatchJob dispatch,
++      ReassignmentService reassignments) {
+     this.identity = identity;
+     this.definitions = definitions;
+     this.outbox = outbox;
+@@ -71,6 +75,7 @@ public class AdminController {
+     this.summary = summary;
+     this.escalation = escalation;
+     this.dispatch = dispatch;
++    this.reassignments = reassignments;
+   }
+ 
+   @PostMapping("/users")
+@@ -272,6 +277,12 @@ public class AdminController {
+     return tasks.overdue(cursor, size);
+   }
+ 
++  /** Moves an open task to another approver; the answer is the new task. */
++  @PostMapping("/tasks/{id}/reassign")
++  public TaskView reassign(@PathVariable long id, @Valid @RequestBody ReassignTaskRequest request) {
++    return reassignments.reassign(id, request.userId(), request.reason());
++  }
++
+   /** Runs one escalation pass and one dispatch pass now, as the timers would. */
+   @PostMapping("/jobs/run")
+   public JobRunResponse runJobs() {
+diff --git a/src/main/java/com/papertrail/workflow/api/dto/Requests.java b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+index 9bf7430..37d2ec1 100644
+--- a/src/main/java/com/papertrail/workflow/api/dto/Requests.java
++++ b/src/main/java/com/papertrail/workflow/api/dto/Requests.java
+@@ -48,6 +48,9 @@ public final class Requests {
+ 
+   public record GrantPermissionRequest(@NotNull PermissionLevel level) {}
+ 
++  public record ReassignTaskRequest(
++      @NotNull Long userId, @NotBlank @Size(max = 500) String reason) {}
++
+   public record UpdateUserRequest(
+       @Size(max = 120) String displayName, @Size(max = 254) String email, Boolean active) {}
+ }
+diff --git a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+index a8a64ae..ef0da1b 100644
+--- a/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
++++ b/src/main/java/com/papertrail/workflow/domain/ApprovalTask.java
+@@ -98,6 +98,14 @@ public class ApprovalTask extends AbstractEntity<Long> {
+     this.decisionComment = trimmed;
+   }
+ 
++  /** Closes an open task that an admin moved to another approver. */
++  public void reassign() {
++    if (!isOpen()) {
++      throw new ConflictException("task " + id + " is " + status + ", not open");
++    }
++    this.status = TaskStatus.REASSIGNED;
++  }
++
+   /** Closes a task that is no longer needed because its step was decided without it. */
+   public void cancel() {
+     if (isOpen()) {
+diff --git a/src/main/java/com/papertrail/workflow/domain/TaskStatus.java b/src/main/java/com/papertrail/workflow/domain/TaskStatus.java
+index 760b45e..c536e7b 100644
+--- a/src/main/java/com/papertrail/workflow/domain/TaskStatus.java
++++ b/src/main/java/com/papertrail/workflow/domain/TaskStatus.java
+@@ -1,9 +1,13 @@
+ package com.papertrail.workflow.domain;
+ 
+-/** Life of one approver assignment. {@code CANCELLED} means the step was decided without it. */
++/**
++ * Life of one approver assignment. {@code CANCELLED} means the step was decided without it; {@code
++ * REASSIGNED} means an admin moved it to another approver, whose new task replaces it.
++ */
+ public enum TaskStatus {
+   OPEN,
+   APPROVED,
+   REJECTED,
+-  CANCELLED
++  CANCELLED,
++  REASSIGNED
+ }
+diff --git a/src/main/java/com/papertrail/workflow/service/ApprovalService.java b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+index f2243ed..e146e00 100644
+--- a/src/main/java/com/papertrail/workflow/service/ApprovalService.java
++++ b/src/main/java/com/papertrail/workflow/service/ApprovalService.java
+@@ -73,7 +73,10 @@ public class ApprovalService {
+     List<ApprovalTask> order =
+         tasks.findForOrder(documentId, document.getRound(), document.getCurrentOrder());
+     List<ApprovalTask> stepTasks =
+-        order.stream().filter(other -> other.getStep().getId().equals(step.getId())).toList();
++        order.stream()
++            .filter(other -> other.getStep().getId().equals(step.getId()))
++            .filter(other -> other.getStatus() != TaskStatus.REASSIGNED)
++            .toList();
+     StepRules.Outcome outcome =
+         StepRules.evaluate(
+             step.getKind(),
+diff --git a/src/main/java/com/papertrail/workflow/service/ReassignmentService.java b/src/main/java/com/papertrail/workflow/service/ReassignmentService.java
+new file mode 100644
+index 0000000..ef9577f
+--- /dev/null
++++ b/src/main/java/com/papertrail/workflow/service/ReassignmentService.java
+@@ -0,0 +1,119 @@
++package com.papertrail.workflow.service;
++
++import com.papertrail.workflow.domain.AppUser;
++import com.papertrail.workflow.domain.ApprovalTask;
++import com.papertrail.workflow.domain.ConflictException;
++import com.papertrail.workflow.domain.Document;
++import com.papertrail.workflow.domain.DocumentStatus;
++import com.papertrail.workflow.domain.ForbiddenException;
++import com.papertrail.workflow.domain.NotFoundException;
++import com.papertrail.workflow.domain.ValidationException;
++import com.papertrail.workflow.persistence.AppUserRepository;
++import com.papertrail.workflow.persistence.ApprovalTaskRepository;
++import com.papertrail.workflow.persistence.DocumentRepository;
++import com.papertrail.workflow.service.Views.TaskView;
++import java.time.Clock;
++import java.time.Instant;
++import java.util.Map;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Moves open tasks between approvers for operators, for example when an approver is on leave. The
++ * old task is closed as {@code REASSIGNED} and a new task with the same due time is opened for the
++ * new approver. It runs under the document row lock that decisions take, so a reassignment and a
++ * decision on the same review happen one after the other.
++ */
++@Service
++public class ReassignmentService {
++
++  private final ApprovalTaskRepository tasks;
++  private final DocumentRepository documents;
++  private final AppUserRepository users;
++  private final EventLog events;
++  private final Clock clock;
++
++  public ReassignmentService(
++      ApprovalTaskRepository tasks,
++      DocumentRepository documents,
++      AppUserRepository users,
++      EventLog events,
++      Clock clock) {
++    this.tasks = tasks;
++    this.documents = documents;
++    this.users = users;
++    this.events = events;
++    this.clock = clock;
++  }
++
++  @Transactional
++  public TaskView reassign(long taskId, long userId, String reason) {
++    long documentId =
++        tasks
++            .findDocumentId(taskId)
++            .orElseThrow(() -> new NotFoundException("task " + taskId + " not found"));
++    Document document =
++        documents.lockById(documentId).orElseThrow(() -> new NotFoundException("task not found"));
++    ApprovalTask task =
++        tasks.findById(taskId).orElseThrow(() -> new NotFoundException("task not found"));
++    if (document.getStatus() != DocumentStatus.IN_REVIEW
++        || !task.isOpen()
++        || task.getRound() != document.getRound()
++        || task.getStepOrder() != document.getCurrentOrder()) {
++      throw new ConflictException("task " + taskId + " is no longer open");
++    }
++    AppUser target =
++        users.findById(userId).orElseThrow(() -> new NotFoundException("user not found"));
++    if (!target.isActive()) {
++      throw new ValidationException("the new approver is inactive");
++    }
++    if (document.isOwnedBy(userId)) {
++      throw new ForbiddenException("the owner of a document cannot approve it");
++    }
++    AppUser previous = task.getAssignee();
++    if (previous.getId() == userId) {
++      throw new ConflictException("the task is already assigned to this user");
++    }
++
++    Instant now = clock.instant();
++    task.reassign();
++    ApprovalTask moved =
++        tasks.save(
++            new ApprovalTask(document, task.getRound(), task.getStep(), target, task.getDueAt()));
++    events.audit(
++        document,
++        previous.getId(),
++        "TASK_REASSIGNED",
++        Map.of(
++            "taskId",
++            taskId,
++            "newTaskId",
++            moved.getId(),
++            "to",
++            userId,
++            "by",
++            "admin",
++            "reason",
++            reason.trim()),
++        now);
++    events.notify(
++        "reassigned:" + taskId,
++        "TASK_REASSIGNED",
++        previous,
++        Map.of("taskId", taskId, "documentId", documentId),
++        now);
++    events.notify(
++        "assigned:" + moved.getId(),
++        "TASK_ASSIGNED",
++        target,
++        Map.of(
++            "taskId",
++            moved.getId(),
++            "documentId",
++            documentId,
++            "dueAt",
++            moved.getDueAt().toString()),
++        now);
++    return TaskView.of(moved);
++  }
++}
+diff --git a/src/main/resources/db/migration/V3__task_reassignment.sql b/src/main/resources/db/migration/V3__task_reassignment.sql
+new file mode 100644
+index 0000000..c8b6b0d
+--- /dev/null
++++ b/src/main/resources/db/migration/V3__task_reassignment.sql
+@@ -0,0 +1,10 @@
++-- A task an admin moves to another approver is closed as REASSIGNED and stays on record.
++ALTER TABLE approval_task DROP CONSTRAINT approval_task_status_check;
++ALTER TABLE approval_task ADD CONSTRAINT approval_task_status_check
++    CHECK (status IN ('OPEN', 'APPROVED', 'REJECTED', 'CANCELLED', 'REASSIGNED'));
++
++-- A task can move away from an approver and back to them within one round, so a person holds at
++-- most one open task per step instead of one task of any status.
++ALTER TABLE approval_task DROP CONSTRAINT approval_task_document_id_round_step_id_assignee_id_key;
++CREATE UNIQUE INDEX approval_task_open_assignee
++    ON approval_task (document_id, round, step_id, assignee_id) WHERE status = 'OPEN';
+diff --git a/src/test/java/com/papertrail/workflow/api/TaskReassignmentApiTest.java b/src/test/java/com/papertrail/workflow/api/TaskReassignmentApiTest.java
+new file mode 100644
+index 0000000..b7bdd66
+--- /dev/null
++++ b/src/test/java/com/papertrail/workflow/api/TaskReassignmentApiTest.java
+@@ -0,0 +1,162 @@
++package com.papertrail.workflow.api;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.papertrail.workflow.domain.Decision;
++import com.papertrail.workflow.domain.StepKind;
++import com.papertrail.workflow.service.ApprovalService;
++import com.papertrail.workflow.service.DocumentService;
++import com.papertrail.workflow.support.IntegrationTestBase;
++import com.papertrail.workflow.support.TestData;
++import java.time.Instant;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.ResultActions;
++
++class TaskReassignmentApiTest extends IntegrationTestBase {
++
++  @Autowired private DocumentService documents;
++  @Autowired private ApprovalService approvals;
++
++  private long owner;
++  private long approver;
++  private long deputy;
++
++  @BeforeEach
++  void setUp() {
++    owner = data.user("Ines Berg");
++    approver = data.user("Tomas Vale");
++    deputy = data.user("Lena Hart");
++  }
++
++  private long submitted(String definitionName) {
++    long id = data.draft(data.principal(owner), definitionName, "Supplier contract");
++    documents.submit(data.principal(owner), id);
++    return id;
++  }
++
++  private ResultActions reassign(long taskId, long userId) throws Exception {
++    return mvc.perform(
++        post("/api/v1/admin/tasks/" + taskId + "/reassign")
++            .header("Authorization", ADMIN_AUTH)
++            .contentType(MediaType.APPLICATION_JSON)
++            .content("{\"userId\":" + userId + ",\"reason\":\"Approver on leave\"}"));
++  }
++
++  private String taskStatus(long taskId) {
++    return jdbc.queryForObject(
++        "select status from approval_task where id = ?", String.class, taskId);
++  }
++
++  @Test
++  void anOpenTaskMovesToTheNewApproverWithTheSameDueTime() throws Exception {
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++    long document = submitted("Contract");
++    long old = taskOf(document, approver);
++
++    reassign(old, deputy)
++        .andExpect(status().isOk())
++        .andExpect(jsonPath("$.assigneeId").value(deputy))
++        .andExpect(jsonPath("$.status").value("OPEN"));
++
++    long moved = taskOf(document, deputy);
++    assertThat(taskStatus(old)).isEqualTo("REASSIGNED");
++    assertThat(
++            jdbc.queryForObject(
++                "select due_at from approval_task where id = ?", Instant.class, moved))
++        .isEqualTo(
++            jdbc.queryForObject(
++                "select due_at from approval_task where id = ?", Instant.class, old));
++    assertThat(
++            jdbc.queryForList(
++                "select event_type from outbox_event where recipient_user_id = ? order by id",
++                String.class,
++                approver))
++        .containsExactly("TASK_ASSIGNED", "TASK_REASSIGNED");
++    assertThat(
++            jdbc.queryForObject(
++                "select count(*) from audit_event where document_id = ? and action = 'TASK_REASSIGNED'",
++                Integer.class,
++                document))
++        .isEqualTo(1);
++
++    approvals.decide(data.principal(deputy), moved, Decision.APPROVE, null);
++    mvc.perform(get("/api/v1/documents/" + document).header("Authorization", data.bearer(owner)))
++        .andExpect(jsonPath("$.summary.status").value("APPROVED"));
++  }
++
++  @Test
++  void anAllOfStepCompletesWithTheReplacementInsteadOfTheMovedTask() throws Exception {
++    long second = data.user("Omar Lind");
++    long legal = data.group("legal", approver, second);
++    data.publish("Contract", TestData.step(1, StepKind.ALL_OF, null, legal, 0, 480));
++    long document = submitted("Contract");
++
++    reassign(taskOf(document, second), deputy).andExpect(status().isOk());
++    approvals.decide(data.principal(approver), taskOf(document, approver), Decision.APPROVE, null);
++    assertThat(
++            jdbc.queryForObject("select status from document where id = ?", String.class, document))
++        .isEqualTo("IN_REVIEW");
++
++    approvals.decide(data.principal(deputy), taskOf(document, deputy), Decision.APPROVE, null);
++    assertThat(
++            jdbc.queryForObject("select status from document where id = ?", String.class, document))
++        .isEqualTo("APPROVED");
++  }
++
++  @Test
++  void theMovedTaskCanNoLongerBeDecided() throws Exception {
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++    long document = submitted("Contract");
++    long old = taskOf(document, approver);
++    reassign(old, deputy).andExpect(status().isOk());
++
++    mvc.perform(
++            post("/api/v1/tasks/" + old + "/decision")
++                .header("Authorization", data.bearer(approver))
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("{\"decision\":\"APPROVE\"}"))
++        .andExpect(status().isConflict());
++  }
++
++  @Test
++  void closedTasksTheOwnerAndInactiveUsersAreRefused() throws Exception {
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++    long document = submitted("Contract");
++    long task = taskOf(document, approver);
++    long away = data.user("Kai Moss");
++    jdbc.update("update app_user set active = false where id = ?", away);
++
++    reassign(task, owner)
++        .andExpect(status().isForbidden())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:forbidden"));
++    reassign(task, away).andExpect(status().isBadRequest());
++    reassign(task, approver).andExpect(status().isConflict());
++    reassign(task + 100, deputy).andExpect(status().isNotFound());
++
++    approvals.decide(data.principal(approver), task, Decision.APPROVE, null);
++    reassign(task, deputy)
++        .andExpect(status().isConflict())
++        .andExpect(jsonPath("$.type").value("urn:workflow:problem:conflict"));
++  }
++
++  @Test
++  void theRouteNeedsTheAdminToken() throws Exception {
++    data.publish("Contract", TestData.step(1, StepKind.SINGLE, approver, null, 0, 480));
++    long task = taskOf(submitted("Contract"), approver);
++
++    mvc.perform(
++            post("/api/v1/admin/tasks/" + task + "/reassign")
++                .header("Authorization", data.bearer(owner))
++                .contentType(MediaType.APPLICATION_JSON)
++                .content("{\"userId\":" + deputy + ",\"reason\":\"Approver on leave\"}"))
++        .andExpect(status().isUnauthorized());
++    assertThat(taskStatus(task)).isEqualTo("OPEN");
++  }
++}

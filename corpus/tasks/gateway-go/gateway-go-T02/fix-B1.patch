@@ -1,0 +1,16 @@
+diff --git a/internal/core/budget.go b/internal/core/budget.go
+index abfef95..45e4683 100644
+--- a/internal/core/budget.go
++++ b/internal/core/budget.go
+@@ -59,7 +59,11 @@ func (b *RetryBudget) AllowRetry(now time.Time) bool {
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+ 	requests, retries := 0, 0
++	sec := now.Unix()
+ 	for _, bk := range b.buckets {
++		if bk.second <= sec-int64(len(b.buckets)) {
++			continue // a second that has left the window
++		}
+ 		requests += bk.requests
+ 		retries += bk.retries
+ 	}

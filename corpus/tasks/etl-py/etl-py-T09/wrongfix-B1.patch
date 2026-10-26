@@ -1,0 +1,31 @@
+diff --git a/src/etl/quality/checks.py b/src/etl/quality/checks.py
+index 31e0efa..33b9051 100644
+--- a/src/etl/quality/checks.py
++++ b/src/etl/quality/checks.py
+@@ -9,7 +9,7 @@ from __future__ import annotations
+ 
+ from collections.abc import Collection
+ from dataclasses import dataclass
+-from datetime import date, timedelta
++from datetime import UTC, date, datetime, time, timedelta
+ from decimal import Decimal
+ from enum import StrEnum
+ from typing import Protocol
+@@ -265,11 +265,15 @@ class DailyTotalAnomaly:
+         self, connection: Connection, first: date, last: date
+     ) -> dict[str, dict[date, Decimal]]:
+         """Per `by` value, the total of each local day in first..last that has rows."""
+-        local_day = cast(func.timezone(self.zone.key, self.table.c[self.timestamp]), Date)
++        moment = self.table.c[self.timestamp]
++        local_day = cast(func.timezone(self.zone.key, moment), Date)
++        # Filter on the stored timestamp itself so the ordered_at index can serve the range.
++        start = datetime.combine(first, time.min, tzinfo=UTC)
++        end = datetime.combine(last + timedelta(days=1), time.min, tzinfo=UTC)
+         group = self.table.c[self.by]
+         statement = (
+             select(group, local_day.label("day"), func.sum(self.table.c[self.amount]))
+-            .where(local_day.between(first, last))
++            .where(moment >= start, moment < end)
+             .group_by(group, local_day)
+         )
+         if self.where is not None:

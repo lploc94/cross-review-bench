@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/jenkinsci/configuration-as-code-plugin",
+  "intro_pr": 2865,
+  "intro_merged_at": "2026-08-03T08:08:25Z",
+  "fix_pr": 2895,
+  "fix_merged_at": "2026-08-30T15:01:24Z",
+  "license": "MIT",
+  "base_commit": "38fe6dc620f21f51210b7323a655d9358f89fb1d",
+  "intro_commit": "67aa18696b8fd4e109234a71de5ca068400ca71a",
+  "fix_commit": "86fe99d4bbab596883e25f5558507231a2e7c760",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

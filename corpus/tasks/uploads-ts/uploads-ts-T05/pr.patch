@@ -1,0 +1,735 @@
+diff --git a/README.md b/README.md
+index fe7e007..b6aece2 100644
+--- a/README.md
++++ b/README.md
+@@ -80,10 +80,17 @@ they are created; an expired or aborted session releases its bytes and its stage
+ 
+ **Deletion and cleanup.** Deleting a file marks its row deleted, releases its bytes and removes
+ its storage object right away. A background cleanup job (every `CLEANUP_INTERVAL_S`) expires
+-sessions past their expiry, removes the objects of deleted files whose removal failed once
+-`DELETED_GRACE_S` has passed, and removes staged chunks that belong to no open session. Several
+-instances can run the scan worker and the cleanup job at once: rows are claimed with
+-`FOR UPDATE SKIP LOCKED`.
++sessions past their expiry, applies retention rules, removes the objects of deleted files whose
++removal failed once `DELETED_GRACE_S` has passed, and removes staged chunks that belong to no open
++session. Several instances can run the scan worker and the cleanup job at once: rows are claimed
++with `FOR UPDATE SKIP LOCKED`.
++
++**Retention.** A tenant can give a folder a retention period: `PUT /v1/retention/logs/2030/` with
++`{"days": 30}`. The cleanup job then deletes every live file under `logs/2030/` once it is 30
++days (of 24 hours) old, as if it had been deleted through the API: its bytes are released and its
++object removed. When several of the tenant's rules match a path, the one
++with the longest prefix applies, so `logs/` at 30 days and `logs/audit/` at 3650 days keep audit
++logs for ten years. A tenant has at most 100 rules; days run from 1 to 36500.
+ 
+ ## API
+ 
+@@ -106,6 +113,9 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | DELETE | `/v1/uploads/:id` | `uploads:write` | 204 |
+ | GET | `/v1/tenant` | `tenant:read` | 200 |
+ | PATCH | `/v1/tenant` | `tenant:admin` | 200 |
++| GET | `/v1/retention` | `tenant:read` | 200 |
++| PUT | `/v1/retention/<folder>/` | `tenant:admin` | 200 |
++| DELETE | `/v1/retention/<folder>/` | `tenant:admin` | 204 |
+ 
+ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/week%201.txt`).
+ 
+@@ -128,6 +138,9 @@ Paths in URLs are percent-encoded segment by segment (`/v1/files/team%20notes/we
+   `upload_session_state` with its state in `details.state`.
+ - **`PATCH /v1/tenant`** takes `{ "quotaBytes" }`. Tenants are returned as `{ id, name,
+   quotaBytes, usedBytes, availableBytes, createdAt }`.
++- **`PUT /v1/retention/<folder>/`** takes `{ "days" }` and creates or changes the folder's rule;
++  the folder is a path followed by `/`. Rules are returned as `{ prefix, days, createdAt,
++  updatedAt }`, and `GET /v1/retention` answers `{ "data": [...] }` in prefix order.
+ 
+ Errors always have the shape `{ "error": { "code", "message", "details"? } }`:
+ 
+@@ -160,7 +173,7 @@ migrations/          plain SQL, applied in order by src/db/migrate.ts
+ src/
+   api/               routes, plugins (auth, errors), zod schemas, serializers, request bodies
+   services/          use cases: uploads, resumable sessions, files and signed links, scanning,
+-                     cleanup, tenants and API keys
++                     cleanup and retention, tenants and API keys
+   domain/            paths, content sniffing, image dimensions, cursors, scopes, errors, entities
+   repositories/      one module per table: SQL and row mappers
+   db/                pool, transactions, migration runner
+diff --git a/migrations/0004_retention_rules.sql b/migrations/0004_retention_rules.sql
+new file mode 100644
+index 0000000..b4dd456
+--- /dev/null
++++ b/migrations/0004_retention_rules.sql
+@@ -0,0 +1,11 @@
++-- Retention rules: a tenant's live files under `prefix` (a folder, ending with '/') are deleted by
++-- the cleanup job once they are `days` days old. When several of the tenant's rules match a file,
++-- the one with the longest prefix applies.
++CREATE TABLE retention_rules (
++  tenant_id  uuid NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
++  prefix     text COLLATE "C" NOT NULL CHECK (right(prefix, 1) = '/'),
++  days       integer NOT NULL CHECK (days BETWEEN 1 AND 36500),
++  created_at timestamptz NOT NULL,
++  updated_at timestamptz NOT NULL,
++  PRIMARY KEY (tenant_id, prefix)
++);
+diff --git a/src/api/routes/index.ts b/src/api/routes/index.ts
+index ccf4554..1014d3e 100644
+--- a/src/api/routes/index.ts
++++ b/src/api/routes/index.ts
+@@ -5,6 +5,7 @@ import { fileRoutes } from "./files.js";
+ import { healthRoutes } from "./health.js";
+ import { publicRoutes } from "./public.js";
+ import { resumableRoutes } from "./resumable.js";
++import { retentionRoutes } from "./retention.js";
+ import { tenantRoutes } from "./tenant.js";
+ import type { RouteOptions } from "./types.js";
+ 
+@@ -22,6 +23,7 @@ export async function registerRoutes(app: FastifyInstance, options: RouteOptions
+       await api.register(directUploadRoutes, options);
+       await api.register(resumableRoutes, options);
+       await api.register(tenantRoutes, options);
++      await api.register(retentionRoutes, options);
+     },
+     { prefix: "/v1" },
+   );
+diff --git a/src/api/routes/retention.ts b/src/api/routes/retention.ts
+new file mode 100644
+index 0000000..a42b1d9
+--- /dev/null
++++ b/src/api/routes/retention.ts
+@@ -0,0 +1,30 @@
++import type { FastifyPluginAsync } from "fastify";
++import { authOf, requireScope } from "../plugins/auth.js";
++import { wildcardParamsSchema } from "../schemas/common.js";
++import { putRetentionBodySchema } from "../schemas/retention.js";
++import { serializeRetentionRule } from "../serializers.js";
++import { parse } from "../validation.js";
++import type { RouteOptions } from "./types.js";
++
++/** The caller's retention rules: `/v1/retention/<folder prefix>/`. */
++export const retentionRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services }) => {
++  app.get("/retention", { preHandler: requireScope("tenant:read") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const rules = await services.retention.listRules(tenantId);
++    return { data: rules.map(serializeRetentionRule) };
++  });
++
++  app.put("/retention/*", { preHandler: requireScope("tenant:admin") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const params = parse(wildcardParamsSchema, request.params, "params");
++    const body = parse(putRetentionBodySchema, request.body, "body");
++    return serializeRetentionRule(await services.retention.setRule(tenantId, params["*"], body.days));
++  });
++
++  app.delete("/retention/*", { preHandler: requireScope("tenant:admin") }, async (request, reply) => {
++    const { tenantId } = authOf(request);
++    const params = parse(wildcardParamsSchema, request.params, "params");
++    await services.retention.removeRule(tenantId, params["*"]);
++    return reply.code(204).send();
++  });
++};
+diff --git a/src/api/routes/types.ts b/src/api/routes/types.ts
+index b760e86..005c75b 100644
+--- a/src/api/routes/types.ts
++++ b/src/api/routes/types.ts
+@@ -2,6 +2,7 @@ import type { Pool } from "../../db/pool.js";
+ import type { ApiKeyService } from "../../services/apiKeyService.js";
+ import type { FileService } from "../../services/fileService.js";
+ import type { ResumableUploadService } from "../../services/resumable.js";
++import type { RetentionService } from "../../services/retention.js";
+ import type { TenantService } from "../../services/tenantService.js";
+ import type { UploadService } from "../../services/uploadService.js";
+ 
+@@ -12,6 +13,7 @@ export interface RouteServices {
+   readonly files: FileService;
+   readonly uploads: UploadService;
+   readonly resumable: ResumableUploadService;
++  readonly retention: RetentionService;
+ }
+ 
+ /** Limits the routes validate requests against (from the configuration). */
+diff --git a/src/api/schemas/retention.ts b/src/api/schemas/retention.ts
+new file mode 100644
+index 0000000..fa6c1bb
+--- /dev/null
++++ b/src/api/schemas/retention.ts
+@@ -0,0 +1,6 @@
++import { z } from "zod";
++import { MAX_RETENTION_DAYS } from "../../domain/retention.js";
++
++export const putRetentionBodySchema = z.object({
++  days: z.number().int().min(1).max(MAX_RETENTION_DAYS),
++});
+diff --git a/src/api/serializers.ts b/src/api/serializers.ts
+index c862ab1..6801798 100644
+--- a/src/api/serializers.ts
++++ b/src/api/serializers.ts
+@@ -1,5 +1,6 @@
+ import type { FileRecord } from "../domain/file.js";
+ import { availableBytes, type Tenant } from "../domain/tenant.js";
++import type { RetentionRule } from "../domain/retention.js";
+ import type { UploadSession } from "../domain/uploadSession.js";
+ 
+ export interface FileBody {
+@@ -57,3 +58,12 @@ export function serializeTenant(tenant: Tenant) {
+     createdAt: tenant.createdAt.toISOString(),
+   };
+ }
++
++export function serializeRetentionRule(rule: RetentionRule) {
++  return {
++    prefix: rule.prefix,
++    days: rule.days,
++    createdAt: rule.createdAt.toISOString(),
++    updatedAt: rule.updatedAt.toISOString(),
++  };
++}
+diff --git a/src/app.ts b/src/app.ts
+index 1192ed2..9cee7d6 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -11,6 +11,7 @@ import { CleanupService } from "./services/cleanup.js";
+ import { FileCatalog } from "./services/fileCatalog.js";
+ import { FileService } from "./services/fileService.js";
+ import { ResumableUploadService } from "./services/resumable.js";
++import { RetentionService } from "./services/retention.js";
+ import { HttpScanner, NoopScanner, type Scanner } from "./services/scanner.js";
+ import { ScanWorker } from "./services/scanWorker.js";
+ import { TenantService } from "./services/tenantService.js";
+@@ -64,6 +65,7 @@ export function buildServices(deps: AppDeps): RouteServices {
+       sessionTtlSeconds: config.uploads.sessionTtlSeconds,
+       chunkLeaseSeconds: config.uploads.chunkLeaseSeconds,
+     }),
++    retention: new RetentionService({ pool, clock }),
+   };
+ }
+ 
+diff --git a/src/domain/paths.ts b/src/domain/paths.ts
+index ee0481a..1b5cbed 100644
+--- a/src/domain/paths.ts
++++ b/src/domain/paths.ts
+@@ -89,6 +89,17 @@ export function normalizePath(input: string): string {
+   return path;
+ }
+ 
++/**
++ * Validate a folder prefix (`reports/2025/`) and return its canonical form: a valid path followed
++ * by `/`, so `reports/2025/` never matches `reports/2025-old/…`.
++ */
++export function normalizeFolderPrefix(input: string): string {
++  if (!input.endsWith("/")) {
++    throw new ValidationError("invalid prefix: must end with /", { prefix: input });
++  }
++  return `${normalizePath(input.slice(0, -1))}/`;
++}
++
+ /** The last segment of a normalized path. */
+ export function baseName(path: string): string {
+   const slash = path.lastIndexOf("/");
+diff --git a/src/domain/retention.ts b/src/domain/retention.ts
+new file mode 100644
+index 0000000..7cb1515
+--- /dev/null
++++ b/src/domain/retention.ts
+@@ -0,0 +1,15 @@
++/** A tenant's retention rule: live files under `prefix` are deleted once `days` days old. */
++export interface RetentionRule {
++  readonly tenantId: string;
++  /** A folder prefix, ending with `/`. */
++  readonly prefix: string;
++  readonly days: number;
++  readonly createdAt: Date;
++  readonly updatedAt: Date;
++}
++
++/** About a hundred years: the longest retention a rule can set. */
++export const MAX_RETENTION_DAYS = 36_500;
++
++/** Rules a tenant may have; the cleanup job evaluates all of them for each of its files. */
++export const MAX_RETENTION_RULES = 100;
+diff --git a/src/repositories/retentionRepo.ts b/src/repositories/retentionRepo.ts
+new file mode 100644
+index 0000000..69efbdf
+--- /dev/null
++++ b/src/repositories/retentionRepo.ts
+@@ -0,0 +1,127 @@
++import type { Queryable } from "../db/pool.js";
++import type { RetentionRule } from "../domain/retention.js";
++import { requireRow, toSafeInteger } from "./mapping.js";
++
++interface RuleRow {
++  tenant_id: string;
++  prefix: string;
++  days: number;
++  created_at: Date;
++  updated_at: Date;
++}
++
++const COLUMNS = "tenant_id, prefix, days, created_at, updated_at";
++
++function mapRule(row: RuleRow): RetentionRule {
++  return {
++    tenantId: row.tenant_id,
++    prefix: row.prefix,
++    days: row.days,
++    createdAt: row.created_at,
++    updatedAt: row.updated_at,
++  };
++}
++
++/** The tenant's rules in prefix order. */
++export async function listRules(db: Queryable, tenantId: string): Promise<RetentionRule[]> {
++  const result = await db.query<RuleRow>(
++    `SELECT ${COLUMNS} FROM retention_rules WHERE tenant_id = $1 ORDER BY prefix`,
++    [tenantId],
++  );
++  return result.rows.map(mapRule);
++}
++
++/** How many rules the tenant has for other prefixes than `prefix`. */
++export async function countOtherRules(db: Queryable, tenantId: string, prefix: string): Promise<number> {
++  const result = await db.query<{ count: string }>(
++    "SELECT count(*) AS count FROM retention_rules WHERE tenant_id = $1 AND prefix <> $2",
++    [tenantId, prefix],
++  );
++  return toSafeInteger(requireRow(result.rows, "countOtherRules").count, "count");
++}
++
++/** Create the rule for a prefix, or change its days. */
++export async function upsertRule(
++  db: Queryable,
++  rule: { tenantId: string; prefix: string; days: number; now: Date },
++): Promise<RetentionRule> {
++  const result = await db.query<RuleRow>(
++    `INSERT INTO retention_rules (tenant_id, prefix, days, created_at, updated_at)
++     VALUES ($1, $2, $3, $4, $4)
++     ON CONFLICT (tenant_id, prefix) DO UPDATE SET days = EXCLUDED.days, updated_at = EXCLUDED.updated_at
++     RETURNING ${COLUMNS}`,
++    [rule.tenantId, rule.prefix, rule.days, rule.now],
++  );
++  return mapRule(requireRow(result.rows, "upsertRule"));
++}
++
++/** Returns false when the tenant has no rule for the prefix. */
++export async function deleteRule(db: Queryable, tenantId: string, prefix: string): Promise<boolean> {
++  const result = await db.query("DELETE FROM retention_rules WHERE tenant_id = $1 AND prefix = $2", [
++    tenantId,
++    prefix,
++  ]);
++  return result.rowCount === 1;
++}
++
++/** A live file that its retention rule says is due for deletion. */
++export interface ExpiredFile {
++  readonly id: string;
++  readonly tenantId: string;
++  readonly size: number;
++  readonly storageKey: string;
++}
++
++interface ExpiredFileRow {
++  id: string;
++  tenant_id: string;
++  size: string;
++  storage_key: string;
++}
++
++/**
++ * Up to `limit` live files older than the rule with the longest prefix that matches their path,
++ * oldest first. Days are counted as 24 hours, whatever the session's time zone.
++ */
++export async function findExpiredFiles(db: Queryable, now: Date, limit: number): Promise<ExpiredFile[]> {
++  const result = await db.query<ExpiredFileRow>(
++    `SELECT files.id, files.tenant_id, files.size, files.storage_key
++     FROM retention_rules rule
++     JOIN files ON files.tenant_id = rule.tenant_id AND starts_with(files.path, rule.prefix)
++     WHERE files.status <> 'deleted'
++       AND files.created_at <= $1::timestamptz - make_interval(hours => rule.days * 24)
++       AND NOT EXISTS (
++         SELECT 1 FROM retention_rules longer
++         WHERE longer.tenant_id = rule.tenant_id
++           AND length(longer.prefix) > length(rule.prefix)
++           AND starts_with(files.path, longer.prefix)
++       )
++     ORDER BY files.created_at, files.id
++     LIMIT $2`,
++    [now, limit],
++  );
++  return result.rows.map((row) => ({
++    id: row.id,
++    tenantId: row.tenant_id,
++    size: toSafeInteger(row.size, "files.size"),
++    storageKey: row.storage_key,
++  }));
++}
++
++/**
++ * Mark an expired file deleted. The rule is read again here, so a file whose rule was removed or
++ * lengthened since findExpiredFiles picked it is left alone.
++ */
++export async function expireFile(db: Queryable, id: string, now: Date): Promise<void> {
++  await db.query(
++    `UPDATE files SET status = 'deleted', deleted_at = $2, updated_at = $2, next_scan_at = NULL
++     WHERE id = $1
++       AND files.created_at <= $2::timestamptz - make_interval(hours => 24 * (
++         SELECT rule.days FROM retention_rules rule
++         WHERE rule.tenant_id = files.tenant_id AND starts_with(files.path, rule.prefix)
++         ORDER BY length(rule.prefix) DESC
++         LIMIT 1
++       ))`,
++    [id, now],
++  );
++}
+diff --git a/src/repositories/tenantRepo.ts b/src/repositories/tenantRepo.ts
+index 2e61c5c..639a7fd 100644
+--- a/src/repositories/tenantRepo.ts
++++ b/src/repositories/tenantRepo.ts
+@@ -53,6 +53,12 @@ export async function updateQuota(
+   return row ? mapTenant(row) : null;
+ }
+ 
++/** Lock the tenant's row for the transaction. Returns false when there is no such tenant. */
++export async function lockTenant(db: Queryable, id: string): Promise<boolean> {
++  const result = await db.query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE", [id]);
++  return result.rowCount === 1;
++}
++
+ /**
+  * Reserve `bytes` of the tenant's quota: one conditional UPDATE, so concurrent reservations can
+  * never together pass the quota. Returns false, changing nothing, when the bytes do not fit.
+diff --git a/src/services/cleanup.ts b/src/services/cleanup.ts
+index b2048bf..a523758 100644
+--- a/src/services/cleanup.ts
++++ b/src/services/cleanup.ts
+@@ -3,6 +3,7 @@ import { withTransaction } from "../db/tx.js";
+ import { addSeconds, type Clock } from "../infra/clock.js";
+ import type { Logger } from "../infra/logger.js";
+ import * as files from "../repositories/fileRepo.js";
++import * as retention from "../repositories/retentionRepo.js";
+ import * as tenants from "../repositories/tenantRepo.js";
+ import * as sessions from "../repositories/uploadSessionRepo.js";
+ import type { StorageDriver } from "../storage/driver.js";
+@@ -22,6 +23,7 @@ export interface CleanupDeps {
+ 
+ export interface CleanupReport {
+   readonly expiredSessions: number;
++  readonly expiredFiles: number;
+   readonly purgedObjects: number;
+   readonly orphanedStaging: number;
+ }
+@@ -34,11 +36,13 @@ export const MAX_BATCHES_PER_RUN = 50;
+  *
+  * 1. expire open upload sessions past their expiry, releasing their reservations and dropping
+  *    their staged chunks;
+- * 2. remove the storage objects of soft-deleted files once their grace period is over (normally
++ * 2. delete live files that are older than their folder's retention rule, releasing their bytes
++ *    and removing their storage objects;
++ * 3. remove the storage objects of soft-deleted files once their grace period is over (normally
+  *    removed right after the delete; this catches the ones that failed then);
+- * 3. remove staged chunks that belong to no open session.
++ * 4. remove staged chunks that belong to no open session.
+  *
+- * Steps 1 and 2 lock their rows with FOR UPDATE SKIP LOCKED, so concurrent runs split the work.
++ * Steps 1 and 3 lock their rows with FOR UPDATE SKIP LOCKED, so concurrent runs split the work.
+  * A failing step is logged and does not stop the others.
+  */
+ export class CleanupService {
+@@ -50,12 +54,13 @@ export class CleanupService {
+ 
+   async runOnce(): Promise<CleanupReport> {
+     const expiredSessions = await this.step("expire upload sessions", () => this.expireSessions());
++    const expiredFiles = await this.step("apply retention rules", () => this.applyRetention());
+     const purgedObjects = await this.step("purge deleted objects", () => this.purgeDeletedObjects());
+     const orphanedStaging = await this.step("remove orphaned staging", () =>
+       this.removeOrphanedStaging(),
+     );
+-    const report = { expiredSessions, purgedObjects, orphanedStaging };
+-    if (expiredSessions + purgedObjects + orphanedStaging > 0) {
++    const report = { expiredSessions, expiredFiles, purgedObjects, orphanedStaging };
++    if (expiredSessions + expiredFiles + purgedObjects + orphanedStaging > 0) {
+       this.deps.logger.info(report, "cleanup run finished");
+     }
+     return report;
+@@ -92,6 +97,42 @@ export class CleanupService {
+     return total;
+   }
+ 
++  /**
++   * Delete the files that retention rules say are due, oldest first: each one is marked deleted
++   * and its bytes released in a transaction of its own, then its object is removed. An object
++   * that cannot be removed is left to purgeDeletedObjects.
++   */
++  async applyRetention(): Promise<number> {
++    const { pool, clock, logger, settings } = this.deps;
++    let total = 0;
++    for (let batch = 0; batch < MAX_BATCHES_PER_RUN; batch++) {
++      const now = clock.now();
++      const due = await retention.findExpiredFiles(pool, now, settings.batchSize);
++      for (const file of due) {
++        await withTransaction(pool, async (client) => {
++          await retention.expireFile(client, file.id, now);
++          await tenants.releaseBytes(client, file.tenantId, file.size, logger);
++        });
++        await this.removeExpiredObject(file, now);
++        total++;
++      }
++      if (due.length < settings.batchSize) break;
++    }
++    return total;
++  }
++
++  private async removeExpiredObject(file: retention.ExpiredFile, now: Date): Promise<void> {
++    try {
++      await this.deps.storage.delete(file.storageKey);
++      await files.markObjectsDeleted(this.deps.pool, [file.id], now);
++    } catch (err) {
++      this.deps.logger.warn(
++        { err, fileId: file.id },
++        "could not remove an expired file's object; the purge step will retry",
++      );
++    }
++  }
++
+   async purgeDeletedObjects(): Promise<number> {
+     const { pool, clock, logger, storage, settings } = this.deps;
+     let total = 0;
+diff --git a/src/services/retention.ts b/src/services/retention.ts
+new file mode 100644
+index 0000000..110a0dd
+--- /dev/null
++++ b/src/services/retention.ts
+@@ -0,0 +1,52 @@
++import type { Pool } from "../db/pool.js";
++import { withTransaction } from "../db/tx.js";
++import { NotFoundError, ValidationError } from "../domain/errors.js";
++import { normalizeFolderPrefix } from "../domain/paths.js";
++import { MAX_RETENTION_DAYS, MAX_RETENTION_RULES, type RetentionRule } from "../domain/retention.js";
++import type { Clock } from "../infra/clock.js";
++import * as rules from "../repositories/retentionRepo.js";
++import * as tenants from "../repositories/tenantRepo.js";
++
++/** A tenant's retention rules. The cleanup job applies them (CleanupService.applyRetention). */
++export class RetentionService {
++  private readonly pool: Pool;
++  private readonly clock: Clock;
++
++  constructor(deps: { pool: Pool; clock: Clock }) {
++    this.pool = deps.pool;
++    this.clock = deps.clock;
++  }
++
++  async listRules(tenantId: string): Promise<RetentionRule[]> {
++    return rules.listRules(this.pool, tenantId);
++  }
++
++  /**
++   * Set the retention of a folder. The tenant's row is locked while the rules are counted, so
++   * concurrent requests cannot together pass MAX_RETENTION_RULES.
++   */
++  async setRule(tenantId: string, rawPrefix: string, days: number): Promise<RetentionRule> {
++    const prefix = normalizeFolderPrefix(rawPrefix);
++    if (!Number.isInteger(days) || days < 1 || days > MAX_RETENTION_DAYS) {
++      throw new ValidationError(`days must be a whole number from 1 to ${MAX_RETENTION_DAYS}`);
++    }
++    return withTransaction(this.pool, async (client) => {
++      if (!(await tenants.lockTenant(client, tenantId))) {
++        throw NotFoundError.resource("tenant", tenantId);
++      }
++      if ((await rules.countOtherRules(client, tenantId, prefix)) >= MAX_RETENTION_RULES) {
++        throw new ValidationError(`a tenant has at most ${MAX_RETENTION_RULES} retention rules`, {
++          limit: MAX_RETENTION_RULES,
++        });
++      }
++      return rules.upsertRule(client, { tenantId, prefix, days, now: this.clock.now() });
++    });
++  }
++
++  async removeRule(tenantId: string, rawPrefix: string): Promise<void> {
++    const prefix = normalizeFolderPrefix(rawPrefix);
++    if (!(await rules.deleteRule(this.pool, tenantId, prefix))) {
++      throw new NotFoundError(`no retention rule for ${prefix}`, { prefix });
++    }
++  }
++}
+diff --git a/test/api/retention.test.ts b/test/api/retention.test.ts
+new file mode 100644
+index 0000000..005038e
+--- /dev/null
++++ b/test/api/retention.test.ts
+@@ -0,0 +1,178 @@
++import { access } from "node:fs/promises";
++import path from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { MAX_RETENTION_RULES } from "../../src/domain/retention.js";
++import { buildTestApp, type TestApp } from "../helpers/app.js";
++import {
++  createTenant,
++  expectStatus,
++  issueKey,
++  storeFile,
++  tenantUsage,
++  type ErrorResponse,
++  type TestTenant,
++} from "../helpers/fixtures.js";
++
++const DAY_S = 86_400;
++
++interface RuleBody {
++  prefix: string;
++  days: number;
++  createdAt: string;
++  updatedAt: string;
++}
++
++describe("retention rules", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeEach(async () => {
++    t = await buildTestApp({ env: { CLEANUP_BATCH_SIZE: "2" } });
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  function putRule(prefix: string, days: unknown, who: TestTenant = tenant) {
++    return t.app.inject({ method: "PUT", url: `/v1/retention/${prefix}`, headers: who.headers, payload: { days } });
++  }
++
++  function deleteRule(prefix: string, who: TestTenant = tenant) {
++    return t.app.inject({ method: "DELETE", url: `/v1/retention/${prefix}`, headers: who.headers });
++  }
++
++  async function listRules(who: TestTenant = tenant): Promise<[string, number][]> {
++    const response = await t.app.inject({ url: "/v1/retention", headers: who.headers });
++    expectStatus(response, 200);
++    return response.json<{ data: RuleBody[] }>().data.map((rule) => [rule.prefix, rule.days]);
++  }
++
++  async function deletedPaths(): Promise<string[]> {
++    const result = await t.pool.query<{ path: string }>(
++      "SELECT path FROM files WHERE tenant_id = $1 AND status = 'deleted' ORDER BY path",
++      [tenant.tenantId],
++    );
++    return result.rows.map((row) => row.path);
++  }
++
++  it("creates, changes, lists and removes the caller's rules", async () => {
++    const created = await putRule("logs/2030/", 30);
++    expectStatus(created, 200);
++    expect(created.json<RuleBody>()).toEqual({
++      prefix: "logs/2030/",
++      days: 30,
++      createdAt: "2030-01-15T10:00:00.000Z",
++      updatedAt: "2030-01-15T10:00:00.000Z",
++    });
++    expectStatus(await putRule("archive/", 3650), 200);
++    t.clock.advanceSeconds(60);
++    expect((await putRule("logs/2030/", 7)).json<RuleBody>().updatedAt).toBe("2030-01-15T10:01:00.000Z");
++    expect(await listRules()).toEqual([["archive/", 3650], ["logs/2030/", 7]]);
++
++    const other = await createTenant(t.pool, t.clock, { name: "Harbor Logistics" });
++    expect(await listRules(other)).toEqual([]);
++    expectStatus(await deleteRule("archive/", other), 404);
++    expectStatus(await deleteRule("archive/"), 204);
++    expectStatus(await deleteRule("archive/"), 404);
++    expect(await listRules()).toEqual([["logs/2030/", 7]]);
++  });
++
++  it("validates prefixes, days, scopes and the number of rules", async () => {
++    for (const prefix of ["logs", "logs//", "a%5Cb/", "by-id/x/"]) {
++      const response = await putRule(prefix, 30);
++      expectStatus(response, 400);
++      expect(response.json<ErrorResponse>().error.code).toBe("validation_error");
++    }
++    for (const days of [0, 36_501, 1.5, "30", null]) expectStatus(await putRule("logs/", days), 400);
++    const reader = await issueKey(t.pool, t.clock, tenant.tenantId, ["tenant:read"]);
++    expectStatus(await putRule("logs/", 30, reader), 403);
++    expectStatus(await deleteRule("logs/", reader), 403);
++
++    for (let i = 0; i < MAX_RETENTION_RULES; i++) expectStatus(await putRule(`f${i}/`, 10), 200);
++    const over = await putRule("one-more/", 10);
++    expectStatus(over, 400);
++    expect(over.json<ErrorResponse>().error.details).toEqual({ limit: MAX_RETENTION_RULES });
++    expectStatus(await putRule("f0/", 20), 200);
++  });
++
++  it("deletes files once they reach their rule's age, releasing bytes and removing objects", async () => {
++    const old = await storeFile(t.app, tenant, "logs/old.log", "o".repeat(100));
++    await storeFile(t.app, tenant, "keep/old.txt", "k".repeat(50));
++    t.clock.advanceSeconds(DAY_S);
++    await storeFile(t.app, tenant, "logs/new.log", "n".repeat(10));
++    expectStatus(await putRule("logs/", 30), 200);
++
++    t.clock.advanceSeconds(29 * DAY_S - 1);
++    expect((await t.cleanup.runOnce()).expiredFiles).toBe(0);
++    t.clock.advanceSeconds(1);
++    expect((await t.cleanup.runOnce()).expiredFiles).toBe(1);
++    expect(await deletedPaths()).toEqual(["logs/old.log"]);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(60);
++    await expect(access(path.join(t.storageRoot ?? "", "objects", "t", tenant.tenantId, old.id))).rejects.toThrow();
++    const row = await t.pool.query("SELECT 1 FROM files WHERE id = $1 AND object_deleted_at IS NOT NULL", [old.id]);
++    expect(row.rowCount).toBe(1);
++
++    t.clock.advanceSeconds(DAY_S);
++    expect((await t.cleanup.runOnce()).expiredFiles).toBe(1);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(50);
++  });
++
++  it("applies the rule with the longest matching prefix", async () => {
++    for (const p of ["logs/app.log", "logs/audit/2030.log", "logs-old/x.log"]) await storeFile(t.app, tenant, p, "x");
++    expectStatus(await putRule("logs/", 1), 200);
++    expectStatus(await putRule("logs/audit/", 3650), 200);
++    t.clock.advanceSeconds(2 * DAY_S);
++    expect((await t.cleanup.runOnce()).expiredFiles).toBe(1);
++    expect(await deletedPaths()).toEqual(["logs/app.log"]);
++  });
++
++  it("covers files of every live status, in batches, and only the rule's tenant", async () => {
++    const other = await createTenant(t.pool, t.clock, { name: "Harbor Logistics" });
++    await storeFile(t.app, other, "tmp/theirs.bin", "x");
++    const ids: string[] = [];
++    for (const name of ["a", "b", "c", "d"]) ids.push((await storeFile(t.app, tenant, `tmp/${name}.bin`, name)).id);
++    await t.pool.query("UPDATE files SET status = 'quarantined', next_scan_at = NULL WHERE id = $1", [ids[0]]);
++    await t.pool.query("UPDATE files SET status = 'available', next_scan_at = NULL WHERE id = $1", [ids[1]]);
++    expectStatus(await t.app.inject({ method: "DELETE", url: "/v1/files/tmp/d.bin", headers: tenant.headers }), 204);
++    expectStatus(await putRule("tmp/", 7), 200);
++
++    t.clock.advanceSeconds(7 * DAY_S);
++    expect((await t.cleanup.runOnce()).expiredFiles).toBe(3);
++    expect(await deletedPaths()).toEqual(["tmp/a.bin", "tmp/b.bin", "tmp/c.bin", "tmp/d.bin"]);
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(0);
++    expect(await tenantUsage(t.pool, other.tenantId)).toBe(1);
++  });
++
++  it("leaves files whose rule was removed or lengthened after the job picked them", async () => {
++    const first = await storeFile(t.app, tenant, "tmp/first.txt", "f");
++    t.clock.advanceSeconds(1);
++    await storeFile(t.app, tenant, "drafts/a.txt", "a");
++    await storeFile(t.app, tenant, "exports/b.txt", "b");
++    for (const prefix of ["tmp/", "drafts/", "exports/"]) expectStatus(await putRule(prefix, 1), 200);
++    t.clock.advanceSeconds(2 * DAY_S);
++
++    // Hold the job on the oldest file while the rules of the other two change.
++    const holder = await t.pool.connect();
++    try {
++      await holder.query("BEGIN");
++      await holder.query("SELECT id FROM files WHERE id = $1 FOR UPDATE", [first.id]);
++      const run = t.cleanup.applyRetention();
++      for (let attempt = 0; attempt < 500; attempt++) {
++        const waiting = await t.pool.query(
++          "SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
++        );
++        if (waiting.rowCount !== 0) break;
++        await new Promise((resolve) => setTimeout(resolve, 20));
++      }
++      expectStatus(await deleteRule("drafts/"), 204);
++      expectStatus(await putRule("exports/", 3650), 200);
++      await holder.query("ROLLBACK");
++      await run;
++    } finally {
++      holder.release();
++    }
++    expect(await deletedPaths()).toEqual(["tmp/first.txt"]);
++  });
++});

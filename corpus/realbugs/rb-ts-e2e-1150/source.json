@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/tester-army/e2e",
+  "intro_pr": 980,
+  "intro_merged_at": "2026-10-13T07:54:52Z",
+  "fix_pr": 1150,
+  "fix_merged_at": "2026-10-15T08:12:19Z",
+  "license": "Apache-2.0",
+  "base_commit": "fc9064415d427060fad1d406c4c491dda248ad4f",
+  "intro_commit": "3a53fbd8e5fb8ed345dd00331b3a5b5b90bac1d3",
+  "fix_commit": "93bf5d84da38ba0d0b6b76fc24aeed98697da7f2",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

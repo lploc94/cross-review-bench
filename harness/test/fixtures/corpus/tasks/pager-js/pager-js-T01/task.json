@@ -1,0 +1,59 @@
+{
+  "schema": "crb-task/v1",
+  "id": "pager-js-T01",
+  "repo": "pager-js",
+  "kind": "buggy",
+  "title": "Validate pagination arguments and add pageCount",
+  "description": "Validate the page and size arguments of paginate (both must be positive integers), and add pageCount(items, size) that returns how many pages are needed to show every item.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/pager.js",
+      "lines": [
+        6,
+        6
+      ],
+      "category": "boundary",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "page 0 passes validation and returns an empty slice",
+      "trigger": "paginate(items, 0, size)",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/page-zero.test.js"
+      ],
+      "hidden_test_cmd": "node --test test/hidden/page-zero.test.js",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Page 0 is a valid alias for the first page in this module; callers rely on it.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/pager.js",
+      "lines": [
+        13,
+        13
+      ],
+      "category": "logic",
+      "severity": "high",
+      "difficulty": "L1",
+      "summary": "pageCount drops a partial last page",
+      "trigger": "items.length not a multiple of size",
+      "testable": true,
+      "hidden_tests": [
+        "test/hidden/page-count.test.js"
+      ],
+      "hidden_test_cmd": "node --test \"test/hidden/*.test.js\"",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "pageCount intentionally counts only full pages, as the existing test shows.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

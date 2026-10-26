@@ -1,0 +1,16 @@
+{
+  "schema": "crb-task/v1",
+  "id": "booking-java-T12",
+  "repo": "booking-java",
+  "kind": "clean",
+  "title": "Minimum length of stay and closed-to-arrival restrictions",
+  "description": "Revenue managers want the usual arrival restrictions: a minimum stay over busy periods (festival weekends, New Year) and nights on which no stay may start (a changeover day). Today any stay that fits the inventory can be booked.\n\n- Migration V2 adds `stay_restriction(room_type_id, start_date, end_date, min_stay, closed_to_arrival)`: a range of nights, both ends inclusive, with a minimum stay, closed to arrival, or both.\n- Restrictions bind the arrival night only. A stay arriving on a covered night must last at least the minimum and may not arrive on a night closed to arrival; a stay that arrives earlier runs through those nights freely. When several restrictions cover the arrival night the strictest applies: closed if any closes it, else the longest minimum.\n- `PricingService.quote` and `HoldService.create` check them (the hold before any inventory is taken). A refused stay is a 400 problem `urn:innkeep:problem:stay-restricted` with `rule` (`min-stay` or `closed-to-arrival`) and `night`. Existing holds and reservations are not checked again; availability search and the calendar do not show restrictions yet.\n- Admin API: `GET` and `PUT /api/v1/admin/properties/{code}/room-types/{roomType}/restrictions`. `PUT` replaces the room type's whole list (an empty list clears it) under a `FOR NO KEY UPDATE` lock on the room type row: concurrent replacements apply one after the other, while holds, reservations and inventory writes for the room type do not wait for it. Each entry needs start and end dates (end on or after start, at most 366 nights) and a minimum stay (1 to `max-nights-per-stay`) or `closedToArrival`; at most 100 entries.\n- README: concept and API table.\n\nTests: admin replace and list, validation, a quote refused with the rule and night (and accepted with enough nights), a hold arriving on a closed night that takes no rooms, and an uncommitted replacement that holds back another replacement but not a hold.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [],
+  "decoys": [],
+  "clean_hidden_tests": [
+    "src/test/java/com/innkeep/booking/service/ArrivalNightRestrictionTest.java"
+  ],
+  "clean_hidden_test_cmd": "mvn -q -B test -Dtest=ArrivalNightRestrictionTest"
+}

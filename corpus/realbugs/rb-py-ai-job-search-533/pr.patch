@@ -1,0 +1,323 @@
+diff --git a/.claude/commands/apply.md b/.claude/commands/apply.md
+index b56cd6b..0c7387e 100644
+--- a/.claude/commands/apply.md
++++ b/.claude/commands/apply.md
+@@ -298,9 +298,11 @@ An ATS parser reads the PDF's embedded **text layer**, not the rendered page —
+ **1. Extract the text layer:**
+ 
+ ```bash
+-python tools/verify_pdf.py cv/main_<company>_<role>.pdf --dump-text cv/main_<company>_<role>.txt
++python tools/verify_pdf.py cv/main_<company>_<role>.pdf --ascii-dates --dump-text cv/main_<company>_<role>.txt
+ ```
+ 
++`--ascii-dates` is the date-range check from `05-cv-templates.md` ("Date fields must be ASCII ranges"): it exits 1 if the raw text layer has a year joined to a Unicode dash - the en-dash LaTeX makes from `--`, which a Workday import dropped together with the date - naming each hit and its code point. It reads the raw layer, not the folded comparison `--contains` uses, which is why `--contains "2016-2024"` cannot catch this. The dump is written before the check runs, so a failure still leaves the `.txt`. Fix a hit in the `<CV_EXT>` date argument (a single ASCII hyphen), then re-run 5a-5c and re-extract.
++
+ The command prints `extractor: pypdf` or `extractor: pdftotext`. Record that name in the Step 6 report. Read the `.txt` file. If that tool is unavailable, the Poppler fallback is:
+ 
+ ```bash
+@@ -312,7 +314,7 @@ cd cv && pdftotext -layout -enc UTF-8 main_<company>_<role>.pdf main_<company>_<
+ - [ ] **Text extracted at all**, with no garbage runs: no `(cid:NNN)` markers, no `�` replacement characters, no stretches of missing text that are visible in the PDF
+ - [ ] **Email and phone survive as literal text.** Icon fonts extract as glyph names (the stock template's contact line extracts as `MOBILE-ALT [+XX ...] • Envelope [your.email@...]`) — that noise is harmless, but the actual address and digits must be present. A contact detail carried only by an icon or a hyperlink target (like the `LinkedIn` link text) is invisible to an ATS; the email must be printed as text.
+ - [ ] **Reading order matches the visual order** — section headings appear in the same sequence as on the page, and lines from different sections are not interleaved. The stock banking template is single-column and safe; custom templates registered via `/add-template` with sidebars or multi-column layouts are where this breaks.
+-- [ ] **Dates recognizable** — each role and degree has its years present in the extraction.
++- [ ] **Dates recognizable and ASCII-joined** — each role and degree has its years present in the extraction with a start *and* an end, and `--ascii-dates` above exited 0. A bare single year (`2016`) is the half the flag cannot see: it imports as a start with no end, so read for it.
+ 
+ Failures here are template-level problems: fix them in the `<CV_EXT>` source (e.g. print the email as text rather than icon-only), then re-run 5a–5c and re-extract. If a custom template's layout fundamentally scrambles extraction order, tell the user prominently — they may be trading ATS compatibility for looks.
+ 
+diff --git a/.claude/skills/job-application-assistant/05-cv-templates.md b/.claude/skills/job-application-assistant/05-cv-templates.md
+index f25c457..cdc4e93 100644
+--- a/.claude/skills/job-application-assistant/05-cv-templates.md
++++ b/.claude/skills/job-application-assistant/05-cv-templates.md
+@@ -1,5 +1,5 @@
+ ---
+-framework_version: 1.4.4
++framework_version: 1.4.5
+ ---
+ 
+ # CV Templates and Tailoring Guide
+@@ -310,7 +310,7 @@ Two independent causes, both easy to avoid:
+ 
+    Where a genuine range exists, use it even when a single year would be factually accurate - a degree written `1995` is true but imports worse than `1992-1995`. Do not invent a start date you do not have; a lone graduation year is fine, just expect it to be typed in by hand.
+ 
+-**Add this to the step 5d checks**: after extracting the text layer, confirm every experience entry shows a start *and* an end separated by an ASCII hyphen. Because the failure is silent and invisible in the PDF, the candidate otherwise discovers it only while filling in the application form.
++**Cause 1 is mechanical in step 5d**: `python tools/verify_pdf.py cv/main_<company>_<role>.pdf --ascii-dates` scans the raw text layer for a year joined to a Unicode dash and exits 1 naming each hit with its code point (`U+2013 in 'Role Title 2016–2024'`). It deliberately reads the raw layer: the fold that lets `--contains "2016-2024"` match what the template renders maps that same en-dash back to `-`, so `--contains` can never see this. A year on either side of the dash is enough, so `Mar 2016 – Jul 2016` and `2016 – Present` are caught too; a numeric range with no year (`EUR 600k–1M`) is left alone. **Cause 2 stays a read-through check**: after extracting the text layer, confirm every experience entry shows a start *and* an end. Because both failures are silent and invisible in the PDF, the candidate otherwise discovers them only while filling in the application form.
+ 
+ ## Page Budget - Hard 2-Page Limit
+ 
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 89f8d05..136b7ca 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -176,6 +176,7 @@ jobs:
+         run: |
+           python3 tools/verify_pdf.py cv/main_example.pdf \
+             --pages 2 \
++            --ascii-dates \
+             --contains '[your.email@example.com]' \
+             --contains 'Professional Experience' \
+             --contains 'Achievement'
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b2d4be5..d782f55 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,27 @@ per-file diff commands.
+ 
+ ### Added
+ 
++- **`verify_pdf.py --ascii-dates` makes the documented date-range rule executable**
++  (`tools/verify_pdf.py`, `/apply` Step 5d, `05-cv-templates.md`, CI) - "Date fields must be
++  ASCII ranges" records a real Workday import that dropped a role's end date because
++  `2016--2024` reaches the text layer as `2016<U+2013>2024`, and told Step 5d to confirm every
++  entry's years are joined by an ASCII hyphen. Nothing executed that: the natural probe,
++  `--contains "2016-2024"`, failed identically for "en-dashed" and "absent" before #458 and
++  passes on both since, because the fold maps the en-dash back to `-` on purpose. The new flag
++  reads the raw layer (never the fold), fails on a year joined to any Unicode dash or the
++  minus sign, and names each hit with its line and code point. A year on either side is
++  enough (`Mar 2016 – Jul 2016`, `2016 – Present`); a numeric range with no year is not a
++  date. Step 5d's extraction command now carries the flag (the dump is still written before
++  the check fails), the "Dates recognizable" checklist item points at it and keeps the bare
++  single-year half as a read-through, the guide's "add this to the step 5d checks" paragraph
++  names the command, and the upstream-only CI assertion runs it on the stock CV. Demonstrated
++  on the stock template: a `\cventry{2016--2024}` build fails with `U+2013`, the
++  `\cventry{2016-2024}` build passes, and `--contains "2016-2024"` passes on both. Only
++  horizontal whitespace may sit between the year and the dash, so a year ending one line is
++  not joined to a dash that opens the next (a bullet, a wrapped prose line) - yang2632's
++  catch in review, with the regex and fixture. Thirteen new `test_verify_pdf.py` cases.
++  Proposed by 9scorp4 in Discussion #385.
++
+ - **Real Excel workbook integration tests for the salary converter**
+   (`tests/test_convert_salary_excel_integration.py`, `.github/workflows/ci.yml`) -
+   generate temporary `.xlsx` files and invoke the documented converter CLI,
+diff --git a/tests/test_verify_pdf.py b/tests/test_verify_pdf.py
+index 6cb5bd2..dee3dde 100644
+--- a/tests/test_verify_pdf.py
++++ b/tests/test_verify_pdf.py
+@@ -6,7 +6,9 @@ from unittest.mock import patch
+ 
+ from tools.verify_pdf import (
+     VerificationError,
++    build_parser,
+     extract_text_layer,
++    find_non_ascii_date_ranges,
+     normalize_text,
+     parse_page_count,
+     run_tool,
+@@ -61,6 +63,61 @@ class NormalizeTextTests(unittest.TestCase):
+         self.assertEqual(normalize_text("Master\u2019s"), normalize_text("Master's"))
+ 
+ 
++class FindNonAsciiDateRangesTests(unittest.TestCase):
++    """The date-range rule reads the raw layer; `--contains` folds and cannot.
++
++    `05-cv-templates.md` documents a Workday import that dropped a role's end
++    date because `2016--2024` reaches the text layer as `2016<U+2013>2024`, and
++    asks Step 5d to confirm every entry's years are joined by an ASCII hyphen.
++    The fold that makes `--contains "2016-2024"` pass on that layer (#458) is
++    what makes `--contains` unable to detect it - so this check never folds.
++
++    The newline cases are yang2632's finding on the PR: `\s*` between year and
++    dash also matched a line break, so a heading ending in an ASCII date joined
++    a dash that merely opened the next line.
++    """
++
++    def test_en_dash_between_years_is_reported_with_its_code_point(self):
++        hits = find_non_ascii_date_ranges("Six Sigma Green Belt, 2016\u20132024.\n")
++        self.assertEqual(hits, [("Six Sigma Green Belt, 2016\u20132024.", "\u2013")])
++
++    def test_ascii_hyphen_range_is_clean(self):
++        self.assertEqual(find_non_ascii_date_ranges("2016-2024\nMar 2016 - Jul 2016\n"), [])
++
++    def test_a_year_on_either_side_of_the_dash_is_enough(self):
++        # Month-qualified and open-ended ranges: the year is only on one side.
++        for text in ("Mar 2016 \u2013 Jul 2016", "2016 \u2013 Present", "\u2013 2024"):
++            with self.subTest(text=text):
++                self.assertEqual(len(find_non_ascii_date_ranges(text)), 1)
++
++    def test_other_unicode_dashes_and_the_minus_sign_are_caught(self):
++        for dash in ("\u2010", "\u2011", "\u2012", "\u2014", "\u2015", "\u2212"):
++            with self.subTest(dash=dash):
++                self.assertEqual(find_non_ascii_date_ranges(f"2016{dash}2024")[0][1], dash)
++
++    def test_numeric_range_without_a_year_is_not_a_date(self):
++        # 05-cv-templates.md keeps `--` in prose ranges like EUR 600k--1M.
++        self.assertEqual(find_non_ascii_date_ranges("EUR 600k\u20131M, 12\u201315 people"), [])
++
++    def test_year_ending_a_line_is_not_joined_to_the_next_lines_dash(self):
++        text = "Heading 1988-1994\n\u2013 note\n"
++        self.assertEqual(find_non_ascii_date_ranges(text), [])
++
++    def test_dash_ending_a_line_is_not_joined_to_the_next_lines_year(self):
++        text = "Six Sigma \u2013\n2016 onwards\n"
++        self.assertEqual(find_non_ascii_date_ranges(text), [])
++
++    def test_same_line_spaces_around_the_dash_are_still_caught(self):
++        self.assertEqual(len(find_non_ascii_date_ranges("1988 \u2013 1994")), 1)
++
++    def test_hits_are_reported_in_document_order_one_per_range(self):
++        text = "2016\u20132024 role\nmore text\nJan 2010 \u2013 Dec 2012 degree\n"
++        self.assertEqual(
++            [line for line, _ in find_non_ascii_date_ranges(text)],
++            ["2016\u20132024 role", "Jan 2010 \u2013 Dec 2012 degree"],
++        )
++
++
+ class VerifyPdfTests(unittest.TestCase):
+     def setUp(self):
+         self.temp_dir = tempfile.TemporaryDirectory()
+@@ -147,6 +204,41 @@ class VerifyPdfTests(unittest.TestCase):
+ 
+         self.assertEqual(dump.read_text(encoding="utf-8"), "2016\u20132024\n")
+ 
++    @patch("tools.verify_pdf._extract_pypdf", return_value=None)
++    @patch("tools.verify_pdf.run_tool")
++    def test_ascii_dates_rejects_the_en_dash_range_that_contains_accepts(self, mock_run_tool, _pypdf):
++        # The same layer, two verdicts: --contains folds U+2013 to "-" and passes;
++        # --ascii-dates reads the raw layer and fails, naming the code point.
++        layer = "Role Title 2016\u20132024\n"
++        mock_run_tool.side_effect = [layer, "Pages:          1\n", layer, "Pages:          1\n"]
++
++        verify_pdf(self.pdf, required_text=("2016-2024",))
++
++        with self.assertRaisesRegex(VerificationError, r"U\+2013.*2016\u20132024"):
++            verify_pdf(self.pdf, required_text=("2016-2024",), ascii_dates=True)
++
++    @patch("tools.verify_pdf._extract_pypdf", return_value=None)
++    @patch("tools.verify_pdf.run_tool")
++    def test_ascii_dates_accepts_hyphen_ranges(self, mock_run_tool, _pypdf):
++        mock_run_tool.side_effect = ["Role Title 2016-2024\nMar 2016 - Jul 2016\n", "Pages:          1\n"]
++
++        verify_pdf(self.pdf, ascii_dates=True)
++
++    @patch("tools.verify_pdf._extract_pypdf", return_value=None)
++    @patch("tools.verify_pdf.run_tool")
++    def test_ascii_dates_still_writes_the_dump_before_failing(self, mock_run_tool, _pypdf):
++        mock_run_tool.side_effect = ["2016\u20132024\n", "Pages:          1\n"]
++        dump = Path(self.temp_dir.name) / "dump.txt"
++
++        with self.assertRaises(VerificationError):
++            verify_pdf(self.pdf, dump_text=dump, ascii_dates=True)
++
++        self.assertEqual(dump.read_text(encoding="utf-8"), "2016\u20132024\n")
++
++    def test_ascii_dates_flag_is_off_by_default_and_parses(self):
++        self.assertFalse(build_parser().parse_args(["x.pdf"]).ascii_dates)
++        self.assertTrue(build_parser().parse_args(["x.pdf", "--ascii-dates"]).ascii_dates)
++
+     def test_rejects_missing_pdf(self):
+         with self.assertRaisesRegex(VerificationError, "PDF does not exist"):
+             verify_pdf(Path(self.temp_dir.name) / "missing.pdf")
+diff --git a/tools/verify_pdf.py b/tools/verify_pdf.py
+index d72239d..f75f03c 100644
+--- a/tools/verify_pdf.py
++++ b/tools/verify_pdf.py
+@@ -9,6 +9,11 @@ extractable characters. Poppler remains the fallback.
+ Unicode normalization form (NFC), and the typographic substitutions LaTeX makes to
+ the source text. The fold is comparison-time only - the `--dump-text` output stays
+ the raw text layer an ATS parser actually sees.
++
++`--ascii-dates` is the one check that deliberately does NOT fold: it scans the raw
++layer for a year joined to a Unicode dash - the en-dash LaTeX makes from `--`, which
++a Workday import dropped along with the date (`05-cv-templates.md`, "Date fields
++must be ASCII ranges") - and fails naming each hit with its code point.
+ """
+ 
+ import argparse
+@@ -84,6 +89,40 @@ def normalize_text(text):
+     return " ".join(text.split())
+ 
+ 
++# Dash-like code points a year must never be joined to in a date range. U+2013 is
++# what LaTeX makes from `--` and what the documented Workday import dropped; the
++# rest are the other Unicode dashes and the minus sign, which a parser that splits
++# a range only on U+002D treats the same way.
++NON_ASCII_DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
++_YEAR = r"(?:19|20)\d{2}"
++# Horizontal whitespace only between the year and the dash: `\s*` also matched
++# a newline, so a year ending one line joined a dash opening the next (a bullet,
++# a wrapped prose line) and an ASCII date was reported as U+2013.
++NON_ASCII_DATE_RANGE = re.compile(
++    rf"{_YEAR}[^\S\n]*[{NON_ASCII_DASHES}]|[{NON_ASCII_DASHES}][^\S\n]*{_YEAR}"
++)
++
++
++def find_non_ascii_date_ranges(text):
++    """Return (line, dash) for every year joined to a non-ASCII dash in raw text.
++
++    Works on the raw text layer, never on `normalize_text()` output: the fold
++    maps U+2013 back to `-` so `--contains "2016-2024"` can match what the
++    template renders, which is exactly why `--contains` cannot see this defect.
++    A year on either side of the dash is enough ("Mar 2016 - Jul 2016",
++    "2016 - Present"), so the check is locale-agnostic; a numeric range with
++    no year ("EUR 600k-1M") is not a date and is left alone.
++    """
++    hits = []
++    for match in NON_ASCII_DATE_RANGE.finditer(text):
++        dash = next(c for c in match.group(0) if c in NON_ASCII_DASHES)
++        line_start = text.rfind("\n", 0, match.start()) + 1
++        line_end = text.find("\n", match.end())
++        line = text[line_start : line_end if line_end != -1 else len(text)]
++        hits.append((" ".join(line.split()), dash))
++    return hits
++
++
+ def _extract_pypdf(pdf_path):
+     """Return (text, pages) or None if pypdf is unavailable, raises, or yields no text."""
+     try:
+@@ -120,7 +159,14 @@ def extract_text_layer(pdf_path):
+     return text, pages, "pdftotext"
+ 
+ 
+-def verify_pdf(pdf_path, expected_pages=None, min_chars=1, required_text=(), dump_text=None):
++def verify_pdf(
++    pdf_path,
++    expected_pages=None,
++    min_chars=1,
++    required_text=(),
++    dump_text=None,
++    ascii_dates=False,
++):
+     pdf_path = Path(pdf_path)
+     if not pdf_path.is_file():
+         raise VerificationError(f"PDF does not exist: {pdf_path}")
+@@ -158,6 +204,17 @@ def verify_pdf(pdf_path, expected_pages=None, min_chars=1, required_text=(), dum
+             raise VerificationError(
+                 f"text layer is missing required text: {required!r} (extractor: {extractor})"
+             )
++
++    if ascii_dates:
++        hits = find_non_ascii_date_ranges(extracted_text)
++        if hits:
++            listed = "; ".join(f"U+{ord(dash):04X} in {line[:80]!r}" for line, dash in hits)
++            raise VerificationError(
++                f"{len(hits)} date range(s) joined by a non-ASCII dash - an ATS that splits "
++                f"ranges on U+002D drops the date; write the date argument with a single "
++                f"ASCII hyphen (05-cv-templates.md, 'Date fields must be ASCII ranges'): "
++                f"{listed} (extractor: {extractor})"
++            )
+     return extractor, extracted_text, actual_pages
+ 
+ 
+@@ -188,6 +245,15 @@ def build_parser():
+         type=Path,
+         help="write the extracted text layer to this path (UTF-8)",
+     )
++    parser.add_argument(
++        "--ascii-dates",
++        action="store_true",
++        help=(
++            "fail if the raw text layer has a year joined to a Unicode dash (the "
++            "en-dash LaTeX makes from --), which ATS date parsers drop; this check "
++            "never folds, unlike --contains"
++        ),
++    )
+     return parser
+ 
+ 
+@@ -214,6 +280,7 @@ def main(argv=None):
+             args.min_chars,
+             args.contains,
+             dump_text=args.dump_text,
++            ascii_dates=args.ascii_dates,
+         )
+     except VerificationError as exc:
+         print(f"Error: {args.pdf}: {exc}", file=sys.stderr)

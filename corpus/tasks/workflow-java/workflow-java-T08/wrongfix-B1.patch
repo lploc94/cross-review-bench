@@ -1,0 +1,38 @@
+diff --git a/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java b/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
+index f3c7f6e..9ea8ed5 100644
+--- a/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
++++ b/src/main/java/com/papertrail/workflow/domain/DocumentStateMachine.java
+@@ -21,11 +21,15 @@ public final class DocumentStateMachine {
+ 
+   /**
+    * The owner sends a rejected document for another round, within {@code window} of the rejection.
+-   * Earlier decisions stay on record. After the window the rejection is final.
++   * Earlier decisions stay on record. After the window, or once retention has archived its text,
++   * the rejection is final.
+    */
+   public static void resubmit(Document document, Principal actor, Duration window, Instant now) {
+     requireOwner(document, actor, "resubmit");
+     requireStatus(document, DocumentStatus.REJECTED, "resubmit");
++    if (document.isArchived()) {
++      throw new InvalidTransitionException("an archived document cannot be resubmitted");
++    }
+     if (!now.isBefore(document.getUpdatedAt().plus(window))) {
+       throw new InvalidTransitionException("the resubmit window of this document has closed");
+     }
+diff --git a/src/main/java/com/papertrail/workflow/service/ArchiveService.java b/src/main/java/com/papertrail/workflow/service/ArchiveService.java
+index 2d09fc4..c8a06e8 100644
+--- a/src/main/java/com/papertrail/workflow/service/ArchiveService.java
++++ b/src/main/java/com/papertrail/workflow/service/ArchiveService.java
+@@ -24,7 +24,11 @@ public class ArchiveService {
+ 
+   private static final Logger LOG = LoggerFactory.getLogger(ArchiveService.class);
+ 
+-  /** The statuses a review ends in. */
++  /**
++   * The statuses a review ends in. Archiving a rejection makes it final: {@link
++   * DocumentStateMachine#resubmit} refuses an archived document, so its marker never goes back out
++   * for review.
++   */
+   private static final List<String> FINISHED =
+       List.of(
+           DocumentStatus.APPROVED.name(),

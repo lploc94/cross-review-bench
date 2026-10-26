@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "rb-ts-codex-security-1729",
+  "repo": "rb-ts-codex-security-1729",
+  "kind": "realbug",
+  "title": "refactor(release): consolidate GitHub release publication",
+  "description": "<!-- Use a Conventional Commit title: <type>[optional scope][!]: <description>. See RELEASING.md. -->\n\n## Summary\n\nGitHub release publication combines release lookup, archive verification, note composition, and tag checks in a large workflow step. Extract that flow into an SDK script shared by the workflow and its tests, and included in the existing container build inputs.\n\n## Changes\n\n- Put the publication helper alongside the existing SDK release helpers.\n- Preserve release creation, exact archive verification, note and Latest updates, live tag checks, and subprocess failure handling.\n- Exercise the workflow boundary and release scenarios through the shared helper.\n- Keep the test import inside the SDK source copied by Docker.\n\n## Testing\n\nAfter merging current main and reconciling the release test fixtures:\n\n- SDK types, formatting, CI build, and plugin build passed.\n- Full seeded release-automation suite: 302 passed, 0 failed, and 904 assertions.\n- Independent review and three native review passes found no actionable regressions.\n- Hosted CI must pass on the updated head before merge. No live release was published during validation.\n\n## Risk and rollout\n\nRelease behavior depends on preserving tag validation, exact asset checks, note handling, and failure status. The focused tests cover those flows, and the Docker build verifies the helper is available in the packaging environment. No live release was published during validation.\n\n## Public disclosure review\n\n- [x] No customer, partner, prospect, or user identities, data, or identifying details are included.\n- [x] No credentials, personal data, private source, scan findings, or nonpublic links or tickets are included.\n- [x] I reviewed the branch name, title, description, commits, changes, comments, logs, screenshots, attachments, and links for public disclosure.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "decoys": [],
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "sdk/typescript/scripts/publish-github-release.mjs",
+      "lines": [
+        150,
+        153
+      ],
+      "category": "error-handling",
+      "severity": "low",
+      "difficulty": "L1",
+      "summary": "publishGitHubRelease parses the generate-notes command stdout with JSON.parse before calling output() on the result, so when gh fails with empty or non-JSON stdout the publisher throws a JSON SyntaxError (exit 1) instead of the command failure with its exit status; the status check runs only after a successful parse.",
+      "trigger": "The gh api releases/generate-notes call exits non-zero (e.g. status 17) and prints empty or malformed stdout.",
+      "fix_patch": "fix-B1.patch",
+      "testable": true,
+      "hidden_tests": [
+        "sdk/typescript/tests-ts/release-automation.test.ts"
+      ],
+      "hidden_test_cmd": "cd sdk/typescript && npx -y bun@1.3.14 test --timeout 30000 ./tests-ts/release-automation.test.ts -t \"preserves note-generation failure\""
+    }
+  ]
+}

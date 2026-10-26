@@ -1,0 +1,32 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T08",
+  "repo": "workflow-java",
+  "kind": "buggy",
+  "title": "Retention: archive the text of finished documents",
+  "description": "Legal asked us not to keep the full text of contracts and claims forever once their review is over; the decisions and the audit trail must stay. This adds a retention period and a job that archives finished documents.\n\n- New settings under `workflow.retention`: `finished-after` (default P365D), `resubmit-window` (default P30D) and `batch-size` (default 100, 1–1000). Negative durations fail the startup; `WorkflowConfig` gains the nested `Retention` record.\n- A rejected document can now be resubmitted only within `resubmit-window` of its rejection; after that the rejection is final and `resubmit` answers 409 `invalid-transition` (`DocumentStateMachine.resubmit` takes the window).\n- `ArchiveService.archiveFinished` locks up to one batch of finished documents (approved, withdrawn, rejected) whose last change is older than `finished-after`, oldest first, with `FOR UPDATE SKIP LOCKED` so several instances share the work, and archives them through `DocumentStateMachine.archive`: the body is replaced by a marker and the new `archived` flag is set. The last change time is left alone. `ArchiveJob` runs it on the job interval when scheduling is on.\n- `GET /documents/{id}` returns `archived`, and no body for an archived document. Title, tasks, decisions and audit rows are kept.\n- Migration V3 adds `document.archived` and a partial index for the job's query.\n- README: the resubmit window, a Retention concept, the new settings and the document route.\n\nTests: approved and withdrawn documents archived exactly at the end of the period while drafts and documents under review are not, the detail of an archived document, the resubmit window, a final rejection archived after the period, the state machine and the settings validation.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/papertrail/workflow/service/ArchiveService.java",
+      "lines": [27, 49],
+      "category": "data-integrity",
+      "severity": "high",
+      "difficulty": "L3",
+      "summary": "ArchiveService treats REJECTED as finished as soon as it is rejected: FINISHED lists it next to APPROVED and WITHDRAWN and the only cutoff is now - finished-after, so the resubmit window is ignored. The README (and DocumentStateMachine.resubmit) say a rejected document stays open to resubmission for resubmit-window and only then becomes final. Whenever finished-after is shorter than resubmit-window (both are settings; updated_at of a rejected document is its rejection time), a rejected document whose owner can still resubmit has its body destroyed; the owner's resubmit then succeeds and sends the archive marker out for review as the document's text, and the original text is lost.",
+      "trigger": "finished-after PT0S (or any value under the window), resubmit-window P30D: reject a document, run the archive job the next day: its body becomes \"(archived)\" although the owner may resubmit it for another 29 days; resubmitting starts round 2 with the marker as body.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/papertrail/workflow/service/RejectedRetentionWindowTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=RejectedRetentionWindowTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "A rejected document cannot be archived inside its window: the retention period is 365 days by default and the resubmit window 30 days (application.yml), so any document past finished-after is long past its resubmit window, and DocumentStateMachine.resubmit already refuses a resubmit once the window has closed. The two settings do not need to be combined in the archive query.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

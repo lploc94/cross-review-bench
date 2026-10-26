@@ -1,0 +1,717 @@
+diff --git a/README.md b/README.md
+index 603ec06..c9c0469 100644
+--- a/README.md
++++ b/README.md
+@@ -71,7 +71,12 @@ client does not retry by itself. Calls to `sync()` while one runs share it.
+ **Devices and tokens.** A user has up to 50 devices. Each device authenticates with
+ `Authorization: Bearer sd_<device id>_<secret>`; only the sha256 of the secret is stored, and
+ the token is shown once, when the device is registered. Any device of a user can register
+-another one.
++another one, or revoke one (itself included) when it is lost or sold: the revoked device keeps
++its place in the device list with `revokedAt`, still counts toward the limit, and its token is
++refused with 401 `device_revoked` from then on, except by `GET /v1/me`, which reports when the
++device was revoked. The server also forgets the device's sync position. A client whose device
++was revoked drops its outbox, and `sync()` rejects with `DeviceRevokedError`, whose `unsynced`
++counts the local changes that never reached the server; later syncs send nothing.
+ 
+ **Protocol version.** Requests to `/v1/sync/*` must send `Sync-Protocol: 1`; a missing or other
+ version is answered 426 `protocol_mismatch` with the server's version. Every answer carries the
+@@ -89,6 +94,7 @@ version is answered 426 `protocol_mismatch` with the server's version. Every ans
+ | GET | `/v1/me` | the calling device and its user |
+ | GET | `/v1/devices` | the user's devices with their cursors |
+ | POST | `/v1/devices` | `{ "name" }` → 201 `{ "device", "token" }` |
++| POST | `/v1/devices/:id/revoke` | `{ "device" }`; the device's token stops working |
+ 
+ Every route except `/health` needs a device token. Errors always have the shape
+ `{ "error": { "code", "message", "details"? } }`:
+@@ -96,7 +102,7 @@ Every route except `/health` needs a device token. Errors always have the shape
+ | Status | Codes |
+ |---|---|
+ | 400 | `validation_error`, `bad_request` |
+-| 401 | `unauthorized` |
++| 401 | `unauthorized`, `device_revoked` |
+ | 404 | `not_found` |
+ | 409 | `device_limit` |
+ | 413 | `payload_too_large` |
+diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
+index c10ba7b..fe77fe6 100644
+--- a/packages/client/src/index.ts
++++ b/packages/client/src/index.ts
+@@ -8,7 +8,14 @@ export { CorruptStoreError, SchemaVersionError } from "./store/errors.js";
+ export { META_KEYS } from "./store/metaStore.js";
+ export { migrate, schemaVersion, type MigrationOutcome } from "./store/migrator.js";
+ export { CLIENT_MIGRATIONS, CLIENT_SCHEMA_VERSION, type SchemaMigration } from "./store/schema.js";
+-export { HttpError, InvalidResponseError, NetworkError, ProtocolMismatchError, isRetryableStatus } from "./transport/errors.js";
++export {
++  DeviceRevokedError,
++  HttpError,
++  InvalidResponseError,
++  NetworkError,
++  ProtocolMismatchError,
++  isRetryableStatus,
++} from "./transport/errors.js";
+ export { DEFAULT_HTTP_TIMEOUT_MS, HttpTransport, type HttpTransportOptions } from "./transport/httpTransport.js";
+ export type { SyncTransport } from "./transport/transport.js";
+ export { DEVICES_PATH, ME_PATH, PULL_PATH, PUSH_PATH, STATUS_PATH, WireTransport, decode, errorFromResponse } from "./transport/wire.js";
+diff --git a/packages/client/src/store/metaStore.ts b/packages/client/src/store/metaStore.ts
+index 889df59..b7f27f1 100644
+--- a/packages/client/src/store/metaStore.ts
++++ b/packages/client/src/store/metaStore.ts
+@@ -11,6 +11,8 @@ export const META_KEYS = {
+   lastHlc: "last_hlc",
+   /** This replica's HLC node id, chosen once when the database is created. */
+   nodeId: "node_id",
++  /** Set (to the local time, epoch ms) once the server has revoked this device. */
++  revokedAt: "revoked_at",
+ } as const;
+ 
+ /** Typed access to the client's small persistent state. */
+diff --git a/packages/client/src/store/outboxStore.ts b/packages/client/src/store/outboxStore.ts
+index 2b0089c..7107f44 100644
+--- a/packages/client/src/store/outboxStore.ts
++++ b/packages/client/src/store/outboxStore.ts
+@@ -52,6 +52,7 @@ export class OutboxStore {
+   private readonly deleteByMutationId: Statement<[string]>;
+   private readonly markFailed: Statement<[string, number]>;
+   private readonly countAll: Statement<[], { count: number }>;
++  private readonly deleteAll: Statement<[]>;
+ 
+   constructor(db: SqliteDatabase) {
+     this.db = db;
+@@ -64,6 +65,7 @@ export class OutboxStore {
+       "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE seq = ?",
+     );
+     this.countAll = db.prepare("SELECT count(*) AS count FROM outbox");
++    this.deleteAll = db.prepare("DELETE FROM outbox");
+   }
+ 
+   /** Queue a mutation; returns its seq. */
+@@ -100,6 +102,11 @@ export class OutboxStore {
+     })();
+   }
+ 
++  /** Drop every queued mutation; returns how many there were. */
++  clear(): number {
++    return this.deleteAll.run().changes;
++  }
++
+   count(): number {
+     return this.countAll.get()?.count ?? 0;
+   }
+diff --git a/packages/client/src/sync/syncClient.ts b/packages/client/src/sync/syncClient.ts
+index 694c08a..4236fa4 100644
+--- a/packages/client/src/sync/syncClient.ts
++++ b/packages/client/src/sync/syncClient.ts
+@@ -22,9 +22,10 @@ import {
+ } from "@sync/shared";
+ import { openDatabase, type SqliteDatabase } from "../store/database.js";
+ import { DocsStore, type StoredDoc } from "../store/docsStore.js";
+-import { MetaStore } from "../store/metaStore.js";
++import { META_KEYS, MetaStore } from "../store/metaStore.js";
+ import { migrate } from "../store/migrator.js";
+ import { OutboxStore } from "../store/outboxStore.js";
++import { DeviceRevokedError, HttpError } from "../transport/errors.js";
+ import type { SyncTransport } from "../transport/transport.js";
+ import { ChangeEmitter, rethrowLater, type ChangeListener, type DocumentChange } from "./changes.js";
+ import { pullChanges } from "./pullPhase.js";
+@@ -296,6 +297,8 @@ export class SyncClient {
+    * call returns the running sync's promise; writes made meanwhile may wait for the next sync.
+    * A failure rejects with a SyncError whose `retryable` says whether calling `sync()` again
+    * later can succeed; nothing acknowledged or applied before the failure is lost or repeated.
++   * Once the server has revoked the device, every sync rejects with a DeviceRevokedError and
++   * sends nothing; the local changes that were still queued are dropped.
+    */
+   sync(): Promise<SyncResult> {
+     if (this.closed) return Promise.reject(new ClientClosedError());
+@@ -325,17 +328,36 @@ export class SyncClient {
+ 
+   private async pushThenPull(): Promise<SyncResult> {
+     const { db, docs, outbox, meta, hlc, transport, emitter } = this.parts;
+-    const pushed = await pushOutbox({ db, outbox, meta, hlc, transport, batchSize: this.parts.pushBatchSize });
+-    const pulled = await pullChanges({
+-      db,
+-      docs,
+-      meta,
+-      hlc,
+-      transport,
+-      limit: this.parts.pullLimit,
+-      onChanges: (changes) => emitter.emit(changes),
+-    });
+-    return { pushed: pushed.pushed, pulled: pulled.pulled, applied: pulled.applied };
++    if (meta.get(META_KEYS.revokedAt) !== null) throw new DeviceRevokedError(outbox.count());
++    try {
++      const pushed = await pushOutbox({ db, outbox, meta, hlc, transport, batchSize: this.parts.pushBatchSize });
++      const pulled = await pullChanges({
++        db,
++        docs,
++        meta,
++        hlc,
++        transport,
++        limit: this.parts.pullLimit,
++        onChanges: (changes) => emitter.emit(changes),
++      });
++      return { pushed: pushed.pushed, pulled: pulled.pulled, applied: pulled.applied };
++    } catch (err) {
++      if (err instanceof HttpError && err.code === "device_revoked") throw this.retire(err);
++      throw err;
++    }
++  }
++
++  /** Remember that the server revoked this device and drop the outbox, which can never be sent. */
++  private retire(cause: HttpError): DeviceRevokedError {
++    const { meta, outbox, clock } = this.parts;
++    meta.set(META_KEYS.revokedAt, String(clock.now()));
++    let unsynced = 0;
++    try {
++      unsynced = outbox.clear();
++    } catch {
++      // The replica is marked revoked, so whatever stays in the outbox is never sent.
++    }
++    return new DeviceRevokedError(unsynced, { cause });
+   }
+ 
+   private assertOpen(): void {
+diff --git a/packages/client/src/transport/errors.ts b/packages/client/src/transport/errors.ts
+index 101f7de..f738364 100644
+--- a/packages/client/src/transport/errors.ts
++++ b/packages/client/src/transport/errors.ts
+@@ -42,3 +42,20 @@ export class InvalidResponseError extends SyncError {
+     super("invalid_response", message, options);
+   }
+ }
++
++/**
++ * The server revoked this device. The replica stays readable but never syncs again; `unsynced`
++ * local changes never reached the server. Not retryable.
++ */
++export class DeviceRevokedError extends SyncError {
++  readonly unsynced: number;
++
++  constructor(unsynced: number, options: { cause?: unknown } = {}) {
++    super(
++      "device_revoked",
++      `this device was revoked; ${unsynced} local change${unsynced === 1 ? "" : "s"} never reached the server`,
++      { cause: options.cause, details: { unsynced } },
++    );
++    this.unsynced = unsynced;
++  }
++}
+diff --git a/packages/client/src/transport/wire.ts b/packages/client/src/transport/wire.ts
+index 97c21af..c79c017 100644
+--- a/packages/client/src/transport/wire.ts
++++ b/packages/client/src/transport/wire.ts
+@@ -8,6 +8,7 @@ import {
+   meResponseSchema,
+   pushResponseSchema,
+   registerDeviceResponseSchema,
++  revokeDeviceResponseSchema,
+   syncStatusResponseSchema,
+   type PullRequest,
+   type PullResponse,
+@@ -15,6 +16,7 @@ import {
+   type MeResponse,
+   type PushResponse,
+   type RegisterDeviceResponse,
++  type RevokeDeviceResponse,
+   type SyncStatusResponse,
+ } from "@sync/shared";
+ import type { z } from "zod";
+@@ -96,6 +98,16 @@ export abstract class WireTransport implements SyncTransport {
+     return decode(response, registerDeviceResponseSchema);
+   }
+ 
++  /** Revoke a device of the same user (this one included): its token stops working. */
++  async revokeDevice(deviceId: string): Promise<RevokeDeviceResponse> {
++    const response = await this.send({
++      method: "POST",
++      path: `${DEVICES_PATH}/${encodeURIComponent(deviceId)}/revoke`,
++      headers: {},
++    });
++    return decode(response, revokeDeviceResponseSchema);
++  }
++
+   private async send(request: WireRequest): Promise<WireResponse> {
+     const headers = {
+       ...request.headers,
+diff --git a/packages/client/test/e2e/revocation.test.ts b/packages/client/test/e2e/revocation.test.ts
+new file mode 100644
+index 0000000..7d016b4
+--- /dev/null
++++ b/packages/client/test/e2e/revocation.test.ts
+@@ -0,0 +1,60 @@
++import { DeviceRevokedError, PUSH_PATH } from "@sync/client";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { openClient, type TestClient } from "../helpers/clients.js";
++import { startTestServer, type TestAccount, type TestServer } from "../helpers/testServer.js";
++
++let server: TestServer;
++let laptop: TestAccount;
++let phone: TestAccount;
++const opened: TestClient[] = [];
++
++function client(account: TestAccount): TestClient {
++  const c = openClient(server, account);
++  opened.push(c);
++  return c;
++}
++
++beforeEach(async () => {
++  server = await startTestServer();
++  laptop = await server.createUser("Ada");
++  phone = await server.addDevice(laptop);
++});
++
++afterEach(async () => {
++  for (const c of opened.splice(0)) await c.client.close();
++  await server.close();
++});
++
++describe("a revoked device", () => {
++  it("stops syncing and reports the local changes that never reached the server", async () => {
++    const lost = client(phone);
++    lost.client.set("notes", "n1", { title: "draft" });
++    lost.client.set("tasks", "t1", { title: "call back" });
++    await client(laptop).transport.revokeDevice(phone.deviceId);
++
++    const err = await lost.client.sync().catch((e: unknown) => e);
++    expect(err).toBeInstanceOf(DeviceRevokedError);
++    expect(err).toMatchObject({ code: "device_revoked", retryable: false, unsynced: 2 });
++    expect(lost.client.pendingCount()).toBe(0);
++    expect(lost.client.get("notes", "n1")?.fields).toEqual({ title: "draft" });
++    expect(await server.countEvents(laptop.userId)).toBe(0);
++    expect(lost.client.syncState().lastError).toMatchObject({ code: "device_revoked" });
++
++    const requests = lost.transport.log.length;
++    lost.client.set("notes", "n2", { title: "after" });
++    await expect(lost.client.sync()).rejects.toMatchObject({ code: "device_revoked", unsynced: 1 });
++    expect(lost.transport.log).toHaveLength(requests);
++    expect(lost.transport.count(PUSH_PATH)).toBe(1);
++  });
++
++  it("does not affect the other devices of the user", async () => {
++    const own = client(laptop);
++    const revoked = await own.transport.revokeDevice(phone.deviceId);
++    expect(revoked.device).toMatchObject({ id: phone.deviceId, revokedAt: expect.any(String) as string });
++
++    own.client.set("notes", "n1", { title: "still syncing" });
++    expect(await own.client.sync()).toMatchObject({ pushed: 1 });
++    expect((await own.transport.me()).device.revokedAt).toBeNull();
++    expect((await client(phone).transport.me()).device.revokedAt).toBe(revoked.device.revokedAt);
++  });
++});
+diff --git a/packages/server/migrations/0005_device_revocation.sql b/packages/server/migrations/0005_device_revocation.sql
+new file mode 100644
+index 0000000..5d87378
+--- /dev/null
++++ b/packages/server/migrations/0005_device_revocation.sql
+@@ -0,0 +1,2 @@
++-- A revoked device keeps its row (and its name in the device list) but its token is refused.
++ALTER TABLE devices ADD COLUMN revoked_at timestamptz;
+diff --git a/packages/server/src/api/plugins/auth.ts b/packages/server/src/api/plugins/auth.ts
+index 69f249d..3785a48 100644
+--- a/packages/server/src/api/plugins/auth.ts
++++ b/packages/server/src/api/plugins/auth.ts
+@@ -1,6 +1,6 @@
+-import type { FastifyRequest, onRequestAsyncHookHandler } from "fastify";
++import type { FastifyRequest, onRequestAsyncHookHandler, preHandlerAsyncHookHandler } from "fastify";
+ import type { AuthContext } from "../../domain/accounts.js";
+-import { UnauthorizedError } from "../../domain/errors.js";
++import { DeviceRevokedError, UnauthorizedError } from "../../domain/errors.js";
+ import type { AuthService } from "../../services/authService.js";
+ 
+ declare module "fastify" {
+@@ -40,3 +40,13 @@ export function authOf(request: FastifyRequest): AuthContext {
+   }
+   return request.auth;
+ }
++
++/**
++ * preHandler of the routes a revoked device may no longer use: 401 `device_revoked`.
++ * `authenticate` still accepts a revoked device's token, so `GET /v1/me` can tell the device
++ * when it was revoked.
++ */
++export const requireActiveDevice: preHandlerAsyncHookHandler = async function requireActiveDevice(request) {
++  const auth = authOf(request);
++  if (auth.revokedAt !== null) throw new DeviceRevokedError(auth.deviceId, auth.revokedAt);
++};
+diff --git a/packages/server/src/api/routes/devices.ts b/packages/server/src/api/routes/devices.ts
+index 5f08fac..d8374a4 100644
+--- a/packages/server/src/api/routes/devices.ts
++++ b/packages/server/src/api/routes/devices.ts
+@@ -1,11 +1,14 @@
+ import type { FastifyInstance } from "fastify";
+-import { authOf } from "../plugins/auth.js";
+-import { registerDeviceBodySchema } from "../schemas/devices.js";
++import { authOf, requireActiveDevice } from "../plugins/auth.js";
++import { deviceParamsSchema, registerDeviceBodySchema } from "../schemas/devices.js";
+ import { serializeDevice, serializeDeviceWithCursor } from "../serializers.js";
+ import { parse } from "../validation.js";
+ import type { RouteOptions } from "./types.js";
+ 
+-/** `/v1/me` and `/v1/devices`: the caller, its user's devices; any device may register another one. */
++/**
++ * `/v1/me` and `/v1/devices`: the caller, its user's devices; any device may register another one
++ * or revoke one.
++ */
+ export async function deviceRoutes(app: FastifyInstance, options: RouteOptions): Promise<void> {
+   const { accounts } = options.services;
+ 
+@@ -23,11 +26,17 @@ export async function deviceRoutes(app: FastifyInstance, options: RouteOptions):
+     return { data: devices.map((device) => serializeDeviceWithCursor(device, auth.deviceId)) };
+   });
+ 
+-  app.post("/devices", async (request, reply) => {
++  app.post("/devices", { preHandler: requireActiveDevice }, async (request, reply) => {
+     const auth = authOf(request);
+     const body = parse(registerDeviceBodySchema, request.body, "body");
+     const registered = await accounts.registerDevice(auth.userId, body.name);
+     reply.header("cache-control", "no-store");
+     return reply.code(201).send({ device: serializeDevice(registered.device), token: registered.token });
+   });
++
++  app.post("/devices/:id/revoke", { preHandler: requireActiveDevice }, async (request) => {
++    const params = parse(deviceParamsSchema, request.params, "params");
++    const device = await accounts.revokeDevice(authOf(request), params.id);
++    return { device: serializeDevice(device) };
++  });
+ }
+diff --git a/packages/server/src/api/routes/sync.ts b/packages/server/src/api/routes/sync.ts
+index e897528..a3b8127 100644
+--- a/packages/server/src/api/routes/sync.ts
++++ b/packages/server/src/api/routes/sync.ts
+@@ -1,6 +1,6 @@
+ import type { PullResponse, PushResponse, SyncStatusResponse } from "@sync/shared";
+ import type { FastifyInstance } from "fastify";
+-import { authOf } from "../plugins/auth.js";
++import { authOf, requireActiveDevice } from "../plugins/auth.js";
+ import { pullQuerySchema, pushBodySchema } from "../schemas/sync.js";
+ import { serializeEvent } from "../serializers.js";
+ import { parse } from "../validation.js";
+@@ -15,7 +15,7 @@ export async function syncRoutes(app: FastifyInstance, options: RouteOptions): P
+     defaultLimit: options.limits.pullDefaultLimit,
+   });
+ 
+-  app.post("/push", async (request): Promise<PushResponse> => {
++  app.post("/push", { preHandler: requireActiveDevice }, async (request): Promise<PushResponse> => {
+     const auth = authOf(request);
+     const body = parse(pushBody, request.body, "body");
+     const result = await push.push(auth, body.mutations);
+diff --git a/packages/server/src/api/schemas/devices.ts b/packages/server/src/api/schemas/devices.ts
+index 7d28a50..85fced8 100644
+--- a/packages/server/src/api/schemas/devices.ts
++++ b/packages/server/src/api/schemas/devices.ts
+@@ -1,6 +1,11 @@
++import { uuidSchema } from "@sync/shared";
+ import { z } from "zod";
+ import { deviceNameSchema } from "../../domain/accounts.js";
+ 
+ export const registerDeviceBodySchema = z.strictObject({
+   name: deviceNameSchema,
+ });
++
++export const deviceParamsSchema = z.strictObject({
++  id: uuidSchema,
++});
+diff --git a/packages/server/src/api/serializers.ts b/packages/server/src/api/serializers.ts
+index 0f8e730..0b293d1 100644
+--- a/packages/server/src/api/serializers.ts
++++ b/packages/server/src/api/serializers.ts
+@@ -34,6 +34,7 @@ export function serializeDevice(device: Device) {
+     name: device.name,
+     createdAt: device.createdAt.toISOString(),
+     lastSeenAt: device.lastSeenAt?.toISOString() ?? null,
++    revokedAt: device.revokedAt?.toISOString() ?? null,
+   };
+ }
+ 
+diff --git a/packages/server/src/domain/accounts.ts b/packages/server/src/domain/accounts.ts
+index 708459b..b243faf 100644
+--- a/packages/server/src/domain/accounts.ts
++++ b/packages/server/src/domain/accounts.ts
+@@ -15,6 +15,8 @@ export interface Device {
+   readonly name: string;
+   readonly createdAt: Date;
+   readonly lastSeenAt: Date | null;
++  /** When the device was revoked; its token is refused from then on. */
++  readonly revokedAt: Date | null;
+ }
+ 
+ /** A device with the sync position it last confirmed (null before its first pull). */
+@@ -26,6 +28,8 @@ export interface DeviceWithCursor extends Device {
+ export interface AuthContext {
+   readonly userId: string;
+   readonly deviceId: string;
++  /** Set when the calling device has been revoked. */
++  readonly revokedAt: Date | null;
+ }
+ 
+ const printable = (max: number) =>
+diff --git a/packages/server/src/domain/errors.ts b/packages/server/src/domain/errors.ts
+index 7230603..41872ee 100644
+--- a/packages/server/src/domain/errors.ts
++++ b/packages/server/src/domain/errors.ts
+@@ -28,6 +28,19 @@ export class UnauthorizedError extends DomainError {
+   readonly httpStatus = 401;
+ }
+ 
++/** The token is valid but its device has been revoked. */
++export class DeviceRevokedError extends DomainError {
++  readonly code = "device_revoked";
++  readonly httpStatus = 401;
++
++  constructor(deviceId: string, revokedAt: Date) {
++    super(`device ${deviceId} was revoked at ${revokedAt.toISOString()}`, {
++      deviceId,
++      revokedAt: revokedAt.toISOString(),
++    });
++  }
++}
++
+ export class NotFoundError extends DomainError {
+   readonly code = "not_found";
+   readonly httpStatus = 404;
+diff --git a/packages/server/src/repositories/devices.ts b/packages/server/src/repositories/devices.ts
+index c989d01..df545a2 100644
+--- a/packages/server/src/repositories/devices.ts
++++ b/packages/server/src/repositories/devices.ts
+@@ -8,6 +8,7 @@ interface DeviceRow {
+   name: string;
+   created_at: Date;
+   last_seen_at: Date | null;
++  revoked_at: Date | null;
+ }
+ 
+ function toDevice(row: DeviceRow): Device {
+@@ -17,6 +18,7 @@ function toDevice(row: DeviceRow): Device {
+     name: row.name,
+     createdAt: row.created_at,
+     lastSeenAt: row.last_seen_at,
++    revokedAt: row.revoked_at,
+   };
+ }
+ 
+@@ -24,6 +26,7 @@ export interface DeviceCredentials {
+   readonly id: string;
+   readonly userId: string;
+   readonly tokenHash: string;
++  readonly revokedAt: Date | null;
+ }
+ 
+ export async function insertDevice(
+@@ -42,17 +45,17 @@ export async function findDeviceCredentials(
+   db: Queryable,
+   id: string,
+ ): Promise<DeviceCredentials | null> {
+-  const result = await db.query<{ id: string; user_id: string; token_hash: string }>(
+-    "SELECT id, user_id, token_hash FROM devices WHERE id = $1",
++  const result = await db.query<{ id: string; user_id: string; token_hash: string; revoked_at: Date | null }>(
++    "SELECT id, user_id, token_hash, revoked_at FROM devices WHERE id = $1",
+     [id],
+   );
+   const row = result.rows[0];
+-  return row ? { id: row.id, userId: row.user_id, tokenHash: row.token_hash } : null;
++  return row ? { id: row.id, userId: row.user_id, tokenHash: row.token_hash, revokedAt: row.revoked_at } : null;
+ }
+ 
+ export async function findDevice(db: Queryable, id: string): Promise<Device | null> {
+   const result = await db.query<DeviceRow>(
+-    "SELECT id, user_id, name, created_at, last_seen_at FROM devices WHERE id = $1",
++    "SELECT id, user_id, name, created_at, last_seen_at, revoked_at FROM devices WHERE id = $1",
+     [id],
+   );
+   const row = result.rows[0];
+@@ -74,7 +77,7 @@ export async function listDevicesWithCursors(
+   limit: number,
+ ): Promise<DeviceWithCursor[]> {
+   const result = await db.query<DeviceRow & { last_pulled_seq: string | null }>(
+-    `SELECT d.id, d.user_id, d.name, d.created_at, d.last_seen_at, c.last_pulled_seq
++    `SELECT d.id, d.user_id, d.name, d.created_at, d.last_seen_at, d.revoked_at, c.last_pulled_seq
+        FROM devices d
+        LEFT JOIN device_cursors c ON c.device_id = d.id
+       WHERE d.user_id = $1
+@@ -105,3 +108,15 @@ export async function touchDevice(
+     [id, now, resolutionMs],
+   );
+ }
++
++/** Mark the device revoked at `now`; a device revoked before keeps its first revocation time. */
++export async function markDeviceRevoked(db: Queryable, id: string, now: Date): Promise<Device | null> {
++  const result = await db.query<DeviceRow>(
++    `UPDATE devices SET revoked_at = coalesce(revoked_at, $2)
++      WHERE id = $1
++      RETURNING id, user_id, name, created_at, last_seen_at, revoked_at`,
++    [id, now],
++  );
++  const row = result.rows[0];
++  return row ? toDevice(row) : null;
++}
+diff --git a/packages/server/src/services/accountService.ts b/packages/server/src/services/accountService.ts
+index befbec8..2c87a7e 100644
+--- a/packages/server/src/services/accountService.ts
++++ b/packages/server/src/services/accountService.ts
+@@ -15,7 +15,13 @@ import {
+ } from "../domain/accounts.js";
+ import { DeviceLimitError, EmailTakenError, NotFoundError, ValidationError } from "../domain/errors.js";
+ import { issueToken } from "../domain/tokens.js";
+-import { countDevices, findDevice, insertDevice, listDevicesWithCursors } from "../repositories/devices.js";
++import {
++  countDevices,
++  findDevice,
++  insertDevice,
++  listDevicesWithCursors,
++  markDeviceRevoked,
++} from "../repositories/devices.js";
+ import { pgErrorCode, UNIQUE_VIOLATION } from "../repositories/mapping.js";
+ import { findUserByEmail, findUserById, insertUser, lockUser } from "../repositories/users.js";
+ 
+@@ -59,7 +65,7 @@ export class AccountService {
+     const deviceName = parseInput(deviceNameSchema, input.deviceName, "deviceName");
+     const now = new Date(this.clock.now());
+     const user: User = { id: randomUUID(), email, displayName, createdAt: now };
+-    const device: Device = { id: randomUUID(), userId: user.id, name: deviceName, createdAt: now, lastSeenAt: null };
++    const device: Device = { id: randomUUID(), userId: user.id, name: deviceName, createdAt: now, lastSeenAt: null, revokedAt: null };
+     const issued = issueToken(device.id);
+     try {
+       await withTransaction(this.pool, async (client) => {
+@@ -77,7 +83,7 @@ export class AccountService {
+   async registerDevice(userId: string, name: string): Promise<RegisteredDevice> {
+     const deviceName = parseInput(deviceNameSchema, name, "name");
+     const now = new Date(this.clock.now());
+-    const device: Device = { id: randomUUID(), userId, name: deviceName, createdAt: now, lastSeenAt: null };
++    const device: Device = { id: randomUUID(), userId, name: deviceName, createdAt: now, lastSeenAt: null, revokedAt: null };
+     const issued = issueToken(device.id);
+     await withTransaction(this.pool, async (client) => {
+       // Serializes registrations of one user, so two at once cannot both pass the limit.
+@@ -90,6 +96,20 @@ export class AccountService {
+     return { device, token: issued.token };
+   }
+ 
++  /**
++   * Revoke a device of the caller's user, the caller itself included. Revoking a device that is
++   * already revoked changes nothing.
++   */
++  async revokeDevice(auth: AuthContext, deviceId: string): Promise<Device> {
++    return withTransaction(this.pool, async (client) => {
++      const target = await findDevice(client, deviceId);
++      if (!target || target.userId !== auth.userId) throw NotFoundError.resource("device", deviceId);
++      const revoked = await markDeviceRevoked(client, deviceId, new Date(this.clock.now()));
++      if (!revoked) throw NotFoundError.resource("device", deviceId);
++      return revoked;
++    });
++  }
++
+   async listDevices(userId: string): Promise<DeviceWithCursor[]> {
+     return listDevicesWithCursors(this.pool, userId, this.maxDevicesPerUser);
+   }
+diff --git a/packages/server/src/services/authService.ts b/packages/server/src/services/authService.ts
+index e92d359..bd58258 100644
+--- a/packages/server/src/services/authService.ts
++++ b/packages/server/src/services/authService.ts
+@@ -24,6 +24,6 @@ export class AuthService {
+     const credentials = await findDeviceCredentials(this.pool, parsed.deviceId);
+     if (!credentials || !secretMatches(parsed.secret, credentials.tokenHash)) return null;
+     await touchDevice(this.pool, credentials.id, new Date(this.clock.now()), LAST_SEEN_RESOLUTION_MS);
+-    return { userId: credentials.userId, deviceId: credentials.id };
++    return { userId: credentials.userId, deviceId: credentials.id, revokedAt: credentials.revokedAt };
+   }
+ }
+diff --git a/packages/server/test/api/devices.test.ts b/packages/server/test/api/devices.test.ts
+index dff2453..85c4eb2 100644
+--- a/packages/server/test/api/devices.test.ts
++++ b/packages/server/test/api/devices.test.ts
+@@ -1,7 +1,7 @@
+ import { afterEach, beforeEach, describe, expect, it } from "vitest";
+ import { AccountService } from "../../src/services/accountService.js";
+ import { buildTestApp, type TestApp } from "../helpers/app.js";
+-import { addDevice, createUser, pull, type TestDevice } from "../helpers/fixtures.js";
++import { addDevice, createUser, hlc, mutation, pull, push, type TestDevice } from "../helpers/fixtures.js";
+ 
+ let t: TestApp;
+ let ada: TestDevice;
+@@ -70,6 +70,54 @@ describe("devices", () => {
+   });
+ });
+ 
++describe("revoking a device", () => {
++  function revoke(by: TestDevice, deviceId: string) {
++    return request(by, "POST", `/v1/devices/${deviceId}/revoke`);
++  }
++
++  it("refuses the revoked device's pushes and shows when it was revoked", async () => {
++    const phone = await addDevice(t, ada, "phone");
++    const res = await revoke(ada, phone.deviceId);
++    expect(res.statusCode).toBe(200);
++    const revokedAt = new Date(t.clock.now()).toISOString();
++    expect(res.json()).toMatchObject({ device: { id: phone.deviceId, name: "phone", revokedAt } });
++
++    const pushed = await push(t, phone, [mutation({ hlc: hlc(t.clock.now()) })]);
++    expect(pushed.statusCode).toBe(401);
++    expect(pushed.json()).toMatchObject({ error: { code: "device_revoked" } });
++
++    const me = await request(phone, "GET", "/v1/me");
++    expect(me.statusCode).toBe(200);
++    expect(me.json()).toMatchObject({ device: { id: phone.deviceId, revokedAt } });
++    expect((await push(t, ada, [mutation({ hlc: hlc(t.clock.now()) })])).statusCode).toBe(200);
++  });
++
++  it("keeps the first revocation time", async () => {
++    const phone = await addDevice(t, ada, "phone");
++    const first = (await revoke(ada, phone.deviceId)).json<{ device: { revokedAt: string } }>().device.revokedAt;
++    t.clock.advance(60_000);
++    const again = await revoke(ada, phone.deviceId);
++    expect(again.statusCode).toBe(200);
++    expect(again.json()).toMatchObject({ device: { revokedAt: first } });
++  });
++
++  it("lets a device revoke itself, after which it cannot register or revoke devices", async () => {
++    const phone = await addDevice(t, ada, "phone");
++    expect((await revoke(phone, phone.deviceId)).statusCode).toBe(200);
++    expect((await request(phone, "POST", "/v1/devices", { name: "tablet" })).statusCode).toBe(401);
++    expect((await revoke(phone, ada.deviceId)).statusCode).toBe(401);
++    expect((await request(ada, "GET", "/v1/me")).json()).toMatchObject({ device: { revokedAt: null } });
++  });
++
++  it("does not revoke other users' devices or unknown ones", async () => {
++    const grace = await createUser(t, "Grace");
++    expect((await revoke(ada, grace.deviceId)).statusCode).toBe(404);
++    expect((await revoke(ada, "00000000-0000-4000-8000-00000000abcd")).statusCode).toBe(404);
++    expect((await revoke(ada, "not-a-uuid")).statusCode).toBe(400);
++    expect((await request(grace, "GET", "/v1/me")).json()).toMatchObject({ device: { revokedAt: null } });
++  });
++});
++
+ describe("accounts", () => {
+   it("store emails lowercased and refuse a second user with the same email", async () => {
+     const created = await t.accounts.createUser({ email: " Lin@Example.TEST ", displayName: "Lin", deviceName: "desk" });
+diff --git a/packages/shared/src/core/protocol.ts b/packages/shared/src/core/protocol.ts
+index a07635c..ba2efcc 100644
+--- a/packages/shared/src/core/protocol.ts
++++ b/packages/shared/src/core/protocol.ts
+@@ -85,6 +85,7 @@ export const deviceSchema = z.object({
+   name: z.string(),
+   createdAt: z.iso.datetime({ offset: true }),
+   lastSeenAt: z.iso.datetime({ offset: true }).nullable(),
++  revokedAt: z.iso.datetime({ offset: true }).nullable(),
+ });
+ 
+ /** `GET /v1/me`: the calling device and its user. */
+@@ -103,6 +104,11 @@ export const registerDeviceResponseSchema = z.object({
+   token: z.string().min(1),
+ });
+ 
++/** `POST /v1/devices/:id/revoke`: the revoked device. */
++export const revokeDeviceResponseSchema = z.object({
++  device: deviceSchema,
++});
++
+ export const errorBodySchema = z.object({
+   error: z.object({
+     code: z.string(),
+@@ -121,6 +127,7 @@ export type SyncStatusResponse = z.output<typeof syncStatusResponseSchema>;
+ export type DeviceInfo = z.output<typeof deviceSchema>;
+ export type MeResponse = z.output<typeof meResponseSchema>;
+ export type RegisterDeviceResponse = z.output<typeof registerDeviceResponseSchema>;
++export type RevokeDeviceResponse = z.output<typeof revokeDeviceResponseSchema>;
+ export type ErrorBody = z.output<typeof errorBodySchema>;
+ 
+ /**

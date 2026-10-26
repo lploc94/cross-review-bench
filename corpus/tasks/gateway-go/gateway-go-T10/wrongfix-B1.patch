@@ -1,0 +1,14 @@
+diff --git a/internal/proxy/cors.go b/internal/proxy/cors.go
+index c7aac2b..545839c 100644
+--- a/internal/proxy/cors.go
++++ b/internal/proxy/cors.go
+@@ -64,6 +64,9 @@ func setCORS(h http.Header, c *core.CORSPolicy, origin string) bool {
+ 		return false
+ 	}
+ 	h.Set("Access-Control-Allow-Origin", value)
++	if value != "*" {
++		h.Set("Vary", "Origin")
++	}
+ 	if c.Credentials {
+ 		h.Set("Access-Control-Allow-Credentials", "true")
+ 	}

@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/LMCache/LMCache",
+  "intro_pr": 4696,
+  "intro_merged_at": "2026-08-25T22:40:40Z",
+  "fix_pr": 4748,
+  "fix_merged_at": "2026-08-26T21:21:59Z",
+  "license": "Apache-2.0",
+  "base_commit": "23cca67908e17b193eb8fab08ba1beb0115881cd",
+  "intro_commit": "d48b220003aa6d39eeeb9a3536ac77cbb1d8b0df",
+  "fix_commit": "b5244208191ef2d0c76375784128e8bfca730fc3",
+  "fix_ported": false,
+  "snapshot_changes": []
+}

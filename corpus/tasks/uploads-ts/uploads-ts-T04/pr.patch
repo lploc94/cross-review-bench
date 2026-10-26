@@ -1,0 +1,580 @@
+diff --git a/README.md b/README.md
+index fe7e007..df3d220 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ stored. Each key carries scopes, and each route requires exactly one of them:
+ | Scope | Grants |
+ |---|---|
+ | `files:read` | list files, read metadata, download, create signed links |
+-| `files:write` | upload with `PUT /v1/files/…` or `POST /v1/files` |
++| `files:write` | upload with `PUT /v1/files/…` or `POST /v1/files`, create presigned upload URLs |
+ | `files:delete` | delete files |
+ | `uploads:write` | resumable upload sessions |
+ | `tenant:read` | read the tenant's usage and quota |
+@@ -68,6 +68,17 @@ until `exp`; `sig` is the HMAC-SHA256 of `<id>.<exp>` keyed with `SIGNING_SECRET
+ signature is 403 `invalid_signature`, an expired link 403 `signed_url_expired`, a link to a
+ deleted file 404. Signatures are redacted from the logs.
+ 
++**Presigned uploads.** `POST /v1/uploads/presign` with `{"path", "size", "contentType"?,
++"expiresIn"}` returns `{"url": "/v1/public/uploads?tenant=&path=&size=&exp=&sig=", "headers",
++"expiresAt"}`. Whoever holds the URL can `PUT` exactly `size` bytes (with that `Content-Length`)
++to the path without an API key until it expires, `expiresIn` seconds later (1 to
++`SIGNED_URL_MAX_TTL_S`); `headers` lists the headers to send (the `Content-Type`, when one was
++given). The signature covers the tenant, path, size and expiry. The upload is an ordinary one: the
++quota is reserved when it arrives, the content type is sniffed, the file is scanned, and an
++existing file at the path is never replaced (409 `path_exists`), so a URL stores at most one file.
++A changed URL is 403 `invalid_signature`, an expired one 403 `signed_url_expired`, a body of
++another length 400.
++
+ **Resumable uploads.** A session is created with the path and the total size, which is reserved
+ against the quota at once. Chunks are sent with `PATCH` and an `Upload-Offset` header that must
+ equal the session's current offset; a chunk that starts elsewhere is 409 `offset_mismatch`, and
+@@ -99,6 +110,8 @@ instances can run the scan worker and the cleanup job at once: rows are claimed
+ | GET | `/v1/files/by-id/:id/meta` | `files:read` | 200 |
+ | POST | `/v1/files/by-id/:id/signed-url` | `files:read` | 200 |
+ | GET | `/v1/public/:id?exp=&sig=` | none (signed) | 200 (304) |
++| POST | `/v1/uploads/presign` | `files:write` | 200 |
++| PUT | `/v1/public/uploads?tenant=&path=&size=&exp=&sig=` | none (signed) | 201 |
+ | POST | `/v1/uploads[?overwrite=true]` | `uploads:write` | 201 with `Location` |
+ | PATCH | `/v1/uploads/:id` | `uploads:write` | 204 |
+ | HEAD | `/v1/uploads/:id` | `uploads:write` | 200 |
+@@ -191,7 +204,7 @@ test/                vitest suites; test/helpers has the app builder, fixtures a
+ | `MAX_UPLOAD_BYTES` | `104857600` (100 MiB) | per file, at most 5 GiB |
+ | `UPLOAD_SESSION_TTL_S` | `86400` | lifetime of a resumable session |
+ | `UPLOAD_CHUNK_LEASE_S` | `600` | longest time one chunk may take |
+-| `SIGNED_URL_MAX_TTL_S` | `604800` | longest signed-link lifetime |
++| `SIGNED_URL_MAX_TTL_S` | `604800` | longest signed-link and presigned-upload lifetime |
+ | `LIST_MAX_LIMIT` | `1000` | largest listing page |
+ | `SCANNER` | `noop` | `noop` or `http` |
+ | `SCANNER_URL` | required for `http` | |
+diff --git a/src/api/routes/index.ts b/src/api/routes/index.ts
+index ccf4554..e72de66 100644
+--- a/src/api/routes/index.ts
++++ b/src/api/routes/index.ts
+@@ -3,24 +3,28 @@ import { authenticate } from "../plugins/auth.js";
+ import { directUploadRoutes } from "./directUploads.js";
+ import { fileRoutes } from "./files.js";
+ import { healthRoutes } from "./health.js";
++import { presignRoutes, publicUploadRoutes } from "./presignedUploads.js";
+ import { publicRoutes } from "./public.js";
+ import { resumableRoutes } from "./resumable.js";
+ import { tenantRoutes } from "./tenant.js";
+ import type { RouteOptions } from "./types.js";
+ 
+ /**
+- * Every route of the service. Health checks and signed downloads are public; everything else
+- * under /v1 sits behind API-key authentication, and each route checks its own scope.
++ * Every route of the service. Health checks, signed downloads and presigned uploads are public;
++ * everything else under /v1 sits behind API-key authentication, and each route checks its own
++ * scope.
+  */
+ export async function registerRoutes(app: FastifyInstance, options: RouteOptions): Promise<void> {
+   await app.register(healthRoutes, options);
+   await app.register(publicRoutes, { ...options, prefix: "/v1" });
++  await app.register(publicUploadRoutes, { ...options, prefix: "/v1" });
+   await app.register(
+     async (api) => {
+       api.addHook("onRequest", authenticate(options.services.apiKeys));
+       await api.register(fileRoutes, options);
+       await api.register(directUploadRoutes, options);
+       await api.register(resumableRoutes, options);
++      await api.register(presignRoutes, options);
+       await api.register(tenantRoutes, options);
+     },
+     { prefix: "/v1" },
+diff --git a/src/api/routes/presignedUploads.ts b/src/api/routes/presignedUploads.ts
+new file mode 100644
+index 0000000..5b493c0
+--- /dev/null
++++ b/src/api/routes/presignedUploads.ts
+@@ -0,0 +1,43 @@
++import type { FastifyPluginAsync } from "fastify";
++import { authOf, requireScope } from "../plugins/auth.js";
++import { acceptRawBodies, contentLengthOf, requestBodyStream } from "../requestBody.js";
++import { presignedUploadQuerySchema, presignUploadBodySchema } from "../schemas/uploads.js";
++import { serializeFile } from "../serializers.js";
++import { parse } from "../validation.js";
++import type { RouteOptions } from "./types.js";
++
++/** `POST /uploads/presign`: the URL grants a write, so asking for one takes the upload scope. */
++export const presignRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services, limits }) => {
++  const presignBody = presignUploadBodySchema(limits.signedUrlMaxTtlSeconds);
++
++  app.post("/uploads/presign", { preHandler: requireScope("files:write") }, async (request) => {
++    const { tenantId } = authOf(request);
++    const body = parse(presignBody, request.body, "body");
++    const presigned = services.presignedUploads.presign({
++      tenantId,
++      path: body.path,
++      size: body.size,
++      expiresIn: body.expiresIn,
++      ...(body.contentType === undefined ? {} : { contentType: body.contentType }),
++    });
++    return { url: presigned.url, headers: presigned.headers, expiresAt: presigned.expiresAt.toISOString() };
++  });
++};
++
++/** `PUT /public/uploads?tenant=&path=&size=&exp=&sig=`: no Authorization header, the signature is the authority. */
++export const publicUploadRoutes: FastifyPluginAsync<RouteOptions> = async (app, { services }) => {
++  acceptRawBodies(app);
++
++  app.put("/public/uploads", async (request, reply) => {
++    const query = parse(presignedUploadQuerySchema, request.query, "query");
++    const contentLength = contentLengthOf(request);
++    const contentType = request.headers["content-type"];
++    const outcome = await services.presignedUploads.upload({
++      query,
++      body: requestBodyStream(request),
++      ...(contentLength === undefined ? {} : { contentLength }),
++      ...(contentType === undefined ? {} : { declaredType: contentType }),
++    });
++    return reply.code(201).send(serializeFile(outcome.file));
++  });
++};
+diff --git a/src/api/routes/types.ts b/src/api/routes/types.ts
+index b760e86..23e5ad4 100644
+--- a/src/api/routes/types.ts
++++ b/src/api/routes/types.ts
+@@ -1,6 +1,7 @@
+ import type { Pool } from "../../db/pool.js";
+ import type { ApiKeyService } from "../../services/apiKeyService.js";
+ import type { FileService } from "../../services/fileService.js";
++import type { PresignedUploadService } from "../../services/presignedUploads.js";
+ import type { ResumableUploadService } from "../../services/resumable.js";
+ import type { TenantService } from "../../services/tenantService.js";
+ import type { UploadService } from "../../services/uploadService.js";
+@@ -12,6 +13,7 @@ export interface RouteServices {
+   readonly files: FileService;
+   readonly uploads: UploadService;
+   readonly resumable: ResumableUploadService;
++  readonly presignedUploads: PresignedUploadService;
+ }
+ 
+ /** Limits the routes validate requests against (from the configuration). */
+diff --git a/src/api/schemas/uploads.ts b/src/api/schemas/uploads.ts
+index d6b2b3f..02c5771 100644
+--- a/src/api/schemas/uploads.ts
++++ b/src/api/schemas/uploads.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { idSchema } from "./common.js";
+ 
+ /** Sizes above MAX_UPLOAD_BYTES are refused by the service with 413, like any oversized upload. */
+ export const createSessionBodySchema = z.object({
+@@ -15,3 +16,28 @@ export const uploadOffsetHeadersSchema = z.object({
+     .transform(Number)
+     .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)),
+ });
++
++/** `POST /uploads/presign`: what the URL will allow, and for how many seconds. */
++export function presignUploadBodySchema(maxTtlSeconds: number) {
++  return z.object({
++    path: z.string().min(1).max(4096),
++    size: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
++    contentType: z.string().min(1).max(255).optional(),
++    expiresIn: z.number().int().min(1).max(maxTtlSeconds),
++  });
++}
++
++const decimalParam = z
++  .string()
++  .regex(/^\d{1,16}$/, { error: "must be a non-negative integer" })
++  .transform(Number)
++  .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
++
++/** The query of a presigned upload URL; the signature over it is checked by the service. */
++export const presignedUploadQuerySchema = z.object({
++  tenant: idSchema,
++  path: z.string().min(1).max(4096),
++  size: decimalParam,
++  exp: decimalParam,
++  sig: z.string().max(128),
++});
+diff --git a/src/app.ts b/src/app.ts
+index 1192ed2..57eb862 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -10,6 +10,7 @@ import { ApiKeyService } from "./services/apiKeyService.js";
+ import { CleanupService } from "./services/cleanup.js";
+ import { FileCatalog } from "./services/fileCatalog.js";
+ import { FileService } from "./services/fileService.js";
++import { PresignedUploadService } from "./services/presignedUploads.js";
+ import { ResumableUploadService } from "./services/resumable.js";
+ import { HttpScanner, NoopScanner, type Scanner } from "./services/scanner.js";
+ import { ScanWorker } from "./services/scanWorker.js";
+@@ -33,6 +34,15 @@ const JSON_BODY_LIMIT_BYTES = 64 * 1024;
+ export function buildServices(deps: AppDeps): RouteServices {
+   const { pool, clock, logger, storage, config } = deps;
+   const catalog = new FileCatalog({ pool, clock, logger, storage });
++  const signer = new UrlSigner(config.signing.secret);
++  const uploads = new UploadService({
++    pool,
++    clock,
++    logger,
++    storage,
++    catalog,
++    maxUploadBytes: config.uploads.maxUploadBytes,
++  });
+   return {
+     apiKeys: new ApiKeyService({ pool, clock }),
+     tenants: new TenantService({ pool, clock }),
+@@ -42,18 +52,11 @@ export function buildServices(deps: AppDeps): RouteServices {
+       logger,
+       storage,
+       catalog,
+-      signer: new UrlSigner(config.signing.secret),
++      signer,
+       signedUrlMaxTtlSeconds: config.signing.maxTtlSeconds,
+       listMaxLimit: config.listMaxLimit,
+     }),
+-    uploads: new UploadService({
+-      pool,
+-      clock,
+-      logger,
+-      storage,
+-      catalog,
+-      maxUploadBytes: config.uploads.maxUploadBytes,
+-    }),
++    uploads,
+     resumable: new ResumableUploadService({
+       pool,
+       clock,
+@@ -64,6 +67,12 @@ export function buildServices(deps: AppDeps): RouteServices {
+       sessionTtlSeconds: config.uploads.sessionTtlSeconds,
+       chunkLeaseSeconds: config.uploads.chunkLeaseSeconds,
+     }),
++    presignedUploads: new PresignedUploadService({
++      clock,
++      signer,
++      uploads,
++      maxUploadBytes: config.uploads.maxUploadBytes,
++    }),
+   };
+ }
+ 
+diff --git a/src/services/presignedUploads.ts b/src/services/presignedUploads.ts
+new file mode 100644
+index 0000000..156919e
+--- /dev/null
++++ b/src/services/presignedUploads.ts
+@@ -0,0 +1,113 @@
++import type { Readable } from "node:stream";
++import { InvalidSignatureError, PayloadTooLargeError, SignedUrlExpiredError, ValidationError } from "../domain/errors.js";
++import { normalizePath } from "../domain/paths.js";
++import { normalizeDeclaredType } from "../domain/sniff.js";
++import type { Clock } from "../infra/clock.js";
++import type { UploadOutcome, UploadService } from "./uploadService.js";
++import { unixNow, type UploadGrant, type UrlSigner } from "./urlSigner.js";
++
++export interface PresignedUploadDeps {
++  readonly clock: Clock;
++  readonly signer: UrlSigner;
++  readonly uploads: UploadService;
++  readonly maxUploadBytes: number;
++}
++
++export interface PresignInput {
++  readonly tenantId: string;
++  readonly path: string;
++  readonly size: number;
++  readonly contentType?: string;
++  readonly expiresIn: number;
++}
++
++export interface PresignedUpload {
++  /** Path and query of the public upload route; prefix it with the service's base URL. */
++  readonly url: string;
++  /** Headers the upload request should carry. */
++  readonly headers: Record<string, string>;
++  readonly expiresAt: Date;
++}
++
++export interface PresignedPut {
++  /** The parameters of the URL, as the request carried them. */
++  readonly query: { tenant: string; path: string; size: number; exp: number; sig: string };
++  readonly body: Readable;
++  /** The request's Content-Length, undefined for a chunked body. */
++  readonly contentLength?: number;
++  readonly declaredType?: string;
++}
++
++/**
++ * Presigned upload URLs: a tenant's API key asks for a URL that lets whoever holds it store one
++ * file of a given size at a given path, without an API key, until the URL expires. The upload
++ * itself is an ordinary single-request upload (quota reserved from the Content-Length, sniffing,
++ * scanning) that never replaces an existing file.
++ */
++export class PresignedUploadService {
++  private readonly deps: PresignedUploadDeps;
++
++  constructor(deps: PresignedUploadDeps) {
++    this.deps = deps;
++  }
++
++  /** `size` and `expiresIn` arrive validated by the route's schema; the size limit is checked here. */
++  presign(input: PresignInput): PresignedUpload {
++    const path = normalizePath(input.path);
++    if (input.size > this.deps.maxUploadBytes) {
++      throw new PayloadTooLargeError(this.deps.maxUploadBytes);
++    }
++    let declaredType: string | null = null;
++    if (input.contentType !== undefined) {
++      declaredType = normalizeDeclaredType(input.contentType);
++      if (declaredType === null) throw new ValidationError("contentType must be a media type");
++    }
++
++    const expiresAt = this.deps.clock.now().getTime() + input.expiresIn * 1000;
++    const grant: UploadGrant = { tenantId: input.tenantId, path, size: input.size, expiresAt };
++    const query = new URLSearchParams({
++      tenant: grant.tenantId,
++      path: grant.path,
++      size: String(grant.size),
++      exp: String(grant.expiresAt),
++      sig: this.deps.signer.signUpload(grant),
++    });
++    return {
++      url: `/v1/public/uploads?${query.toString()}`,
++      headers: declaredType === null ? {} : { "content-type": declaredType },
++      expiresAt: new Date(expiresAt),
++    };
++  }
++
++  /** Store the body a presigned URL was used for. */
++  async upload(put: PresignedPut): Promise<UploadOutcome> {
++    let grant: UploadGrant;
++    try {
++      grant = this.authorize(put.query);
++      if (put.contentLength !== grant.size) {
++        throw new ValidationError(`the body must have the URL's size, ${grant.size} bytes`, { size: grant.size });
++      }
++    } catch (err) {
++      put.body.destroy();
++      throw err;
++    }
++    return this.deps.uploads.upload({
++      tenantId: grant.tenantId,
++      path: grant.path,
++      overwrite: false,
++      body: put.body,
++      size: grant.size,
++      ...(put.declaredType === undefined ? {} : { declaredType: put.declaredType }),
++    });
++  }
++
++  /** The signature is checked before the expiry, so a forged URL learns nothing. */
++  private authorize(query: PresignedPut["query"]): UploadGrant {
++    const grant: UploadGrant = { tenantId: query.tenant, path: query.path, size: query.size, expiresAt: query.exp };
++    if (!this.deps.signer.verifyUpload(grant, query.sig)) throw new InvalidSignatureError();
++    if (grant.expiresAt <= unixNow(this.deps.clock)) {
++      throw new SignedUrlExpiredError(new Date(grant.expiresAt));
++    }
++    return grant;
++  }
++}
+diff --git a/src/services/urlSigner.ts b/src/services/urlSigner.ts
+index 1d80792..d9db7ab 100644
+--- a/src/services/urlSigner.ts
++++ b/src/services/urlSigner.ts
+@@ -9,8 +9,9 @@ export function unixNow(clock: Clock): number {
+ const SIGNATURE = /^[0-9a-f]{64}$/;
+ 
+ /**
+- * HMAC-SHA256 signatures for download links. The payload of a download link is
+- * `<file id>.<expiry in unix seconds>`; the signature is its lowercase hex HMAC.
++ * HMAC-SHA256 signatures for download and upload links. The payload of a download link is
++ * `<file id>.<expiry in unix seconds>`, that of an upload link `uploadPayload(grant)`; the
++ * signature is its lowercase hex HMAC.
+  */
+ export class UrlSigner {
+   private readonly secret: string;
+@@ -37,8 +38,35 @@ export class UrlSigner {
+     const presented = Buffer.from(signature, "hex");
+     return expected.length === presented.length && timingSafeEqual(expected, presented);
+   }
++
++  signUpload(grant: UploadGrant): string {
++    return this.sign(uploadPayload(grant));
++  }
++
++  /** Whether `signature` is the one signUpload gives for exactly this grant. */
++  verifyUpload(grant: UploadGrant, signature: string): boolean {
++    const expected = this.signUpload(grant);
++    return signature === expected;
++  }
+ }
+ 
+ export function downloadPayload(fileId: string, expiresAt: number): string {
+   return `${fileId}.${expiresAt}`;
+ }
++
++/** What a presigned upload URL allows: one upload of `size` bytes to `path` until `expiresAt`. */
++export interface UploadGrant {
++  readonly tenantId: string;
++  readonly path: string;
++  readonly size: number;
++  readonly expiresAt: number;
++}
++
++/**
++ * The signed payload of an upload link. The `upload` prefix keeps it apart from download
++ * payloads, and the path goes last as the only free-form field; paths never contain control
++ * characters, so newline separators cannot be forged from inside one.
++ */
++export function uploadPayload(grant: UploadGrant): string {
++  return ["upload", grant.tenantId, String(grant.size), String(grant.expiresAt), grant.path].join("\n");
++}
+diff --git a/test/api/presignedUploads.test.ts b/test/api/presignedUploads.test.ts
+new file mode 100644
+index 0000000..b7c273e
+--- /dev/null
++++ b/test/api/presignedUploads.test.ts
+@@ -0,0 +1,122 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { UrlSigner, unixNow } from "../../src/services/urlSigner.js";
++import { buildTestApp, TEST_SIGNING_SECRET, type TestApp } from "../helpers/app.js";
++import { createTenant, expectStatus, tenantUsage, type ErrorResponse, type FileBody, type TestTenant } from "../helpers/fixtures.js";
++
++interface PresignBody {
++  url: string;
++  headers: Record<string, string>;
++  expiresAt: string;
++}
++
++describe("presigned uploads", () => {
++  let t: TestApp;
++  let tenant: TestTenant;
++
++  beforeEach(async () => {
++    t = await buildTestApp();
++    tenant = await createTenant(t.pool, t.clock);
++  });
++
++  afterEach(async () => {
++    await t.close();
++  });
++
++  function presign(payload: Record<string, unknown>, headers: Record<string, string> = tenant.headers) {
++    return t.app.inject({ method: "POST", url: "/v1/uploads/presign", headers, payload });
++  }
++
++  async function presignedUrl(path: string, size: number): Promise<string> {
++    const response = await presign({ path, size, expiresIn: 600 });
++    expectStatus(response, 200);
++    return response.json<PresignBody>().url;
++  }
++
++  function putTo(url: string, body: string) {
++    return t.app.inject({ method: "PUT", url, headers: { "content-type": "text/plain" }, payload: body });
++  }
++
++  it("stores the file without an API key, once", async () => {
++    const response = await presign({ path: "inbox/scan 1.txt", size: 13, contentType: "text/plain", expiresIn: 600 });
++    expectStatus(response, 200);
++    const presigned = response.json<PresignBody>();
++    expect(presigned.expiresAt).toBe("2030-01-15T10:10:00.000Z");
++    expect(presigned.headers).toEqual({ "content-type": "text/plain" });
++    const url = new URL(presigned.url, "http://localhost");
++    expect(url.pathname).toBe("/v1/public/uploads");
++    expect(url.searchParams.get("path")).toBe("inbox/scan 1.txt");
++
++    const stored = await putTo(presigned.url, "scanned pages");
++    expectStatus(stored, 201);
++    expect(stored.json<FileBody>()).toMatchObject({ path: "inbox/scan 1.txt", size: 13, status: "pending_scan" });
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(13);
++
++    const again = await putTo(presigned.url, "other content");
++    expectStatus(again, 409);
++    expect(again.json<ErrorResponse>().error.code).toBe("path_exists");
++    expect(await tenantUsage(t.pool, tenant.tenantId)).toBe(13);
++  });
++
++  it("refuses a URL whose parameters were changed", async () => {
++    const other = await createTenant(t.pool, t.clock, { name: "Harbor Logistics" });
++    const original = new URL(await presignedUrl("inbox/a.txt", 4), "http://localhost");
++    const changes: [string, string][] = [
++      ["path", "inbox/b.txt"],
++      ["size", "5"],
++      ["tenant", other.tenantId],
++      ["exp", String(Number(original.searchParams.get("exp")) + 3600)],
++      ["sig", (original.searchParams.get("sig") ?? "").toUpperCase()],
++    ];
++    for (const [name, value] of changes) {
++      const changed = new URL(original);
++      changed.searchParams.set(name, value);
++      const response = await putTo(`${changed.pathname}${changed.search}`, name === "size" ? "abcde" : "abcd");
++      expectStatus(response, 403);
++      expect(response.json<ErrorResponse>().error.code).toBe("invalid_signature");
++    }
++    expect(await tenantUsage(t.pool, other.tenantId)).toBe(0);
++  });
++
++  it("refuses an expired URL", async () => {
++    const grant = { tenantId: tenant.tenantId, path: "late.txt", size: 4, expiresAt: unixNow(t.clock) };
++    const query = new URLSearchParams({
++      tenant: grant.tenantId,
++      path: grant.path,
++      size: "4",
++      exp: String(grant.expiresAt),
++      sig: new UrlSigner(TEST_SIGNING_SECRET).signUpload(grant),
++    });
++    const response = await putTo(`/v1/public/uploads?${query.toString()}`, "late");
++    expectStatus(response, 403);
++    expect(response.json<ErrorResponse>().error.code).toBe("signed_url_expired");
++  });
++
++  it("takes only a body of the signed size", async () => {
++    const url = await presignedUrl("sized.txt", 10);
++    for (const body of ["too short", "much too long"]) {
++      const response = await putTo(url, body);
++      expectStatus(response, 400);
++      expect(response.json<ErrorResponse>().error.details).toEqual({ size: 10 });
++    }
++    expectStatus(await putTo(url, "just right"), 201);
++  });
++
++  it("reserves the quota when the file arrives", async () => {
++    const small = await createTenant(t.pool, t.clock, { name: "Small Co", quotaBytes: 8 });
++    const response = await presign({ path: "big.txt", size: 12, expiresIn: 60 }, small.headers);
++    expectStatus(response, 200);
++    const upload = await putTo(response.json<PresignBody>().url, "twelve bytes");
++    expectStatus(upload, 422);
++    expect(await tenantUsage(t.pool, small.tenantId)).toBe(0);
++  });
++
++  it("validates the request for a URL and needs files:write", async () => {
++    expectStatus(await presign({ path: "a.txt", size: 1, expiresIn: t.config.signing.maxTtlSeconds + 1 }), 400);
++    expectStatus(await presign({ path: "a.txt", size: 0, expiresIn: 60 }), 400);
++    expectStatus(await presign({ path: "../a.txt", size: 1, expiresIn: 60 }), 400);
++    expectStatus(await presign({ path: "a.txt", size: 1, contentType: "not a type", expiresIn: 60 }), 400);
++    expectStatus(await presign({ path: "a.txt", size: t.config.uploads.maxUploadBytes + 1, expiresIn: 60 }), 413);
++    const reader = await createTenant(t.pool, t.clock, { scopes: ["files:read", "uploads:write"] });
++    expectStatus(await presign({ path: "a.txt", size: 1, expiresIn: 60 }, reader.headers), 403);
++  });
++});
+diff --git a/test/services/urlSigner.test.ts b/test/services/urlSigner.test.ts
+index 2aff8b4..500e4f5 100644
+--- a/test/services/urlSigner.test.ts
++++ b/test/services/urlSigner.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { downloadPayload, UrlSigner } from "../../src/services/urlSigner.js";
++import { downloadPayload, uploadPayload, UrlSigner } from "../../src/services/urlSigner.js";
+ 
+ const signer = new UrlSigner("a-signing-secret-of-at-least-32-chars");
+ 
+@@ -16,6 +16,15 @@ describe("UrlSigner", () => {
+     expect(new UrlSigner("another-signing-secret-of-32-chars!").verify(payload, sig)).toBe(false);
+   });
+ 
++  it("signs upload grants apart from download links", () => {
++    const grant = { tenantId: "4f2b8c1e-0000-4000-8000-0000000000aa", path: "in/a.pdf", size: 20, expiresAt: 1_900_000_000 };
++    const sig = signer.signUpload(grant);
++    expect(uploadPayload(grant)).toBe("upload\n4f2b8c1e-0000-4000-8000-0000000000aa\n20\n1900000000\nin/a.pdf");
++    expect(signer.verifyUpload(grant, sig)).toBe(true);
++    expect(signer.verifyUpload({ ...grant, size: 21 }, sig)).toBe(false);
++    expect(signer.verify(downloadPayload(grant.tenantId, grant.expiresAt), sig)).toBe(false);
++  });
++
+   it("refuses short secrets", () => {
+     expect(() => new UrlSigner("too-short")).toThrow(/at least 32/);
+   });

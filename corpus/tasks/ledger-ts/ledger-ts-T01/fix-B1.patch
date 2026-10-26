@@ -1,0 +1,39 @@
+diff --git a/src/repositories/transfers.ts b/src/repositories/transfers.ts
+index a1ff4fa..24b751d 100644
+--- a/src/repositories/transfers.ts
++++ b/src/repositories/transfers.ts
+@@ -83,6 +83,20 @@ export async function findTransfer(
+   return row ? mapTransfer(row) : null;
+ }
+ 
++/** Like `findTransfer`, and locks the row for the rest of the transaction (`SELECT … FOR UPDATE`). */
++export async function lockTransfer(
++  db: Queryable,
++  tenantId: string,
++  id: string,
++): Promise<Transfer | null> {
++  const result = await db.query<TransferRow>(
++    `SELECT ${COLUMNS} FROM transfers WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
++    [tenantId, id],
++  );
++  const row = firstRow(result.rows);
++  return row ? mapTransfer(row) : null;
++}
++
+ /** The transfer that reverses `transferId`, or null when it has not been reversed. */
+ export async function findReversal(
+   db: Queryable,
+diff --git a/src/services/transferService.ts b/src/services/transferService.ts
+index 24caf44..43e3162 100644
+--- a/src/services/transferService.ts
++++ b/src/services/transferService.ts
+@@ -105,7 +105,8 @@ export class TransferService {
+   ): Promise<PostingResult> {
+     const now = this.clock.now();
+     return withTransaction(this.pool, async (client) => {
+-      const original = await transfers.findTransfer(client, tenantId, id);
++      // Concurrent reversals of one transfer queue on its row, so the second one sees the first.
++      const original = await transfers.lockTransfer(client, tenantId, id);
+       if (!original) throw NotFoundError.resource("transfer", id);
+       if (original.reversalOf !== null) {
+         throw new ConflictError(`transfer ${original.id} is a reversal and cannot be reversed`, {

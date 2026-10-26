@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/papertrail/workflow/domain/Delegation.java b/src/main/java/com/papertrail/workflow/domain/Delegation.java
+index a052533..acaf7e9 100644
+--- a/src/main/java/com/papertrail/workflow/domain/Delegation.java
++++ b/src/main/java/com/papertrail/workflow/domain/Delegation.java
+@@ -57,7 +57,7 @@ public class Delegation extends AbstractEntity<Long> {
+ 
+   /** Whether the delegation is in force on {@code day}, a date in the business calendar's zone. */
+   public boolean coversDay(LocalDate day) {
+-    return !day.isBefore(startsOn) && day.isBefore(endsOn);
++    return !day.isBefore(startsOn) && !day.isAfter(endsOn);
+   }
+ 
+   @Override

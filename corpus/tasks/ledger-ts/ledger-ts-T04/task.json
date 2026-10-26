@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "ledger-ts-T04",
+  "repo": "ledger-ts",
+  "kind": "buggy",
+  "title": "Account statements (JSON and CSV)",
+  "description": "Adds `GET /accounts/:id/statement?from=&to=&format=json|csv` (scope `transfers:read`, like the entries list) so customers can pull a statement for a date range instead of paging through `/entries`.\n\n- `from` and `to` are UTC calendar days (`YYYY-MM-DD`), both included; a statement covers at most 366 days and at most 10,000 entries.\n- The JSON form returns the opening balance at the start of `from`, the period's entries oldest first (same entry shape as `/entries`) and the closing balance at the end of `to`.\n- `format=csv` returns the same statement as a download: header row, an `opening` row, one `entry` row per entry and a `closing` row, with amounts and balances in major units so the file opens cleanly in a spreadsheet.\n- New `StatementService` reads the account and its entries in one REPEATABLE READ, read-only transaction so the balances always agree with the listed entries; a new `listEntriesInPeriod` repository query backs it with the existing `(tenant_id, account_id, created_at, id)` index.\n\nTests cover balances and entries for a month, the inclusive `to` day, an empty period, the CSV layout and headers, validation, tenant isolation and scopes.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/services/statementService.ts",
+      "lines": [61, 62],
+      "category": "logic",
+      "severity": "high",
+      "difficulty": "L2",
+      "summary": "The opening balance is the account's current balance_minor minus the period's entries, so any entry posted after the period end is wrongly folded into both the opening and the closing balance",
+      "trigger": "a statement for a past period of an account that has entries after the period's end (including a quiet period followed by activity)",
+      "testable": true,
+      "hidden_tests": ["test/hidden/statementBalances.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/statementBalances.test.ts",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "The opening balance is exact. getStatement reads the account and the entries in one REPEATABLE READ snapshot, and LedgerVerifier guarantees accounts.balance_minor is the sum of the account's entries, so balance_minor minus the period's movement is precisely the balance at period.start; nothing can land between the two reads.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/api/statementCsv.ts",
+      "lines": [13, 13],
+      "category": "data-integrity",
+      "severity": "medium",
+      "difficulty": "L4",
+      "summary": "CSV amounts and balances are always divided by 100 and printed with two decimals, which is wrong for JPY/VND (no minor unit) and KWD/BHD (three decimals); formatMinor with the account currency's exponent should be used",
+      "trigger": "format=csv for an account in JPY, VND, KWD or BHD (e.g. 1500 JPY exported as 15.00, 1.005 KWD as 10.05)",
+      "testable": true,
+      "hidden_tests": ["test/hidden/statementCsvCurrencies.test.ts"],
+      "hidden_test_cmd": "npx vitest run test/hidden/statementCsvCurrencies.test.ts",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "Dividing by 100 is the currency exponent for every account this ledger can hold: currencySchema in src/api/schemas/common.ts only accepts currencies with two decimal places, so a statement account is always in cents and toFixed(2) is the right rendering.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}

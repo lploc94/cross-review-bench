@@ -1,0 +1,49 @@
+{
+  "schema": "crb-task/v1",
+  "id": "workflow-java-T01",
+  "repo": "workflow-java",
+  "kind": "buggy",
+  "title": "Delegate approval tasks for a period",
+  "description": "When an approver is on leave their tasks sit until they escalate, and today the only way out is to withdraw and resubmit the document against a different definition. This lets an approver hand their tasks to a colleague for a few days.\n\n- `POST /api/v1/delegations {delegatorId?, delegateId, from, until}` creates a delegation. `from` and `until` are dates in the business calendar's zone, both included; `until` may not be in the past. A user creates delegations for themself; an admin may name the delegator. The delegate must be an active user other than the delegator, and one delegator's delegations may not overlap (409; the delegator's row is locked while checking). `DELETE /api/v1/delegations/{id}` ends one (its delegator or an admin; anyone else gets 404).\n- While a delegation is in force, `ApprovalService.decide` accepts a decision from the delegate on the delegator's open tasks: the state machine guard is checked as the assignee, the task records `decided_by` and `on_behalf_of`, and the audit row of the decision carries `onBehalfOf`. Task views show both fields.\n- `DocumentAccess` lets the delegate read, by id, the documents where a delegator in force today has an open task, so the delegate can see what they are approving. Lists and counts are unchanged.\n- Migration V3: `delegation` table, `approval_task.decided_by` / `on_behalf_of`.\n- README: delegations in Concepts and the API table.\n\nTests: a delegate deciding on the delegator's behalf (response, audit row, document read), no delegation, a delegation that has not started or has ended, an admin creating one for another user, overlap, reversed and self delegations, and ending a delegation.",
+  "pr_patch": "pr.patch",
+  "visible_test_cmd": null,
+  "bugs": [
+    {
+      "id": "B1",
+      "file": "src/main/java/com/papertrail/workflow/service/DelegationService.java",
+      "lines": [51, 57],
+      "category": "security",
+      "severity": "critical",
+      "difficulty": "L2",
+      "summary": "DelegationService.create takes the delegator from the request's delegatorId whenever it is present, and the only authorization check looks at the wrong user's admin flag: it refuses a non-admin only when the named delegator is an admin. The route is a user route (AuthenticationFilter accepts any user token), so any user can post {delegatorId: <someone else>, delegateId: <themself>} and gets a delegation in force at once; through the PR's own changes to DocumentAccess and ApprovalService.decide they can then read that user's documents and approve or reject their tasks. The README promises that a user creates delegations for themself and only an admin may name the delegator: a non-admin's delegatorId must be the caller (403 otherwise).",
+      "trigger": "User Lena (not an admin) posts {\"delegatorId\": <Tomas>, \"delegateId\": <Lena>, \"from\": today, \"until\": in a week}: 201, and Lena can then approve Tomas's open task.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/papertrail/workflow/api/DelegationCreatorTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=DelegationCreatorTest",
+      "fix_patch": "fix-B1.patch",
+      "wrong_fix_patch": "wrongfix-B1.patch",
+      "false_rebuttal": "Naming another delegator does not give the caller anything: DocumentStateMachine.requireDecidable still compares the task's assignee with the principal, and DocumentAccess.lockVisible runs findVisibleById with the caller's own user id, so a user who is not the assignee gets 404 on the task's document whatever delegation rows exist. The admin check only exists to keep admin accounts' delegations in admin hands.",
+      "justification": null
+    },
+    {
+      "id": "B2",
+      "file": "src/main/java/com/papertrail/workflow/domain/Delegation.java",
+      "lines": [59, 60],
+      "category": "boundary",
+      "severity": "medium",
+      "difficulty": "L1",
+      "summary": "Delegation.coversDay treats the end as exclusive (`day.isBefore(endsOn)`), while the README, the description, the overlap query (`d.endsOn >= :from`) and the migration's check (`ends_on >= starts_on`) treat `until` as included. On the last day of every delegation the delegate can neither decide the delegator's tasks nor read their documents, and a one-day delegation (from = until, which the API accepts) never takes effect.",
+      "trigger": "Delegation from Monday until Wednesday; on Wednesday the delegate's decision on the delegator's task answers 404.",
+      "testable": true,
+      "hidden_tests": ["src/test/java/com/papertrail/workflow/api/DelegationUntilDayTest.java"],
+      "hidden_test_cmd": "mvn -q -B test -Dtest=DelegationUntilDayTest",
+      "fix_patch": "fix-B2.patch",
+      "wrong_fix_patch": "wrongfix-B2.patch",
+      "false_rebuttal": "The exclusive end is deliberate and consistent with the rest of the code: DelegationRepository.findByDelegateIdAndEndsOnGreaterThanEqual already returns a delegation on its until day, and coversDay is evaluated against the business zone's date, which in Europe/London runs ahead of the stored UTC dates, so the until day is still covered in local time.",
+      "justification": null
+    }
+  ],
+  "decoys": [],
+  "clean_hidden_tests": [],
+  "clean_hidden_test_cmd": null
+}
